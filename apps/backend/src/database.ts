@@ -16,6 +16,7 @@ interface AppliedMigration {
 
 const CURRENT_SCHEMA_TABLES = [
   'audit_events',
+  'auth_user',
   'candle_cache',
   'crossex_instruments',
   'credential_session',

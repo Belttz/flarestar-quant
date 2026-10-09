@@ -1,4 +1,4 @@
-param([string]$Command = "start", [string]$Path = "")
+﻿param([string]$Command = "start", [string]$Path = "")
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root

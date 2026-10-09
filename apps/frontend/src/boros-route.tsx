@@ -785,7 +785,7 @@ export function BorosStrategyView({
       <div className="boros-control-grid">
         <fieldset className="boros-exchange-control" aria-label={t('Exchange filter')}>
           <legend className="sr-only">{t('Exchange filter')}</legend>
-          <div className="boros-exchange-head"><span>{t('Exchange filter')}</span><small>{opportunities.length} {t('matching opportunities')}</small><button type="button" disabled={selectedExchanges === null} onClick={() => setSelectedExchanges(null)}>{selectedExchanges === null ? t('All selected') : t('Select all')}</button></div>
+          <div className="boros-exchange-head"><small>{opportunities.length} {t('matching opportunities')}</small><button type="button" disabled={selectedExchanges === null} onClick={() => setSelectedExchanges(null)}>{selectedExchanges === null ? t('All selected') : t('Select all')}</button></div>
           <div className="boros-exchange-groups">
             <div className="boros-exchange-group supported">
               <span className="boros-exchange-group-label"><i />{t('CrossEx supported')}</span>

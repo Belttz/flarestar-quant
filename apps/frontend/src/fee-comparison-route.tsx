@@ -15,6 +15,8 @@ interface FeeComparisonViewProps {
   feesReady: boolean;
   error: string | null;
   onRefresh: () => void;
+  /** Receives the market selector's visible-batch symbols for live quote streaming. */
+  watchSelectorQuotes?: (symbols: string[]) => void;
 }
 
 function percent(rate: number): string {
@@ -25,7 +27,7 @@ function money(value: number): string {
   return value.toLocaleString('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 4 });
 }
 
-export function FeeComparisonView({ catalog, marketSnapshot, favorites, fees, feesReady, error, onRefresh }: FeeComparisonViewProps) {
+export function FeeComparisonView({ catalog, marketSnapshot, favorites, fees, feesReady, error, onRefresh, watchSelectorQuotes }: FeeComparisonViewProps) {
   const { t } = useLanguage();
   const [tickerInput, setTickerInput] = useState('BTC');
   const [notionalInput, setNotionalInput] = useState('10000');
@@ -65,6 +67,7 @@ export function FeeComparisonView({ catalog, marketSnapshot, favorites, fees, fe
           assetName={assetName}
           assetIcon={assetIcon}
           onSelect={setTickerInput}
+          onVisibleSymbols={watchSelectorQuotes}
           t={t}
           showMarketStats={false}
         />

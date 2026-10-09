@@ -5,7 +5,14 @@ import {
   type FundingRatePoint,
   type HyperliquidPerpMetadataSnapshot,
 } from '@gate-crossex/public-data';
-import { PortfolioSnapshotSchema, ReconciliationReportSchema, UserPreferencesSchema, type CrossExInstrument, type CrossExRiskLimit, type PortfolioSnapshot, type PublicMarketSnapshot, type ReconciliationReport, type UserPreferences } from '@gate-crossex/shared-types';
+import {
+  PortfolioSnapshotSchema, ReconciliationReportSchema, UserPreferencesSchema,
+  PORTFOLIO_EQUITY_RETENTION_MS,
+  equityBucketStart,
+  portfolioEquitySampleFromSnapshot,
+  type CrossExInstrument, type CrossExRiskLimit, type PortfolioSnapshot, type PublicMarketSnapshot, type ReconciliationReport, type UserPreferences,
+  type PortfolioEquityGranularity, type PortfolioEquityPoint, type PortfolioEquitySnapshotInput,
+} from '@gate-crossex/shared-types';
 
 export interface CredentialMetadata {
   id: string;
@@ -541,6 +548,102 @@ export function readLatestPortfolioSnapshot(database: Database.Database): Portfo
   } catch {
     return null;
   }
+}
+
+/** Minimum spacing between two recorded equity samples of one database (refresh-button debounce). */
+const PORTFOLIO_EQUITY_MIN_INTERVAL_MS = 60_000;
+/** Last recorded sample time per database; WeakMap keeps closed databases collectable. */
+const lastPortfolioEquitySampleAt = new WeakMap<Database.Database, number>();
+
+export interface PortfolioEquitySampleResult {
+  /** `false` when the sample was suppressed by the debounce or carried an unusable timestamp. */
+  recorded: boolean;
+  sampledAtMs: number;
+}
+
+/**
+ * Persist one equity sample at every granularity: the exact raw timestamp plus its floored
+ * hour/day buckets (see `migrations/0023_portfolio_equity_samples.sql`). Equity is
+ * `snapshot.account.marginBalance` — the same figure the asset page shows as the "Margin
+ * balance" KPI — and `unrealizedPnl` sums futures and margin positions. Gate spot balances are
+ * denominated per coin and are intentionally out of scope.
+ *
+ * Samples are debounced to at most one per minute per database so refresh-button spam cannot
+ * produce dense raw points; the ~5 minute background reconciliation cadence is unaffected.
+ * A back-dated timestamp (clock moved backwards) is still recorded — the upsert simply
+ * overwrites the affected buckets.
+ */
+export function recordPortfolioEquitySample(
+  database: Database.Database,
+  snapshot: PortfolioEquitySnapshotInput,
+  sampledAtMs: number,
+): PortfolioEquitySampleResult {
+  const sampledAt = Number.isFinite(sampledAtMs) ? Math.max(0, Math.trunc(sampledAtMs)) : 0;
+  if (sampledAt <= 0) return { recorded: false, sampledAtMs: sampledAt };
+  const previousAt = lastPortfolioEquitySampleAt.get(database);
+  if (previousAt !== undefined && sampledAt >= previousAt
+    && sampledAt - previousAt < PORTFOLIO_EQUITY_MIN_INTERVAL_MS) {
+    return { recorded: false, sampledAtMs: sampledAt };
+  }
+  const point = portfolioEquitySampleFromSnapshot(snapshot, sampledAt);
+  const upsert = database.prepare(`
+    INSERT INTO portfolio_equity_samples (granularity, bucket_start, sampled_at, equity, unrealized_pnl)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(granularity, bucket_start) DO UPDATE SET
+      sampled_at = excluded.sampled_at,
+      equity = excluded.equity,
+      unrealized_pnl = excluded.unrealized_pnl
+  `);
+  database.transaction(() => {
+    for (const granularity of ['raw', 'hour', 'day'] as const) {
+      upsert.run(granularity, equityBucketStart(sampledAt, granularity), sampledAt, point.equity, point.unrealizedPnl);
+    }
+  })();
+  lastPortfolioEquitySampleAt.set(database, sampledAt);
+  return { recorded: true, sampledAtMs: sampledAt };
+}
+
+/**
+ * Read the persisted equity series of one granularity from `fromMs` (inclusive), oldest first.
+ * Returns an empty array when nothing has been sampled yet — the empty state, never an error.
+ */
+export function readPortfolioEquitySeries(
+  database: Database.Database,
+  granularity: PortfolioEquityGranularity,
+  fromMs: number,
+): PortfolioEquityPoint[] {
+  const safeFrom = Number.isFinite(fromMs) ? Math.max(0, Math.trunc(fromMs)) : 0;
+  const rows = database.prepare(`
+    SELECT bucket_start, equity, unrealized_pnl
+    FROM portfolio_equity_samples
+    WHERE granularity = ? AND bucket_start >= ?
+    ORDER BY bucket_start
+  `).all(granularity, safeFrom) as Array<{ bucket_start: number; equity: string; unrealized_pnl: string | null }>;
+  return rows.map((row) => ({ time: row.bucket_start, equity: row.equity, unrealizedPnl: row.unrealized_pnl }));
+}
+
+/** Epoch ms of the oldest sample of any granularity; `null` when nothing was ever recorded. */
+export function readPortfolioEquityFirstSampleAt(database: Database.Database): number | null {
+  const row = database.prepare('SELECT MIN(bucket_start) AS first_bucket FROM portfolio_equity_samples')
+    .get() as { first_bucket: number | null } | undefined;
+  return row?.first_bucket ?? null;
+}
+
+/**
+ * Delete samples older than each granularity's retention window (raw 7d, hour 45d, day 730d,
+ * per `PORTFOLIO_EQUITY_RETENTION_MS`). Returns the number of deleted rows.
+ */
+export function prunePortfolioEquitySamples(database: Database.Database, nowMs: number): number {
+  const safeNow = Number.isFinite(nowMs) ? Math.max(0, Math.trunc(nowMs)) : 0;
+  return database.transaction(() => {
+    let deleted = 0;
+    for (const granularity of ['raw', 'hour', 'day'] as const) {
+      deleted += database.prepare(`
+        DELETE FROM portfolio_equity_samples WHERE granularity = ? AND bucket_start < ?
+      `).run(granularity, safeNow - PORTFOLIO_EQUITY_RETENTION_MS[granularity]).changes;
+    }
+    return deleted;
+  })();
 }
 
 export function saveReconciliationReport(database: Database.Database, report: ReconciliationReport): void {

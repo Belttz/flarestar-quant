@@ -41,7 +41,8 @@ export interface LiveMarket {
   openInterestValue: string;
   receivedAt: string;
   updatedAt: string;
-  source: 'gate_crossex_websocket' | 'demo_seed';
+  /** rest_book_ticker marks rows synthesized from a venue's bulk REST sweep (spread board view). */
+  source: 'gate_crossex_websocket' | 'demo_seed' | 'rest_book_ticker';
 }
 
 export interface MarketSnapshot {
@@ -67,11 +68,38 @@ export interface MarketDefinition {
 /** Streamed symbols beyond the seed set are bounded so a long session cannot grow subscriptions without limit. */
 const MAX_DYNAMIC_SYMBOLS = 1_000;
 
+/**
+ * The upstream CrossEx socket rejects any subscription frame beyond 100 symbols per channel per
+ * connection ("Each channel is limited to 100 symbols per connection") — and it rejects the WHOLE
+ * frame, so a single oversized request silently starves every symbol in it. Symbols are therefore
+ * spread across a pool of connections, each carrying at most 100 symbols on every channel.
+ */
+const SYMBOLS_PER_SHARD = 100;
+const MAX_SHARDS = Math.ceil((1_000 + 200) / SYMBOLS_PER_SHARD);
+
+interface ShardConnection {
+  index: number;
+  socket: WebSocket | null;
+  /** Symbols routed to this shard; every channel subscription for them lives on this one connection. */
+  readonly symbols: Set<string>;
+  /** Per-channel subscription requests sent (or queued) to the upstream socket. */
+  readonly subscriptions: Map<string, Set<string>>;
+  state: MarketSnapshot['connectionState'];
+  reconnectAttempt: number;
+  heartbeat: ReturnType<typeof setInterval> | null;
+  reconnectTimer: ReturnType<typeof setTimeout> | null;
+  awaitingPong: boolean;
+}
+
 type MarketListener = (message: MarketHubMessage) => void;
 
+// Low-liquidity instruments omit or null out optional quote fields. bid/ask must stay optional
+// so one sparse frame cannot invalidate the whole ticker push (Bug: best-bid stuck at '0').
 const TickerPushSchema = z.object({
   channel: z.literal('ticker'), event: z.literal('update'), result: z.object({
-    s: z.string(), lp: z.string(), bp: z.string(), bs: z.string(), ap: z.string(), as: z.string(),
+    s: z.string(), lp: z.string(),
+    bp: z.string().nullable().optional(), bs: z.string().nullable().optional(),
+    ap: z.string().nullable().optional(), as: z.string().nullable().optional(),
     o: z.string().nullable(), h: z.string().nullable(), l: z.string().nullable(), v: z.string().nullable(),
     q: z.string().nullable().optional(), ts: z.number(),
   }),
@@ -173,14 +201,55 @@ function normalizeTradeSymbol(raw: string): string {
   return raw.toUpperCase().replace(/[^A-Z0-9]/g, '');
 }
 
+/** A push text field carries data when present and non-empty; quotes additionally need a positive value. */
+function usableText(value: string | null | undefined): value is string {
+  return value !== null && value !== undefined && value.trim() !== '';
+}
+
+function usableQuote(value: string | null | undefined): value is string {
+  if (!usableText(value)) return false;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0;
+}
+
+interface BookTopOfBook {
+  bidPrice?: string;
+  bidSize?: string;
+  askPrice?: string;
+  askSize?: string;
+}
+
+/** Best bid/ask of a maintained book; sides without a usable price are absent, not empty strings. */
+function bookTopOf(book: BookState | undefined): BookTopOfBook | null {
+  if (!book) return null;
+  let topBid: [string, string] | null = null;
+  for (const level of book.bids) {
+    if (topBid === null || Number(level[0]) > Number(topBid[0])) topBid = level;
+  }
+  let topAsk: [string, string] | null = null;
+  for (const level of book.asks) {
+    if (topAsk === null || Number(level[0]) < Number(topAsk[0])) topAsk = level;
+  }
+  const top: BookTopOfBook = {};
+  if (topBid && usableQuote(topBid[0])) {
+    top.bidPrice = topBid[0];
+    top.bidSize = topBid[1];
+  }
+  if (topAsk && usableQuote(topAsk[0])) {
+    top.askPrice = topAsk[0];
+    top.askSize = topAsk[1];
+  }
+  return Object.keys(top).length > 0 ? top : null;
+}
+
 export class CrossExMarketHub {
-  private socket: WebSocket | null = null;
-  private heartbeat: ReturnType<typeof setInterval> | null = null;
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private reconnectAttempt = 0;
+  private readonly shards = new Map<number, ShardConnection>();
+  private readonly symbolShards = new Map<string, number>();
+  private nextShardIndex = 0;
+  /** Registered symbols that could not get a shard slot yet; retried on the eviction sweep. */
+  private readonly pendingAssignments = new Set<string>();
   private stopped = true;
-  private state: MarketSnapshot['connectionState'] = 'disconnected';
-  private readonly subscriptions = new Map<string, Set<string>>();
+  private lastNotifiedState: MarketSnapshot['connectionState'] = 'disconnected';
   private readonly invalidSymbols = new Map<string, Set<string>>();
   private readonly markets = new Map<string, LiveMarket>();
   private readonly listeners = new Set<MarketListener>();
@@ -218,34 +287,58 @@ export class CrossExMarketHub {
     this.stopped = false;
     this.dynamicMarketSweep = setInterval(() => this.evictIdleDynamicMarkets(), DYNAMIC_MARKET_SWEEP_MS);
     this.dynamicMarketSweep.unref?.();
-    this.connect();
+    // Seed markets stream from the first connection; dynamic markets join via ensureMarkets.
+    const seeds = [...this.markets.keys()];
+    for (const channel of ['ticker', 'funding_rate', 'open_interest']) this.subscribeSymbols(channel, seeds);
+    this.connectShards();
   }
 
   stop(): void {
     this.stopped = true;
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    if (this.heartbeat) clearInterval(this.heartbeat);
+    for (const shard of this.shards.values()) {
+      if (shard.reconnectTimer) clearTimeout(shard.reconnectTimer);
+      if (shard.heartbeat) clearInterval(shard.heartbeat);
+      shard.reconnectTimer = null;
+      shard.heartbeat = null;
+      shard.socket?.close();
+      shard.socket = null;
+      shard.state = 'disconnected';
+    }
     if (this.dynamicMarketSweep) clearInterval(this.dynamicMarketSweep);
-    this.reconnectTimer = null;
-    this.heartbeat = null;
     this.dynamicMarketSweep = null;
     for (const book of this.books.values()) {
       if (book.emitTimer) clearTimeout(book.emitTimer);
       book.emitTimer = null;
     }
-    this.socket?.close();
-    this.socket = null;
-    this.state = 'disconnected';
+    this.refreshConnectionState();
   }
 
   snapshot(): MarketSnapshot {
     const markets = [...this.markets.values()].sort((a, b) => a.asset.localeCompare(b.asset) || a.venue.localeCompare(b.venue));
     const newest = markets.reduce((latest, market) => market.updatedAt > latest ? market.updatedAt : latest, new Date(0).toISOString());
-    return { connectionState: this.state, updatedAt: newest, markets };
+    return { connectionState: this.aggregatedState(), updatedAt: newest, markets };
   }
 
   connectionState(): MarketSnapshot['connectionState'] {
-    return this.state;
+    return this.aggregatedState();
+  }
+
+  /** Aggregate the shard states: data is flowing as long as any shard is healthy. */
+  private aggregatedState(): MarketSnapshot['connectionState'] {
+    if (this.stopped || this.shards.size === 0) return this.stopped ? 'disconnected' : 'connecting';
+    const states = new Set([...this.shards.values()].map((shard) => shard.state));
+    if (states.has('healthy')) return 'healthy';
+    if (states.has('stale')) return 'stale';
+    if (states.has('reconnecting')) return 'reconnecting';
+    return 'connecting';
+  }
+
+  /** Publish a snapshot when the aggregated connection state changes. */
+  private refreshConnectionState(): void {
+    const next = this.aggregatedState();
+    if (next === this.lastNotifiedState) return;
+    this.lastNotifiedState = next;
+    this.notify({ type: 'market.snapshot', payload: this.snapshot() });
   }
 
   /** Registered market count without building the sorted snapshot. */
@@ -401,53 +494,140 @@ export class CrossExMarketHub {
     };
   }
 
+  /** Route each symbol to its shard, subscribe the channel there, and dial new shards on demand. */
   private subscribeSymbols(channel: string, symbols: string[]): void {
-    const set = this.subscriptions.get(channel) ?? new Set<string>();
     const invalid = this.invalidSymbols.get(channel);
-    const added = symbols.filter((symbol) => !set.has(symbol) && !invalid?.has(symbol));
-    for (const symbol of added) set.add(symbol);
-    this.subscriptions.set(channel, set);
-    const socket = this.socket;
-    if (added.length > 0 && socket?.readyState === WebSocket.OPEN) {
-      this.sendSubscribe(socket, channel, added);
+    const byShard = new Map<ShardConnection, string[]>();
+    for (const symbol of symbols) {
+      if (invalid?.has(symbol)) continue;
+      const shard = this.shardFor(symbol);
+      if (!shard) {
+        this.pendingAssignments.add(symbol);
+        continue;
+      }
+      this.pendingAssignments.delete(symbol);
+      const list = byShard.get(shard);
+      if (list) list.push(symbol);
+      else byShard.set(shard, [symbol]);
+    }
+    for (const [shard, list] of byShard) {
+      const subscribed = shard.subscriptions.get(channel) ?? new Set<string>();
+      const added = list.filter((symbol) => !subscribed.has(symbol));
+      for (const symbol of added) subscribed.add(symbol);
+      shard.subscriptions.set(channel, subscribed);
+      const socket = shard.socket;
+      if (added.length > 0 && socket?.readyState === WebSocket.OPEN) {
+        this.sendSubscribe(socket, channel, added);
+      }
     }
   }
 
   private unsubscribeSymbols(channel: string, symbols: string[]): void {
-    const set = this.subscriptions.get(channel);
-    if (!set) return;
-    const removed = symbols.filter((symbol) => set.delete(symbol));
-    const socket = this.socket;
-    if (removed.length > 0 && socket?.readyState === WebSocket.OPEN) {
-      this.sendUnsubscribe(socket, channel, removed);
+    const byShard = new Map<ShardConnection, string[]>();
+    for (const symbol of symbols) {
+      const shard = this.shardOf(symbol);
+      if (!shard) continue;
+      const list = byShard.get(shard);
+      if (list) list.push(symbol);
+      else byShard.set(shard, [symbol]);
+    }
+    for (const [shard, list] of byShard) {
+      const subscribed = shard.subscriptions.get(channel);
+      if (!subscribed) continue;
+      const removed = list.filter((symbol) => subscribed.delete(symbol));
+      const socket = shard.socket;
+      if (removed.length > 0 && socket?.readyState === WebSocket.OPEN) {
+        this.sendUnsubscribe(socket, channel, removed);
+      }
     }
   }
 
-  private connect(): void {
+  private shardOf(symbol: string): ShardConnection | null {
+    const index = this.symbolShards.get(symbol);
+    return index === undefined ? null : this.shards.get(index) ?? null;
+  }
+
+  /**
+   * Assign a symbol to a connection shard. Existing assignments are stable so every channel of a
+   * symbol shares one socket; a new symbol lands on the first shard with room, spawning (and
+   * dialing) a fresh connection when all shards are full. Returns null when the pool is exhausted.
+   */
+  private shardFor(symbol: string): ShardConnection | null {
+    const existing = this.shardOf(symbol);
+    if (existing) return existing;
+    for (const shard of [...this.shards.values()].sort((a, b) => a.index - b.index)) {
+      if (shard.symbols.size < SYMBOLS_PER_SHARD) {
+        shard.symbols.add(symbol);
+        this.symbolShards.set(symbol, shard.index);
+        return shard;
+      }
+    }
+    if (this.shards.size >= MAX_SHARDS) return null;
+    const shard: ShardConnection = {
+      index: this.nextShardIndex++,
+      socket: null,
+      symbols: new Set([symbol]),
+      subscriptions: new Map(),
+      state: 'connecting',
+      reconnectAttempt: 0,
+      heartbeat: null,
+      reconnectTimer: null,
+      awaitingPong: false,
+    };
+    this.shards.set(shard.index, shard);
+    this.symbolShards.set(symbol, shard.index);
+    this.connectShard(shard);
+    return shard;
+  }
+
+  /** Drop a symbol's shard slot; idle shards (no symbols left) are closed and retired. */
+  private releaseSymbolShard(symbol: string): void {
+    const shard = this.shardOf(symbol);
+    if (!shard) return;
+    this.symbolShards.delete(symbol);
+    shard.symbols.delete(symbol);
+    for (const subscribed of shard.subscriptions.values()) subscribed.delete(symbol);
+    if (shard.symbols.size > 0) return;
+    if (shard.reconnectTimer) clearTimeout(shard.reconnectTimer);
+    if (shard.heartbeat) clearInterval(shard.heartbeat);
+    shard.reconnectTimer = null;
+    shard.heartbeat = null;
+    this.shards.delete(shard.index);
+    const socket = shard.socket;
+    shard.socket = null;
+    socket?.close();
+    this.refreshConnectionState();
+  }
+
+  private connectShards(): void {
+    for (const shard of [...this.shards.values()]) {
+      if (!shard.socket) this.connectShard(shard);
+    }
+  }
+
+  private connectShard(shard: ShardConnection): void {
     if (this.stopped) return;
-    this.state = this.reconnectAttempt === 0 ? 'connecting' : 'reconnecting';
+    shard.state = shard.reconnectAttempt === 0 ? 'connecting' : 'reconnecting';
+    this.refreshConnectionState();
     const socket = new WebSocket(this.url);
-    this.socket = socket;
+    shard.socket = socket;
     let awaitingPong = false;
     let lastMessageAt = Date.now();
     let lastMarketMessageAt = Date.now();
     socket.on('pong', () => { awaitingPong = false; });
     socket.on('open', () => {
-      this.state = 'healthy';
-      this.reconnectAttempt = 0;
+      shard.state = 'healthy';
+      shard.reconnectAttempt = 0;
       awaitingPong = false;
       lastMessageAt = Date.now();
       lastMarketMessageAt = Date.now();
-      const symbols = [...this.markets.keys()];
-      for (const channel of ['ticker', 'funding_rate', 'open_interest']) {
-        const invalid = this.invalidSymbols.get(channel);
-        this.subscriptions.set(channel, new Set(symbols.filter((symbol) => !invalid?.has(symbol))));
-      }
-      for (const [channel, subscribed] of this.subscriptions) {
+      // The per-shard subscription sets persist across reconnects, so resending them here
+      // restores every channel this shard is responsible for.
+      for (const [channel, subscribed] of shard.subscriptions) {
         if (subscribed.size > 0) this.sendSubscribe(socket, channel, [...subscribed]);
       }
-      if (this.heartbeat) clearInterval(this.heartbeat);
-      this.heartbeat = setInterval(() => {
+      if (shard.heartbeat) clearInterval(shard.heartbeat);
+      shard.heartbeat = setInterval(() => {
         if (socket.readyState !== WebSocket.OPEN) return;
         const now = Date.now();
         // Market pushes can naturally be bursty. Once all market channels have been quiet for two
@@ -462,39 +642,46 @@ export class CrossExMarketHub {
           socket.ping();
         }
         const nextState = now - lastMessageAt > this.staleAfterMs ? 'stale' : 'healthy';
-        if (nextState !== this.state) {
-          this.state = nextState;
-          this.notify({ type: 'market.snapshot', payload: this.snapshot() });
+        if (nextState !== shard.state) {
+          shard.state = nextState;
+          this.refreshConnectionState();
         }
       }, Math.min(this.heartbeatIntervalMs, this.marketIdlePingAfterMs));
-      this.heartbeat.unref?.();
-      this.notify({ type: 'market.snapshot', payload: this.snapshot() });
+      shard.heartbeat.unref?.();
+      this.refreshConnectionState();
     });
     socket.on('message', (data) => {
       const receivedAt = Date.now();
       awaitingPong = false;
       lastMessageAt = receivedAt;
-      if (this.state === 'stale') {
-        this.state = 'healthy';
-        this.notify({ type: 'market.snapshot', payload: this.snapshot() });
+      if (shard.state === 'stale') {
+        shard.state = 'healthy';
+        this.refreshConnectionState();
       }
-      if (this.handleMessage(data.toString(), receivedAt)) lastMarketMessageAt = receivedAt;
+      if (this.handleMessage(data.toString(), receivedAt, shard)) lastMarketMessageAt = receivedAt;
     });
     socket.on('error', () => undefined);
     socket.on('close', () => {
-      if (this.heartbeat) clearInterval(this.heartbeat);
-      this.heartbeat = null;
-      if (this.socket === socket) this.socket = null;
+      if (shard.heartbeat) clearInterval(shard.heartbeat);
+      shard.heartbeat = null;
       for (const [symbol, book] of this.books) {
         if (book.emitTimer) clearTimeout(book.emitTimer);
         this.books.delete(symbol);
       }
+      if (shard.socket === socket) shard.socket = null;
       if (this.stopped) return;
-      this.state = 'reconnecting';
-      const exponential = Math.min(30_000, 1_000 * 2 ** Math.min(5, this.reconnectAttempt++));
+      // A shard whose symbols all drifted away is retired instead of reconnected.
+      if (shard.symbols.size === 0 || !this.shards.has(shard.index)) {
+        this.shards.delete(shard.index);
+        this.refreshConnectionState();
+        return;
+      }
+      shard.state = 'reconnecting';
+      const exponential = Math.min(30_000, 1_000 * 2 ** Math.min(5, shard.reconnectAttempt++));
       const wait = Math.round(exponential * (0.85 + Math.random() * 0.3));
-      this.reconnectTimer = setTimeout(() => this.connect(), wait);
-      this.reconnectTimer.unref?.();
+      shard.reconnectTimer = setTimeout(() => this.connectShard(shard), wait);
+      shard.reconnectTimer.unref?.();
+      this.refreshConnectionState();
     });
   }
 
@@ -528,9 +715,16 @@ export class CrossExMarketHub {
         this.unsubscribeSymbols(channel, [symbol]);
         this.invalidSymbols.get(channel)?.delete(symbol);
       }
+      this.releaseSymbolShard(symbol);
       this.markets.delete(symbol);
       this.dynamicMarkets.delete(symbol);
       this.dynamicSymbolCount = Math.max(0, this.dynamicSymbolCount - 1);
+    }
+    // Symbols that waited for a shard slot get another chance once space may have freed up.
+    if (this.pendingAssignments.size > 0 && !this.stopped) {
+      const pending = [...this.pendingAssignments].filter((symbol) => this.markets.has(symbol));
+      this.pendingAssignments.clear();
+      for (const channel of ['ticker', 'funding_rate', 'open_interest']) this.subscribeSymbols(channel, pending);
     }
   }
 
@@ -545,7 +739,7 @@ export class CrossExMarketHub {
    * Frames arrive continuously for every subscribed symbol, so the channel/event fields are
    * inspected first and exactly one schema runs per frame instead of trying each in sequence.
    */
-  private handleMessage(raw: string, receivedAt: number): boolean {
+  private handleMessage(raw: string, receivedAt: number, shard: ShardConnection): boolean {
     let payload: unknown;
     try { payload = JSON.parse(raw); } catch { return false; }
     if (typeof payload !== 'object' || payload === null) return false;
@@ -554,18 +748,33 @@ export class CrossExMarketHub {
       const subscriptionFailure = SubscriptionFailureSchema.safeParse(payload);
       if (!subscriptionFailure.success) return false;
       const channel = subscriptionFailure.data.channel;
-      const symbols = this.subscriptions.get(channel);
+      const subscribed = shard.subscriptions.get(channel);
       const invalidFound = invalidSymbolsFromMessage(subscriptionFailure.data.error.message);
-      if (!symbols || invalidFound.length === 0) return false;
+      // A failure without an invalidSymbols list is a wholesale frame rejection (e.g. the
+      // per-connection symbol cap). Shards never exceed the cap, so re-request the set once
+      // after a short pause; the next reconnect would do the same if it persisted.
+      if (invalidFound.length === 0) {
+        if (subscribed && subscribed.size > 0 && !shard.reconnectTimer) {
+          const socket = shard.socket;
+          const retry = setTimeout(() => {
+            if (socket?.readyState === WebSocket.OPEN && shard.socket === socket) {
+              this.sendSubscribe(socket, channel, [...subscribed]);
+            }
+          }, 2_000);
+          retry.unref?.();
+        }
+        return false;
+      }
+      if (!subscribed) return false;
       const invalid = this.invalidSymbols.get(channel) ?? new Set<string>();
       for (const symbol of invalidFound) {
-        symbols.delete(symbol);
+        subscribed.delete(symbol);
         invalid.add(symbol);
       }
       this.invalidSymbols.set(channel, invalid);
-      const socket = this.socket;
-      if (socket?.readyState === WebSocket.OPEN && symbols.size > 0 && ['ticker', 'funding_rate', 'open_interest'].includes(channel)) {
-        this.sendSubscribe(socket, channel, [...symbols]);
+      const socket = shard.socket;
+      if (socket?.readyState === WebSocket.OPEN && subscribed.size > 0 && ['ticker', 'funding_rate', 'open_interest'].includes(channel)) {
+        this.sendSubscribe(socket, channel, [...subscribed]);
       }
       return false;
     }
@@ -573,7 +782,8 @@ export class CrossExMarketHub {
     if (frame.channel === 'ticker') {
       const ticker = TickerPushSchema.safeParse(payload);
       if (!ticker.success) return false;
-      const current = this.markets.get(ticker.data.result.s);
+      const symbol = this.resolveStreamSymbol(ticker.data.result.s);
+      const current = this.markets.get(symbol);
       if (!current) return true;
       const value = ticker.data.result;
       const currentTimestamp = current.source === 'gate_crossex_websocket'
@@ -582,11 +792,30 @@ export class CrossExMarketHub {
       // A reconnect can flush delayed frames after a newer ticker has already arrived. Never
       // roll a symbol's executable bid/ask backward to an older source timestamp.
       if (Number.isFinite(currentTimestamp) && value.ts < currentTimestamp) return true;
-      this.publish({ ...current, lastPrice: value.lp, bidPrice: value.bp, bidSize: value.bs, askPrice: value.ap,
-        askSize: value.as, open24h: value.o ?? current.open24h, high24h: value.h ?? current.high24h,
-        low24h: value.l ?? current.low24h, volume24h: value.v ?? current.volume24h,
-        quoteVolume24h: value.q ?? current.quoteVolume24h, receivedAt: new Date(receivedAt).toISOString(),
-        updatedAt: new Date(value.ts).toISOString(), source: 'gate_crossex_websocket' });
+      // Sparse pushes (low-liquidity instruments) resolve field by field: the push wins, then
+      // the maintained order book's top level, then the previously published value — a partial
+      // frame must never overwrite live data with zeros.
+      const bookTop = bookTopOf(this.books.get(symbol));
+      const frameBid = usableQuote(value.bp) ? value.bp : bookTop?.bidPrice;
+      const frameAsk = usableQuote(value.ap) ? value.ap : bookTop?.askPrice;
+      // When the frame carries no quote and the book offers none either, keep the stored record
+      // untouched instead of publishing an all-empty update.
+      if (!usableQuote(value.lp) && frameBid === undefined && frameAsk === undefined) return true;
+      this.publish({
+        ...current,
+        lastPrice: usableQuote(value.lp) ? value.lp : current.lastPrice,
+        bidPrice: frameBid ?? current.bidPrice,
+        bidSize: usableText(value.bs) ? value.bs : bookTop?.bidSize ?? current.bidSize,
+        askPrice: frameAsk ?? current.askPrice,
+        askSize: usableText(value.as) ? value.as : bookTop?.askSize ?? current.askSize,
+        open24h: usableText(value.o) ? value.o : current.open24h,
+        high24h: usableText(value.h) ? value.h : current.high24h,
+        low24h: usableText(value.l) ? value.l : current.low24h,
+        volume24h: usableText(value.v) ? value.v : current.volume24h,
+        quoteVolume24h: usableText(value.q) ? value.q : current.quoteVolume24h,
+        receivedAt: new Date(receivedAt).toISOString(),
+        updatedAt: new Date(value.ts).toISOString(), source: 'gate_crossex_websocket',
+      });
       return true;
     }
     // The ticker's `updatedAt`, `receivedAt`, and `source` are the strategy engine's evidence that
@@ -629,7 +858,7 @@ export class CrossExMarketHub {
   }
 
   private applyBookUpdate(result: z.infer<typeof OrderBookUpdatePushSchema>['result']): void {
-    const symbol = result.s;
+    const symbol = this.resolveStreamSymbol(result.s);
     if (!this.bookWatchers.has(`order_book_update:${symbol}`)) return;
     let book = this.books.get(symbol);
     if (!book || result.snapshot) {
@@ -693,8 +922,9 @@ export class CrossExMarketHub {
   }
 
   private applyKline(interval: CandleInterval, result: { s: string; o: string; h: string; l: string; c: string; v: string; t: number; x: boolean }): void {
-    if (!this.klineWatchers.has(`kline_${interval}:${result.s}`)) return;
-    const key = `${result.s}:${interval}`;
+    const symbol = this.resolveStreamSymbol(result.s);
+    if (!this.klineWatchers.has(`kline_${interval}:${symbol}`)) return;
+    const key = `${symbol}:${interval}`;
     const series = this.candleSeries.get(key) ?? [];
     const candle: Candle = { startTime: result.t, open: result.o, high: result.h, low: result.l, close: result.c, volume: result.v, closed: result.x };
     const last = series[series.length - 1];
@@ -707,12 +937,24 @@ export class CrossExMarketHub {
     }
     if (series.length > MAX_CANDLES) series.splice(0, series.length - MAX_CANDLES);
     this.candleSeries.set(key, series);
-    this.notify({ type: 'kline.update', payload: { symbol: result.s, interval, candle } });
+    this.notify({ type: 'kline.update', payload: { symbol, interval, candle } });
   }
 
   private publish(market: LiveMarket): void {
     this.markets.set(market.symbol, market);
     this.notify({ type: 'market.update', payload: market });
+  }
+
+  /**
+   * Map a pushed stream symbol onto its registered CrossEx market. Spot pushes arrive under the
+   * venue-native pair name (e.g. "BTC_USDT") while futures pushes carry the CrossEx symbol, so a
+   * bare pair name resolves against the registered GATE spot namespace; unknown names pass
+   * through unchanged and miss the lookup as before.
+   */
+  private resolveStreamSymbol(raw: string): string {
+    if (this.markets.has(raw)) return raw;
+    const spotCandidate = `GATE_SPOT_${raw}`;
+    return this.markets.has(spotCandidate) ? spotCandidate : raw;
   }
 }
 

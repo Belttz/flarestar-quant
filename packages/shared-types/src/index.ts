@@ -1,4 +1,9 @@
 import { z } from 'zod';
+// Re-exported for consumers; also imported by name because `export *` does not create local
+// bindings and the opportunity schemas below reference these two directly.
+import { AssetClassSchema, AssetSuperClassSchema } from './asset-classification.js';
+export * from './asset-classification.js';
+export * from './portfolio-equity.js';
 export const EnvironmentSchema = z.enum(['testnet','live']);
 export type Environment = z.infer<typeof EnvironmentSchema>;
 export const VenueSchema = z.enum(['GATE','BINANCE','OKX','BYBIT']);
@@ -17,6 +22,16 @@ export const HealthResponseSchema = z.object({
   connectionState: ConnectionStateSchema,
 });
 export type HealthResponse = z.infer<typeof HealthResponseSchema>;
+
+export const AuthSessionResponseSchema = z.object({
+  authenticated: z.boolean(),
+  username: z.string().nullable(),
+});
+export type AuthSessionResponse = z.infer<typeof AuthSessionResponseSchema>;
+
+export const AuthChangePasswordResponseSchema = z.object({ ok: z.boolean() });
+export type AuthChangePasswordResponse = z.infer<typeof AuthChangePasswordResponseSchema>;
+
 export interface RiskRule { id: string; scope: 'account'|'venue'|'asset'|'strategy'; metric: string; limit: string; enabled: boolean; }
 
 export const TradingModeSchema = z.enum(['unset', 'readonly', 'live']);
@@ -542,6 +557,8 @@ export const MarketCatalogVenueSchema = z.object({
   venue: z.string(),
   symbol: z.string(),
   quote: z.string(),
+  /** Which business line this catalog row belongs to; defaulted so older payloads stay compatible. */
+  business: z.enum(['FUTURE', 'SPOT']).default('FUTURE'),
 });
 export type MarketCatalogVenue = z.infer<typeof MarketCatalogVenueSchema>;
 
@@ -602,6 +619,135 @@ export const FundingOverviewResponseSchema = z.object({
   cacheStatus: z.enum(['fresh', 'stale']),
 });
 export type FundingOverviewResponse = z.infer<typeof FundingOverviewResponseSchema>;
+
+/**
+ * Derived classification carried by every opportunity row.
+ *
+ * All four fields default so payloads produced before this change (and rows built without the
+ * catalog context) keep parsing: the backend fills them in, the frontend only renders them.
+ */
+export const OpportunityRowClassificationSchema = z.object({
+  assetClass: AssetClassSchema.default('TOKEN'),
+  assetSuperClass: AssetSuperClassSchema.default('CRYPTO'),
+  /** Stripped variant marker (`X` / `ON` / `B` / `G`); `null` for canonical assets. */
+  variantSuffix: z.string().nullable().default(null),
+  isPreIpo: z.boolean().default(false),
+});
+export type OpportunityRowClassification = z.infer<typeof OpportunityRowClassificationSchema>;
+
+/**
+ * 24h volume and open interest of one opportunity leg. Amounts are Decimal strings; `null` means
+ * "not published by the venue" and renders as `—`. Spot legs never carry open interest.
+ */
+export const OpportunityMarketStatsSchema = z.object({
+  /** 24h volume denominated in the base asset. */
+  volume24h: z.string().nullable().default(null),
+  /** 24h volume denominated in the quote currency (USD) — the value shown in the table. */
+  quoteVolume24h: z.string().nullable().default(null),
+  /** Open interest denominated in the base asset. */
+  openInterest: z.string().nullable().default(null),
+  /** Open interest denominated in USD — the value shown in the table; null for spot legs. */
+  openInterestValue: z.string().nullable().default(null),
+});
+export type OpportunityMarketStats = z.infer<typeof OpportunityMarketStatsSchema>;
+
+/** One ranked funding-carry opportunity on the Opportunities board. */
+export const FundingOpportunitySchema = z.object({
+  asset: z.string(),
+  venue: z.string(),
+  /** Executable perpetual symbol the funding rate belongs to. */
+  symbol: z.string(),
+  /** Spot leg symbol of this row's venue combination; null when no live spot pair is connected. */
+  spotSymbol: z.string().nullable(),
+  /**
+   * Spot leg of this row's (spot venue × perpetual venue) combination; null when the row's spot
+   * venue lists no connected live spot pair. Collapsed rows carry the preferred venue, expanded
+   * rows carry their own combination's venue.
+   */
+  spotVenue: z.string().nullable().default(null),
+  /** Every connected venue that lists a live spot pair for this asset, CATALOG_VENUES order. */
+  spotVenues: z.array(z.string()).default([]),
+  /** POSITIVE funding → buy spot + short the perpetual; NEGATIVE → the reverse. */
+  direction: z.enum(['POSITIVE', 'NEGATIVE']),
+  /** |fundingRate8h| × 3 × 365 × 100, in percent; the board sorts this descending. */
+  fundingApr: z.number().finite(),
+  /** Signed 8h-equivalent funding fraction as a Decimal string. */
+  fundingRate8h: z.string(),
+  fundingIntervalHours: z.number().positive().max(24).nullable(),
+  nextFundingAt: z.string().nullable(),
+  lastPrice: z.string().nullable(),
+  /** True when the spot hedge leg is connected (registered on the market hub). */
+  executable: z.boolean(),
+  ...OpportunityRowClassificationSchema.shape,
+  /** Volume / open interest of this row's perpetual leg; null when the venue publishes neither. */
+  perpStats: OpportunityMarketStatsSchema.nullable().default(null),
+});
+export type FundingOpportunity = z.infer<typeof FundingOpportunitySchema>;
+
+/**
+ * One tradable orientation of an asset's exchange pair, nested under its asset-level row.
+ * The board collapses every pair of an asset into a single parent row; these children carry the
+ * per-combination detail revealed when the row is expanded.
+ */
+export const SpreadCombinationSchema = z.object({
+  pairType: z.enum(['SPOT_PERP', 'PERP_PERP']),
+  /** Sell leg (aligned with the engine's spread = sellBid − buyAsk). */
+  leftSymbol: z.string(),
+  rightSymbol: z.string(),
+  leftVenue: z.string(),
+  rightVenue: z.string(),
+  sellBid: z.string(),
+  buyAsk: z.string(),
+  spreadBps: z.number().finite(),
+  updatedAt: z.string(),
+  executable: z.boolean(),
+});
+export type SpreadCombination = z.infer<typeof SpreadCombinationSchema>;
+
+/**
+ * One ranked cross-exchange spread opportunity on the Opportunities board. Rows are asset-level:
+ * the top-level leg fields mirror the asset's *best* combination so sorting and one-click execution
+ * keep working unchanged, while `combinations` holds every pair for the expand/collapse detail view.
+ */
+export const SpreadOpportunitySchema = z.object({
+  pairType: z.enum(['SPOT_PERP', 'PERP_PERP']),
+  asset: z.string(),
+  /** Sell leg (aligned with the engine's spread = sellBid − buyAsk). */
+  leftSymbol: z.string(),
+  /** Buy leg. */
+  rightSymbol: z.string(),
+  leftVenue: z.string(),
+  rightVenue: z.string(),
+  sellBid: z.string(),
+  buyAsk: z.string(),
+  /** (sellBid − buyAsk) / buyAsk × 10⁴, signed; the board sorts this descending. */
+  spreadBps: z.number().finite(),
+  updatedAt: z.string(),
+  executable: z.boolean(),
+  ...OpportunityRowClassificationSchema.shape,
+  /** Volume / open interest of the sell leg. */
+  leftStats: OpportunityMarketStatsSchema.nullable().default(null),
+  /** Volume / open interest of the buy leg. */
+  rightStats: OpportunityMarketStatsSchema.nullable().default(null),
+  /** Every (sell venue, buy venue) pair of this asset, best spread first; drives the expand view. */
+  combinations: z.array(SpreadCombinationSchema).default([]),
+});
+export type SpreadOpportunity = z.infer<typeof SpreadOpportunitySchema>;
+
+export const OpportunityResponseSchema = z.object({
+  funding: z.array(FundingOpportunitySchema),
+  spread: z.array(SpreadOpportunitySchema),
+  /** Row counts of each board *after* filtering but *before* paging — used to render page numbers. */
+  totals: z.object({
+    funding: z.number().int().nonnegative().default(0),
+    spread: z.number().int().nonnegative().default(0),
+  }).default({ funding: 0, spread: 0 }),
+  offset: z.number().int().nonnegative().default(0),
+  limit: z.number().int().positive().default(50),
+  fetchedAt: z.string(),
+  cacheStatus: z.enum(['fresh', 'stale']),
+});
+export type OpportunityResponse = z.infer<typeof OpportunityResponseSchema>;
 
 export const FundingHistoryEntrySchema = z.object({
   symbol: z.string(),
@@ -724,7 +870,8 @@ export const LiveMarketSchema = z.object({
   receivedAt: z.string(),
   /** Exchange source timestamp carried by the latest ticker frame. */
   updatedAt: z.string(),
-  source: z.enum(['gate_crossex_websocket', 'demo_seed']),
+  /** rest_book_ticker rows come from the bulk REST sweep and are ~1 TTL cycle stale. */
+  source: z.enum(['gate_crossex_websocket', 'demo_seed', 'rest_book_ticker']),
 });
 export type LiveMarket = z.infer<typeof LiveMarketSchema>;
 
@@ -916,7 +1063,7 @@ export const BorosStrategiesResponseSchema = BorosUpstreamStrategiesResponseSche
 export type BorosStrategiesResponse = z.infer<typeof BorosStrategiesResponseSchema>;
 
 export const StrategyConfigSchema = z.object({
-  kind: z.enum(['position', 'auto', 'premium']),
+  kind: z.enum(['position', 'auto', 'premium', 'carry']),
   asset: z.string(),
   hedgeAsset: z.string().optional(),
   adrRatio: PositiveDecimalTextSchema.optional(),
@@ -930,6 +1077,21 @@ export const StrategyConfigSchema = z.object({
   /** Paired funding-arbitrage strategies may use a negative spread as their maximum opening cost. */
   entryBps: SignedDecimalTextSchema.optional(),
   takeProfitBps: PositiveDecimalTextSchema.optional(),
+  /** Auto strategies: optional adverse-move stop-loss; a trigger closes both legs and stops. */
+  stopLossBps: z.number().gt(0).optional(),
+  /** Explicit leg symbols override the venue/asset derivation (required for spot legs). */
+  leftSymbol: z.string().regex(/^(?:(?:GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_SPOT_[A-Z0-9]+_(?:USDT|USDC)|(?:GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_[A-Z0-9]+_(?:USDT|USDC|USD))$/).optional(),
+  rightSymbol: z.string().regex(/^(?:(?:GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_SPOT_[A-Z0-9]+_(?:USDT|USDC)|(?:GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_[A-Z0-9]+_(?:USDT|USDC|USD))$/).optional(),
+  /** carry: funding direction the strategy harvests; the leg sides derive from it. */
+  fundingDirection: z.enum(['POSITIVE', 'NEGATIVE']).optional(),
+  /** carry: annualized funding percentage gate that must be met before opening (15 = 15% APR). */
+  fundingAprMin: z.number().gt(0).lte(1000).optional(),
+  /** carry: basis convergence take-profit between the perpetual and the spot leg, in bps. */
+  basisTakeProfitBps: z.number().gt(0).lt(10_000).optional(),
+  /** carry: leverage preset for the perpetual leg; the engine never adjusts account leverage. */
+  contractLeverage: PositiveDecimalTextSchema.optional(),
+  /** carry: verify the spot account holds enough quote/inventory before opening. */
+  inventoryCheck: z.boolean().optional(),
   entryPremiumPct: SignedDecimalTextSchema.optional(),
   takeProfitPremiumPct: SignedDecimalTextSchema.optional(),
   grid: z.boolean().optional(),
@@ -954,9 +1116,22 @@ export const StrategyConfigSchema = z.object({
 });
 export type StrategyConfig = z.infer<typeof StrategyConfigSchema>;
 
+/** Carry strategy accounting snapshot written by the strategy engine (all amounts in USDT). */
+export const StrategyCarryMetricsSchema = z.object({
+  fundingCollectedUsdt: z.string(),
+  basisEntryBps: z.string(),
+  basisCurrentBps: z.string(),
+  basisPnlUsdt: z.string(),
+  feesPaidUsdt: z.string(),
+  netPnlUsdt: z.string(),
+  entryFundingApr: z.string(),
+  nextFundingAccrualAt: z.string().nullable(),
+});
+export type StrategyCarryMetrics = z.infer<typeof StrategyCarryMetricsSchema>;
+
 export const StrategyRecordSchema = z.object({
   id: z.string(),
-  kind: z.enum(['position', 'auto', 'premium']),
+  kind: z.enum(['position', 'auto', 'premium', 'carry']),
   status: z.string(),
   accountProfileId: z.string().nullable(),
   accountLabel: z.string().nullable(),
@@ -967,6 +1142,7 @@ export const StrategyRecordSchema = z.object({
   filledRight: z.string(),
   openPosition: z.string(),
   realizedPnl: z.string(),
+  carryMetrics: StrategyCarryMetricsSchema.nullish(),
   createdAt: z.string(),
   updatedAt: z.string(),
   stoppedAt: z.string().nullable(),

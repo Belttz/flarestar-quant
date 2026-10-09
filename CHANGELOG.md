@@ -2,6 +2,31 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [0.3.0] - 2026-10-10
+
+### Added
+
+- One-command server deployment. `deploy/server/bootstrap.sh` clones the repository and installs (or upgrades) the terminal on a fresh Linux host from a single `curl … | bash`, then builds and starts a Docker Compose stack whose Caddy reverse proxy provisions HTTPS. Re-running the same command upgrades in place and keeps `cloud.env` and `.local-data/`.
+- Windows one-click deployment under `deploy/windows/`: private Node bootstrap, dependency install, build, background start, Start-menu shortcut, optional autostart, and a read-only health check.
+- Funding-rate, spread, and single-venue funding rankings on the opportunities page, with per-venue asset detail, category filtering, sorting, pagination, and collapse/expand per asset.
+- Trade-page execution tabs for both business lines (positions, open orders, order history, fills), with row-level cancellation of resting and historical orders.
+- Portfolio equity sampling with 1D/1W/1M/1Y chart periods, plus CrossEx account transfers from the funding page.
+- Carry strategies can now trade both legs across every venue pair — the spot leg on a venue that runs a spot business, the perpetual leg on a venue that runs futures — with balance gating routed per leg and annualised yield derived from each venue's actual funding interval.
+- Short spot positions are visible and closable: a CrossEx coin liability is shown as a signed negative holding with one-click market buy-back, and a "how to repay" guide appears when the venue has no spot market for that coin.
+
+### Changed
+
+- Renamed the product to **星闪量化 FlareStar Quant** (previously StarFlash Quant). The source repository is now `Belttz/flarestar-quant`.
+- A spot sell ticket now caps quantity at the coin's available balance instead of the quote-currency balance, so a sell without the asset is rejected before it reaches Gate.
+- Market-data WebSocket connections are sharded so every channel stays within Gate's 100-symbols-per-connection limit; oversized subscriptions were rejected wholesale upstream.
+
+### Fixed
+
+- `/opportunities/funding-top` and `/tools/trading-fees` returned 404 on a hard refresh because the backend never registered them as client routes.
+- Spot closes no longer submit the raw balance and skip lot-size rounding, which Gate rejected with `TRADE_ORDER_LOT_SIZE_ERROR`.
+- The strategy asset-search dropdown rendered behind the exchange-B selector.
+- Quote-currency debts can be bought back when the venue lists the pair, and liability-only spot holdings are no longer dropped by the venue's spot-business filter.
+
 ## [0.2.5] - 2026-09-16
 
 ### Added

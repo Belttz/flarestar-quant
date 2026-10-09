@@ -17,6 +17,7 @@ import { createServer } from 'node:net';
 import { arch, platform } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { needsBuild } from './build-fresh.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const dataDir = resolve(process.env.GCT_DATA_DIR ?? join(root, '.local-data'));
@@ -33,6 +34,60 @@ const npmCommand = npmCli ? process.execPath : isWindows ? 'npm.cmd' : 'npm';
 
 function npmArgs(args) {
   return npmCli ? [npmCli, ...args] : args;
+}
+
+/**
+ * Independent build stages behind the launcher's startup sequence. Each stage builds only when
+ * its outputs are stale relative to its own sources plus its config/manifest inputs; the shared
+ * packages' dist artifacts are counted among the downstream stages' inputs, so rebuilding a
+ * package cascades into the backend and frontend builds. GCT_FORCE_BUILD=1 bypasses the checks.
+ */
+function buildStages(mode) {
+  const packageSources = ['shared-types', 'domain', 'public-data']
+    .map((name) => join(root, 'packages', name, 'src'));
+  const packageExtraFiles = ['shared-types', 'domain', 'public-data']
+    .flatMap((name) => [
+      join(root, 'packages', name, 'package.json'),
+      join(root, 'packages', name, 'tsconfig.json'),
+    ]);
+  const packageOutputs = ['shared-types', 'domain', 'public-data']
+    .map((name) => join(root, 'packages', name, 'dist', 'index.js'));
+  const packageStage = {
+    name: 'shared packages',
+    command: ['run', 'build:packages'],
+    sources: packageSources,
+    extraFiles: packageExtraFiles,
+    outputs: packageOutputs,
+  };
+  if (mode === 'dev') return [packageStage];
+  return [
+    packageStage,
+    {
+      name: 'backend',
+      command: ['run', 'build', '-w', 'apps/backend'],
+      sources: [join(root, 'apps', 'backend', 'src')],
+      extraFiles: [
+        join(root, 'apps', 'backend', 'package.json'),
+        join(root, 'apps', 'backend', 'tsconfig.json'),
+        ...packageOutputs,
+      ],
+      outputs: [join(root, 'apps', 'backend', 'dist', 'server.js')],
+    },
+    {
+      name: 'frontend',
+      command: ['run', 'build', '-w', 'apps/frontend'],
+      sources: [join(root, 'apps', 'frontend', 'src'), join(root, 'apps', 'frontend', 'index.html')],
+      extraFiles: [
+        join(root, 'apps', 'frontend', 'package.json'),
+        join(root, 'apps', 'frontend', 'tsconfig.json'),
+        join(root, 'apps', 'frontend', 'tsconfig.app.json'),
+        join(root, 'apps', 'frontend', 'tsconfig.node.json'),
+        join(root, 'apps', 'frontend', 'vite.config.ts'),
+        ...packageOutputs,
+      ],
+      outputs: [join(root, 'apps', 'frontend', 'dist', 'index.html')],
+    },
+  ];
 }
 
 function spawnNpmSync(args, options) {
@@ -261,14 +316,19 @@ async function start(mode) {
     ports: { backend: backendPort, frontend: frontendPort },
   });
 
-  const buildScript = mode === 'dev' ? 'build:packages' : 'build';
-  const packageBuild = spawnNpmSync(['run', buildScript], { cwd: root, stdio: 'inherit' });
-  if (packageBuild.error) {
-    throw new Error(`Could not launch npm for the ${buildScript} build: ${packageBuild.error.message}`);
-  }
-  if (packageBuild.status !== 0) {
-    const description = mode === 'dev' ? 'shared packages' : 'production application';
-    throw new Error(`Failed to build ${description} (npm exited with code ${packageBuild.status ?? 'unknown'})`);
+  const forceBuild = process.env.GCT_FORCE_BUILD === '1';
+  for (const stage of buildStages(mode)) {
+    if (!needsBuild(stage.outputs, stage.sources, stage.extraFiles, forceBuild)) {
+      console.log(`[launcher] ${stage.name} are up to date, skipping their build.`);
+      continue;
+    }
+    const stageBuild = spawnNpmSync(stage.command, { cwd: root, stdio: 'inherit' });
+    if (stageBuild.error) {
+      throw new Error(`Could not launch npm for the ${stage.name} build: ${stageBuild.error.message}`);
+    }
+    if (stageBuild.status !== 0) {
+      throw new Error(`Failed to build the ${stage.name} (npm exited with code ${stageBuild.status ?? 'unknown'})`);
+    }
   }
 
   const environment = {

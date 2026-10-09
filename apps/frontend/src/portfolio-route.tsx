@@ -34,6 +34,7 @@ import { marginRatePercent } from './portfolio-metrics.js';
 import { PositionsTable } from './positions-table.js';
 import type { PositionTableRow } from './strategy-positions.js';
 import { PositionCloseDialog, type ClosePositionTarget } from './position-close-dialog.js';
+import { PortfolioEquityCard, type EquityChartPoint } from './portfolio-equity-card.js';
 
 function VenueFromCode({ code }: { code: string }) {
   const exchange = exchanges.find((item) => item.id === code.toLowerCase());
@@ -115,6 +116,7 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
   const [instruments, setInstruments] = useState<CrossExInstrument[] | null>(null);
   const [closeTargets, setCloseTargets] = useState<ClosePositionTarget[] | null>(null);
   const [closeNotice, setCloseNotice] = useState<{ kind: 'ok' | 'error'; title: string; text: string } | null>(null);
+  const [equityRefreshTick, setEquityRefreshTick] = useState(0);
   const confirmDialogRef = useRef<HTMLElement | null>(null);
   const transferMonitorGeneration = useRef(0);
   const locale = language === 'zh' ? 'zh-CN' : 'en-GB';
@@ -491,6 +493,13 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
     : null;
   const usageTone = marginUsage === null ? '' : marginUsage >= 85 ? 'critical' : marginUsage >= 60 ? 'hot' : '';
 
+  // Latest equity from the live snapshot, appended to the persisted curve so the line's
+  // endpoint tracks the "Margin balance" KPI between background reconciliations.
+  const equityFetchedMs = snapshot ? Date.parse(snapshot.fetchedAt) : Number.NaN;
+  const currentEquity: EquityChartPoint | null = marginBalance !== null && Number.isFinite(equityFetchedMs) && equityFetchedMs > 0
+    ? { time: equityFetchedMs, value: marginBalance }
+    : null;
+
   const stream = accountStream ?? portfolio?.live?.stream;
   const lastEventAt = portfolio?.live?.lastEventAt ?? stream?.lastEventAt ?? null;
   const lastReconciledAt = portfolio?.live?.lastReconciledAt ?? snapshot?.fetchedAt ?? null;
@@ -527,7 +536,11 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
   async function refresh() {
     if (refreshing) return;
     setRefreshing(true);
-    try { await onRefresh(); } catch { /* The sync chip already reflects staleness. */ } finally { setRefreshing(false); }
+    try {
+      await onRefresh();
+      // Reconciliation may have recorded a new equity sample; reload the curve.
+      setEquityRefreshTick((tick) => tick + 1);
+    } catch { /* The sync chip already reflects staleness. */ } finally { setRefreshing(false); }
   }
 
   function requestPositionClose(rows: PositionTableRow[]) {
@@ -708,6 +721,8 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
         <em>{maintenanceMargin !== null ? `${t('Maintenance margin')} $${formatAmount(maintenanceMargin)}` : '—'}</em>
       </article>
     </section>
+
+    <PortfolioEquityCard refreshSignal={equityRefreshTick} currentEquity={currentEquity} />
 
     <section className="portfolio-content">
       <article className="allocation-card terminal-panel">

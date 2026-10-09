@@ -285,3 +285,83 @@ describe('local API request coordination', () => {
     handle.close();
   });
 });
+
+describe('opportunities and portfolio-equity request assembly', () => {
+  const opportunityPayload = {
+    funding: [], spread: [], fetchedAt: '2026-08-01T00:00:00.000Z', cacheStatus: 'fresh',
+  };
+
+  it('sends pageSize when provided and falls back to the legacy limit alias otherwise', async () => {
+    const urls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      urls.push(String(url));
+      return new Response(JSON.stringify(opportunityPayload), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }));
+    try {
+      await api.opportunities({ funding: false, spread: true, pageSize: 25 });
+      await api.opportunities({ funding: false, spread: true, pageSize: 100, limit: 10 });
+      await api.opportunities({ funding: false, spread: true, limit: 10 });
+      await api.opportunities({ funding: false, spread: true });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(urls).toHaveLength(4);
+    const [pageSizeUrl, bothUrl, legacyUrl, defaultUrl] = urls;
+    expect(pageSizeUrl).toContain('pageSize=25');
+    expect(pageSizeUrl).not.toContain('limit=');
+    // pageSize wins when both parameters are provided.
+    expect(bothUrl).toContain('pageSize=100');
+    expect(bothUrl).not.toContain('limit=');
+    // Without pageSize the legacy limit alias travels (default 50 when neither is given).
+    expect(legacyUrl).toContain('limit=10');
+    expect(legacyUrl).not.toContain('pageSize=');
+    expect(defaultUrl).toContain('limit=50');
+  });
+
+  it('serializes the classification, pre-IPO, sort and paging parameters', async () => {
+    const urls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      urls.push(String(url));
+      return new Response(JSON.stringify(opportunityPayload), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }));
+    try {
+      await api.opportunities({
+        funding: true, spread: false, assetClass: ['STOCK', 'ETF'], assetSuperClass: ['RWA'],
+        preIpo: 'exclude', sort: 'volume', dir: 'asc', offset: 100, pageSize: 50,
+      });
+      await api.opportunities({ funding: true, spread: false, preIpo: 'all', sort: 'default', dir: 'desc', offset: 0 });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    const [fullUrl, defaultUrl] = urls.map((url) => decodeURIComponent(url));
+    expect(fullUrl).toContain('assetClass=STOCK,ETF');
+    expect(fullUrl).toContain('assetSuperClass=RWA');
+    expect(fullUrl).toContain('preIpo=exclude');
+    expect(fullUrl).toContain('sort=volume');
+    expect(fullUrl).toContain('dir=asc');
+    expect(fullUrl).toContain('offset=100');
+    // Defaults never travel: all / default / desc / offset 0 keep the query clean.
+    expect(defaultUrl).not.toContain('preIpo=');
+    expect(defaultUrl).not.toContain('sort=');
+    expect(defaultUrl).not.toContain('dir=');
+    expect(defaultUrl).not.toContain('offset=');
+  });
+
+  it('requests the equity curve behind the portfolio-equity read intent', async () => {
+    const fetchMock = vi.fn(async (_path: string, _init?: RequestInit) => {
+      void _path;
+      void _init;
+      return new Response(JSON.stringify({
+        range: '7d', granularity: 'hour', points: [],
+        firstSampleAt: null, fetchedAt: '2026-08-01T00:00:00.000Z',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.portfolioEquity('7d')).resolves.toMatchObject({ range: '7d', granularity: 'hour', points: [] });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/crossex/portfolio-equity?range=7d');
+    expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).get('x-gct-read-intent')).toBe('portfolio-equity');
+  });
+});

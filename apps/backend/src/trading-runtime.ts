@@ -4,8 +4,18 @@ import { Decimal } from 'decimal.js';
 import { z } from 'zod';
 import type { LiveBalance, PortfolioFill, PortfolioFuturesPosition, UnresolvedOrder } from '@gate-crossex/shared-types';
 import { DEFAULT_CREDENTIAL_PROFILE, type CredentialVault } from './credential-vault.js';
-import { CrossExOrderRequestSchema, GateApiError, type GateCrossExAccount, type GateCrossExRiskLimit, type ReadOnlyCrossExGateway, type TradingCrossExGateway } from './crossex-client.js';
+import {
+  CrossExOrderRequestSchema,
+  GateApiError,
+  type GateCrossExAccount,
+  type GateCrossExRiskLimit,
+  type GateSpotAccount,
+  type PortfolioOperationsCrossExGateway,
+  type ReadOnlyCrossExGateway,
+  type TradingCrossExGateway,
+} from './crossex-client.js';
 import type { PrivateCrossExEvent } from './private-stream.js';
+import { readInstrumentCatalog } from './repositories.js';
 import type { TradingSession } from './trading-session.js';
 
 const decimalText = z.string().regex(/^\d+(?:\.\d+)?$/).refine((value) => new Decimal(value).gt(0));
@@ -13,20 +23,33 @@ const decimalText = z.string().regex(/^\d+(?:\.\d+)?$/).refine((value) => new De
 const signedDecimalText = z.string().regex(/^-?\d+(?:\.\d+)?$/);
 const venue = z.enum(['GATE', 'BINANCE', 'OKX', 'BYBIT', 'KRAKEN', 'HYPERLIQUID', 'DERIBIT', 'LIGHTER']);
 
+const FUTURE_SYMBOL_PATTERN = /^(GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_[A-Z0-9]+_(USDT|USDC|USD)$/;
+/** Spot exposure across the connected venues; the live-instrument order guard narrows at runtime. */
+const SPOT_SYMBOL_PATTERN = /^(GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_SPOT_[A-Z0-9]+_(USDT|USDC)$/;
+/** Prefix test used wherever only the business line matters (quote sizing, leverage tiers). */
+const isSpotSymbol = (symbol: string): boolean => /^[A-Z0-9]+_SPOT_/.test(symbol);
+const strategyLegSymbol = z.string().regex(
+  /^(?:(?:GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_SPOT_[A-Z0-9]+_(?:USDT|USDC)|(?:GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_[A-Z0-9]+_(?:USDT|USDC|USD))$/,
+);
+
 const CreateOrderInputSchema = z.object({
-  symbol: z.string().regex(/^(GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_[A-Z0-9]+_(USDT|USDC|USD)$/),
+  symbol: z.string().regex(
+    /^(?:(?:GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_SPOT_[A-Z0-9]+_(?:USDT|USDC)|(?:GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_[A-Z0-9]+_(?:USDT|USDC|USD))$/,
+  ),
   side: z.enum(['BUY', 'SELL']),
   type: z.enum(['LIMIT', 'MARKET']),
   timeInForce: z.enum(['GTC', 'IOC', 'FOK', 'POC']).default('GTC'),
   quantity: decimalText,
   price: decimalText.optional(),
+  /** Spot market buys may be sized in quote currency instead of a base quantity. */
+  quoteQty: decimalText.optional(),
   reduceOnly: z.boolean().default(false),
   positionSide: z.enum(['NONE', 'LONG', 'SHORT']).default('NONE'),
 }).superRefine((value, context) => {
   if (value.type === 'LIMIT' && !value.price) context.addIssue({ code: 'custom', path: ['price'], message: 'price is required for limit orders' });
 });
 export const CreateStrategyInputSchema = z.object({
-  kind: z.enum(['position', 'auto', 'premium']),
+  kind: z.enum(['position', 'auto', 'premium', 'carry']),
   asset: z.string().regex(/^[A-Z0-9]{2,20}$/),
   /** premium: ticker of the local listing that hedges the ADR leg (e.g. SKHYNIX for SKHY). */
   hedgeAsset: z.string().regex(/^[A-Z0-9]{2,20}$/).optional(),
@@ -48,6 +71,21 @@ export const CreateStrategyInputSchema = z.object({
   /** Position strategies may accept a bounded opening cost, represented by a negative spread. */
   entryBps: signedDecimalText.optional(),
   takeProfitBps: decimalText.optional(),
+  /** auto: optional adverse-move stop-loss; |spread| beyond it closes both legs and stops. */
+  stopLossBps: z.number().gt(0).optional(),
+  /** Explicit leg symbols override the venue/asset derivation (required for Gate spot legs). */
+  leftSymbol: strategyLegSymbol.optional(),
+  rightSymbol: strategyLegSymbol.optional(),
+  /** carry: funding direction the strategy harvests; the leg sides derive from it. */
+  fundingDirection: z.enum(['POSITIVE', 'NEGATIVE']).default('POSITIVE'),
+  /** carry: annualized funding percentage gate that must be met before opening (15 = 15% APR). */
+  fundingAprMin: z.number().gt(0).lte(1000).default(15),
+  /** carry: basis convergence take-profit between the perpetual and the spot leg, in bps. */
+  basisTakeProfitBps: z.number().gt(0).lt(10_000).default(20),
+  /** carry: leverage preset for the perpetual leg; the engine never adjusts account leverage. */
+  contractLeverage: decimalText.refine((value) => new Decimal(value).lte(200)).default('1'),
+  /** carry: verify the spot account holds enough quote/inventory before opening. */
+  inventoryCheck: z.boolean().default(false),
   /** premium: absolute premium levels in percent; signed because ADRs can trade at a discount. */
   entryPremiumPct: signedDecimalText.optional(),
   takeProfitPremiumPct: signedDecimalText.optional(),
@@ -77,13 +115,23 @@ export const CreateStrategyInputSchema = z.object({
     if (value.executionMethod !== 'TAKER_TAKER') context.addIssue({ code: 'custom', path: ['executionMethod'], message: 'close plans execute taker orders' });
     return;
   }
-  // Premium legs trade two different tickers, so both may sit on the same venue.
-  if (value.kind !== 'premium' && value.leftVenue === value.rightVenue) context.addIssue({ code: 'custom', path: ['rightVenue'], message: 'venues must differ' });
-  if (value.leftSide === value.rightSide) context.addIssue({ code: 'custom', path: ['rightSide'], message: 'legs must have opposing sides' });
-  if (value.kind !== 'premium' && !value.entryBps) context.addIssue({ code: 'custom', path: ['entryBps'], message: 'entry threshold is required' });
-  if (value.kind === 'auto' && value.entryBps !== undefined && new Decimal(value.entryBps).lte(0)) {
-    context.addIssue({ code: 'custom', path: ['entryBps'], message: 'entry threshold must be greater than zero for auto strategies' });
+  // Premium legs trade two different tickers and carry strategies hedge a spot leg against a
+  // perpetual, so only plain paired positions must sit on two different venues. A same-venue auto
+  // strategy is allowed only across businesses (one spot leg vs one future leg on that venue).
+  if (value.kind === 'position' && value.leftVenue === value.rightVenue) {
+    context.addIssue({ code: 'custom', path: ['rightVenue'], message: 'venues must differ' });
   }
+  if (value.kind === 'auto' && value.leftVenue === value.rightVenue) {
+    const leftIsSpot = isSpotSymbol(value.leftSymbol ?? '');
+    const rightIsSpot = isSpotSymbol(value.rightSymbol ?? '');
+    if (leftIsSpot === rightIsSpot) {
+      context.addIssue({ code: 'custom', path: ['rightVenue'], message: 'same-venue strategies must pair a spot and a future market' });
+    }
+  }
+  if (value.leftSide === value.rightSide) context.addIssue({ code: 'custom', path: ['rightSide'], message: 'legs must have opposing sides' });
+  if (value.kind !== 'premium' && value.kind !== 'carry' && !value.entryBps) context.addIssue({ code: 'custom', path: ['entryBps'], message: 'entry threshold is required' });
+  // Auto thresholds are signed: a positive entry sells the rich leg when the spread is wide, a
+  // negative entry accepts a bounded opening cost to buy the rich leg (spread ≤ entryBps).
   if (value.kind === 'position' && !value.totalAmount) context.addIssue({ code: 'custom', path: ['totalAmount'], message: 'total amount is required' });
   if (value.kind === 'auto' && (!value.maxPosition || !value.takeProfitBps)) context.addIssue({ code: 'custom', path: ['maxPosition'], message: 'max position and take profit are required' });
   if (value.executionMethod === 'MAKER_TAKER' && !value.makerLeg) context.addIssue({ code: 'custom', path: ['makerLeg'], message: 'maker leg is required' });
@@ -101,6 +149,44 @@ export const CreateStrategyInputSchema = z.object({
       if (!value.maxPosition) context.addIssue({ code: 'custom', path: ['maxPosition'], message: 'max position is required' });
     }
   }
+  if (value.kind === 'carry') {
+    // The carry legs are fixed: left is a spot market on the left venue, right the matching
+    // perpetual on the right venue (cross-venue carry is allowed since architecture v2); each
+    // symbol must belong to the venue chosen for its leg.
+    if (!value.leftSymbol) {
+      context.addIssue({ code: 'custom', path: ['leftSymbol'], message: 'left spot symbol is required' });
+    } else if (!SPOT_SYMBOL_PATTERN.test(value.leftSymbol)) {
+      context.addIssue({ code: 'custom', path: ['leftSymbol'], message: 'left symbol must be a spot market' });
+    } else if (!value.leftSymbol.startsWith(`${value.leftVenue}_SPOT_`)) {
+      context.addIssue({ code: 'custom', path: ['leftSymbol'], message: 'left symbol must belong to the left venue' });
+    }
+    if (!value.rightSymbol) {
+      context.addIssue({ code: 'custom', path: ['rightSymbol'], message: 'right perpetual symbol is required' });
+    } else if (!FUTURE_SYMBOL_PATTERN.test(value.rightSymbol)) {
+      context.addIssue({ code: 'custom', path: ['rightSymbol'], message: 'right symbol must be a futures market' });
+    } else if (!value.rightSymbol.startsWith(`${value.rightVenue}_FUTURE_`)) {
+      context.addIssue({ code: 'custom', path: ['rightSymbol'], message: 'right symbol must belong to the right venue' });
+    }
+    if (value.leftSymbol && value.rightSymbol) {
+      const leftBase = value.leftSymbol.split('_')[2];
+      const rightBase = value.rightSymbol.split('_')[2];
+      if (leftBase !== rightBase) {
+        context.addIssue({ code: 'custom', path: ['rightSymbol'], message: 'carry legs must share one base asset' });
+      }
+    }
+    if (!value.totalAmount) context.addIssue({ code: 'custom', path: ['totalAmount'], message: 'total amount is required' });
+    if (value.entryBps !== undefined) context.addIssue({ code: 'custom', path: ['entryBps'], message: 'entry threshold does not apply to carry strategies' });
+    if (value.takeProfitBps !== undefined) context.addIssue({ code: 'custom', path: ['takeProfitBps'], message: 'take profit does not apply to carry strategies' });
+    // Leg sides always derive from the funding direction and are never chosen freely.
+    const expectedLeftSide = value.fundingDirection === 'POSITIVE' ? 'BUY' : 'SELL';
+    const expectedRightSide = value.fundingDirection === 'POSITIVE' ? 'SELL' : 'BUY';
+    if (value.leftSide !== expectedLeftSide) context.addIssue({ code: 'custom', path: ['leftSide'], message: 'left side must match the funding direction' });
+    if (value.rightSide !== expectedRightSide) context.addIssue({ code: 'custom', path: ['rightSide'], message: 'right side must match the funding direction' });
+    // Selling spot without holding it would borrow; negative carry therefore must verify inventory.
+    if (value.fundingDirection === 'NEGATIVE' && !value.inventoryCheck) {
+      context.addIssue({ code: 'custom', path: ['inventoryCheck'], message: 'inventory check is required when harvesting negative funding' });
+    }
+  }
 });
 export type CreateStrategyInput = z.infer<typeof CreateStrategyInputSchema>;
 
@@ -109,6 +195,45 @@ export const UpdatePremiumTakeProfitInputSchema = z.object({
   takeProfitPremiumPct: signedDecimalText,
 });
 export type UpdatePremiumTakeProfitInput = z.infer<typeof UpdatePremiumTakeProfitInputSchema>;
+
+export type StrategyKind = 'position' | 'auto' | 'premium' | 'carry';
+
+/**
+ * Carry accounting snapshot persisted alongside the strategy row and surfaced on the record.
+ * Field naming follows the shared engine convention: camelCase, amounts suffixed `Usdt`,
+ * ratios suffixed `Bps`/`Apr`, timestamps ISO 8601 UTC.
+ */
+export interface StrategyCarryMetrics {
+  fundingCollectedUsdt: string;
+  basisEntryBps: string;
+  basisCurrentBps: string;
+  basisPnlUsdt: string;
+  feesPaidUsdt: string;
+  netPnlUsdt: string;
+  entryFundingApr: string;
+  nextFundingAccrualAt: string | null;
+}
+
+const StrategyCarryMetricsSchema = z.object({
+  fundingCollectedUsdt: z.string(),
+  basisEntryBps: z.string(),
+  basisCurrentBps: z.string(),
+  basisPnlUsdt: z.string(),
+  feesPaidUsdt: z.string(),
+  netPnlUsdt: z.string(),
+  entryFundingApr: z.string(),
+  nextFundingAccrualAt: z.string().nullable(),
+});
+
+function carryMetricsFromRow(value: string | null): StrategyCarryMetrics | null {
+  if (!value) return null;
+  try {
+    const parsed = StrategyCarryMetricsSchema.safeParse(JSON.parse(value));
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
 
 export interface ExecutionOrder {
   id: string; remoteOrderId: string | null; clientOrderId: string;
@@ -120,11 +245,13 @@ export interface ExecutionOrder {
 }
 
 export interface StrategyRecord {
-  id: string; kind: 'position' | 'auto' | 'premium'; status: string; config: CreateStrategyInput;
+  id: string; kind: StrategyKind; status: string; config: CreateStrategyInput;
   accountProfileId: string | null; accountLabel: string | null;
   progress: number; filledQuantity: string; filledLeft: string; filledRight: string; openPosition: string;
   /** Sum of realized PnL reported by strategy-linked trade fills. */
   realizedPnl: string;
+  /** Carry accounting snapshot; null for every non-carry strategy. */
+  carryMetrics: StrategyCarryMetrics | null;
   createdAt: string; updatedAt: string; stoppedAt: string | null;
 }
 
@@ -146,9 +273,10 @@ interface OrderRow {
 }
 
 interface StrategyRow {
-  id: string; kind: 'position' | 'auto' | 'premium'; environment: 'live'; status: string; config_json: string;
+  id: string; kind: StrategyKind; environment: 'live'; status: string; config_json: string;
   credential_profile_id: string | null; credential_profile_label: string | null;
   progress: number; filled_quantity: string; filled_left: string; filled_right: string; open_position: string;
+  metrics_json: string | null;
   created_at: string; updated_at: string; stopped_at: string | null;
 }
 
@@ -168,6 +296,7 @@ function strategyFromRow(row: StrategyRow): StrategyRecord {
     config: CreateStrategyInputSchema.parse(JSON.parse(row.config_json)), progress: row.progress,
     filledQuantity: row.filled_quantity, filledLeft: row.filled_left, filledRight: row.filled_right,
     openPosition: row.open_position, realizedPnl: '0',
+    carryMetrics: carryMetricsFromRow(row.metrics_json ?? null),
     createdAt: row.created_at, updatedAt: row.updated_at, stoppedAt: row.stopped_at };
 }
 
@@ -287,9 +416,14 @@ export class TradingRuntime {
   /**
    * Validate the full planned strategy exposure against a fresh account balance, then apply the
    * requested per-leg leverage. The 10% reserve covers small price moves, taker fees, and rounding
-   * between this check and the actual entry.
+   * between this check and the actual entry. Spot legs (full cash, no leverage tiers) skip the
+   * futures risk-limit gate, and `mutateLeverage: false` keeps carry strategies from touching the
+   * account's leverage preset at all.
    */
-  async prepareStrategyMargin(legs: StrategyMarginLeg[]): Promise<StrategyMarginPreflight> {
+  async prepareStrategyMargin(
+    legs: StrategyMarginLeg[],
+    options: { mutateLeverage?: boolean } = {},
+  ): Promise<StrategyMarginPreflight> {
     if (!this.session.liveTradingEnabled) throw new TradingRuntimeError('live_trading_locked', 403);
     const credentials = await this.vault.get(DEFAULT_CREDENTIAL_PROFILE);
     if (!credentials) throw new TradingRuntimeError('credential_not_configured', 409);
@@ -298,6 +432,8 @@ export class TradingRuntime {
       || !tradingGateway.queryLeverages || !tradingGateway.setLeverage) {
       throw new TradingRuntimeError('strategy_margin_preflight_unavailable', 503);
     }
+    const isSpotLeg = (symbol: string): boolean => isSpotSymbol(symbol);
+    const leveragedLegs = legs.filter((leg) => !isSpotLeg(leg.symbol));
 
     const venues = [...new Set(legs.map((leg) => leg.venue.toUpperCase()))];
     let account: GateCrossExAccount | null = null;
@@ -325,7 +461,10 @@ export class TradingRuntime {
       // Margin relief is based on a fresh exchange position snapshot. A cached portfolio could
       // incorrectly classify an exposure-increasing order as a close after the position changed.
       positions = await tradingGateway.queryPositions(credentials);
-      riskLimits = await this.gateway.queryRiskLimits([...new Set(legs.map((leg) => leg.symbol))]);
+      // Spot legs have no leverage tiers; only query risk limits for the futures legs.
+      riskLimits = leveragedLegs.length > 0
+        ? await this.gateway.queryRiskLimits([...new Set(leveragedLegs.map((leg) => leg.symbol))])
+        : [];
     } catch (error) {
       if (error instanceof GateApiError && error.statusCode === 429) {
         throw new TradingRuntimeError('strategy_preflight_rate_limited', 429);
@@ -348,15 +487,16 @@ export class TradingRuntime {
       })();
       const plannedQuantity = new Decimal(leg.estimatedQuantity)
         .mul(leg.side === 'BUY' ? 1 : -1);
-      const maxPositionValue = maxRiskPositionValueAtLeverage(
+      // Spot legs are full-cash positions without leverage tiers; skip the futures risk-limit gate.
+      const maxPositionValue = isSpotLeg(leg.symbol) ? null : maxRiskPositionValueAtLeverage(
         riskLimitBySymbol.get(leg.symbol),
         new Decimal(leg.leverage),
       );
-      if (!maxPositionValue) {
+      if (!isSpotLeg(leg.symbol) && !maxPositionValue) {
         throw new TradingRuntimeError('strategy_position_limit_unavailable', 503, leg.symbol);
       }
       const projectedPositionValue = existingQuantity.plus(plannedQuantity).abs().mul(leg.estimatedPrice);
-      if (projectedPositionValue.gt(maxPositionValue)) {
+      if (maxPositionValue !== null && projectedPositionValue.gt(maxPositionValue)) {
         throw new TradingRuntimeError('strategy_position_exceeds_leverage_limit', 409, leg.symbol);
       }
       // Closing or reducing an opposite position consumes no additional margin. If the order
@@ -398,26 +538,28 @@ export class TradingRuntime {
       }
     }
 
-    const uniqueLegs = [...new Map(legs.map((leg) => [leg.symbol, leg])).values()];
-    try {
-      for (const leg of uniqueLegs) {
-        // Gate accepts comma-separated symbols, but venue adapters do not consistently return
-        // every requested key from that batched form. Verify each leg independently so a missing
-        // batch entry cannot trigger an unnecessary (and sometimes rejected) leverage update.
-        const current = await tradingGateway.queryLeverages(credentials, [leg.symbol]);
-        const currentLeverage = current[leg.symbol];
-        if (currentLeverage !== undefined
-          && new Decimal(currentLeverage).eq(new Decimal(leg.leverage))) continue;
-        await tradingGateway.setLeverage(credentials, leg.symbol, leg.leverage);
+    const uniqueLegs = [...new Map(leveragedLegs.map((leg) => [leg.symbol, leg])).values()];
+    if (options.mutateLeverage !== false && uniqueLegs.length > 0) {
+      try {
+        for (const leg of uniqueLegs) {
+          // Gate accepts comma-separated symbols, but venue adapters do not consistently return
+          // every requested key from that batched form. Verify each leg independently so a missing
+          // batch entry cannot trigger an unnecessary (and sometimes rejected) leverage update.
+          const current = await tradingGateway.queryLeverages(credentials, [leg.symbol]);
+          const currentLeverage = current[leg.symbol];
+          if (currentLeverage !== undefined
+            && new Decimal(currentLeverage).eq(new Decimal(leg.leverage))) continue;
+          await tradingGateway.setLeverage(credentials, leg.symbol, leg.leverage);
+        }
+      } catch (error) {
+        if (error instanceof GateApiError && error.statusCode === 429) {
+          throw new TradingRuntimeError('strategy_preflight_rate_limited', 429);
+        }
+        if (error instanceof GateApiError && error.statusCode >= 400 && error.statusCode < 500) {
+          throw new TradingRuntimeError('strategy_leverage_rejected', 400, error.label);
+        }
+        throw new TradingRuntimeError('strategy_leverage_unavailable', 503);
       }
-    } catch (error) {
-      if (error instanceof GateApiError && error.statusCode === 429) {
-        throw new TradingRuntimeError('strategy_preflight_rate_limited', 429);
-      }
-      if (error instanceof GateApiError && error.statusCode >= 400 && error.statusCode < 500) {
-        throw new TradingRuntimeError('strategy_leverage_rejected', 400, error.label);
-      }
-      throw new TradingRuntimeError('strategy_leverage_unavailable', 503);
     }
     return { requiredMargin: requiredMargin.toString(), availableMargin: availableMargin.toString() };
   }
@@ -749,6 +891,15 @@ export class TradingRuntime {
     referencePrice?: string,
   ): Promise<ExecutionOrder> {
     const input = CreateOrderInputSchema.parse(raw);
+    // Live-instrument guard: once the instrument catalog has been fetched, spot orders outside
+    // the live catalog are rejected up front instead of surfacing as exchange rejections.
+    // Missing catalog data fails open so tests and first-run deployments keep working.
+    if (SPOT_SYMBOL_PATTERN.test(input.symbol)) {
+      const catalog = readInstrumentCatalog(this.database);
+      if (catalog && !catalog.items.some((item) => item.symbol === input.symbol && item.state === 'live')) {
+        throw new TradingRuntimeError('unknown_market_symbol', 400);
+      }
+    }
     if (!this.session.liveTradingEnabled && !metadata?.riskReducing) {
       throw new TradingRuntimeError('live_trading_locked', 403);
     }
@@ -756,7 +907,9 @@ export class TradingRuntime {
     if (!credentials) throw new TradingRuntimeError('credential_not_configured', 409);
     const tradingGateway = this.gateway as Partial<TradingCrossExGateway>;
     if (!tradingGateway.createOrder) throw new TradingRuntimeError('live_gateway_unavailable', 503);
-    if (!metadata && referencePrice !== undefined && !input.reduceOnly) {
+    // Spot symbols have no futures risk-limit tiers; the per-order leverage-tier preflight below
+    // only applies to perpetual orders (strategy orders always carry metadata and skip it anyway).
+    if (!metadata && referencePrice !== undefined && !input.reduceOnly && !isSpotSymbol(input.symbol)) {
       if (!referencePrice || !decimalText.safeParse(referencePrice).success
         || !tradingGateway.queryPositions || !tradingGateway.queryLeverages) {
         throw new TradingRuntimeError('order_position_limit_unavailable', 503);
@@ -795,7 +948,10 @@ export class TradingRuntime {
     }
     const clientOrderId = `gct-${Date.now()}-${randomUUID().slice(0, 8)}`;
     const gateInput = CrossExOrderRequestSchema.parse({ text: clientOrderId, symbol: input.symbol, side: input.side,
-      type: input.type, time_in_force: input.timeInForce, qty: input.quantity, price: input.price,
+      type: input.type, time_in_force: input.timeInForce,
+      // Gate spot market buys are sized in quote currency; every other order sizes in base qty.
+      ...(input.quoteQty !== undefined ? { quote_qty: input.quoteQty } : { qty: input.quantity }),
+      price: input.price,
       reduce_only: input.reduceOnly ? 'true' : 'false', position_side: input.positionSide });
     const now = new Date().toISOString();
     const id = randomUUID();
@@ -1159,6 +1315,32 @@ export class TradingRuntime {
     const row = this.statement("SELECT * FROM execution_strategies WHERE id = ? AND environment = 'live'").get(id) as StrategyRow | undefined;
     if (!row) throw new TradingRuntimeError('strategy_not_found', 404);
     return this.withStrategyMetrics(strategyFromRow(row));
+  }
+
+  /**
+   * Spot account balances for carry entry gating: quote coverage for the buy-and-hold leg and
+   * base inventory for the sell-inventory leg. Returns null when the configured gateway cannot
+   * serve spot accounts, so callers can degrade to "unavailable" instead of guessing coverage.
+   */
+  async querySpotAccounts(exchangeType?: string): Promise<GateSpotAccount[] | null> {
+    const credentials = await this.vault.get(DEFAULT_CREDENTIAL_PROFILE);
+    if (!credentials) throw new TradingRuntimeError('credential_not_configured', 409);
+    const operations = this.gateway as Partial<PortfolioOperationsCrossExGateway>;
+    if (!operations.querySpotAccounts) return null;
+    try {
+      return await operations.querySpotAccounts(credentials, exchangeType);
+    } catch (error) {
+      if (error instanceof GateApiError && error.statusCode === 429) {
+        throw new TradingRuntimeError('strategy_preflight_rate_limited', 429);
+      }
+      throw new TradingRuntimeError('strategy_inventory_check_unavailable', 503);
+    }
+  }
+
+  /** Persist the carry accounting snapshot that is surfaced on the strategy record. */
+  updateStrategyMetrics(id: string, metrics: StrategyCarryMetrics): void {
+    this.database.prepare('UPDATE execution_strategies SET metrics_json = ? WHERE id = ?')
+      .run(JSON.stringify(metrics), id);
   }
 
   private withStrategyMetrics(strategy: StrategyRecord): StrategyRecord {

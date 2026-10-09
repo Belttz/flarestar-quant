@@ -104,6 +104,24 @@ describe('venue public market data client', () => {
     expect(candles[1]).toMatchObject({ closed: false });
   });
 
+  it('normalizes Gate spot candlestick rows into ascending millisecond series', async () => {
+    const fetchMock = vi.fn((url: string | URL | Request) => {
+      expect(String(url)).toBe('https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=BTC_USDT&interval=1m&limit=2');
+      // GET /spot/candlesticks returns positional rows: [unix, quoteVolume, o, h, l, c, baseVolume, closed].
+      return response([
+        ['1783703460', '639550000.0', '63950.1', '63960.0', '63948.2', '63955.5', '1.25', 'true'],
+        ['1783703400', '639400000.0', '63940.0', '63951.0', '63939.5', '63950.1', '0.98', 'false'],
+      ]);
+    });
+    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch, () => 1_783_703_490_000);
+
+    const candles = await client.queryCandles('GATE_SPOT_BTC_USDT', '1m', 2);
+
+    expect(candles.map((candle) => candle.startTime)).toEqual([1_783_703_400_000, 1_783_703_460_000]);
+    expect(candles[0]).toMatchObject({ open: '63940.0', close: '63950.1', volume: '0.98', closed: true });
+    expect(candles[1]).toMatchObject({ closed: false });
+  });
+
   it('requests the Gate page immediately before an exclusive history cursor', async () => {
     const fetchMock = vi.fn((url: string | URL | Request) => {
       expect(String(url)).toBe('https://api.gateio.ws/api/v4/futures/usdt/candlesticks?contract=BTC_USDT&interval=1m&from=1783703279&to=1783703399');
@@ -752,5 +770,162 @@ describe('bulk venue funding stats', () => {
       venue: 'DERIBIT', base: 'SOL', quote: 'USDC', fundingRate: '0.000012', fundingIntervalHours: 8, fundingRate8h: '0.000012',
       nextFundingAt: null, openInterestValue: '16000000', lastPrice: '81', change24h: '0.025',
     }]);
+  });
+
+  it('QA supplement: DERIBIT spot candles are rejected without an upstream request (no spot fetcher by design)', async () => {
+    const fetchMock = vi.fn();
+    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch);
+
+    await expect(client.queryCandles('DERIBIT_SPOT_BTC_USDT', '1m', 10))
+      .rejects.toMatchObject({ name: 'PublicMarketDataError', code: 'UNSUPPORTED_SYMBOL' });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('QA supplement: Binance spot klines use the spot v3 endpoint with endTime pagination', async () => {
+    const fetchMock = vi.fn((_url: string | URL | Request) => response([
+      [1_783_703_400_000, '63960', '63970', '63950', '63965', '12.5'],
+      [1_783_703_460_000, '63965', '63980', '63960', '63975', '9.1'],
+    ]));
+    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch);
+
+    const candles = await client.queryCandles('BINANCE_SPOT_BTC_USDT', '1m', 2, 1_783_703_490_000);
+
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain('https://api.binance.com/api/v3/klines?symbol=BTCUSDT');
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain('endTime=1783703489999');
+    expect(candles).toEqual([
+      { startTime: 1_783_703_400_000, open: '63960', high: '63970', low: '63950', close: '63965', volume: '12.5', closed: true },
+      { startTime: 1_783_703_460_000, open: '63965', high: '63980', low: '63960', close: '63975', volume: '9.1', closed: true },
+    ]);
+  });
+
+  it('sweeps Binance spot and perp bookTickers, dropping dated futures and odd quotes', async () => {
+    const fetchMock = vi.fn((url: string | URL | Request) => String(url).includes('fapi.binance.com')
+      ? response([
+        { symbol: 'ETHUSDT', bidPrice: '3120.5', askPrice: '3120.6', bidQty: '1', askQty: '1', time: 1 },
+        // Dated future (settlement suffix) and a non-stable quote are not CrossEx markets.
+        { symbol: 'BTCUSDT_260327', bidPrice: '64000', askPrice: '64001', time: 1 },
+        { symbol: 'BTCUSD', bidPrice: '64000', askPrice: '64001', time: 1 },
+      ])
+      : response([
+        { symbol: 'BTCUSDT', bidPrice: '63962.00', askPrice: '63962.10', bidQty: '1', askQty: '1', time: 1 },
+        { symbol: 'BTCTUSD', bidPrice: '63900', askPrice: '63901', time: 1 },
+      ]));
+    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch);
+
+    const tickers = await client.queryVenueBookTickers('BINANCE');
+
+    expect(tickers).toEqual([
+      // Prices normalize through positiveNumberText, so trailing zeros drop. Binance bookTicker
+      // carries no volume and no open interest, and no extra request is made to fill them in.
+      {
+        venue: 'BINANCE', business: 'SPOT', base: 'BTC', quote: 'USDT', bidPrice: '63962', askPrice: '63962.1', lastPrice: null,
+        volume24h: null, quoteVolume24h: null, openInterestValue: null,
+      },
+      {
+        venue: 'BINANCE', business: 'FUTURE', base: 'ETH', quote: 'USDT', bidPrice: '3120.5', askPrice: '3120.6', lastPrice: null,
+        volume24h: null, quoteVolume24h: null, openInterestValue: null,
+      },
+    ]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('sweeps OKX spot and swap tickers, dropping inverse swaps', async () => {
+    const fetchMock = vi.fn((url: string | URL | Request) => String(url).includes('instType=SWAP')
+      ? response({ code: '0', msg: '', data: [
+        { instId: 'ETH-USDT-SWAP', bidPx: '3120.5', askPx: '3120.7', last: '3120.6', vol24h: '12000', volCcy24h: '37500000.5', ts: '1783703477068' },
+        // Inverse (coin-margined) swap is not a CrossEx linear market.
+        { instId: 'BTC-USD-SWAP', bidPx: '64000', askPx: '64001', last: '64000', ts: '1783703477068' },
+        { instId: 'BTC-USDC-SWAP', bidPx: '0', askPx: '0', ts: '1783703477068' },
+      ] })
+      : response({ code: '0', msg: '', data: [
+        { instId: 'BTC-USDT', bidPx: '63962', askPx: '63962.2', last: '63962.1', vol24h: '900.25', volCcy24h: '57500000', ts: '1783703477068' },
+        // A zero turnover means the venue published nothing usable for this row.
+        { instId: 'BTC-USDC', bidPx: '63961', askPx: '63961.2', vol24h: '0', volCcy24h: '0', ts: '1783703477068' },
+      ] }));
+    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch);
+
+    const tickers = await client.queryVenueBookTickers('OKX');
+
+    expect(tickers).toEqual([
+      {
+        venue: 'OKX', business: 'SPOT', base: 'BTC', quote: 'USDT', bidPrice: '63962', askPrice: '63962.2', lastPrice: '63962.1',
+        volume24h: '900.25', quoteVolume24h: '57500000', openInterestValue: null,
+      },
+      {
+        venue: 'OKX', business: 'SPOT', base: 'BTC', quote: 'USDC', bidPrice: '63961', askPrice: '63961.2', lastPrice: null,
+        volume24h: null, quoteVolume24h: null, openInterestValue: null,
+      },
+      {
+        venue: 'OKX', business: 'FUTURE', base: 'ETH', quote: 'USDT', bidPrice: '3120.5', askPrice: '3120.7', lastPrice: '3120.6',
+        volume24h: '12000', quoteVolume24h: '37500000.5', openInterestValue: null,
+      },
+    ]);
+  });
+
+  it('sweeps Bybit spot and linear tickers, dropping dated futures and keeping PERP quoting', async () => {
+    const fetchMock = vi.fn((url: string | URL | Request) => String(url).includes('category=linear')
+      ? response({ retCode: 0, retMsg: 'OK', result: { list: [
+        { symbol: 'SIRENUSDT', bid1Price: '0.119', ask1Price: '0.12', lastPrice: '0.1195', volume24h: '8800000', turnover24h: '1050000.75', openInterestValue: '420000' },
+        { symbol: 'BTC-26DEC25', bid1Price: '64000', ask1Price: '64001' },
+        { symbol: 'BTCUSDC', bid1Price: '0', ask1Price: '0' },
+      ] } })
+      : response({ retCode: 0, retMsg: 'OK', result: { list: [
+        { symbol: 'SIRENUSDT', bid1Price: '0.1192', ask1Price: '0.1194', lastPrice: '0.1193', volume24h: '1200000', turnover24h: '143000' },
+      ] } }));
+    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch);
+
+    const tickers = await client.queryVenueBookTickers('BYBIT');
+
+    expect(tickers).toEqual([
+      {
+        venue: 'BYBIT', business: 'SPOT', base: 'SIREN', quote: 'USDT', bidPrice: '0.1192', askPrice: '0.1194', lastPrice: '0.1193',
+        volume24h: '1200000', quoteVolume24h: '143000', openInterestValue: null,
+      },
+      {
+        venue: 'BYBIT', business: 'FUTURE', base: 'SIREN', quote: 'USDT', bidPrice: '0.119', askPrice: '0.12', lastPrice: '0.1195',
+        volume24h: '8800000', quoteVolume24h: '1050000.75', openInterestValue: '420000',
+      },
+    ]);
+  });
+
+  it('sweeps Gate spot and USDT-settled futures tickers into CrossEx rows', async () => {
+    const fetchMock = vi.fn((url: string | URL | Request) => String(url).includes('/futures/usdt/tickers')
+      ? response([
+        { contract: 'SIREN_USDT', highest_bid: '0.119', lowest_ask: '0.12', last: '0.1195', volume_24h_base: '5000000', volume_24h_quote: '595000' },
+        { contract: 'BTC_USDC', highest_bid: '64000', lowest_ask: '64001', last: '64000' },
+      ])
+      : response([
+        { currency_pair: 'SIREN_USDT', highest_bid: '0.1192', lowest_ask: '0.1194', last: '0.1193', base_volume: '750000', quote_volume: '89250.5' },
+        { currency_pair: 'SIREN_USDC', highest_bid: '0.1191', lowest_ask: '0.1195', last: '0.1192' },
+      ]));
+    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch);
+
+    const tickers = await client.queryVenueBookTickers('GATE');
+
+    expect(tickers).toEqual([
+      {
+        venue: 'GATE', business: 'SPOT', base: 'SIREN', quote: 'USDT', bidPrice: '0.1192', askPrice: '0.1194', lastPrice: '0.1193',
+        volume24h: '750000', quoteVolume24h: '89250.5', openInterestValue: null,
+      },
+      {
+        venue: 'GATE', business: 'SPOT', base: 'SIREN', quote: 'USDC', bidPrice: '0.1191', askPrice: '0.1195', lastPrice: '0.1192',
+        volume24h: null, quoteVolume24h: null, openInterestValue: null,
+      },
+      {
+        venue: 'GATE', business: 'FUTURE', base: 'SIREN', quote: 'USDT', bidPrice: '0.119', askPrice: '0.12', lastPrice: '0.1195',
+        volume24h: '5000000', quoteVolume24h: '595000', openInterestValue: null,
+      },
+    ]);
+  });
+
+  it('returns no REST book rows for venues without a full-market ticker sweep', async () => {
+    const fetchMock = vi.fn();
+    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch);
+
+    await expect(client.queryVenueBookTickers('KRAKEN')).resolves.toEqual([]);
+    await expect(client.queryVenueBookTickers('HYPERLIQUID')).resolves.toEqual([]);
+    await expect(client.queryVenueBookTickers('DERIBIT')).resolves.toEqual([]);
+    await expect(client.queryVenueBookTickers('LIGHTER')).resolves.toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

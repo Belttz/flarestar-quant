@@ -1,17 +1,29 @@
 import { useEffect, useRef } from 'react';
 import { AreaSeries, CandlestickSeries, ColorType, createChart, CrosshairMode, HistogramSeries, LineSeries, LineStyle, TickMarkType, type AreaData, type CandlestickData, type IChartApi, type ISeriesApi, type LogicalRange, type Time, type UTCTimestamp } from 'lightweight-charts';
 import type { Candle, CandleInterval } from './api.js';
+import { candleVolumeValue, formatCompactVolume, hasUsableVolume, volumeBarColor } from './charts-volume.js';
 import type { PremiumHistoryPoint } from './premium-history.js';
 import type { PriceDifferenceHistoryPoint } from './price-difference-history.js';
+
+// 成交量纯函数既在这里使用，也从本模块对外导出，方便调用方（如交易页读数）直接引用。
+export { NO_VOLUME_TEXT, candleVolumeValue, formatCompactVolume, hasUsableVolume, volumeBarColor } from './charts-volume.js';
+export type { VolumePalette } from './charts-volume.js';
 
 type ChartTheme = 'dark' | 'light';
 
 const PALETTES: Record<ChartTheme, { grid: string; label: string; green: string; red: string; volumeUp: string; volumeDown: string; crosshair: string }> = {
-  dark: { grid: '#1d2938', label: '#667386', green: '#19d6ae', red: '#f05b72', volumeUp: 'rgba(25, 214, 174, .38)', volumeDown: 'rgba(240, 91, 114, .32)', crosshair: '#3d4c5e' },
-  light: { grid: '#dbe3ea', label: '#7a8794', green: '#009b7d', red: '#d74860', volumeUp: 'rgba(0, 155, 125, .35)', volumeDown: 'rgba(215, 72, 96, .3)', crosshair: '#9fb0bd' },
+  dark: { grid: '#1d2938', label: '#667386', green: '#19d6ae', red: '#f05b72', volumeUp: 'rgba(25, 214, 174, .55)', volumeDown: 'rgba(240, 91, 114, .5)', crosshair: '#3d4c5e' },
+  light: { grid: '#dbe3ea', label: '#7a8794', green: '#009b7d', red: '#d74860', volumeUp: 'rgba(0, 155, 125, .55)', volumeDown: 'rgba(215, 72, 96, .5)', crosshair: '#9fb0bd' },
 };
 
 const VISIBLE_CANDLES = 96;
+
+/** 有成交量时：成交量面板占底部 18%，蜡烛主图让出下方 26%。 */
+const VOLUME_SCALE_MARGINS = { top: 0.82, bottom: 0 };
+/** 没有成交量时：面板高度压到 0，K 线占满整块高度。 */
+const HIDDEN_VOLUME_SCALE_MARGINS = { top: 1, bottom: 0 };
+const PRICE_SCALE_TOP_MARGIN = 0.08;
+const PRICE_SCALE_BOTTOM_MARGIN_WITH_VOLUME = 0.26;
 
 function chartText(locale: string, english: string, chinese: string): string {
   return locale.toLowerCase().startsWith('zh') ? chinese : english;
@@ -40,6 +52,7 @@ export function CandleChart({ candles, interval, seriesKey, theme, locale, place
   const onLoadMoreRef = useRef(onLoadMore);
   const shownKeyRef = useRef<string | null>(null);
   const precisionRef = useRef<number | null>(null);
+  const volumeVisibleRef = useRef<boolean | null>(null);
   const renderedRef = useRef<{ key: string; theme: ChartTheme; candles: Candle[] } | null>(null);
   onHoverRef.current = onHover;
   onLoadMoreRef.current = onLoadMore;
@@ -101,6 +114,20 @@ export function CandleChart({ candles, interval, seriesKey, theme, locale, place
     const volumeSeries = volumeSeriesRef.current;
     if (!chart || !priceSeries || !volumeSeries) return;
     const palette = PALETTES[theme];
+    // 数据源可能完全没有成交量（部分 REST/WS 回填不返回 v）。这种情况下不要把一根根 0 高度的柱子
+    // 摆在底部占位，而是把成交量面板压成 0 高、主图 bottom margin 归 0，让 K 线占满整块高度。
+    const showVolume = hasUsableVolume(candles);
+    if (volumeVisibleRef.current !== showVolume) {
+      volumeVisibleRef.current = showVolume;
+      volumeSeries.applyOptions({ visible: showVolume });
+      chart.priceScale('volume').applyOptions({ scaleMargins: showVolume ? VOLUME_SCALE_MARGINS : HIDDEN_VOLUME_SCALE_MARGINS });
+      chart.applyOptions({
+        rightPriceScale: {
+          borderVisible: false,
+          scaleMargins: { top: PRICE_SCALE_TOP_MARGIN, bottom: showVolume ? PRICE_SCALE_BOTTOM_MARGIN_WITH_VOLUME : 0 },
+        },
+      });
+    }
     // Live ticks arrive several times a second and only ever revise or append the final candle
     // (state updates preserve the identity of untouched candle objects). Feed those through the
     // chart's incremental update path; rebuilding the full series is reserved for a new
@@ -131,8 +158,8 @@ export function CandleChart({ candles, interval, seriesKey, theme, locale, place
       });
       volumeSeries.update({
         time,
-        value: Number(candle.volume) || 0,
-        color: Number(candle.close) >= Number(candle.open) ? palette.volumeUp : palette.volumeDown,
+        value: candleVolumeValue(candle.volume),
+        color: volumeBarColor(candle, palette),
       });
     } else {
       candleByTimeRef.current = new Map(candles.map((candle) => [Math.floor(candle.startTime / 1000), candle]));
@@ -142,8 +169,9 @@ export function CandleChart({ candles, interval, seriesKey, theme, locale, place
       })));
       volumeSeries.setData(candles.map((candle) => ({
         time: Math.floor(candle.startTime / 1000) as UTCTimestamp,
-        value: Number(candle.volume) || 0,
-        color: Number(candle.close) >= Number(candle.open) ? palette.volumeUp : palette.volumeDown,
+        // 个别 K 线缺成交量时画 0（不画 NaN），其余柱子照常按真实量级缩放。
+        value: candleVolumeValue(candle.volume),
+        color: volumeBarColor(candle, palette),
       })));
     }
     renderedRef.current = { key: seriesKey, theme, candles };
@@ -161,7 +189,7 @@ export function CandleChart({ candles, interval, seriesKey, theme, locale, place
 
   const last = candles[candles.length - 1];
   const summary = last
-    ? `${candles.length} ${interval} candles. Latest open ${last.open}, high ${last.high}, low ${last.low}, close ${last.close}.`
+    ? `${candles.length} ${interval} candles. Latest open ${last.open}, high ${last.high}, low ${last.low}, close ${last.close}, volume ${formatCompactVolume(last.volume)}.`
     : `No ${interval} candles available.`;
   return <div className="price-chart">
     <div className="chart-host" ref={hostRef} role="img" aria-label={summary} />
@@ -185,7 +213,22 @@ interface HistoryChartProps<T extends HistoryChartPoint> {
   onLoadMore: () => void;
 }
 
-const PREMIUM_PALETTES: Record<ChartTheme, { grid: string; label: string; line: string; fillTop: string; fillBottom: string; crosshair: string }> = {
+/** Colors for one theme of an area history chart. */
+export interface AreaHistoryPalette {
+  grid: string;
+  label: string;
+  line: string;
+  fillTop: string;
+  fillBottom: string;
+  crosshair: string;
+}
+
+type AreaHistoryPaletteSet = Record<ChartTheme, AreaHistoryPalette>;
+
+/** Formats one area-chart value for the price axis, crosshair label and summary text. */
+type AreaValueFormatter = (value: number) => string;
+
+const PREMIUM_PALETTES: AreaHistoryPaletteSet = {
   dark: {
     grid: '#1a2524',
     label: '#66756f',
@@ -204,13 +247,45 @@ const PREMIUM_PALETTES: Record<ChartTheme, { grid: string; label: string; line: 
   },
 };
 
+/** Green-toned palettes for the asset-page equity curve (dark / light). */
+export const EQUITY_PALETTES: AreaHistoryPaletteSet = {
+  dark: {
+    grid: '#17211f',
+    label: '#66756f',
+    line: '#19d6ae',
+    fillTop: 'rgba(25, 214, 174, .18)',
+    fillBottom: 'rgba(25, 214, 174, .02)',
+    crosshair: '#3c5750',
+  },
+  light: {
+    grid: '#dce8e4',
+    label: '#718079',
+    line: '#009b7d',
+    fillTop: 'rgba(0, 155, 125, .16)',
+    fillBottom: 'rgba(0, 155, 125, .02)',
+    crosshair: '#93a8a1',
+  },
+};
+
+function formatPercentValue(value: number): string {
+  return `${value.toFixed(2)}%`;
+}
+
+function formatBpsValue(value: number): string {
+  return `${value.toFixed(2)} bps`;
+}
+
+function formatEquityUsd(value: number): string {
+  return `$${value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
 function chartTimeToLocalDate(time: Time): Date {
   if (typeof time === 'number') return new Date(time * 1000);
   if (typeof time === 'string') return new Date(time);
   return new Date(time.year, time.month - 1, time.day);
 }
 
-function SpreadHistoryChart<T extends HistoryChartPoint>({
+function AreaHistoryChart<T extends HistoryChartPoint>({
   points,
   seriesKey,
   visibleDurationMs,
@@ -219,9 +294,10 @@ function SpreadHistoryChart<T extends HistoryChartPoint>({
   placeholder,
   onHover,
   onLoadMore,
-  unit,
+  palettes,
+  formatValue,
   ariaLabel,
-}: HistoryChartProps<T> & { unit: '%' | ' bps'; ariaLabel: string }) {
+}: HistoryChartProps<T> & { palettes: AreaHistoryPaletteSet; formatValue: AreaValueFormatter; ariaLabel: string }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<'Area'> | null>(null);
@@ -276,13 +352,13 @@ function SpreadHistoryChart<T extends HistoryChartPoint>({
       priceFormat: {
         type: 'custom',
         minMove: 0.01,
-        formatter: (value: number) => `${value.toFixed(2)}${unit}`,
+        formatter: (value: number) => formatValue(value),
       },
     });
-  }, [unit]);
+  }, [formatValue]);
 
   useEffect(() => {
-    const palette = PREMIUM_PALETTES[theme];
+    const palette = palettes[theme];
     chartRef.current?.applyOptions({
       layout: { background: { type: ColorType.Solid, color: 'transparent' }, textColor: palette.label },
       grid: { horzLines: { color: palette.grid } },
@@ -317,7 +393,7 @@ function SpreadHistoryChart<T extends HistoryChartPoint>({
       crosshairMarkerBorderColor: palette.line,
       crosshairMarkerBackgroundColor: palette.line,
     });
-  }, [theme, locale]);
+  }, [palettes, theme, locale]);
 
   useEffect(() => {
     const chart = chartRef.current;
@@ -348,7 +424,7 @@ function SpreadHistoryChart<T extends HistoryChartPoint>({
 
   const latest = points[points.length - 1];
   const summary = latest
-    ? `${ariaLabel}. ${points.length} points. Latest ${latest.value.toFixed(2)}${unit}.`
+    ? `${ariaLabel}. ${points.length} points. Latest ${formatValue(latest.value)}.`
     : `${ariaLabel}. No data available.`;
   return <div className="premium-history-chart">
     <div className="chart-host" ref={hostRef} role="img" aria-label={summary} />
@@ -357,11 +433,21 @@ function SpreadHistoryChart<T extends HistoryChartPoint>({
 }
 
 export function PremiumHistoryChart(props: HistoryChartProps<PremiumHistoryPoint>) {
-  return <SpreadHistoryChart {...props} unit="%" ariaLabel="Historical ADR premium" />;
+  return <AreaHistoryChart {...props} palettes={PREMIUM_PALETTES} formatValue={formatPercentValue} ariaLabel="Historical ADR premium" />;
 }
 
 export function PriceDifferenceHistoryChart(props: HistoryChartProps<PriceDifferenceHistoryPoint>) {
-  return <SpreadHistoryChart {...props} unit=" bps" ariaLabel="Historical price difference" />;
+  return <AreaHistoryChart {...props} palettes={PREMIUM_PALETTES} formatValue={formatBpsValue} ariaLabel="Historical price difference" />;
+}
+
+export interface EquityHistoryPoint {
+  time: number;
+  value: number;
+}
+
+/** Asset-page equity curve: USD-denominated area chart on the green equity palette. */
+export function EquityHistoryChart(props: HistoryChartProps<EquityHistoryPoint>) {
+  return <AreaHistoryChart {...props} palettes={EQUITY_PALETTES} formatValue={formatEquityUsd} ariaLabel="Portfolio equity history" />;
 }
 
 export interface FundingChartPoint {

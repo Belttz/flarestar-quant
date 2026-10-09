@@ -1,0 +1,202 @@
+classDiagram
+    direction LR
+
+    class AssetClass {
+        <<enumeration>>
+        STOCK
+        ETF
+        INDEX
+        FOREX
+        COMMODITY
+        PRE_IPO
+        COIN
+        TOKEN
+        CONTRACT
+    }
+    class AssetSuperClass {
+        <<enumeration>>
+        RWA
+        CRYPTO
+    }
+    class PreIpoFilterMode {
+        <<enumeration>>
+        all
+        only
+        exclude
+    }
+    class OpportunitySortKey {
+        <<enumeration>>
+        spread
+        apr
+        volume
+        oi
+        asset
+    }
+
+    class AssetClassification {
+        +string asset
+        +string canonicalAsset
+        +string variantSuffix
+        +AssetClass assetClass
+        +AssetSuperClass assetSuperClass
+        +boolean isPreIpo
+    }
+    class AssetClassificationModule {
+        <<module>>
+        +ASSET_CLASS_MEMBERS
+        +ASSET_VARIANT_SUFFIXES
+        +splitAssetVariant(asset) Variant
+        +classifyAsset(asset, context) AssetClassification
+        +classifyAssetCached(asset, context) AssetClassification
+        +assetSuperClassOf(assetClass) AssetSuperClass
+        +matchesAssetClassFilter(c, classes) boolean
+        +matchesPreIpoFilter(c, mode) boolean
+        +assetClassLabelKey(assetClass) string
+    }
+
+    class OpportunityMarketStats {
+        +string volume24h
+        +string quoteVolume24h
+        +string openInterest
+        +string openInterestValue
+    }
+    class FundingOpportunity {
+        +string asset
+        +string venue
+        +string symbol
+        +string spotSymbol
+        +number fundingApr
+        +boolean executable
+        +AssetClass assetClass
+        +AssetSuperClass assetSuperClass
+        +string variantSuffix
+        +boolean isPreIpo
+        +OpportunityMarketStats perpStats
+    }
+    class SpreadOpportunity {
+        +string asset
+        +string leftSymbol
+        +string rightSymbol
+        +string leftVenue
+        +string rightVenue
+        +number spreadBps
+        +AssetClass assetClass
+        +AssetSuperClass assetSuperClass
+        +string variantSuffix
+        +boolean isPreIpo
+        +OpportunityMarketStats leftStats
+        +OpportunityMarketStats rightStats
+    }
+    class OpportunityResponse {
+        +FundingOpportunity[] funding
+        +SpreadOpportunity[] spread
+        +Totals totals
+        +number offset
+        +number limit
+        +string fetchedAt
+        +string cacheStatus
+    }
+
+    class OpportunityFilters {
+        +boolean funding
+        +boolean spread
+        +number minApr
+        +number minBps
+        +string asset
+        +string[] venues
+        +SpreadPairType[] pairTypes
+        +AssetSuperClass[] assetClasses
+        +PreIpoFilterMode preIpo
+        +OpportunitySortKey sort
+        +SortDirection dir
+        +number offset
+        +number limit
+    }
+    class OpportunityService {
+        -deps OpportunityDependencies
+        +list(catalog, filters) Promise~OpportunityResponse~
+        -buildFundingBoard(overview, filters, stats) FundingOpportunity[]
+        -buildSpreadBoard(filters, stats) Promise~SpreadOpportunity[]~
+        -applySort(rows, filters) void
+        -slicePage(rows, filters) Page
+    }
+    class OpportunityMarketStatsIndex {
+        <<module>>
+        +buildMarketStatsIndex(markets, overview) Map
+        +resolveStats(symbol, asset, venue, index, overview) OpportunityMarketStats
+    }
+    class VenueBookTicker {
+        +string venue
+        +string business
+        +string base
+        +string quote
+        +string bidPrice
+        +string askPrice
+        +string lastPrice
+        +string volume24h
+        +string quoteVolume24h
+        +string openInterestValue
+    }
+
+    class PortfolioEquityPoint {
+        +number time
+        +string equity
+        +string unrealizedPnl
+    }
+    class PortfolioEquitySeriesResponse {
+        +PortfolioEquityRange range
+        +PortfolioEquityGranularity granularity
+        +PortfolioEquityPoint[] points
+        +string firstSampleAt
+        +string fetchedAt
+    }
+    class PortfolioEquityStore {
+        <<module>>
+        +recordPortfolioEquitySample(db, sample) void
+        +readPortfolioEquitySeries(db, granularity, fromMs) PortfolioEquityPoint[]
+        +prunePortfolioEquitySamples(db, nowMs) void
+    }
+
+    class OpportunitiesView {
+        <<React>>
+        +board OpportunityBoard
+        +filters SpreadFilters
+        +parseAssetClassFilter(value) AssetSuperClass[]
+        +serializeAssetClassFilter(classes) string
+        +parsePreIpoFilter(value) PreIpoFilterMode
+        +parseSortFilter(value, dir) SortState
+        +toggleSort(key) void
+    }
+    class PortfolioEquityCard {
+        <<React>>
+        +range PortfolioEquityRange
+        +load() Promise
+        +onRangeChange(range) void
+    }
+    class EquityHistoryChart {
+        <<React>>
+        +points HistoryChartPoint[]
+        +seriesKey string
+        +theme ChartTheme
+        +locale string
+    }
+
+    AssetClassificationModule ..> AssetClassification : creates
+    AssetClassification --> AssetClass
+    AssetClassification --> AssetSuperClass
+    FundingOpportunity *-- OpportunityMarketStats : perpStats
+    SpreadOpportunity *-- OpportunityMarketStats : leftStats / rightStats
+    FundingOpportunity --> AssetClass
+    SpreadOpportunity --> AssetClass
+    OpportunityResponse *-- FundingOpportunity
+    OpportunityResponse *-- SpreadOpportunity
+    OpportunityService ..> OpportunityFilters : consumes
+    OpportunityService ..> OpportunityResponse : produces
+    OpportunityService ..> AssetClassificationModule : classifies + filters
+    OpportunityService ..> OpportunityMarketStatsIndex : resolves stats
+    OpportunityMarketStatsIndex ..> VenueBookTicker : maps (volume / OI)
+    PortfolioEquityStore ..> PortfolioEquityPoint : persists
+    PortfolioEquitySeriesResponse *-- PortfolioEquityPoint
+    PortfolioEquityCard ..> PortfolioEquitySeriesResponse : fetches
+    PortfolioEquityCard *-- EquityHistoryChart
+    OpportunitiesView ..> OpportunityResponse : renders

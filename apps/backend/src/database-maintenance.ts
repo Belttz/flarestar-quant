@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import { prunePortfolioEquitySamples } from './repositories.js';
 
 const DAY_MS = 24 * 60 * 60_000;
 const AUDIT_RETENTION_MS = 180 * DAY_MS;
@@ -10,12 +11,14 @@ export interface DatabaseMaintenanceResult {
   strategyLogsDeleted: number;
   fillsDeleted: number;
   ordersDeleted: number;
+  portfolioEquitySamplesDeleted: number;
 }
 
 /**
  * Bound locally generated operational data while preserving active strategy state. Execution
  * history is retained for a year; rows belonging to running, paused, or unresolved strategies
- * are never selected for pruning.
+ * are never selected for pruning. Equity samples are trimmed per granularity (raw 7d,
+ * hour 45d, day 730d).
  */
 export function runDatabaseMaintenance(
   database: Database.Database,
@@ -60,11 +63,15 @@ export function runDatabaseMaintenance(
     const ordersDeleted = database.prepare(`
       DELETE FROM execution_orders WHERE ${eligibleOrderFilter}
     `).run(executionCutoff).changes;
+    // Nested transaction() calls become SQLite savepoints, so the equity prune joins the
+    // same atomic maintenance pass.
+    const portfolioEquitySamplesDeleted = prunePortfolioEquitySamples(database, now);
     return {
       auditEventsDeleted: expiredAudit + excessAudit,
       strategyLogsDeleted,
       fillsDeleted,
       ordersDeleted,
+      portfolioEquitySamplesDeleted,
     };
   })();
 }

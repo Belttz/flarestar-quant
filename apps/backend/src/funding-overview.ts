@@ -114,10 +114,28 @@ export class FundingOverviewService {
     return this.refreshInFlight;
   }
 
+  /**
+   * Cached funding settlement interval in hours for one executable perpetual symbol, or null
+   * when the venue row is unknown (never fetched, upstream error, or non-futures symbol). The
+   * carry strategy engine uses this to annualize funding and advance its accrual clock.
+   */
+  fundingIntervalFor(symbol: string): number | null {
+    const match = CROSSEX_FUTURE_SYMBOL.exec(symbol);
+    if (!match) return null;
+    const nativeAsset = match[1];
+    if (!nativeAsset) return null;
+    const parts = symbol.split('_');
+    const venue = parts[0] as FundingStatVenue;
+    const quote = parts[3] ?? '';
+    return this.venues.get(venue)?.rows.get(`${nativeAsset}:${quote}`)?.fundingIntervalHours ?? null;
+  }
+
   buildResponse(catalog: FundingOverviewCatalogView): FundingOverviewResponse {
     const assets = [...catalog.assets.entries()].map(([asset, venueList]) => ({
       asset,
-      venues: venueList.map((entry): FundingOverviewVenueEntry => {
+      // Spot catalog rows share the perpetual's base/quote but carry no funding, so they are
+      // skipped — otherwise they would join a perp stat and fabricate a funding row.
+      venues: venueList.filter((entry) => entry.business !== 'SPOT').map((entry): FundingOverviewVenueEntry => {
         const cached = this.venues.get(entry.venue as FundingStatVenue);
         // Catalog assets are canonical identities, while venue statistics retain the native
         // ticker. Join through the executable CrossEx symbol so aliases never alter routing.

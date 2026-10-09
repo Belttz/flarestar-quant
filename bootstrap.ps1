@@ -168,7 +168,7 @@ function Install-GateCrossExSource {
 
     $InstallRoot = [IO.Path]::GetFullPath((Get-Setting 'GCT_INSTALL_DIR' (Join-Path $env:USERPROFILE 'gate-crossex'))).TrimEnd('\', '/')
     $Marker = Join-Path $InstallRoot '.gate-crossex-source-install'
-    $SavedRepository = 'your-quantguy/gate-crossex'
+    $SavedRepository = 'Belttz/flarestar-quant'
     $SavedRef = 'main'
     $ExistingSourceConfig = Join-Path $InstallRoot '.gate-crossex-source.json'
     if (Test-Path -LiteralPath $ExistingSourceConfig -PathType Leaf) {

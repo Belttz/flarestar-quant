@@ -24,10 +24,14 @@ async function createHubHarness(): Promise<HubHarness> {
   const received: Array<Record<string, unknown>> = [];
   const messages: MarketHubMessage[] = [];
   hub.subscribe((message) => messages.push(message));
+  // The hub may shard symbols across several upstream connections; capture frames from all of
+  // them while keeping the first dial (the seed shard) as the harness's primary socket.
   const socketPromise = new Promise<ServerSocket>((resolve) => server.once('connection', resolve));
+  server.on('connection', (sock: ServerSocket) => {
+    sock.on('message', (data: { toString(): string }) => received.push(JSON.parse(data.toString()) as Record<string, unknown>));
+  });
   hub.start();
   const socket = await socketPromise;
-  socket.on('message', (data: { toString(): string }) => received.push(JSON.parse(data.toString()) as Record<string, unknown>));
   const harness = { hub, server, socket, received, messages };
   harnesses.push(harness);
   return harness;
@@ -85,9 +89,13 @@ describe('CrossEx websocket liveness', () => {
     await new Promise<void>((resolve) => server.once('listening', resolve));
     const address = server.address();
     if (typeof address === 'string' || !address) throw new Error('missing server address');
+    let connections = 0;
+    server.on('connection', () => { connections += 1; });
     const socketPromise = new Promise<WebSocketDefault>((resolve) => server.once('connection', resolve));
     const hub = new CrossExMarketHub(`ws://127.0.0.1:${address.port}`, {
-      heartbeatIntervalMs: 10, marketIdlePingAfterMs: 40, staleAfterMs: 10_000,
+      // The pong must land before the next heartbeat tick, so keep the tick at 100ms: a 10ms
+      // window flakes when the whole suite loads the CPU, while production defaults are 25s/2s.
+      heartbeatIntervalMs: 100, marketIdlePingAfterMs: 100, staleAfterMs: 10_000,
     });
     try {
       hub.start();
@@ -95,8 +103,11 @@ describe('CrossEx websocket liveness', () => {
       let pingCount = 0;
       socket.on('ping', () => { pingCount += 1; });
       await waitFor(() => pingCount > 0);
-      await new Promise((resolve) => setTimeout(resolve, 60));
+      // Cover at least one follow-up heartbeat tick: the auto-pong must have arrived, the
+      // connection must stay healthy, and no reconnect dial may have happened.
+      await new Promise((resolve) => setTimeout(resolve, 250));
       expect(hub.snapshot().connectionState).toBe('healthy');
+      expect(connections).toBe(1);
     } finally {
       hub.stop();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -128,6 +139,116 @@ describe('CrossEx websocket liveness', () => {
       hub.stop();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+});
+
+describe('CrossEx ticker sparse-field fallback', () => {
+  it('resolves null bid/ask from the maintained book top instead of dropping the frame', async () => {
+    const { hub, socket } = await createHubHarness();
+    await waitFor(() => hub.marketCount() > 0);
+    const symbol = 'GATE_FUTURE_BTC_USDT';
+    const releaseBook = hub.watchOrderBook(symbol);
+    socket.send(JSON.stringify({ time: 1, channel: 'order_book_update', event: 'update', result: {
+      snapshot: true, ts: 1_771_990_690_000, s: symbol,
+      a: [['118500.5', '1.5'], ['118501.0', '2']],
+      b: [['118499.5', '2.5'], ['118499.0', '3']],
+    } }));
+    await waitFor(() => hub.orderBook(symbol) !== null);
+
+    // Sparse ticker: bid/ask and every 24h stat are null. The frame must still land, with the
+    // quote sides backed by the book's top levels.
+    socket.send(JSON.stringify({ time: 2, channel: 'ticker', event: 'update', result: {
+      s: symbol, lp: '118500', bp: null, ap: null,
+      o: null, h: null, l: null, v: null, ts: 1_771_990_800_000,
+    } }));
+    await waitFor(() => hub.market(symbol)?.source === 'gate_crossex_websocket');
+    const market = hub.market(symbol);
+    expect(market?.lastPrice).toBe('118500');
+    expect(market?.bidPrice).toBe('118499.5');
+    expect(market?.bidSize).toBe('2.5');
+    expect(market?.askPrice).toBe('118500.5');
+    expect(market?.askSize).toBe('1.5');
+
+    // A later full ticker still wins over the book-backed values.
+    socket.send(JSON.stringify({ time: 3, channel: 'ticker', event: 'update', result: {
+      s: symbol, lp: '118502', bp: '118501.5', bs: '1', ap: '118502.5', as: '0.5',
+      o: '118000', h: '119000', l: '117500', v: '1000', ts: 1_771_990_810_000,
+    } }));
+    await waitFor(() => hub.market(symbol)?.bidPrice === '118501.5');
+    expect(hub.market(symbol)?.askPrice).toBe('118502.5');
+    releaseBook();
+  });
+
+  it('keeps previously published 24h fields when a push nulls them out', async () => {
+    const { hub, socket } = await createHubHarness();
+    await waitFor(() => hub.marketCount() > 0);
+    const symbol = 'BINANCE_FUTURE_ETH_USDT';
+    socket.send(JSON.stringify({ time: 1, channel: 'ticker', event: 'update', result: {
+      s: symbol, lp: '3862', bp: '3861.5', bs: '2', ap: '3862.5', as: '1',
+      o: '3800', h: '3900', l: '3750', v: '900', q: '3467400', ts: 1_771_990_800_000,
+    } }));
+    await waitFor(() => hub.market(symbol)?.source === 'gate_crossex_websocket');
+
+    socket.send(JSON.stringify({ time: 2, channel: 'ticker', event: 'update', result: {
+      s: symbol, lp: '3863', bp: '3862.5', bs: '2', ap: '3863.5', as: '1',
+      o: null, h: null, l: null, v: null, ts: 1_771_990_810_000,
+    } }));
+    await waitFor(() => hub.market(symbol)?.lastPrice === '3863');
+    const market = hub.market(symbol);
+    expect(market?.open24h).toBe('3800');
+    expect(market?.high24h).toBe('3900');
+    expect(market?.low24h).toBe('3750');
+    expect(market?.volume24h).toBe('900');
+  });
+
+  it('keeps the stored record untouched when a frame carries no usable quote at all', async () => {
+    const { hub, socket } = await createHubHarness();
+    await waitFor(() => hub.marketCount() > 0);
+    const symbol = 'OKX_FUTURE_BTC_USDT';
+    socket.send(JSON.stringify({ time: 1, channel: 'ticker', event: 'update', result: {
+      s: symbol, lp: '118420', bp: '118419', bs: '1', ap: '118421', as: '1',
+      o: '118000', h: '119000', l: '117500', v: '1000', ts: 1_771_990_800_000,
+    } }));
+    await waitFor(() => hub.market(symbol)?.source === 'gate_crossex_websocket');
+    const before = hub.market(symbol);
+
+    // No lp, no bid/ask, no book for this symbol: nothing may be published or wiped.
+    socket.send(JSON.stringify({ time: 2, channel: 'ticker', event: 'update', result: {
+      s: symbol, lp: '', bp: null, ap: null,
+      o: null, h: null, l: null, v: null, ts: 1_771_990_820_000,
+    } }));
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+    expect(hub.market(symbol)).toEqual(before);
+  });
+
+  it('maps native spot pair names onto registered GATE spot markets for ticker, book, and kline pushes', async () => {
+    const { hub, socket } = await createHubHarness();
+    await waitFor(() => hub.marketCount() > 0);
+    const symbol = 'GATE_SPOT_BTC_USDT';
+    expect(hub.ensureMarkets([{ symbol, venue: 'GATE', asset: 'BTC' }])).toBe(true);
+
+    socket.send(JSON.stringify({ time: 1, channel: 'ticker', event: 'update', result: {
+      s: 'BTC_USDT', lp: '118420', bp: '118419', bs: '0.5', ap: '118421', as: '0.4',
+      o: '118000', h: '119000', l: '117500', v: '100', ts: 1_771_990_800_000,
+    } }));
+    await waitFor(() => hub.market(symbol)?.source === 'gate_crossex_websocket');
+    expect(hub.market(symbol)?.lastPrice).toBe('118420');
+    expect(hub.market(symbol)?.bidPrice).toBe('118419');
+
+    hub.watchOrderBook(symbol);
+    socket.send(JSON.stringify({ time: 2, channel: 'order_book_update', event: 'update', result: {
+      snapshot: true, ts: 1_771_990_810_000, s: 'BTC_USDT',
+      a: [['118421', '0.4']], b: [['118419', '0.5']],
+    } }));
+    await waitFor(() => hub.orderBook(symbol) !== null);
+    expect(hub.orderBook(symbol)?.bids).toEqual([['118419', '0.5']]);
+
+    hub.watchKlines(symbol, '1m');
+    socket.send(JSON.stringify({ channel: 'kline_1m', event: 'update', result: {
+      s: 'BTC_USDT', o: '118400', h: '118430', l: '118390', c: '118420', v: '10', t: 1_771_990_740_000, T: 1_771_990_799_999, x: false,
+    } }));
+    await waitFor(() => hub.candles(symbol, '1m').length === 1);
+    expect(hub.candles(symbol, '1m')[0]).toMatchObject({ close: '118420' });
   });
 });
 
@@ -197,7 +318,7 @@ describe('CrossEx dynamic market channels', () => {
     expect(hub.snapshot().markets.some((market) => market.symbol === symbol)).toBe(false);
   });
 
-  it('chunks every public subscription request at the documented 100-symbol limit', async () => {
+  it('spreads subscriptions across shard connections so no frame exceeds the 100-symbol cap', async () => {
     const { hub, received } = await createHubHarness();
     await waitFor(() => received.some((message) => message.channel === 'ticker'));
     const definitions = Array.from({ length: 130 }, (_, index) => ({
@@ -206,17 +327,26 @@ describe('CrossEx dynamic market channels', () => {
       asset: `DYN${index}`,
     }));
     expect(hub.ensureMarkets(definitions)).toBe(true);
-    await waitFor(() => received.filter((message) => message.channel === 'ticker' && message.event === 'subscribe').length >= 3);
+    await waitFor(() => {
+      const subscribed = new Set(received
+        .filter((message) => message.channel === 'ticker' && message.event === 'subscribe')
+        .flatMap((message) => message.payload as string[])
+        .filter((symbol) => String(symbol).includes('_DYN')));
+      return subscribed.size >= 130;
+    }, 5_000);
 
     for (const channel of ['ticker', 'funding_rate', 'open_interest']) {
-      const dynamicRequests = received.filter((message) =>
+      const frames = received.filter((message) =>
         message.channel === channel
         && message.event === 'subscribe'
         && Array.isArray(message.payload)
-        && message.payload.some((symbol) => String(symbol).includes('_DYN')),
-      );
-      expect(dynamicRequests).toHaveLength(2);
-      expect(dynamicRequests.every((message) => (message.payload as unknown[]).length <= 100)).toBe(true);
+        && (message.payload as unknown[]).some((symbol) => String(symbol).includes('_DYN')));
+      // 20 dynamic symbols land on the seed shard (capacity left below 100) and the remaining
+      // 110 need two more connections: three shard frames per channel in total.
+      expect(frames.length).toBe(3);
+      expect(frames.every((message) => (message.payload as unknown[]).length <= 100)).toBe(true);
+      const symbols = frames.flatMap((message) => message.payload as string[]).filter((symbol) => String(symbol).includes('_DYN'));
+      expect(new Set(symbols).size).toBe(130);
     }
   });
 

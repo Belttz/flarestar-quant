@@ -43,6 +43,7 @@ import {
   isPositiveDecimal,
   liveMarketFor,
   maxPositionValueAtLeverage,
+  minimumNotionalIssue,
   priceText,
   projectedPositionValue,
   quoteFor,
@@ -53,7 +54,6 @@ import {
   usesSharedCrossExMargin,
   type PairedPositionPrefill,
   type PairHistoryRange,
-  type StrategyKind,
 } from './route-shared.js';
 import { strategyAssetOptions, strategyVenueSymbol } from './strategy-asset-options.js';
 import { StrategyAssetSearch } from './strategy-asset-search.js';
@@ -82,6 +82,33 @@ const REALIZED_FUNDING_TILES = [
   { days: 7, labelKey: 'Cumulative 7-day', digits: 3 },
   { days: 30, labelKey: 'Cumulative 30-day', digits: 3 },
 ] as const;
+
+/** One-shot prefill query appended by the Opportunities board (architecture §4.2). */
+const QUERY_ASSET_PATTERN = /^[A-Z0-9]{1,20}$/;
+const QUERY_DECIMAL_PATTERN = /^-?\d+(?:\.\d+)?$/;
+
+function queryAsset(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const asset = value.trim().toUpperCase();
+  return QUERY_ASSET_PATTERN.test(asset) ? asset : null;
+}
+
+function queryVenueId(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const venueId = value.trim().toLowerCase();
+  return exchanges.some((venue) => venue.id === venueId) ? venueId : null;
+}
+
+function queryProduct(value: string | null | undefined): 'perpetual' | 'spot' | null {
+  if (value === 'spot') return 'spot';
+  if (value === 'perp' || value === 'perpetual') return 'perpetual';
+  return null;
+}
+
+function queryDecimal(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  return trimmed && QUERY_DECIMAL_PATTERN.test(trimmed) ? trimmed : null;
+}
 
 function useInstrumentCatalog(): CrossExInstrument[] | null {
   const [instruments, setInstruments] = useState<CrossExInstrument[] | null>(null);
@@ -123,6 +150,7 @@ function strategyMarketLabel(config: StrategyConfig): string {
     return assets.join(' / ');
   }
   if (config.kind === 'premium') return `${config.asset} / ${config.hedgeAsset}`;
+  if (config.kind === 'carry') return `${config.asset} · Spot ⇄ perpetual`;
   const left = marketSymbol(config.asset, quoteFor(config.leftVenue.toLowerCase()), 'perpetual');
   const right = marketSymbol(config.asset, quoteFor(config.rightVenue.toLowerCase()), 'perpetual');
   return left === right ? left : `${left} ↔ ${right}`;
@@ -311,7 +339,11 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   }
 
   function kindLabel(strategy: StrategyRecord): string {
-    return t(strategy.config.closePlan ? 'Hedge position strategy' : strategy.kind === 'auto' ? 'Price-difference bot' : strategy.kind === 'premium' ? 'SK hynix premium bot' : 'Cross-exchange hedge');
+    return t(strategy.config.closePlan ? 'Hedge position strategy'
+      : strategy.kind === 'auto' ? 'Price-difference bot'
+      : strategy.kind === 'premium' ? 'SK hynix premium bot'
+      : strategy.kind === 'carry' ? 'Spot-perpetual carry bot'
+      : 'Cross-exchange hedge');
   }
 
   return <>
@@ -328,7 +360,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
         {positionsView.status === 'stale' && <div className="no-strategies stale-strategy-positions"><span>!</span><strong>{t('Position snapshot is stale')}</strong><small>{t('Waiting for a fresh account snapshot.')}</small></div>}
         {positionsView.status === 'unavailable' && <div className="no-strategies"><span>◎</span><strong>{t('Position data unavailable')}</strong><small>{t('Waiting for a fresh account snapshot.')}</small></div>}
       </> : <>
-        <div className={`running-table ${showingHistory ? 'historical' : ''}`}><div className="running-head">{showingHistory && <span>{t('Start time')}</span>}<span>{t('Strategy')}</span><span>{t('Market name')}</span><span>{t('Exchanges')}</span><span>{t('Entry / Exit')}</span>{showingHistory && <span>{t('Realized PnL')}</span>}<span>{t('Size limits')}</span><span>{t('Method')}</span><span>{t('Execution log')}</span><span>{t(showingHistory ? 'Duration' : 'Runtime')}</span><span>{t('Status')}</span>{!showingHistory && <span />}</div>{visibleStrategies.map((strategy) => {
+        <div className={`running-table ${showingHistory ? 'historical' : ''}`}><div className="running-head">{showingHistory && <span>{t('Start time')}</span>}<span>{t('Strategy')}</span><span>{t('Market name')}</span><span>{t('Exchanges')}</span><span>{t('Entry / Exit')}</span><span>{t('Funding collected')}</span>{showingHistory && <span>{t('Realized PnL')}</span>}<span>{t('Size limits')}</span><span>{t('Method')}</span><span>{t('Execution log')}</span><span>{t(showingHistory ? 'Duration' : 'Runtime')}</span><span>{t('Status')}</span>{!showingHistory && <span />}</div>{visibleStrategies.map((strategy) => {
       const config = strategy.config;
       const premium = config.kind === 'premium';
       const timedClose = Boolean(config.closePlan);
@@ -339,7 +371,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
       return <div className="running-row" key={strategy.id}>
         {showingHistory && <span className="strategy-start-time"><strong>{startedAt.date}</strong><small>{startedAt.time}</small></span>}
         <span><strong>{strategy.id}</strong><small>{kindLabel(strategy)}{strategy.accountLabel ? ` · ${strategy.accountLabel}` : ''}</small></span>
-        <span><strong>{strategyMarketLabel(config)}</strong><small>{t(premium ? 'ADR premium' : 'Perpetual')}</small></span>
+        <span><strong>{strategyMarketLabel(config)}</strong><small>{t(config.kind === 'carry' ? 'Spot ⇄ perpetual' : premium ? 'ADR premium' : 'Perpetual')}</small></span>
         <span>{timedClose ? [...new Set(config.closePlan?.targets.map((target) => symbolParts(target.symbol).venue) ?? [])].join(' ⇄ ') : config.leftVenue === config.rightVenue ? leftVenue?.name ?? config.leftVenue : `${leftVenue?.name ?? config.leftVenue} ⇄ ${rightVenue?.name ?? config.rightVenue}`}</span>
         <span>{timedClose
           ? <><strong>{config.closePlan?.orderCount} {t('orders')}</strong><small>{config.closePlan?.intervalSeconds}s {t('Time gap between orders').toLowerCase()}</small></>
@@ -354,7 +386,12 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
                 if (event.key === 'Escape') setEditingTakeProfitId(null);
               }} autoFocus /><span>%</span><button className="save-take-profit" onClick={() => void saveTakeProfit(strategy)} disabled={updatingTakeProfitId === strategy.id}>{updatingTakeProfitId === strategy.id ? t('Saving…') : t('Save')}</button><button className="cancel-take-profit" aria-label={t('Cancel edit')} onClick={() => setEditingTakeProfitId(null)} disabled={updatingTakeProfitId === strategy.id}>×</button></small>
               : <small className="take-profit-value"><span>{shortPremium ? '≤' : '≥'} {config.takeProfitPremiumPct}%</span>{strategy.status === 'RUNNING' && <button className="edit-take-profit" onClick={() => editTakeProfit(strategy)}>{t('Edit take profit')}</button>}</small>}</>
-          : <><strong>≥ {config.entryBps} bps</strong><small>{config.takeProfitBps ? `≤ ${config.takeProfitBps} bps` : t('Stop at full fill')}</small></>}</span>
+          : config.kind === 'carry'
+          ? <><strong>{t('Funding APR')} ≥ {config.fundingAprMin}%</strong><small>{config.fundingDirection} · {t('basis')} {Number(config.basisTakeProfitBps) >= 0 ? '≤' : '≥'} {Math.abs(Number(config.basisTakeProfitBps))} bps</small></>
+          : <><strong>{Number(config.entryBps) < 0 ? '≤' : '≥'} {config.entryBps} bps</strong><small>{config.takeProfitBps ? `≤ ${config.takeProfitBps} bps` : t('Stop at full fill')}</small></>}</span>
+        <span className="strategy-funding-collected">{config.kind === 'carry' && strategy.carryMetrics
+          ? <><strong className={Number(strategy.carryMetrics.fundingCollectedUsdt) >= 0 ? 'positive' : 'negative'}>{Number(strategy.carryMetrics.fundingCollectedUsdt) >= 0 ? '+' : ''}{Number(strategy.carryMetrics.fundingCollectedUsdt).toFixed(4)}</strong><small>USDT</small></>
+          : '—'}</span>
         {showingHistory && <span className={`strategy-realized-pnl ${Number(strategy.realizedPnl) >= 0 ? 'positive' : 'negative'}`}><strong>{Number(strategy.realizedPnl) >= 0 ? '+' : ''}{Number(strategy.realizedPnl).toFixed(2)}</strong><small>USDT</small></span>}
         <span>{timedClose ? `${config.closePlan?.targets.length} ${t('Positions')} · ${config.closePlan?.orderCount} ${t('orders')}` : `${config.perOrderQuantity} ${config.asset} · ${t('max')} ${strategyMaxAmount(config)}`}</span>
         <span>{config.executionMethod.replaceAll('_', '–')}</span>
@@ -379,7 +416,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
     {selectedLogStrategy && <div className="execution-log-backdrop" role="presentation" onMouseDown={() => setSelectedLogStrategyId(null)}>
       <section ref={logDialogRef} tabIndex={-1} className="execution-log-modal" role="dialog" aria-modal="true" aria-labelledby="execution-log-title" onMouseDown={(event) => event.stopPropagation()}>
         <header><div><p className="eyebrow">{t('Strategy execution log')}</p><h2 id="execution-log-title">{selectedLogStrategy.id}</h2><span>{strategyMarketLabel(selectedLogStrategy.config)} · {selectedLogStrategy.config.closePlan ? [...new Set(selectedLogStrategy.config.closePlan.targets.map((target) => symbolParts(target.symbol).venue))].join(' ⇄ ') : selectedLogStrategy.config.leftVenue === selectedLogStrategy.config.rightVenue ? selectedLogStrategy.config.leftVenue : `${selectedLogStrategy.config.leftVenue} ⇄ ${selectedLogStrategy.config.rightVenue}`}</span></div><button data-dialog-autofocus aria-label={t('Close execution log')} onClick={() => setSelectedLogStrategyId(null)}>×</button></header>
-        <div className="execution-log-summary"><div><span>{t('Strategy')}</span><strong>{t(selectedLogStrategy.config.closePlan ? 'Hedge position strategy' : selectedLogStrategy.kind === 'auto' ? 'Auto price difference' : selectedLogStrategy.kind === 'premium' ? 'SK hynix premium bot' : 'Cross-exchange hedge')}</strong></div><div><span>{t('Status')}</span><strong className="positive">● {selectedLogStrategy.status}</strong></div><div><span>{t('Execution method')}</span><strong>{selectedLogStrategy.config.executionMethod.replaceAll('_', '–')}</strong></div></div>
+        <div className="execution-log-summary"><div><span>{t('Strategy')}</span><strong>{t(selectedLogStrategy.config.closePlan ? 'Hedge position strategy' : selectedLogStrategy.kind === 'auto' ? 'Auto price difference' : selectedLogStrategy.kind === 'premium' ? 'SK hynix premium bot' : selectedLogStrategy.kind === 'carry' ? 'Spot-perpetual carry bot' : 'Cross-exchange hedge')}</strong></div><div><span>{t('Status')}</span><strong className="positive">● {selectedLogStrategy.status}</strong></div><div><span>{t('Execution method')}</span><strong>{selectedLogStrategy.config.executionMethod.replaceAll('_', '–')}</strong></div></div>
         <div className="execution-log-table">
           <div className="execution-log-head"><span>{t('Time')}</span><span>{t('Event')}</span><span>{t('Spread / trigger')}</span><span>{t('Quantity')}</span><span>{t('Execution result')}</span><span>{t('Result')}</span></div>
           {logLoadState.status === 'loading' && <div className="execution-log-state">{t('Loading execution log…')}</div>}
@@ -409,7 +446,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
 }
 
 interface StrategyViewProps {
-  mode: Exclude<StrategyKind, 'premium'>;
+  mode: 'position' | 'auto';
   prefill?: PairedPositionPrefill | null;
   marketSnapshot: MarketSnapshot | null;
   catalog: MarketCatalogAsset[] | null;
@@ -427,19 +464,26 @@ interface StrategyViewProps {
 
 export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, strategies, balances, authenticatedPortfolio, tradingSnapshot, tradingMode, onOpenModeDialog, onStrategiesChanged, onPositionsRefresh, watchQuotes }: StrategyViewProps) {
   const { language, theme, t } = useLanguage();
+  // Prefill query from the Opportunities board is read once on mount; later renders ignore it.
+  const [query] = useState(() => new URLSearchParams(window.location.search));
+  const autoQuery = mode === 'auto' ? query : null;
   const [directionFlipped, setDirectionFlipped] = useState(false);
   const [reduceOnly, setReduceOnly] = useState(false);
-  const [asset, setAsset] = useState(prefill?.asset ?? 'BTC');
+  const [asset, setAsset] = useState(() => prefill?.asset ?? queryAsset(autoQuery?.get('asset')) ?? 'BTC');
   // The standard direction sells venue A and buys venue B. Funding-page presets therefore put
   // the high-rate (short) venue on A and the low-rate (long) venue on B.
-  const [leftExchangeId, setLeftExchangeId] = useState<string>(prefill?.shortVenue ?? 'binance');
-  const [rightExchangeId, setRightExchangeId] = useState<string>(prefill?.longVenue ?? 'okx');
+  const [leftExchangeId, setLeftExchangeId] = useState<string>(() => prefill?.shortVenue ?? queryVenueId(autoQuery?.get('left')) ?? 'binance');
+  const [rightExchangeId, setRightExchangeId] = useState<string>(() => prefill?.longVenue ?? queryVenueId(autoQuery?.get('right')) ?? 'okx');
   const [executionMethod, setExecutionMethod] = useState<'Taker–Taker' | 'Maker–Taker'>('Taker–Taker');
   const [makerLeg, setMakerLeg] = useState<'left' | 'right'>('left');
   const [amount, setAmount] = useState('');
   const [positionOrderQuantity, setPositionOrderQuantity] = useState('');
-  const [threshold, setThreshold] = useState('0');
+  const [threshold, setThreshold] = useState(() => queryDecimal(autoQuery?.get('entryBps')) ?? '0');
   const [takeProfitThreshold, setTakeProfitThreshold] = useState('0.4');
+  const [stopLossThreshold, setStopLossThreshold] = useState('100');
+  // Auto legs may use the Gate spot market on either side; everything else stays perpetual.
+  const [leftProduct, setLeftProduct] = useState<'perpetual' | 'spot'>(() => queryProduct(autoQuery?.get('leftProduct')) ?? 'perpetual');
+  const [rightProduct, setRightProduct] = useState<'perpetual' | 'spot'>(() => queryProduct(autoQuery?.get('rightProduct')) ?? 'perpetual');
   const [maxPosition, setMaxPosition] = useState('');
   const [orderQuantity, setOrderQuantity] = useState('');
   const [leftLeverage, setLeftLeverage] = useState('1');
@@ -467,8 +511,12 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
     () => strategyAssetOptions(catalog, streamedAssets(marketSnapshot), leftExchangeId, rightExchangeId),
     [catalog, leftExchangeId, marketSnapshot, rightExchangeId],
   );
-  const leftHistorySymbol = strategyVenueSymbol(catalog, leftExchange.id, asset);
-  const rightHistorySymbol = strategyVenueSymbol(catalog, rightExchange.id, asset);
+  const leftHistorySymbol = mode === 'auto' && leftProduct === 'spot'
+    ? `GATE_SPOT_${asset}_USDT`
+    : strategyVenueSymbol(catalog, leftExchange.id, asset);
+  const rightHistorySymbol = mode === 'auto' && rightProduct === 'spot'
+    ? `GATE_SPOT_${asset}_USDT`
+    : strategyVenueSymbol(catalog, rightExchange.id, asset);
   const leftInstrument = instruments?.find((instrument) => instrument.symbol === leftHistorySymbol);
   const rightInstrument = instruments?.find((instrument) => instrument.symbol === rightHistorySymbol);
   const positionFundingRangeLabel = POSITION_FUNDING_RANGES.find((range) => range.days === positionFundingDuration)?.label ?? '30D';
@@ -487,13 +535,25 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
     { exchange: leftExchange, symbol: leftHistorySymbol, feeKind: executionMethod === 'Maker–Taker' && makerLeg === 'left' ? 'maker' : 'taker' },
     { exchange: rightExchange, symbol: rightHistorySymbol, feeKind: executionMethod === 'Maker–Taker' && makerLeg === 'right' ? 'maker' : 'taker' },
   ] as const;
-  const leftLive = liveMarketFor(marketSnapshot, leftExchange.id, asset);
-  const rightLive = liveMarketFor(marketSnapshot, rightExchange.id, asset);
+  // Spot legs must match the exact GATE_SPOT symbol: the venue+asset lookup would otherwise hit
+  // the perpetual market first (both are venue=GATE / asset=X once the spot leg registers), which
+  // collapsed the live spread into the perpetual's own bid-ask bounce (it looked intermittent).
+  const gateSpotLegSymbol = `GATE_SPOT_${asset}_USDT`;
+  const leftLive = mode === 'auto' && leftProduct === 'spot'
+    ? marketSnapshot?.markets.find((item) => item.symbol === gateSpotLegSymbol) ?? null
+    : liveMarketFor(marketSnapshot, leftExchange.id, asset);
+  const rightLive = mode === 'auto' && rightProduct === 'spot'
+    ? marketSnapshot?.markets.find((item) => item.symbol === gateSpotLegSymbol) ?? null
+    : liveMarketFor(marketSnapshot, rightExchange.id, asset);
   const overviewAsset = fundingOverview?.assets.find((entry) => entry.asset === asset);
   const leftOverview = overviewAsset?.venues.find((entry) => entry.venue === leftExchange.id.toUpperCase());
   const rightOverview = overviewAsset?.venues.find((entry) => entry.venue === rightExchange.id.toUpperCase());
-  const leftTicker = marketSymbol(asset, quoteFor(leftExchange.id), 'perpetual');
-  const rightTicker = marketSymbol(asset, quoteFor(rightExchange.id), 'perpetual');
+  const leftTicker = mode === 'auto' && leftProduct === 'spot'
+    ? `${asset}/USDT`
+    : marketSymbol(asset, quoteFor(leftExchange.id), 'perpetual');
+  const rightTicker = mode === 'auto' && rightProduct === 'spot'
+    ? `${asset}/USDT`
+    : marketSymbol(asset, quoteFor(rightExchange.id), 'perpetual');
   const leftStreamPrice = leftLive?.source === 'gate_crossex_websocket'
     ? directionFlipped ? leftLive.askPrice : leftLive.bidPrice
     : undefined;
@@ -522,7 +582,9 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const rightPrice = livePrice(rightStreamPrice, rightOverview?.lastPrice);
   const sellPrice = directionFlipped ? rightPrice : leftPrice;
   const buyPrice = directionFlipped ? leftPrice : rightPrice;
-  const priceDiffBps = sellPrice > 0 && buyPrice > 0 ? ((sellPrice - buyPrice) / buyPrice) * 10_000 : 0;
+  // Null while either leg lacks a price: a missing leg must read as "waiting", never as a real
+  // 0.00 bps spread.
+  const priceDiffBps = sellPrice > 0 && buyPrice > 0 ? ((sellPrice - buyPrice) / buyPrice) * 10_000 : null;
   const priceDifferenceHistoryIsCurrent = priceDifferenceHistory.key === priceDifferenceHistoryKey;
   const priceDifferencePoints = useMemo(() => priceDifferenceHistoryIsCurrent
     ? buildPriceDifferenceHistory(priceDifferenceHistory.left, priceDifferenceHistory.right, directionFlipped, 0)
@@ -530,7 +592,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const latestPriceDifferencePoint = priceDifferencePoints[priceDifferencePoints.length - 1] ?? null;
   const displayedPriceDifferencePoint = hoveredPriceDifference ?? latestPriceDifferencePoint;
   const displayedPriceDifference = hoveredPriceDifference?.value
-    ?? (leftPrice > 0 && rightPrice > 0 ? priceDiffBps : latestPriceDifferencePoint?.value ?? null);
+    ?? priceDiffBps ?? latestPriceDifferencePoint?.value ?? null;
   const displayedLeftPrice = hoveredPriceDifference?.leftClose
     ?? (leftPrice > 0 ? leftPrice : latestPriceDifferencePoint?.leftClose ?? null);
   const displayedRightPrice = hoveredPriceDifference?.rightClose
@@ -620,13 +682,21 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const tradingEnabled = tradingMode === 'live';
   const configuredPerOrder = mode === 'position' ? positionOrderQuantity : orderQuantity;
   const configuredPerOrderNumber = Number(configuredPerOrder);
+  // Both legs trade the same base quantity (the conversion ratio is 1 outside premium bots), so
+  // each leg's minimum notional is checked against the executable-side price of that leg. Legs
+  // without a live price or catalog row are skipped: the backend waits for quotes and stays the
+  // authority when constraints are unknown.
   const sizeIssues = [
     minimumSizeIssue(leftInstrument, configuredPerOrderNumber, leftExchange.name, asset, t),
     minimumSizeIssue(rightInstrument, configuredPerOrderNumber, rightExchange.name, asset, t),
+    minimumNotionalIssue({ instrument: leftInstrument, quantity: configuredPerOrderNumber, price: leftPrice, asset, venueName: leftExchange.name, t }),
+    minimumNotionalIssue({ instrument: rightInstrument, quantity: configuredPerOrderNumber, price: rightPrice, asset, venueName: rightExchange.name, t }),
   ].filter((issue): issue is string => issue !== null);
   const instrumentsReady = leftInstrument !== undefined && rightInstrument !== undefined;
   const signedEntryThreshold = /^-?\d+(?:\.\d+)?$/.test(threshold);
-  const entryThresholdValid = signedEntryThreshold && (mode === 'position' || Number(threshold) > 0);
+  // Both modes accept signed thresholds: auto trades either spread direction, and position
+  // strategies may accept a bounded negative opening cost.
+  const entryThresholdValid = signedEntryThreshold;
   const leftBalance = balanceFor(balances, authenticatedPortfolio, leftExchange.id);
   const rightBalance = balanceFor(balances, authenticatedPortfolio, rightExchange.id);
   const sharedMarginMode = usesSharedCrossExMargin(authenticatedPortfolio);
@@ -635,8 +705,13 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const leftPortfolioPosition = authenticatedPortfolio?.snapshot.futuresPositions?.find((position) => position.symbol === leftHistorySymbol);
   const rightPortfolioPosition = authenticatedPortfolio?.snapshot.futuresPositions?.find((position) => position.symbol === rightHistorySymbol);
   const configuredTarget = Number(mode === 'position' ? amount : maxPosition) || 0;
-  const leftLeverageNumber = mode === 'position' ? Number(leftLeverage) || 0 : 1;
-  const rightLeverageNumber = mode === 'position' ? Number(rightLeverage) || 0 : 1;
+  // Leverage applies to the hedge form and to the continuous bot when both legs are perpetual
+  // (all-futures spread). Spot legs are full-cash and always reserve margin at 1×.
+  const autoAllPerp = mode === 'auto' && leftProduct !== 'spot' && rightProduct !== 'spot';
+  const leftLeverageActive = mode === 'position' || autoAllPerp;
+  const rightLeverageActive = leftLeverageActive;
+  const leftLeverageNumber = leftLeverageActive ? Number(leftLeverage) || 0 : 1;
+  const rightLeverageNumber = rightLeverageActive ? Number(rightLeverage) || 0 : 1;
   const plannedLeftQuantity = configuredTarget * (directionFlipped ? 1 : -1);
   const plannedRightQuantity = -plannedLeftQuantity;
   const projectedLeftPositionValue = projectedPositionValue(
@@ -648,11 +723,12 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const riskLimitsReady = leftRiskPositionValue !== undefined && rightRiskPositionValue !== undefined;
   const positionRiskReviewUnavailable = !reduceOnly && configuredTarget > 0
     && (!riskLimitsReady || projectedLeftPositionValue === null || projectedRightPositionValue === null);
+  // A "null" cap with tiers loaded means no usable venue cap at this leverage (empty or
+  // unlimited-sentinel tiers) — the projected position then simply has no ceiling to exceed.
   const positionRiskLimitExceeded = !reduceOnly && configuredTarget > 0 && riskLimitsReady && (
-    leftRiskPositionValue === null || rightRiskPositionValue === null
-    || (projectedLeftPositionValue !== null && leftRiskPositionValue !== undefined
+    (projectedLeftPositionValue !== null && leftRiskPositionValue !== undefined && leftRiskPositionValue !== null
       && projectedLeftPositionValue > leftRiskPositionValue)
-    || (projectedRightPositionValue !== null && rightRiskPositionValue !== undefined
+    || (projectedRightPositionValue !== null && rightRiskPositionValue !== undefined && rightRiskPositionValue !== null
       && projectedRightPositionValue > rightRiskPositionValue)
   );
   const estimatedLeftMargin = leftLeverageNumber > 0
@@ -687,7 +763,11 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const sizeInputsValid = isPositiveDecimal(configuredPerOrder)
     && isPositiveDecimal(mode === 'position' ? amount : maxPosition)
     && entryThresholdValid
-    && (mode === 'position' || (isPositiveDecimal(takeProfitThreshold) && Number(takeProfitThreshold) < Number(threshold)))
+    // Auto take-profit stays positive; with a negative entry it can sit above the entry level.
+    && (mode === 'position' || (isPositiveDecimal(takeProfitThreshold)
+      && (Number(threshold) <= 0 || Number(takeProfitThreshold) < Number(threshold))))
+    // Optional stop-loss: empty disables it, otherwise it must be a positive bps number.
+    && (mode !== 'auto' || stopLossThreshold.trim() === '' || isPositiveDecimal(stopLossThreshold))
     && instrumentsReady
     && sizeIssues.length === 0;
   const strategyInputsValid = sizeInputsValid && !marginInsufficient
@@ -747,10 +827,13 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   }, [leftHistorySymbol, mode, positionFundingHistoryKey, rightHistorySymbol]);
 
   useEffect(() => {
+    // Never correct while the catalog is still loading: before it arrives the option list is a
+    // streaming-only fallback and would yank away a prefilled (not yet watched) asset.
+    if (catalog === null) return;
     if (availableStrategyAssets.length > 0 && !availableStrategyAssets.some((option) => option.asset === asset)) {
       setAsset(availableStrategyAssets[0].asset);
     }
-  }, [asset, availableStrategyAssets]);
+  }, [asset, availableStrategyAssets, catalog]);
 
   useEffect(() => {
     setHoveredPriceDifference(null);
@@ -774,7 +857,17 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
       ...(executionMethod === 'Maker–Taker' ? { makerLeg } : {}),
       ...(mode === 'position'
         ? { totalAmount: amount, leftLeverage, rightLeverage }
-        : { maxPosition, takeProfitBps: takeProfitThreshold }),
+        : {
+          maxPosition,
+          takeProfitBps: takeProfitThreshold,
+          // Empty stop-loss disables it; the backend treats it as optional too.
+          ...(stopLossThreshold.trim() !== '' ? { stopLossBps: Number(stopLossThreshold) } : {}),
+          // All-futures spreads trade at the configured per-leg leverage; spot legs stay 1×.
+          ...(autoAllPerp ? { leftLeverage, rightLeverage } : {}),
+          // Gate spot legs must carry their explicit symbol so the engine routes spot orders.
+          ...(leftProduct === 'spot' ? { leftSymbol: `GATE_SPOT_${asset}_USDT` } : {}),
+          ...(rightProduct === 'spot' ? { rightSymbol: `GATE_SPOT_${asset}_USDT` } : {}),
+        }),
     };
     try {
       const record = await api.startStrategy(config);
@@ -816,7 +909,16 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
           tradingMode={tradingMode} disabled={reduceOnly} onOpenModeDialog={onOpenModeDialog} onValueChange={setRightLeverage} onRiskLimitChange={setRightRiskPositionValue} />
         <label><span>{t('Entry threshold')}</span><div><input value={threshold} onChange={(event) => setThreshold(event.target.value)} /><b>bps</b></div></label>
         <label className="reduce-only-control"><span onClick={(event) => event.preventDefault()}>{t('Position handling')}</span><div><input type="checkbox" checked={reduceOnly} onChange={(event) => setReduceOnly(event.target.checked)} /><b>{t('Reduce only')}</b></div></label>
-      </> : <><label><span>{t('Order quantity')}</span><div><input placeholder="e.g. 0.05" value={orderQuantity} onChange={(event) => setOrderQuantity(event.target.value)} /><b>{asset}</b></div></label><label><span>{t('Max position')}</span><div><input placeholder="e.g. 2.00" value={maxPosition} onChange={(event) => setMaxPosition(event.target.value)} /><b>{asset}</b></div></label><label><span>{t('Entry threshold')}</span><div><input value={threshold} onChange={(event) => setThreshold(event.target.value)} /><b>bps</b></div></label><label><span>{t('Take-profit threshold')}</span><div><input value={takeProfitThreshold} onChange={(event) => setTakeProfitThreshold(event.target.value)} /><b>bps</b></div></label></>}</div>
+      </> : <><label><span>{t('Order quantity')}</span><div><input placeholder="e.g. 0.05" value={orderQuantity} onChange={(event) => setOrderQuantity(event.target.value)} /><b>{asset}</b></div></label><label><span>{t('Max position')}</span><div><input placeholder="e.g. 2.00" value={maxPosition} onChange={(event) => setMaxPosition(event.target.value)} /><b>{asset}</b></div></label>{autoAllPerp && <>
+        <StrategyLeverageControl label="Exchange A leverage" symbol={leftHistorySymbol} exchangeName={leftExchange.name}
+          asset={asset} quote={quoteFor(leftExchange.id)} value={leftLeverage} referencePrice={leftPrice}
+          fallbackCurrent={leftPortfolioPosition?.leverage} fallbackMax={leftPortfolioPosition?.maxLeverage}
+          tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} onValueChange={setLeftLeverage} onRiskLimitChange={setLeftRiskPositionValue} />
+        <StrategyLeverageControl label="Exchange B leverage" symbol={rightHistorySymbol} exchangeName={rightExchange.name}
+          asset={asset} quote={quoteFor(rightExchange.id)} value={rightLeverage} referencePrice={rightPrice}
+          fallbackCurrent={rightPortfolioPosition?.leverage} fallbackMax={rightPortfolioPosition?.maxLeverage}
+          tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} onValueChange={setRightLeverage} onRiskLimitChange={setRightRiskPositionValue} />
+      </>}<label><span>{t('Entry threshold')}</span><div><input value={threshold} onChange={(event) => setThreshold(event.target.value)} /><b>bps</b></div></label><label><span>{t('Take-profit threshold')}</span><div><input value={takeProfitThreshold} onChange={(event) => setTakeProfitThreshold(event.target.value)} /><b>bps</b></div></label><label><span>{t('Stop-loss threshold')}</span><div><input placeholder={t('Optional')} value={stopLossThreshold} onChange={(event) => setStopLossThreshold(event.target.value)} /><b>bps</b></div></label></>}</div>
       {instrumentsReady && <div className={`strategy-size-check ${sizeInputsValid ? 'valid' : 'invalid'}`}><span>{sizeInputsValid ? '✓' : '!'}</span><p>{sizeInputsValid
         ? t('Per-order quantity meets both exchange minimums')
         : sizeIssues.join(' · ') || t('Enter valid strategy amounts')}</p></div>}
@@ -827,7 +929,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
       {!reduceOnly && configuredTarget > 0 && riskLimitsReady && <div className={`strategy-size-check strategy-risk-limit-check ${positionRiskLimitExceeded ? 'invalid' : 'valid'}`}><span>{positionRiskLimitExceeded ? '!' : '✓'}</span><p>{positionRiskLimitExceeded
         ? t('Configured position exceeds the maximum at selected leverage')
         : t('Configured position fits the leverage-tier limits')}</p></div>}
-      <div className="strategy-setup-actions">{mode === 'position' && <div className="compact-trigger"><span className={priceDiffBps >= Number(threshold) ? 'ready' : ''}>{priceDiffBps >= Number(threshold) ? '✓' : '○'}</span><p>{t('Enter at')} <strong>≥ {threshold || '0'} bps</strong></p></div>}<div className="compact-method"><span>{t('Execution method')}</span><div className="method-options execution-method-options" role="group" aria-label={t('Execution method')}><button type="button" className={executionMethod === 'Taker–Taker' ? 'active' : ''} aria-pressed={executionMethod === 'Taker–Taker'} onClick={() => setExecutionMethod('Taker–Taker')}>⚡ {t('Taker–Taker')}</button><button type="button" className={executionMethod === 'Maker–Taker' ? 'active' : ''} aria-pressed={executionMethod === 'Maker–Taker'} onClick={() => setExecutionMethod('Maker–Taker')}>◫ {t('Maker–Taker')}</button></div>{executionMethod === 'Maker–Taker' && <div className="maker-leg-picker execution-maker-leg-options" role="group" aria-label={t('Choose maker leg')}><button type="button" className={makerLeg === 'left' ? 'active' : ''} aria-pressed={makerLeg === 'left'} onClick={() => setMakerLeg('left')}><small>{t('Maker')} · A</small><strong>{leftExchange.name}</strong></button><button type="button" className={makerLeg === 'right' ? 'active' : ''} aria-pressed={makerLeg === 'right'} onClick={() => setMakerLeg('right')}><small>{t('Maker')} · B</small><strong>{rightExchange.name}</strong></button></div>}</div></div>
+      <div className="strategy-setup-actions">{mode === 'position' && <div className="compact-trigger"><span className={priceDiffBps !== null && priceDiffBps >= Number(threshold) ? 'ready' : ''}>{priceDiffBps !== null && priceDiffBps >= Number(threshold) ? '✓' : '○'}</span><p>{t('Enter at')} <strong>≥ {threshold || '0'} bps</strong></p></div>}<div className="compact-method"><span>{t('Execution method')}</span><div className="method-options execution-method-options" role="group" aria-label={t('Execution method')}><button type="button" className={executionMethod === 'Taker–Taker' ? 'active' : ''} aria-pressed={executionMethod === 'Taker–Taker'} onClick={() => setExecutionMethod('Taker–Taker')}>⚡ {t('Taker–Taker')}</button><button type="button" className={executionMethod === 'Maker–Taker' ? 'active' : ''} aria-pressed={executionMethod === 'Maker–Taker'} onClick={() => setExecutionMethod('Maker–Taker')}>◫ {t('Maker–Taker')}</button></div>{executionMethod === 'Maker–Taker' && <div className="maker-leg-picker execution-maker-leg-options" role="group" aria-label={t('Choose maker leg')}><button type="button" className={makerLeg === 'left' ? 'active' : ''} aria-pressed={makerLeg === 'left'} onClick={() => setMakerLeg('left')}><small>{t('Maker')} · A</small><strong>{leftExchange.name}</strong></button><button type="button" className={makerLeg === 'right' ? 'active' : ''} aria-pressed={makerLeg === 'right'} onClick={() => setMakerLeg('right')}><small>{t('Maker')} · B</small><strong>{rightExchange.name}</strong></button></div>}</div></div>
       {mode === 'position' && <div className="compact-stop"><span>◎</span><p>{`${t('Stops after')} ${amount || '0'} ${asset} ${t('executes')}`}</p></div>}
     </article>
   );
@@ -844,11 +946,15 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
               <div className="leg-top">
                 <VenueSelect
                   label={t('Exchange A')}
-                  menuSubtitle={`${asset} ${t('Perpetual').toLowerCase()}`}
-                  options={exchanges.map((venue) => ({ ...venue, disabled: venue.id === rightExchangeId, detail: marketSymbol(asset, quoteFor(venue.id), 'perpetual') }))}
+                  menuSubtitle={`${asset} ${(mode === 'auto' && leftProduct === 'spot' ? t('Spot') : t('Perpetual')).toLowerCase()}`}
+                  options={exchanges.map((venue) => ({ ...venue, disabled: venue.id === rightExchangeId && (mode !== 'auto' || leftProduct === rightProduct), detail: mode === 'auto' && leftProduct === 'spot' ? `${asset}/USDT` : marketSymbol(asset, quoteFor(venue.id), 'perpetual') }))}
                   value={leftExchangeId}
                   onSelect={setLeftExchangeId}
                 />
+                {mode === 'auto' && leftExchangeId === 'gate' && <div className="leg-product-toggle" role="group" aria-label={t('Market type')}>
+                  <button type="button" className={leftProduct === 'perpetual' ? 'active' : ''} aria-pressed={leftProduct === 'perpetual'} onClick={() => setLeftProduct('perpetual')}>{t('Perpetual')}</button>
+                  <button type="button" className={leftProduct === 'spot' ? 'active' : ''} aria-pressed={leftProduct === 'spot'} onClick={() => setLeftProduct('spot')}>{t('Spot')}</button>
+                </div>}
                 <em>{t(leftSide)} <span>{leftTicker}</span></em>
               </div>
               <dl>
@@ -859,19 +965,25 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
             </div>
             <div className="leg-spread">
               <span>{t('Price difference')}</span>
-              <strong className={priceDiffBps >= 0 ? 'positive' : 'negative'}>{priceDiffBps >= 0 ? '+' : ''}{priceDiffBps.toFixed(2)} bps</strong>
+              {priceDiffBps === null
+                ? <strong>—</strong>
+                : <strong className={priceDiffBps >= 0 ? 'positive' : 'negative'}>{priceDiffBps >= 0 ? '+' : ''}{priceDiffBps.toFixed(2)} bps</strong>}
               <button className="switch-direction" onClick={() => setDirectionFlipped((current) => !current)} aria-label={t('Switch direction')}>⇄</button>
-              <small>{t('Switch direction')}</small>
+              <small>{priceDiffBps === null ? t('Waiting for both leg prices') : t('Switch direction')}</small>
             </div>
             <div className="strategy-leg buy-leg">
               <div className="leg-top">
                 <VenueSelect
                   label={t('Exchange B')}
-                  menuSubtitle={`${asset} ${t('Perpetual').toLowerCase()}`}
-                  options={exchanges.map((venue) => ({ ...venue, disabled: venue.id === leftExchangeId, detail: marketSymbol(asset, quoteFor(venue.id), 'perpetual') }))}
+                  menuSubtitle={`${asset} ${(mode === 'auto' && rightProduct === 'spot' ? t('Spot') : t('Perpetual')).toLowerCase()}`}
+                  options={exchanges.map((venue) => ({ ...venue, disabled: venue.id === leftExchangeId && (mode !== 'auto' || leftProduct === rightProduct), detail: mode === 'auto' && rightProduct === 'spot' ? `${asset}/USDT` : marketSymbol(asset, quoteFor(venue.id), 'perpetual') }))}
                   value={rightExchangeId}
                   onSelect={setRightExchangeId}
                 />
+                {mode === 'auto' && rightExchangeId === 'gate' && <div className="leg-product-toggle" role="group" aria-label={t('Market type')}>
+                  <button type="button" className={rightProduct === 'perpetual' ? 'active' : ''} aria-pressed={rightProduct === 'perpetual'} onClick={() => setRightProduct('perpetual')}>{t('Perpetual')}</button>
+                  <button type="button" className={rightProduct === 'spot' ? 'active' : ''} aria-pressed={rightProduct === 'spot'} onClick={() => setRightProduct('spot')}>{t('Spot')}</button>
+                </div>}
                 <em>{t(rightSide)} <span>{rightTicker}</span></em>
               </div>
               <dl>
@@ -993,7 +1105,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
         <article className={`strategy-launch terminal-panel ${mode === 'auto' ? 'auto-launch' : ''}`}>
           <div className="launch-status"><span><i />{t(mode === 'position' ? 'Review & execute' : 'Review & launch')}</span><small>{t(mode === 'position' ? 'Finite' : 'Continuous')}</small></div>
           <div className="launch-intent"><div><small>{t(mode === 'position' ? 'Total execution' : 'Strategy')}</small><strong>{mode === 'position' ? `${amount || '0'} ${asset}` : `${asset} ${t('spread bot')}`}</strong></div><p><span className={leftSide.toLowerCase()}>{t(leftSide)} {leftExchange.name}</span><i>⇄</i><span className={rightSide.toLowerCase()}>{t(rightSide)} {rightExchange.name}</span></p></div>
-          <dl className="launch-summary review-grid"><div><dt>{t('Entry')}</dt><dd>≥ {threshold || '0'} bps</dd></div>{mode === 'auto' && <div><dt>{t('Take profit')}</dt><dd>≤ {takeProfitThreshold || '0'} bps</dd></div>}{mode === 'position' && <><div><dt>{t('Per order')}</dt><dd>{positionOrderQuantity || '0'} {asset}</dd></div><div><dt>{t('Leverage')}</dt><dd>{leftLeverage || '—'}× / {rightLeverage || '—'}×</dd></div><div><dt>{t('Max position at selected leverage')}</dt><dd>{leftRiskPositionValue !== null && leftRiskPositionValue !== undefined ? formatAmount(leftRiskPositionValue) : '—'} {quoteFor(leftExchange.id)} / {rightRiskPositionValue !== null && rightRiskPositionValue !== undefined ? formatAmount(rightRiskPositionValue) : '—'} {quoteFor(rightExchange.id)}</dd></div><div><dt>{t('Projected position')}</dt><dd>{projectedLeftPositionValue !== null ? formatAmount(projectedLeftPositionValue) : '—'} {quoteFor(leftExchange.id)} / {projectedRightPositionValue !== null ? formatAmount(projectedRightPositionValue) : '—'} {quoteFor(rightExchange.id)}</dd></div><div><dt>{t('Reduce only')}</dt><dd>{t(reduceOnly ? 'Yes' : 'No')}</dd></div></>}<div><dt>{t('Method')}{language === 'zh' ? '：' : ': '}</dt><dd>{configuredExecutionMethod.replaceAll('–', '-')}</dd></div>{mode === 'position' && selectedFeeRows.map(({ exchange, symbol, feeKind }) => {
+          <dl className="launch-summary review-grid"><div><dt>{t('Entry')}</dt><dd>{Number(threshold) < 0 ? '≤' : '≥'} {threshold || '0'} bps</dd></div>{mode === 'auto' && <div><dt>{t('Take profit')}</dt><dd>≤ {takeProfitThreshold || '0'} bps</dd></div>}{mode === 'auto' && stopLossThreshold.trim() !== '' && <div><dt>{t('Stop loss')}</dt><dd>{stopLossThreshold} bps</dd></div>}{autoAllPerp && <div><dt>{t('Leverage')}</dt><dd>{leftLeverage || '1'}× / {rightLeverage || '1'}×</dd></div>}{mode === 'position' && <><div><dt>{t('Per order')}</dt><dd>{positionOrderQuantity || '0'} {asset}</dd></div><div><dt>{t('Leverage')}</dt><dd>{leftLeverage || '—'}× / {rightLeverage || '—'}×</dd></div><div><dt>{t('Max position at selected leverage')}</dt><dd>{leftRiskPositionValue !== null && leftRiskPositionValue !== undefined ? formatAmount(leftRiskPositionValue) : '—'} {quoteFor(leftExchange.id)} / {rightRiskPositionValue !== null && rightRiskPositionValue !== undefined ? formatAmount(rightRiskPositionValue) : '—'} {quoteFor(rightExchange.id)}</dd></div><div><dt>{t('Projected position')}</dt><dd>{projectedLeftPositionValue !== null ? formatAmount(projectedLeftPositionValue) : '—'} {quoteFor(leftExchange.id)} / {projectedRightPositionValue !== null ? formatAmount(projectedRightPositionValue) : '—'} {quoteFor(rightExchange.id)}</dd></div><div><dt>{t('Reduce only')}</dt><dd>{t(reduceOnly ? 'Yes' : 'No')}</dd></div></>}<div><dt>{t('Method')}{language === 'zh' ? '：' : ': '}</dt><dd>{configuredExecutionMethod.replaceAll('–', '-')}</dd></div>{mode === 'position' && selectedFeeRows.map(({ exchange, symbol, feeKind }) => {
             const rate = numericFutureFeeRate(fees, exchange.id, symbol, feeKind) ?? Number.NaN;
             return <div key={exchange.id}><dt>{exchange.name} · {t(feeKind === 'maker' ? 'Maker fee' : 'Taker fee')}</dt><dd>{Number.isFinite(rate) ? `${(rate * 100).toFixed(4)}%` : t('Exchange setting')}</dd></div>;
           })}</dl>
@@ -1013,8 +1125,10 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
       market={`${asset} · ${leftExchange.name} ⇄ ${rightExchange.name}`}
       rows={[
         { label: t('Direction'), value: `${t(leftSide)} ${leftExchange.name} ⇄ ${t(rightSide)} ${rightExchange.name}` },
-        { label: t('Entry'), value: `≥ ${threshold || '0'} bps` },
+        { label: t('Entry'), value: `${Number(threshold) < 0 ? '≤' : '≥'} ${threshold || '0'} bps` },
         ...(mode === 'auto' ? [{ label: t('Take profit'), value: `≤ ${takeProfitThreshold || '0'} bps` }] : []),
+        ...(mode === 'auto' && stopLossThreshold.trim() !== '' ? [{ label: t('Stop loss'), value: `${stopLossThreshold} bps` }] : []),
+        ...(autoAllPerp ? [{ label: t('Leverage'), value: `${leftLeverage || '1'}× / ${rightLeverage || '1'}×` }] : []),
         { label: t(mode === 'position' ? 'Total execution' : 'Max position'), value: `${mode === 'position' ? amount : maxPosition} ${asset}` },
         { label: t('Per order'), value: `${mode === 'position' ? positionOrderQuantity : orderQuantity} ${asset}` },
         ...(mode === 'position' ? [
@@ -1028,6 +1142,428 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
       onConfirm={() => { void launchStrategy(); }}
     />}
     <RunningStrategiesPanel strategies={strategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} instruments={instruments} tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} onStrategiesChanged={onStrategiesChanged} onPositionsRefresh={onPositionsRefresh} />
+  </div>;
+}
+
+interface CarryStrategyViewProps {
+  marketSnapshot: MarketSnapshot | null;
+  catalog: MarketCatalogAsset[] | null;
+  strategies: StrategyRecord[];
+  balances: Record<string, LiveBalance>;
+  authenticatedPortfolio: AuthenticatedPortfolioSnapshot | null;
+  tradingSnapshot: TradingSnapshot | null;
+  tradingMode: TradingMode | null;
+  onOpenModeDialog: () => void;
+  onStrategiesChanged: () => Promise<void>;
+  onPositionsRefresh: () => Promise<void>;
+  watchQuotes: (symbols: string[]) => void;
+}
+
+/** Annualize an 8h-equivalent funding percentage (percent per 8h × 3 × 365). */
+function fundingAprPercent(rate8hPercent: number | null): number | null {
+  return rate8hPercent === null ? null : rate8hPercent * 3 * 365;
+}
+
+/**
+ * Spot-perpetual carry bot: buy the selected venue's spot + short the perpetual on the selected
+ * venue (positive funding) or sell held inventory + long the perpetual (negative funding),
+ * collect each funding settlement, and close both legs once the basis converges to the
+ * take-profit level. Each leg's venue is chosen freely within its connected catalog entries.
+ */
+export function CarryStrategyView({ marketSnapshot, catalog, strategies, balances, authenticatedPortfolio, tradingSnapshot, tradingMode, onOpenModeDialog, onStrategiesChanged, onPositionsRefresh, watchQuotes }: CarryStrategyViewProps) {
+  const { language, theme, t } = useLanguage();
+  // Prefill query from the Opportunities board is read once on mount; later renders ignore it.
+  const [query] = useState(() => new URLSearchParams(window.location.search));
+  const [asset, setAsset] = useState(() => queryAsset(query.get('asset')) ?? 'BTC');
+  const [spotVenueId, setSpotVenueId] = useState(() => queryVenueId(query.get('leftVenue')) ?? 'gate');
+  // The perpetual leg may sit on any connected venue since cross-venue carry (architecture v2).
+  const [perpVenueId, setPerpVenueId] = useState(() => queryVenueId(query.get('rightVenue')) ?? 'gate');
+  const [fundingDirection, setFundingDirection] = useState<'POSITIVE' | 'NEGATIVE'>(() => query.get('direction') === 'NEGATIVE' ? 'NEGATIVE' : 'POSITIVE');
+  const [fundingAprMin, setFundingAprMin] = useState(() => queryDecimal(query.get('aprMin')) ?? '15');
+  const [totalAmount, setTotalAmount] = useState('');
+  const [basisTakeProfit, setBasisTakeProfit] = useState('20');
+  const [inventoryCheck, setInventoryCheck] = useState(false);
+  const [launching, setLaunching] = useState(false);
+  const [confirmingLaunch, setConfirmingLaunch] = useState(false);
+  const [launchNotice, setLaunchNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
+  const [fundingOverview, setFundingOverview] = useState<FundingOverviewResponse | null>(null);
+  const [fundingOverviewError, setFundingOverviewError] = useState(false);
+  const [carryFundingDuration, setCarryFundingDuration] = useState<PositionFundingDuration>(30);
+  const [carryFundingHistory, setCarryFundingHistory] = useState<{
+    key: string;
+    status: 'idle' | 'loading' | 'loaded' | 'failed';
+    entries: Record<string, FundingHistorySeriesEntry>;
+    rangeFrom: number | null;
+  }>({ key: '', status: 'idle', entries: {}, rangeFrom: null });
+
+  const gateExchange = exchanges[0];
+  const spotExchange = exchanges.find((item) => item.id === spotVenueId) ?? gateExchange;
+  const perpExchange = exchanges.find((item) => item.id === perpVenueId) ?? gateExchange;
+  const crossVenue = spotVenueId !== perpVenueId;
+  const availableStrategyAssets = useMemo(
+    () => strategyAssetOptions(catalog, streamedAssets(marketSnapshot), spotVenueId, perpVenueId),
+    [catalog, marketSnapshot, perpVenueId, spotVenueId],
+  );
+  const catalogEntry = useMemo(() => catalog?.find((entry) => entry.asset === asset) ?? null, [asset, catalog]);
+  // The spot leg may sit on any connected venue whose catalog lists a live spot pair; since
+  // architecture v2 the perpetual leg likewise trades on any venue with a live future.
+  const spotVenueIds = useMemo(
+    () => (catalogEntry?.venues ?? []).filter((row) => row.business === 'SPOT').map((row) => row.venue.toLowerCase()),
+    [catalogEntry],
+  );
+  const perpVenueIds = useMemo(
+    () => (catalogEntry?.venues ?? []).filter((row) => row.business === 'FUTURE').map((row) => row.venue.toLowerCase()),
+    [catalogEntry],
+  );
+  const spotVenueOptions = useMemo(() => exchanges.map((venue) => ({
+    ...venue,
+    disabled: catalogEntry === null ? venue.id !== 'gate' : !spotVenueIds.includes(venue.id),
+  })), [catalogEntry, spotVenueIds]);
+  const perpVenueOptions = useMemo(() => exchanges.map((venue) => ({
+    ...venue,
+    disabled: catalogEntry === null ? venue.id !== 'gate' : !perpVenueIds.includes(venue.id),
+  })), [catalogEntry, perpVenueIds]);
+  const spotSymbol = useMemo(() => {
+    // An Opportunities-board prefill pins the exact spot symbol; the catalog refines it later.
+    const fromQuery = query.get('leftSymbol');
+    if (fromQuery && fromQuery.startsWith(`${spotExchange.id.toUpperCase()}_SPOT_`)) return fromQuery;
+    const row = catalogEntry?.venues.find((entry) => entry.business === 'SPOT' && entry.venue === spotExchange.id.toUpperCase());
+    return row?.symbol ?? `GATE_SPOT_${asset}_USDT`;
+  }, [asset, catalogEntry, spotExchange]);
+  const spotQuote = spotSymbol.split('_')[3] ?? 'USDT';
+  const perpSymbol = useMemo(() => {
+    const fromQuery = query.get('rightSymbol');
+    if (fromQuery && fromQuery.startsWith(`${perpExchange.id.toUpperCase()}_FUTURE_`)) return fromQuery;
+    const row = catalogEntry?.venues.find((entry) => entry.business === 'FUTURE' && entry.venue === perpExchange.id.toUpperCase());
+    return row?.symbol ?? strategyVenueSymbol(catalog, perpVenueId, asset);
+  }, [asset, catalog, catalogEntry, perpExchange, perpVenueId]);
+  const perpQuote = perpSymbol.split('_')[3] ?? 'USDT';
+  const spotMarket = marketSnapshot?.markets.find((item) => item.symbol === spotSymbol) ?? null;
+  const perpMarket = marketSnapshot?.markets.find((item) => item.symbol === perpSymbol) ?? null;
+  const spotPrice = Number(spotMarket?.askPrice ?? 0);
+  const perpPrice = Number(perpMarket?.bidPrice ?? 0);
+  const basisBps = spotPrice > 0 && perpPrice > 0 ? ((perpPrice - spotPrice) / spotPrice) * 10_000 : null;
+  // Pre-submit minimum-notional check mirrors the engine's launch validation: each leg is sized
+  // with its own executable-side price (ask for buys, bid for sells).
+  const instruments = useInstrumentCatalog();
+  const spotInstrument = instruments?.find((item) => item.symbol === spotSymbol);
+  const perpInstrument = instruments?.find((item) => item.symbol === perpSymbol);
+  const spotEntryPrice = fundingDirection === 'POSITIVE' ? spotPrice : Number(spotMarket?.bidPrice ?? 0);
+  const perpEntryPrice = fundingDirection === 'POSITIVE' ? perpPrice : Number(perpMarket?.askPrice ?? 0);
+  const notionalIssues = [
+    minimumNotionalIssue({ instrument: spotInstrument, quantity: Number(totalAmount) || 0, price: spotEntryPrice, asset, venueName: spotExchange.name, t }),
+    minimumNotionalIssue({ instrument: perpInstrument, quantity: Number(totalAmount) || 0, price: perpEntryPrice, asset, venueName: perpExchange.name, t }),
+  ].filter((issue): issue is string => issue !== null);
+
+  const overviewEntry = fundingOverview?.assets.find((entry) => entry.asset === asset);
+  const perpOverview = overviewEntry?.venues.find((entry) => entry.venue === perpExchange.id.toUpperCase());
+  // Only the Gate WebSocket reports an 8h-equivalent funding rate; other venues' streamed rates
+  // follow their own settlement interval, so the board's 8h-equivalent value is preferred there.
+  const liveRate8hPercent = perpMarket && perpVenueId === 'gate' && perpMarket.source === 'gate_crossex_websocket' && Number.isFinite(Number(perpMarket.fundingRate))
+    ? Number(perpMarket.fundingRate) * 100
+    : null;
+  const funding8hPercent = liveRate8hPercent
+    ?? (perpOverview?.fundingRate8h !== null && perpOverview?.fundingRate8h !== undefined ? Number(perpOverview.fundingRate8h) * 100 : null);
+  const currentApr = fundingAprPercent(funding8hPercent);
+
+  const tradingEnabled = tradingMode === 'live';
+  const usdtBalance = balances['CROSSEX:USDT']?.availableBalance
+    ?? authenticatedPortfolio?.snapshot.account.availableMargin
+    ?? null;
+  // The spot leg's margin comes from the venue that hosts it: Gate keeps its legacy chain
+  // (isolated SPOT account, then the shared CrossEx USDT margin); other venues match by venue.
+  const spotLegBalance = spotVenueId === 'gate'
+    ? (balances[`SPOT:${spotQuote}`]?.availableBalance ?? usdtBalance)
+    : (authenticatedPortfolio?.snapshot.balances.find((balance) => balance.venue === spotExchange.id.toUpperCase() && balance.coin === spotQuote)?.availableBalance ?? null);
+  // The contract margin likewise lives on the perpetual leg's venue.
+  const perpLegBalance = perpVenueId === 'gate'
+    ? usdtBalance
+    : (authenticatedPortfolio?.snapshot.balances.find((balance) => balance.venue === perpExchange.id.toUpperCase() && balance.coin === perpQuote)?.availableBalance ?? null);
+  const estimatedSpotNotional = (Number(totalAmount) || 0) * spotPrice;
+  const estimatedContractMargin = (Number(totalAmount) || 0) * perpPrice;
+  const inputsValid = isPositiveDecimal(totalAmount)
+    && Number(fundingAprMin) > 0 && Number(fundingAprMin) <= 1000
+    && Number(basisTakeProfit) > 0 && Number(basisTakeProfit) < 10_000
+    && notionalIssues.length === 0;
+
+  const carryFundingHistoryIsCurrent = carryFundingHistory.key === perpSymbol;
+  const carryRangeLabel = POSITION_FUNDING_RANGES.find((range) => range.days === carryFundingDuration)?.label ?? '30D';
+  const carryFundingHistoryStatus = carryFundingHistoryIsCurrent ? carryFundingHistory.status : 'loading';
+  const carryFundingSeries = useMemo<FundingChartSeries[]>(() => {
+    if (!carryFundingHistoryIsCurrent) return [];
+    const entry = carryFundingHistory.entries[perpSymbol];
+    if (!entry || entry.status !== 'ok') return [];
+    // The fetch always spans 30 days; the duration switch slices the tail.
+    const chartRangeFrom = carryFundingHistory.rangeFrom === null
+      ? null
+      : carryFundingHistory.rangeFrom + Math.max(0, POSITION_FUNDING_FETCH_DAYS - carryFundingDuration) * 86_400_000;
+    const settlements = chartRangeFrom === null ? entry.points : entry.points.filter((point) => point.timestamp > chartRangeFrom);
+    const points = cumulativeFundingHistory(settlements, chartRangeFrom);
+    if (points.length === 0) return [];
+    return [{
+      id: `${perpSymbol}:${carryRangeLabel}`,
+      label: perpExchange.name,
+      color: FUNDING_VENUE_COLORS[perpExchange.id.toUpperCase()] ?? '#8aa9ff',
+      points,
+    }];
+  }, [carryFundingDuration, carryFundingHistory, carryFundingHistoryIsCurrent, carryRangeLabel, perpExchange, perpSymbol]);
+
+  useEffect(() => {
+    // A prefill from the Opportunities board must survive: keep the asset whenever the loaded
+    // catalog lists it on either selected venue at all (spot or future). Streaming presence is
+    // irrelevant — the legs may simply not be watched yet — and before the catalog we never
+    // correct.
+    if (catalog === null) return;
+    const venueListed = catalog.some((entry) => entry.asset === asset
+      && entry.venues.some((venue) => venue.venue === spotExchange.id.toUpperCase()
+        || venue.venue === perpExchange.id.toUpperCase()));
+    if (venueListed) return;
+    if (availableStrategyAssets.length > 0) setAsset(availableStrategyAssets[0].asset);
+  }, [asset, availableStrategyAssets, catalog, perpExchange, spotExchange]);
+
+  useEffect(() => {
+    // Once the catalog arrives, snap the spot leg to a venue that actually lists the asset.
+    if (catalogEntry === null || spotVenueIds.includes(spotVenueId)) return;
+    const target = spotVenueIds.includes('gate') ? 'gate' : spotVenueIds[0];
+    if (target) setSpotVenueId(target);
+  }, [catalogEntry, spotVenueId, spotVenueIds]);
+
+  useEffect(() => {
+    // Same snapping for the perpetual leg venue.
+    if (catalogEntry === null || perpVenueIds.includes(perpVenueId)) return;
+    const target = perpVenueIds.includes('gate') ? 'gate' : perpVenueIds[0];
+    if (target) setPerpVenueId(target);
+  }, [catalogEntry, perpVenueId, perpVenueIds]);
+
+  useEffect(() => {
+    watchQuotes([spotSymbol, perpSymbol]);
+  }, [perpSymbol, spotSymbol, watchQuotes]);
+
+  useEffect(() => {
+    // Realized funding of the carry's perpetual leg: always fetch 30 days, slice client-side.
+    let cancelled = false;
+    setCarryFundingHistory({ key: perpSymbol, status: 'loading', entries: {}, rangeFrom: null });
+    void api.fundingHistorySeries([perpSymbol], POSITION_FUNDING_FETCH_DAYS)
+      .then((response) => {
+        if (cancelled) return;
+        setCarryFundingHistory({
+          key: perpSymbol,
+          status: 'loaded',
+          entries: Object.fromEntries(response.entries.map((entry) => [entry.symbol, entry])),
+          rangeFrom: response.from,
+        });
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setCarryFundingHistory({ key: perpSymbol, status: 'failed', entries: {}, rangeFrom: null });
+      });
+    return () => { cancelled = true; };
+  }, [perpSymbol]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => {
+      void api.fundingOverview()
+        .then((response) => { if (!cancelled) { setFundingOverview(response); setFundingOverviewError(false); } })
+        .catch(() => { if (!cancelled) setFundingOverviewError(true); });
+    };
+    load();
+    const timer = window.setInterval(load, 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  const effectiveInventoryCheck = fundingDirection === 'NEGATIVE' ? true : inventoryCheck;
+  // POSITIVE carry buys spot and shorts the perp: the spot venue must cover the spot notional
+  // and the perpetual venue must cover the contract margin. NEGATIVE sells held inventory,
+  // so the entry check does not apply.
+  const spotCoversEntry = spotLegBalance === null || Number(spotLegBalance) >= estimatedSpotNotional;
+  const perpCoversMargin = perpLegBalance === null || Number(perpLegBalance) >= estimatedContractMargin;
+  const gateCoversEntry = fundingDirection === 'POSITIVE'
+    ? spotCoversEntry && perpCoversMargin
+    : true;
+
+  async function launchStrategy() {
+    if (launching) return;
+    setLaunching(true);
+    setLaunchNotice(null);
+    const config: StrategyConfig = {
+      kind: 'carry',
+      asset,
+      leftVenue: spotExchange.id.toUpperCase(),
+      rightVenue: perpExchange.id.toUpperCase(),
+      leftSide: fundingDirection === 'POSITIVE' ? 'BUY' : 'SELL',
+      rightSide: fundingDirection === 'POSITIVE' ? 'SELL' : 'BUY',
+      fundingDirection,
+      fundingAprMin: Number(fundingAprMin),
+      totalAmount,
+      basisTakeProfitBps: Number(basisTakeProfit),
+      contractLeverage: '1',
+      inventoryCheck: effectiveInventoryCheck,
+      leftSymbol: spotSymbol,
+      rightSymbol: perpSymbol,
+      perOrderQuantity: totalAmount,
+      reduceOnly: false,
+      executionMethod: 'TAKER_TAKER',
+    };
+    try {
+      const record = await api.startStrategy(config);
+      setLaunchNotice({ kind: 'ok', text: `${t('Strategy launched')}: ${record.id}` });
+      await onStrategiesChanged();
+    } catch (error) {
+      setLaunchNotice({ kind: 'error', text: `${t('Strategy rejected')}: ${error instanceof ApiError ? error.message : t('Backend unavailable')}` });
+    } finally {
+      setLaunching(false);
+      setConfirmingLaunch(false);
+      window.setTimeout(() => setLaunchNotice((current) => current?.kind === 'ok' ? null : current), 5000);
+    }
+  }
+
+  function requestStrategyLaunch() {
+    if (!tradingEnabled) {
+      onOpenModeDialog();
+      return;
+    }
+    if (launching || !inputsValid) return;
+    setConfirmingLaunch(true);
+  }
+
+  const leftSide = fundingDirection === 'POSITIVE' ? 'Buy' : 'Sell';
+  const rightSide = fundingDirection === 'POSITIVE' ? 'Sell' : 'Buy';
+  return <div className="alternate-view strategy-view">
+    <section className="view-heading strategy-heading"><div><p className="eyebrow">{t('Funding-rate arbitrage')}</p><h1>{t('Spot-perpetual carry bot.')}</h1><p>{t('Collect funding by holding spot against its perpetual, then exit when the basis converges.')}</p></div><span className="demo-automation"><i /> {t('Backend automation · persistent state')}</span></section>
+
+    <section className="strategy-layout revised">
+      <div className="strategy-main">
+        <article className="strategy-panel strategy-market-panel terminal-panel">
+          <header className="strategy-panel-head"><div><p className="eyebrow">{t('Market & venues')}</p><h2>{t('One asset, spot against its perpetual')}</h2></div><StrategyAssetSearch asset={asset} options={availableStrategyAssets} loading={catalog === null} leftVenueId={spotVenueId} rightVenueId={perpVenueId} leftVenueName={spotExchange.name} rightVenueName={perpExchange.name} onSelect={setAsset} t={t} /></header>
+          {fundingOverviewError && <p className="strategy-overview-warning">{t('Funding overview unavailable - showing streamed quotes only. Check the backend Gate connection.')}</p>}
+          {(spotQuote !== 'USDT' || spotVenueId !== 'gate') && <p className="strategy-overview-warning">{t('Spot legs convert at the venue quote; amounts below use the perp quote (USDT).')}</p>}
+          {crossVenue && <p className="strategy-overview-warning"><b className="venue-badge">{spotExchange.name} ⇄ {perpExchange.name}</b> {t('Cross-venue combination: each leg settles on its own venue, so a venue outage blocks one leg and leaves directional exposure.')}</p>}
+          <div className="strategy-legs">
+            <div className={`strategy-leg ${fundingDirection === 'POSITIVE' ? 'buy-leg' : 'sell-leg'}`}>
+              <div className="leg-top">
+                <VenueSelect label={t('Spot leg venue')} menuSubtitle={spotSymbol} options={spotVenueOptions} value={spotVenueId} onSelect={setSpotVenueId} />
+                <em>{t(leftSide)} <span>{spotSymbol}</span></em>
+              </div>
+              <dl>
+                <div><dt>{t('Best price')}</dt><dd>{spotPrice > 0 ? priceText(spotPrice) : '—'}</dd></div>
+                <div><dt>{t('Available')}</dt><dd>{spotLegBalance ? `${Number(spotLegBalance).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${spotQuote}` : '—'}</dd></div>
+              </dl>
+            </div>
+            <div className="leg-spread">
+              <span>{t('Basis')}</span>
+              <strong className={basisBps !== null && basisBps >= 0 ? 'positive' : 'negative'}>{basisBps === null ? '—' : `${basisBps >= 0 ? '+' : ''}${basisBps.toFixed(2)} bps`}</strong>
+              <small>{crossVenue ? t('Cross-venue basis: venue-to-venue price differences move it too') : t('Perpetual minus spot')}</small>
+            </div>
+            <div className={`strategy-leg ${fundingDirection === 'POSITIVE' ? 'sell-leg' : 'buy-leg'}`}>
+              <div className="leg-top">
+                <VenueSelect label={t('Perpetual leg venue')} menuSubtitle={perpSymbol} options={perpVenueOptions} value={perpVenueId} onSelect={setPerpVenueId} />
+                <em>{t(rightSide)} <span>{perpSymbol}</span></em>
+              </div>
+              <dl>
+                <div><dt>{t('Best price')}</dt><dd>{perpPrice > 0 ? priceText(perpPrice) : '—'}</dd></div>
+                <div><dt>{t('Funding APR')}</dt><dd>{currentApr === null ? '—' : `${currentApr >= 0 ? '+' : ''}${currentApr.toFixed(2)}%`}</dd></div>
+              </dl>
+            </div>
+          </div>
+          <div className="launch-warning strategy-market-warning"><span>ⓘ</span><p>{tradingEnabled
+            ? t('Each leg trades on its own selected venue. The engine never adjusts your contract leverage.')
+            : t('Live trading is locked. Use the trading-mode switch in the top bar to enable it.')}</p></div>
+        </article>
+        <article className="premium-history-panel strategy-funding-history terminal-panel">
+          <header className="premium-history-head">
+            <div>
+              <p className="eyebrow">{t('Historical funding')}</p>
+              <h2>{t('Cumulative funding')} <span>{carryRangeLabel}</span></h2>
+              <small>{perpExchange.name} {perpSymbol}</small>
+            </div>
+            <div className="premium-history-controls">
+              <span className={`premium-live-badge${fundingDirection === 'POSITIVE' ? '' : ' negative'}`}><i /> {fundingDirection === 'POSITIVE' ? t('Buy spot · short perp') : t('Sell spot · long perp')}</span>
+              <div role="group" aria-label={t('Duration')}>
+                {POSITION_FUNDING_RANGES.map((range) => <button
+                  key={range.days}
+                  className={carryFundingDuration === range.days ? 'active' : ''}
+                  aria-pressed={carryFundingDuration === range.days}
+                  onClick={() => setCarryFundingDuration(range.days)}
+                >{range.label}</button>)}
+              </div>
+            </div>
+          </header>
+          <div className="funding-detail-chart-wrap strategy-funding-chart-wrap">
+            <Suspense fallback={<div className="funding-history-chart chart-module-loading" role="status">{t('Loading venue histories…')}</div>}>
+              <FundingHistoryChart
+                series={carryFundingSeries}
+                seriesKey={`${perpSymbol}:${carryRangeLabel}`}
+                theme={theme}
+                locale={language === 'zh' ? 'zh-CN' : 'en-US'}
+                placeholder={carryFundingHistoryStatus === 'loading' ? t('Loading venue histories…') : t('Funding history unavailable.')}
+                showDataTable={false}
+              />
+            </Suspense>
+            <div className="funding-detail-legend">
+              {carryFundingSeries.map((item) => {
+                const latest = item.points[item.points.length - 1]?.value ?? 0;
+                return <span key={item.id}><i style={{ background: item.color }} /><strong>{item.label}</strong><em>{latest >= 0 ? '+' : ''}{latest.toFixed(4)}%</em></span>;
+              })}
+            </div>
+          </div>
+        </article>
+      </div>
+
+      <aside className="strategy-sidebar">
+        <article className="strategy-panel strategy-rules compact strategy-rules-sidebar terminal-panel">
+          <header className="strategy-panel-head"><div><p className="eyebrow">{t('Strategy setup')}</p><h2>{t('Configure carry bot')}</h2></div></header>
+          <div className="compact-fields">
+            <label className="reduce-only-control"><span onClick={(event) => event.preventDefault()}>{t('Funding direction')}</span><div className="method-options" role="group" aria-label={t('Funding direction')}>
+              <button type="button" className={fundingDirection === 'POSITIVE' ? 'active' : ''} aria-pressed={fundingDirection === 'POSITIVE'} onClick={() => setFundingDirection('POSITIVE')}><small>+</small><strong>{t('Positive')}</strong></button>
+              <button type="button" className={fundingDirection === 'NEGATIVE' ? 'active' : ''} aria-pressed={fundingDirection === 'NEGATIVE'} onClick={() => setFundingDirection('NEGATIVE')}><small>−</small><strong>{t('Negative')}</strong></button>
+            </div></label>
+            <label><span>{t('Funding APR threshold')}</span><div><input value={fundingAprMin} onChange={(event) => setFundingAprMin(event.target.value)} /><b>%</b></div></label>
+            <label><span>{t('Open amount')}</span><div><input placeholder="e.g. 0.10" value={totalAmount} onChange={(event) => setTotalAmount(event.target.value)} /><b>{asset}</b></div></label>
+            <label><span>{t('Basis take-profit')}</span><div><input value={basisTakeProfit} onChange={(event) => setBasisTakeProfit(event.target.value)} /><b>bps</b></div></label>
+            <label className="inactive-for-reduce-only"><span>{t('Contract leverage')}</span><div><input value="1" readOnly /><b>×</b></div></label>
+            <label className="reduce-only-control"><span onClick={(event) => event.preventDefault()}>{t('Inventory check')}</span><div><input type="checkbox" checked={effectiveInventoryCheck} disabled={fundingDirection === 'NEGATIVE'} onChange={(event) => setInventoryCheck(event.target.checked)} /><b>{t(effectiveInventoryCheck ? 'Yes' : 'No')}</b></div></label>
+          </div>
+          {notionalIssues.length > 0 && <div className="launch-warning"><span>!</span><p>{notionalIssues.join(' · ')}</p></div>}
+          {fundingDirection === 'POSITIVE' && !gateCoversEntry && <div className="launch-warning"><span>!</span><p>{t('Known USDT balance does not cover the spot amount plus the contract margin.')}</p></div>}
+          {fundingDirection === 'NEGATIVE' && <div className="launch-warning"><span>!</span><p>{t('Negative funding sells existing spot inventory — no borrowing. The balance is verified before entry.')}</p></div>}
+        </article>
+        <article className="strategy-launch terminal-panel">
+          <div className="launch-status"><span><i />{t('Review & launch')}</span><small>{t('One cycle')}</small></div>
+          <div className="launch-intent"><div><small>{t('Strategy')}</small><strong>{asset} {t('carry')}</strong></div><p><span className={leftSide.toLowerCase()}>{t(leftSide)} {t('Spot')}</span><i>⇄</i><span className={rightSide.toLowerCase()}>{t(rightSide)} {t('Perpetual')}</span></p></div>
+          <dl className="launch-summary review-grid">
+            <div><dt>{t('Direction')}</dt><dd>{fundingDirection}</dd></div>
+            <div><dt>{t('Funding APR threshold')}</dt><dd>≥ {fundingAprMin || '0'}%</dd></div>
+            <div><dt>{t('Open amount')}</dt><dd>{totalAmount || '0'} {asset}</dd></div>
+            <div><dt>{t('Basis take-profit')}</dt><dd>{fundingDirection === 'POSITIVE' ? '≤' : '≥ −'}{basisTakeProfit || '0'} bps</dd></div>
+            <div><dt>{t('Contract leverage')}</dt><dd>1× ({t('fixed')})</dd></div>
+            <div><dt>{t('Inventory check')}</dt><dd>{t(effectiveInventoryCheck ? 'Yes' : 'No')}</dd></div>
+          </dl>
+          <button className={tradingEnabled ? 'start-strategy' : 'start-strategy locked'} onClick={requestStrategyLaunch} disabled={launching || (tradingEnabled && (!inputsValid || !gateCoversEntry))}>{launching ? t('Launching…') : tradingEnabled ? !inputsValid ? t('Enter valid strategy amounts') : !gateCoversEntry ? t('Insufficient margin') : t('Launch strategy') : t('Live trading locked')}</button>
+          {launchNotice && <div className={`launch-notice ${launchNotice.kind}`}>{launchNotice.text}</div>}
+        </article>
+      </aside>
+    </section>
+
+    {confirmingLaunch && <StrategyLaunchConfirmation
+      market={`${asset} · ${spotExchange.name} ${t('Spot')} ⇄ ${perpExchange.name} ${t('Perpetual')}`}
+      rows={[
+        { label: t('Direction'), value: `${t(leftSide)} ${t('Spot')} ⇄ ${t(rightSide)} ${t('Perpetual')}` },
+        { label: t('Funding APR threshold'), value: `≥ ${fundingAprMin || '0'}%` },
+        { label: t('Open amount'), value: `${totalAmount} ${asset}` },
+        { label: t('Basis take-profit'), value: `${fundingDirection === 'POSITIVE' ? '≤' : '≥ −'}${basisTakeProfit || '0'} bps` },
+        { label: t('Contract leverage'), value: '1×' },
+        { label: t('Inventory check'), value: t(effectiveInventoryCheck ? 'Yes' : 'No') },
+        { label: t('Execution'), value: t('Taker–Taker') },
+      ]}
+      busy={launching}
+      onCancel={() => setConfirmingLaunch(false)}
+      onConfirm={() => { void launchStrategy(); }}
+    />}
+    <RunningStrategiesPanel strategies={strategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} instruments={null} tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} onStrategiesChanged={onStrategiesChanged} onPositionsRefresh={onPositionsRefresh} />
   </div>;
 }
 
@@ -1485,11 +2021,11 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
   const premiumRiskLimitsReady = adrRiskPositionValue !== undefined && hedgeRiskPositionValue !== undefined;
   const premiumRiskReviewUnavailable = !reduceOnly && configuredMaxPosition > 0
     && (!premiumRiskLimitsReady || projectedAdrPositionValue === null || projectedHedgePositionValue === null);
+  // Null caps (loaded but empty/unlimited tiers) mean no ceiling — see positionRiskLimitExceeded.
   const premiumRiskLimitExceeded = !reduceOnly && configuredMaxPosition > 0 && premiumRiskLimitsReady && (
-    adrRiskPositionValue === null || hedgeRiskPositionValue === null
-    || (projectedAdrPositionValue !== null && adrRiskPositionValue !== undefined
+    (projectedAdrPositionValue !== null && adrRiskPositionValue !== undefined && adrRiskPositionValue !== null
       && projectedAdrPositionValue > adrRiskPositionValue)
-    || (projectedHedgePositionValue !== null && hedgeRiskPositionValue !== undefined
+    || (projectedHedgePositionValue !== null && hedgeRiskPositionValue !== undefined && hedgeRiskPositionValue !== null
       && projectedHedgePositionValue > hedgeRiskPositionValue)
   );
   const estimatedAdrNotional = incrementalExposure(

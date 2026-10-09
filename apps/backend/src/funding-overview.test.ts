@@ -44,8 +44,8 @@ describe('funding overview service', () => {
     expect(calls).toBe(FUNDING_STAT_VENUES.length);
 
     const response = service.buildResponse(catalogWith('BTC', [
-      { venue: 'GATE', symbol: 'GATE_FUTURE_BTC_USDT', quote: 'USDT' },
-      { venue: 'BINANCE', symbol: 'BINANCE_FUTURE_BTC_USDT', quote: 'USDT' },
+      { venue: 'GATE', symbol: 'GATE_FUTURE_BTC_USDT', quote: 'USDT', business: 'FUTURE' },
+      { venue: 'BINANCE', symbol: 'BINANCE_FUTURE_BTC_USDT', quote: 'USDT', business: 'FUTURE' },
     ]));
     expect(response.cacheStatus).toBe('fresh');
     expect(response.assets).toHaveLength(1);
@@ -71,7 +71,7 @@ describe('funding overview service', () => {
     const gateway = gatewayReturning((venue) => venue === 'GATE' ? [gateBtcStat] : []);
     const service = new FundingOverviewService(gateway, { now: () => 0 });
     await service.ensureFresh();
-    const response = service.buildResponse(catalogWith('BTC', [{ venue: 'GATE', symbol: 'GATE_FUTURE_BTC_USDC', quote: 'USDC' }]));
+    const response = service.buildResponse(catalogWith('BTC', [{ venue: 'GATE', symbol: 'GATE_FUTURE_BTC_USDC', quote: 'USDC', business: 'FUTURE' }]));
     expect(response.assets[0]?.venues[0]).toMatchObject({ fundingRate: null, openInterestValue: null });
   });
 
@@ -86,7 +86,7 @@ describe('funding overview service', () => {
     await service.ensureFresh();
 
     const response = service.buildResponse(catalogWith('SKHYNIX', [{
-      venue: 'HYPERLIQUID', symbol: 'HYPERLIQUID_FUTURE_SKHX_USDC', quote: 'USDC',
+      venue: 'HYPERLIQUID', symbol: 'HYPERLIQUID_FUTURE_SKHX_USDC', quote: 'USDC', business: 'FUTURE',
     }]));
 
     expect(response.assets[0]).toMatchObject({ asset: 'SKHYNIX' });
@@ -118,7 +118,7 @@ describe('funding overview service', () => {
     await service.ensureFresh();
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
 
-    const response = service.buildResponse(catalogWith('BTC', [{ venue: 'GATE', symbol: 'GATE_FUTURE_BTC_USDT', quote: 'USDT' }]));
+    const response = service.buildResponse(catalogWith('BTC', [{ venue: 'GATE', symbol: 'GATE_FUTURE_BTC_USDT', quote: 'USDT', business: 'FUTURE' }]));
     expect(warned).toContain('GATE');
     expect(response.venueStatus.find((status) => status.venue === 'GATE')).toMatchObject({ status: 'error', rowCount: 1 });
     expect(response.assets[0]?.venues[0]).toMatchObject({ fundingRate: '0.00005', fundingRate8h: '0.0001' });
@@ -128,7 +128,7 @@ describe('funding overview service', () => {
     const gateway: PublicMarketDataGateway = { querySnapshot: () => Promise.reject(new Error('unused')) };
     const service = new FundingOverviewService(gateway, { now: () => 0 });
     await service.ensureFresh();
-    const response = service.buildResponse(catalogWith('BTC', [{ venue: 'GATE', symbol: 'GATE_FUTURE_BTC_USDT', quote: 'USDT' }]));
+    const response = service.buildResponse(catalogWith('BTC', [{ venue: 'GATE', symbol: 'GATE_FUTURE_BTC_USDT', quote: 'USDT', business: 'FUTURE' }]));
     expect(response.assets[0]?.venues[0]).toMatchObject({ fundingRate: null });
     expect(response.venueStatus.every((status) => status.status === 'error')).toBe(true);
   });

@@ -145,6 +145,32 @@ const LighterMarketDetailSchema = z.object({
   open_interest: numeric.optional(), daily_price_change: numeric.optional(),
 });
 
+// --- Bulk all-market book-ticker rows (spread board REST base view). Envelopes parse strictly;
+// rows parse one at a time so a single malformed listing cannot take down a whole venue.
+// Binance's bookTicker feed carries no volume and no open interest; filling the gap would need
+// `/api/v3/ticker/24hr` + `/fapi/v1/ticker/24hr` and double the venue's QPS, which the team
+// explicitly declined. Those rows stay volume-less and the UI renders `—`.
+const BinanceBulkBookTickerRowSchema = z.object({
+  symbol: z.string(), bidPrice: numeric, askPrice: numeric,
+});
+const OkxBookTickerRowSchema = z.object({
+  instId: z.string(), bidPx: numeric.optional(), askPx: numeric.optional(), last: numeric.optional(),
+  // vol24h is base-asset volume, volCcy24h is quote-currency (turnover) volume.
+  vol24h: numeric.optional(), volCcy24h: numeric.optional(),
+});
+const BybitBookTickerRowSchema = z.object({
+  symbol: z.string(), bid1Price: numeric.optional(), ask1Price: numeric.optional(), lastPrice: numeric.optional(),
+  volume24h: numeric.optional(), turnover24h: numeric.optional(), openInterestValue: numeric.optional(),
+});
+const GateSpotTickerRowSchema = z.object({
+  currency_pair: z.string(), highest_bid: numeric.optional(), lowest_ask: numeric.optional(), last: numeric.optional(),
+  base_volume: numeric.optional(), quote_volume: numeric.optional(),
+});
+const GateFutureTickerRowSchema = z.object({
+  contract: z.string(), highest_bid: numeric.optional(), lowest_ask: numeric.optional(), last: numeric.optional(),
+  volume_24h_base: numeric.optional(), volume_24h_quote: numeric.optional(),
+});
+
 /** Kraken quotes a handful of assets under legacy codes; CrossEx uses the modern ones. */
 const KRAKEN_ASSET_RENAMES: Record<string, string> = { XBT: 'BTC', XDG: 'DOGE' };
 const HYPERLIQUID_METADATA_FRESH_MS = 30 * 60_000;
@@ -186,6 +212,18 @@ function finiteNumber(value: unknown): number | null {
 function positiveNumberText(value: unknown): string | null {
   const parsed = finiteNumber(value);
   return parsed !== null && parsed > 0 ? String(parsed) : null;
+}
+
+/**
+ * Volume / open-interest amounts. `'0'` and unparseable text mean "the venue published nothing",
+ * which the opportunity board renders as `—` rather than a misleading zero. Unlike
+ * `positiveNumberText` this keeps the upstream string as-is so very large turnover figures do not
+ * lose precision on their way through a float.
+ */
+function positiveAmountText(value: unknown): string | null {
+  const parsed = finiteNumber(value);
+  if (parsed === null || parsed <= 0) return null;
+  return typeof value === 'number' ? String(value) : String(value).trim();
 }
 
 /** Venue percentage fields use whole percents; normalize all overview changes to a fraction. */
@@ -318,6 +356,32 @@ export interface FundingRatePoint {
   rate: string;
 }
 
+/**
+ * One market's best bid/ask from a venue's all-market bulk REST ticker feed. The spread board
+ * uses these rows as its full-market base view: the CrossEx WebSocket hub only carries markets
+ * someone subscribed to, while one such sweep per business line covers every listing at once.
+ */
+export interface VenueBookTicker {
+  venue: FundingStatVenue;
+  /** CrossEx business line the native listing belongs to. */
+  business: 'SPOT' | 'FUTURE';
+  base: string;
+  quote: string;
+  bidPrice: string;
+  askPrice: string;
+  /** Venue last price when the bulk feed publishes one; null on pure bookTicker feeds. */
+  lastPrice: string | null;
+  /**
+   * 24h volume in base-asset units; null when the venue's bulk feed omits it. Optional for
+   * compatibility with rows produced before the field existed.
+   */
+  volume24h?: string | null;
+  /** 24h volume in quote-currency units — the figure the opportunity board displays. */
+  quoteVolume24h?: string | null;
+  /** Open interest in USD; null for spot rows and for feeds without OI (Binance, Gate REST). */
+  openInterestValue?: string | null;
+}
+
 export interface PublicMarketDataGateway {
   querySnapshot(crossExSymbol: string): Promise<PublicMarketSnapshot>;
   /** Optional candle backfill for supported perpetual venues. */
@@ -326,6 +390,8 @@ export interface PublicMarketDataGateway {
   queryContractSizes?(venue: 'GATE' | 'OKX'): Promise<VenueContractSize[]>;
   /** Optional bulk funding/open-interest stats for every perpetual a venue lists. */
   queryVenueFundingStats?(venue: FundingStatVenue): Promise<VenueFundingStat[]>;
+  /** Optional all-market best bid/ask sweep across one venue's spot and perpetual listings. */
+  queryVenueBookTickers?(venue: FundingStatVenue): Promise<VenueBookTicker[]>;
   /** Optional realized funding history for one CrossEx perpetual symbol. */
   queryFundingHistory?(crossExSymbol: string, startTime: number, endTime: number, signal?: AbortSignal): Promise<FundingRatePoint[]>;
 }
@@ -358,6 +424,8 @@ const GateCandleSchema = z.array(z.object({
   c: z.string(),
   v: z.number(),
 }));
+/** GET /spot/candlesticks rows are positional arrays: [unixSeconds, quoteVolume, open, high, low, close, baseVolume, closed]. */
+const GateSpotCandleSchema = z.array(z.array(z.string()).min(8));
 const BinanceCandleSchema = z.array(z.tuple([
   z.number(), z.string(), z.string(), z.string(), z.string(), z.string(),
 ]).rest(z.unknown()));
@@ -413,6 +481,26 @@ function parseCrossExFutureSymbol(symbol: string): ParsedSymbol {
   const match = /^(BINANCE|GATE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_(.+)_([A-Z0-9]+)$/.exec(symbol);
   if (!match?.[1] || !match[2] || !match[3]) throw new PublicMarketDataError('UNSUPPORTED_SYMBOL');
   return { venue: match[1] as ParsedSymbol['venue'], base: match[2], quote: match[3] };
+}
+
+/** Binance codes spot and linear perps as BASEQUOTE; dated futures carry an underscore suffix. */
+function binanceBaseFromSymbol(symbol: string): { base: string; quote: string } | null {
+  if (symbol.includes('_')) return null;
+  const quote = symbol.endsWith('USDT') ? 'USDT' : symbol.endsWith('USDC') ? 'USDC' : null;
+  if (quote === null) return null;
+  const base = symbol.slice(0, -quote.length);
+  return base && /^[A-Z0-9]+$/.test(base) ? { base, quote } : null;
+}
+
+/** Bybit spot/linear symbols are BASEQUOTE, with USDC perpetuals suffixed PERP. */
+function bybitBaseFromSymbol(symbol: string): { base: string; quote: string } | null {
+  const quote = symbol.endsWith('USDT') ? 'USDT'
+    : symbol.endsWith('USDC') ? 'USDC'
+    : symbol.endsWith('PERP') ? 'USDC'
+    : null;
+  if (quote === null) return null;
+  const base = symbol.slice(0, -quote.length);
+  return base && /^[A-Z0-9]+$/.test(base) ? { base, quote } : null;
 }
 
 function candlesFromDeribitArrays(payload: z.infer<typeof DeribitCandleSchema>): Candle[] {
@@ -651,18 +739,29 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
   }
 
   async queryCandles(crossExSymbol: string, interval: CandleInterval, limit: number, before?: number): Promise<Candle[]> {
-    const symbol = parseCrossExFutureSymbol(crossExSymbol);
     const boundedLimit = Math.max(1, Math.min(500, Math.trunc(limit)));
     let candles: Candle[];
-    switch (symbol.venue) {
-      case 'BINANCE': candles = await this.queryBinanceCandles(symbol, interval, boundedLimit, before); break;
-      case 'GATE': candles = await this.queryGateCandles(symbol, interval, boundedLimit, before); break;
-      case 'OKX': candles = await this.queryOkxCandles(symbol, interval, boundedLimit, before); break;
-      case 'BYBIT': candles = await this.queryBybitCandles(symbol, interval, boundedLimit, before); break;
-      case 'KRAKEN': candles = await this.queryKrakenCandles(symbol, interval, boundedLimit, before); break;
-      case 'HYPERLIQUID': candles = await this.queryHyperliquidCandles(symbol, interval, boundedLimit, before); break;
-      case 'DERIBIT': candles = await this.queryDeribitCandles(symbol, interval, boundedLimit, before); break;
-      case 'LIGHTER': candles = await this.queryLighterCandles(symbol, interval, boundedLimit, before); break;
+    const spotMatch = /^(GATE|BINANCE|OKX|BYBIT)_SPOT_([A-Z0-9]+)_(USDT|USDC)$/.exec(crossExSymbol);
+    if (spotMatch?.[1] && spotMatch[2] && spotMatch[3]) {
+      switch (spotMatch[1]) {
+        case 'GATE': candles = await this.queryGateSpotCandles(spotMatch[2], spotMatch[3], interval, boundedLimit, before); break;
+        case 'BINANCE': candles = await this.queryBinanceSpotCandles(spotMatch[2], spotMatch[3], interval, boundedLimit, before); break;
+        case 'OKX': candles = await this.queryOkxSpotCandles(spotMatch[2], spotMatch[3], interval, boundedLimit, before); break;
+        case 'BYBIT': candles = await this.queryBybitSpotCandles(spotMatch[2], spotMatch[3], interval, boundedLimit, before); break;
+        default: throw new PublicMarketDataError('UNSUPPORTED_SYMBOL');
+      }
+    } else {
+      const symbol = parseCrossExFutureSymbol(crossExSymbol);
+      switch (symbol.venue) {
+        case 'BINANCE': candles = await this.queryBinanceCandles(symbol, interval, boundedLimit, before); break;
+        case 'GATE': candles = await this.queryGateCandles(symbol, interval, boundedLimit, before); break;
+        case 'OKX': candles = await this.queryOkxCandles(symbol, interval, boundedLimit, before); break;
+        case 'BYBIT': candles = await this.queryBybitCandles(symbol, interval, boundedLimit, before); break;
+        case 'KRAKEN': candles = await this.queryKrakenCandles(symbol, interval, boundedLimit, before); break;
+        case 'HYPERLIQUID': candles = await this.queryHyperliquidCandles(symbol, interval, boundedLimit, before); break;
+        case 'DERIBIT': candles = await this.queryDeribitCandles(symbol, interval, boundedLimit, before); break;
+        case 'LIGHTER': candles = await this.queryLighterCandles(symbol, interval, boundedLimit, before); break;
+      }
     }
     const now = this.now();
     return candles
@@ -690,6 +789,157 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
     });
   }
 
+  /**
+   * All-market best bid/ask sweep backing the spread board's REST base view. Only the venues
+   * with a single-request full-market ticker feed are covered (GATE, BINANCE, OKX, BYBIT);
+   * other venues simply contribute no REST rows and stay hub-driven.
+   */
+  async queryVenueBookTickers(venue: FundingStatVenue): Promise<VenueBookTicker[]> {
+    if (venue === 'GATE') return this.queryGateBookTickers();
+    if (venue === 'BINANCE') return this.queryBinanceBookTickers();
+    if (venue === 'OKX') return this.queryOkxBookTickers();
+    if (venue === 'BYBIT') return this.queryBybitBookTickers();
+    return [];
+  }
+
+  private async queryBinanceBookTickers(): Promise<VenueBookTicker[]> {
+    const [spotPayload, futurePayload] = await Promise.all([
+      fetchJson(this.fetchImplementation, 'https://api.binance.com/api/v3/ticker/bookTicker', 8_000_000),
+      fetchJson(this.fetchImplementation, 'https://fapi.binance.com/fapi/v1/ticker/bookTicker', 8_000_000),
+    ]);
+    const rows: VenueBookTicker[] = [];
+    const collect = (payload: unknown, business: 'SPOT' | 'FUTURE'): void => {
+      for (const rawRow of parsePayload(z.array(z.unknown()), payload)) {
+        const row = BinanceBulkBookTickerRowSchema.safeParse(rawRow);
+        if (!row.success) continue;
+        const parsed = binanceBaseFromSymbol(row.data.symbol);
+        if (!parsed) continue;
+        // bookTicker has no last price; the spread board only consumes bid/ask.
+        const bid = positiveNumberText(row.data.bidPrice);
+        const ask = positiveNumberText(row.data.askPrice);
+        if (bid === null || ask === null) continue;
+        // bookTicker publishes neither volume nor open interest; no extra request is made for it.
+        rows.push({
+          venue: 'BINANCE', business, ...parsed, bidPrice: bid, askPrice: ask, lastPrice: null,
+          volume24h: null, quoteVolume24h: null, openInterestValue: null,
+        });
+      }
+    };
+    collect(spotPayload, 'SPOT');
+    collect(futurePayload, 'FUTURE');
+    return rows;
+  }
+
+  private async queryOkxBookTickers(): Promise<VenueBookTicker[]> {
+    const [spotPayload, swapPayload] = await Promise.all([
+      fetchJson(this.fetchImplementation, 'https://www.okx.com/api/v5/market/tickers?instType=SPOT', 8_000_000),
+      fetchJson(this.fetchImplementation, 'https://www.okx.com/api/v5/market/tickers?instType=SWAP', 8_000_000),
+    ]);
+    const rows: VenueBookTicker[] = [];
+    const collect = (payload: unknown, business: 'SPOT' | 'FUTURE', pattern: RegExp): void => {
+      for (const rawRow of parsePayload(okxEnvelope(z.unknown()), payload).data) {
+        const row = OkxBookTickerRowSchema.safeParse(rawRow);
+        if (!row.success) continue;
+        const match = pattern.exec(row.data.instId);
+        if (!match?.[1] || !match[2]) continue;
+        const bid = positiveNumberText(row.data.bidPx);
+        const ask = positiveNumberText(row.data.askPx);
+        if (bid === null || ask === null) continue;
+        rows.push({
+          venue: 'OKX', business, base: match[1], quote: match[2],
+          bidPrice: bid, askPrice: ask, lastPrice: positiveNumberText(row.data.last),
+          volume24h: positiveAmountText(row.data.vol24h),
+          quoteVolume24h: positiveAmountText(row.data.volCcy24h),
+          openInterestValue: null,
+        });
+      }
+    };
+    collect(spotPayload, 'SPOT', /^([A-Z0-9]+)-(USDT|USDC)$/);
+    collect(swapPayload, 'FUTURE', /^([A-Z0-9]+)-(USDT|USDC)-SWAP$/);
+    return rows;
+  }
+
+  private async queryBybitBookTickers(): Promise<VenueBookTicker[]> {
+    const request = async (category: 'spot' | 'linear'): Promise<unknown[]> => {
+      const payload = await fetchJson(
+        this.fetchImplementation,
+        `https://api.bybit.com/v5/market/tickers?category=${category}`,
+        8_000_000,
+      );
+      const envelope = parsePayload(z.object({ retCode: z.number(), result: z.object({ list: z.array(z.unknown()) }) }), payload);
+      if (envelope.retCode !== 0) throw new PublicMarketDataError('UPSTREAM_REJECTED');
+      return envelope.result.list;
+    };
+    const [spotRows, linearRows] = await Promise.all([request('spot'), request('linear')]);
+    const rows: VenueBookTicker[] = [];
+    const collect = (list: unknown[], business: 'SPOT' | 'FUTURE'): void => {
+      for (const rawRow of list) {
+        const row = BybitBookTickerRowSchema.safeParse(rawRow);
+        if (!row.success) continue;
+        // Dated USDC futures look like BTC-26DEC25; perpetuals never carry a dash.
+        if (row.data.symbol.includes('-')) continue;
+        const parsed = bybitBaseFromSymbol(row.data.symbol);
+        if (!parsed) continue;
+        const bid = positiveNumberText(row.data.bid1Price);
+        const ask = positiveNumberText(row.data.ask1Price);
+        if (bid === null || ask === null) continue;
+        rows.push({
+          venue: 'BYBIT', business, ...parsed, bidPrice: bid, askPrice: ask,
+          lastPrice: positiveNumberText(row.data.lastPrice),
+          volume24h: positiveAmountText(row.data.volume24h),
+          quoteVolume24h: positiveAmountText(row.data.turnover24h),
+          openInterestValue: positiveAmountText(row.data.openInterestValue),
+        });
+      }
+    };
+    collect(spotRows, 'SPOT');
+    collect(linearRows, 'FUTURE');
+    return rows;
+  }
+
+  private async queryGateBookTickers(): Promise<VenueBookTicker[]> {
+    const [spotPayload, futurePayload] = await Promise.all([
+      fetchJson(this.fetchImplementation, 'https://api.gateio.ws/api/v4/spot/tickers', 8_000_000),
+      fetchJson(this.fetchImplementation, 'https://api.gateio.ws/api/v4/futures/usdt/tickers', 8_000_000),
+    ]);
+    const rows: VenueBookTicker[] = [];
+    for (const rawRow of parsePayload(z.array(z.unknown()), spotPayload)) {
+      const row = GateSpotTickerRowSchema.safeParse(rawRow);
+      if (!row.success) continue;
+      const match = /^([A-Z0-9]+)_(USDT|USDC)$/.exec(row.data.currency_pair);
+      if (!match?.[1] || !match[2]) continue;
+      const bid = positiveNumberText(row.data.highest_bid);
+      const ask = positiveNumberText(row.data.lowest_ask);
+      if (bid === null || ask === null) continue;
+      rows.push({
+        venue: 'GATE', business: 'SPOT', base: match[1], quote: match[2],
+        bidPrice: bid, askPrice: ask, lastPrice: positiveNumberText(row.data.last),
+        volume24h: positiveAmountText(row.data.base_volume),
+        quoteVolume24h: positiveAmountText(row.data.quote_volume),
+        openInterestValue: null,
+      });
+    }
+    for (const rawRow of parsePayload(z.array(z.unknown()), futurePayload)) {
+      const row = GateFutureTickerRowSchema.safeParse(rawRow);
+      if (!row.success) continue;
+      const match = /^([A-Z0-9]+)_USDT$/.exec(row.data.contract);
+      if (!match?.[1]) continue;
+      const bid = positiveNumberText(row.data.highest_bid);
+      const ask = positiveNumberText(row.data.lowest_ask);
+      if (bid === null || ask === null) continue;
+      rows.push({
+        venue: 'GATE', business: 'FUTURE', base: match[1], quote: 'USDT',
+        bidPrice: bid, askPrice: ask, lastPrice: positiveNumberText(row.data.last),
+        volume24h: positiveAmountText(row.data.volume_24h_base),
+        quoteVolume24h: positiveAmountText(row.data.volume_24h_quote),
+        // Gate's futures `open_interest` mixes contract and currency units across versions, so no
+        // OI is mapped here; the board's funding-overview fallback supplies the USD figure.
+        openInterestValue: null,
+      });
+    }
+    return rows;
+  }
+
   private async queryGateCandles(symbol: ParsedSymbol, interval: CandleInterval, limit: number, before?: number): Promise<Candle[]> {
     if (symbol.quote !== 'USDT') throw new PublicMarketDataError('UNSUPPORTED_SETTLEMENT');
     const contract = `${symbol.base}_${symbol.quote}`;
@@ -705,6 +955,81 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
       startTime: row.t * 1_000, open: row.o, high: row.h, low: row.l, close: row.c,
       volume: String(row.v), closed: true,
     }));
+  }
+
+  private async queryGateSpotCandles(base: string, quote: string, interval: CandleInterval, limit: number, before?: number): Promise<Candle[]> {
+    const pair = `${base}_${quote}`;
+    const timeQuery = before === undefined
+      ? `limit=${limit}`
+      : `from=${Math.max(1, Math.floor((before - 1) / 1000) - Math.ceil(INTERVAL_MILLISECONDS[interval] / 1000) * limit)}&to=${Math.floor((before - 1) / 1000)}`;
+    const payload = await fetchJson(
+      this.fetchImplementation,
+      `https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=${encodeURIComponent(pair)}&interval=${interval}&${timeQuery}`,
+      4_000_000,
+    );
+    return parsePayload(GateSpotCandleSchema, payload).map((row) => ({
+      startTime: Number(row[0]) * 1_000,
+      open: row[2], high: row[3], low: row[4], close: row[5],
+      volume: row[6],
+      closed: row[7] === 'true',
+    }));
+  }
+
+  private async queryBinanceSpotCandles(base: string, quote: string, interval: CandleInterval, limit: number, before?: number): Promise<Candle[]> {
+    if (!['USDT', 'USDC'].includes(quote)) throw new PublicMarketDataError('UNSUPPORTED_SETTLEMENT');
+    const venueSymbol = `${base}${quote}`;
+    const endQuery = before === undefined ? '' : `&endTime=${before - 1}`;
+    const payload = await fetchJson(
+      this.fetchImplementation,
+      `https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(venueSymbol)}&interval=${interval}&limit=${limit}${endQuery}`,
+      4_000_000,
+    );
+    return parsePayload(BinanceCandleSchema, payload).map((row) => ({
+      startTime: row[0], open: row[1], high: row[2], low: row[3], close: row[4],
+      volume: row[5], closed: true,
+    }));
+  }
+
+  private async queryOkxSpotCandles(base: string, quote: string, interval: CandleInterval, limit: number, before?: number): Promise<Candle[]> {
+    if (!['USDT', 'USDC'].includes(quote)) throw new PublicMarketDataError('UNSUPPORTED_SETTLEMENT');
+    const instrument = `${base}-${quote}`;
+    const path = before === undefined ? 'candles' : 'history-candles';
+    const cursorQuery = before === undefined ? '' : `&after=${before}`;
+    const payload = await fetchJson(
+      this.fetchImplementation,
+      `https://www.okx.com/api/v5/market/${path}?instId=${encodeURIComponent(instrument)}&bar=${OKX_BAR[interval]}&limit=${Math.min(limit, 300)}${cursorQuery}`,
+      4_000_000,
+    );
+    const rows = parsePayload(OkxCandleSchema, payload).data;
+    return rows.map((row) => {
+      const [ts, open, high, low, close, volume] = row;
+      if (!ts || !open || !high || !low || !close || volume === undefined) throw new PublicMarketDataError('INVALID_RESPONSE_SCHEMA');
+      const startTime = Number(ts);
+      if (!Number.isFinite(startTime) || startTime <= 0) throw new PublicMarketDataError('INVALID_TIMESTAMP');
+      return { startTime, open, high, low, close, volume, closed: true };
+    });
+  }
+
+  private async queryBybitSpotCandles(base: string, quote: string, interval: CandleInterval, limit: number, before?: number): Promise<Candle[]> {
+    if (!['USDT', 'USDC'].includes(quote)) throw new PublicMarketDataError('UNSUPPORTED_SETTLEMENT');
+    const venueSymbol = `${base}${quote}`;
+    const endQuery = before === undefined ? '' : `&end=${before - 1}`;
+    const payload = await fetchJson(
+      this.fetchImplementation,
+      `https://api.bybit.com/v5/market/kline?category=spot&symbol=${encodeURIComponent(venueSymbol)}&interval=${BYBIT_BAR[interval]}&limit=${limit}${endQuery}`,
+      4_000_000,
+    );
+    const envelope = parsePayload(BybitCandleSchema, payload);
+    if (envelope.retCode !== 0) throw new PublicMarketDataError('UPSTREAM_REJECTED');
+    return envelope.result.list.map((row) => {
+      const [timestamp, open, high, low, close, volume] = row;
+      const startTime = Number(timestamp);
+      if (!timestamp || !open || !high || !low || !close || volume === undefined
+        || !Number.isFinite(startTime) || startTime <= 0) {
+        throw new PublicMarketDataError('INVALID_RESPONSE_SCHEMA');
+      }
+      return { startTime, open, high, low, close, volume, closed: true };
+    });
   }
 
   private async queryBinanceCandles(symbol: ParsedSymbol, interval: CandleInterval, limit: number, before?: number): Promise<Candle[]> {

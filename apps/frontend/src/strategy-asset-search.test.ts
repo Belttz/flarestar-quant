@@ -7,23 +7,23 @@ const catalog: MarketCatalogAsset[] = [
     asset: 'BTC',
     streamed: true,
     venues: [
-      { venue: 'BINANCE', symbol: 'BINANCE_FUTURE_BTC_USDT', quote: 'USDT' },
-      { venue: 'OKX', symbol: 'OKX_FUTURE_BTC_USDT', quote: 'USDT' },
+      { venue: 'BINANCE', symbol: 'BINANCE_FUTURE_BTC_USDT', quote: 'USDT', business: 'FUTURE' },
+      { venue: 'OKX', symbol: 'OKX_FUTURE_BTC_USDT', quote: 'USDT', business: 'FUTURE' },
     ],
   },
   {
     asset: 'ETH',
     streamed: true,
     venues: [
-      { venue: 'BINANCE', symbol: 'BINANCE_FUTURE_ETH_USDT', quote: 'USDT' },
+      { venue: 'BINANCE', symbol: 'BINANCE_FUTURE_ETH_USDT', quote: 'USDT', business: 'FUTURE' },
     ],
   },
   {
     asset: 'SOL',
     streamed: false,
     venues: [
-      { venue: 'BINANCE', symbol: 'BINANCE_FUTURE_SOL_USDT', quote: 'USDT' },
-      { venue: 'OKX', symbol: 'OKX_FUTURE_SOL_USDT', quote: 'USDT' },
+      { venue: 'BINANCE', symbol: 'BINANCE_FUTURE_SOL_USDT', quote: 'USDT', business: 'FUTURE' },
+      { venue: 'OKX', symbol: 'OKX_FUTURE_SOL_USDT', quote: 'USDT', business: 'FUTURE' },
     ],
   },
 ];
@@ -44,8 +44,8 @@ describe('strategy asset search', () => {
       asset: 'SKHYNIX',
       streamed: false,
       venues: [
-        { venue: 'GATE', symbol: 'GATE_FUTURE_SKHYNIX_USDT', quote: 'USDT' },
-        { venue: 'HYPERLIQUID', symbol: 'HYPERLIQUID_FUTURE_SKHX_USDC', quote: 'USDC' },
+        { venue: 'GATE', symbol: 'GATE_FUTURE_SKHYNIX_USDT', quote: 'USDT', business: 'FUTURE' },
+        { venue: 'HYPERLIQUID', symbol: 'HYPERLIQUID_FUTURE_SKHX_USDC', quote: 'USDC', business: 'FUTURE' },
       ],
     }];
 
@@ -63,16 +63,16 @@ describe('strategy asset search', () => {
         asset: 'WBTC',
         streamed: false,
         venues: [
-          { venue: 'BINANCE', symbol: 'BINANCE_FUTURE_WBTC_USDT', quote: 'USDT' },
-          { venue: 'OKX', symbol: 'OKX_FUTURE_WBTC_USDT', quote: 'USDT' },
+          { venue: 'BINANCE', symbol: 'BINANCE_FUTURE_WBTC_USDT', quote: 'USDT', business: 'FUTURE' },
+          { venue: 'OKX', symbol: 'OKX_FUTURE_WBTC_USDT', quote: 'USDT', business: 'FUTURE' },
         ],
       },
       {
         asset: 'BTC2',
         streamed: false,
         venues: [
-          { venue: 'BINANCE', symbol: 'BINANCE_FUTURE_BTC2_USDT', quote: 'USDT' },
-          { venue: 'OKX', symbol: 'OKX_FUTURE_BTC2_USDT', quote: 'USDT' },
+          { venue: 'BINANCE', symbol: 'BINANCE_FUTURE_BTC2_USDT', quote: 'USDT', business: 'FUTURE' },
+          { venue: 'OKX', symbol: 'OKX_FUTURE_BTC2_USDT', quote: 'USDT', business: 'FUTURE' },
         ],
       },
     ], [], 'binance', 'okx');

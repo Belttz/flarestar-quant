@@ -1,0 +1,62 @@
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant V as OpportunitiesView(前端)
+    participant API as GET /api/opportunities
+    participant S as OpportunityService
+    participant CLS as asset-classification(shared)
+    participant ST as OpportunityMarketStatsIndex
+    participant HUB as spreadMarkets()/资金概览缓存
+
+    U->>V: 点击「RWA」/「排除 pre-IPO」/「Spread 列头」/「下一页」
+    V->>V: 更新 filters 并写入 URL query (classes, preipo, sort, dir, page, pageSize)
+    V->>API: GET ?funding|spread&classes&preipo&sort&dir&offset&limit
+    API->>API: OpportunityQuerySchema 校验（非法 token → 400）
+    API->>S: list(catalog, filters)
+    alt 资金板
+        S->>HUB: ensureFresh() + buildResponse(catalog)
+    else 价差板
+        S->>HUB: spreadMarkets()（hub WS ∪ REST 30s 缓存）
+    end
+    S->>ST: buildMarketStatsIndex(markets, overview)
+    ST-->>S: Map<symbol, volume24h/quoteVolume24h/openInterest*>
+    loop 每个候选行
+        S->>CLS: classifyAsset(asset, { hasSpot })
+        CLS-->>S: { assetClass, assetSuperClass, variantSuffix, isPreIpo }
+        S->>S: matchesAssetClassFilter + matchesPreIpoFilter（先于行数上限）
+        S->>ST: resolveStats(左腿/右腿或永续腿)
+        ST-->>S: stats（缺 → null；现货 OI 恒 null）
+    end
+    S->>S: applySort(key, dir)（null 恒排最后；资金板保留 executable 优先）
+    S->>S: totals = 过滤后行数；slice(offset, offset+limit)
+    S-->>API: OpportunityResponse{ rows, totals, offset, limit }
+    API-->>V: 200
+    V->>V: 客户端镜像过滤（兜住一帧旧快照）+ executionPageWindow 页码钳制
+    V-->>U: 表格（类型徽标 / 24h 成交量 / 持仓量）+ 分页控件
+
+sequenceDiagram
+    autonumber
+    participant BG as 后台对账定时器(≈5min)
+    participant RP as refreshPortfolio()
+    participant DB as SQLite
+    participant U as 用户（资产页）
+    participant C as PortfolioEquityCard
+    participant API as GET /api/crossex/portfolio-equity
+    participant CH as EquityHistoryChart(lightweight-charts)
+
+    BG->>RP: triggerPortfolioRefresh()
+    RP->>RP: queryPortfolio() → normalizePortfolio()
+    RP->>DB: savePortfolioSnapshot()
+    RP->>RP: portfolioEquitySampleFromSnapshot(snapshot, fetchedAt)
+    RP->>DB: recordPortfolioEquitySample()（raw 60s 最小间隔 + upsert hour/day）
+    Note over DB: 维护任务清理：raw>7d / hour>45d / day>730d
+
+    U->>C: 打开资产页 / 点击「7d」
+    C->>API: ?range=7d (x-gct-read-intent)
+    API->>API: equityGranularityForRange('7d') → 'hour'
+    API->>DB: readPortfolioEquitySeries('hour', fromMs)
+    DB-->>API: points
+    API-->>C: PortfolioEquitySeriesResponse{ points, firstSampleAt }
+    C->>C: 追加当前快照最新点（若晚于末端）
+    C->>CH: points / seriesKey=range / theme / locale
+    CH-->>U: 面积折线图 + 周期按钮 + 区间涨跌

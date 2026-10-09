@@ -46,7 +46,7 @@ The first time you use Gate CrossEx, run the **install command** once. After tha
    Paste the install command below, press Return, and wait for it to finish:
 
    ```bash
-   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/your-quantguy/gate-crossex/main/bootstrap.sh)"
+   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Belttz/flarestar-quant/main/bootstrap.sh)"
    ```
 
 3. 看到 `Gate CrossEx is ready to start` 后，运行下面的启动命令：<br>
@@ -72,7 +72,7 @@ The first time you use Gate CrossEx, run the **install command** once. After tha
    Paste the install command below, press Enter, and wait for it to finish:
 
    ```powershell
-   & ([scriptblock]::Create((Invoke-RestMethod https://raw.githubusercontent.com/your-quantguy/gate-crossex/main/bootstrap.ps1)))
+   & ([scriptblock]::Create((Invoke-RestMethod https://raw.githubusercontent.com/Belttz/flarestar-quant/main/bootstrap.ps1)))
    ```
 
 3. 看到 `Gate CrossEx is ready to start` 后，在同一个 PowerShell 窗口运行下面的启动命令：<br>
@@ -102,6 +102,27 @@ By default, the local app is available at **http://127.0.0.1:17840**. This is a 
 引导程序会使用 Node.js 官方发布的 SHA-256 校验值验证项目专用运行时。以上安装命令会运行本仓库中的远程脚本；如安全策略有要求，请先检查脚本内容。如需选择其他安装目录，请在运行安装命令前将 `GCT_INSTALL_DIR` 设置为绝对路径。贡献者命令和 Docker 用法请参阅[本地开发文档](docs/local-development.md)。
 
 The bootstrap verifies the private Node.js runtime against Node.js's published SHA-256 checksums. The install commands run a remote script from this repository; inspect it first if required by your security policy. To choose another installation folder, set `GCT_INSTALL_DIR` to an absolute path before running the install command. See [local development](docs/local-development.md) for contributor and Docker commands.
+
+## 服务器部署（一条命令）| Server deployment (one command)
+
+在一台全新的 Linux 服务器上，用 root 或 sudo 运行下面这一条命令即可：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Belttz/flarestar-quant/main/deploy/server/bootstrap.sh | sudo bash -s -- --domain quant.example.com
+```
+
+它会按需安装 Git 与 Docker，把仓库克隆到 `/opt/gate-crossex`（该目录不可写时回退 `~/gate-crossex`），生成 `cloud.env`，构建并启动整套服务，最后打印访问地址与初始凭据。**再次运行同一条命令就是升级**：已有仓库会 `fetch + reset --hard` 到最新提交，未跟踪的 `cloud.env` 与 `.local-data/` 都会保留。
+
+需要交互输入（例如手填登录密码）时改用两段式，让 stdin 留在终端上：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Belttz/flarestar-quant/main/deploy/server/bootstrap.sh -o /tmp/gct.sh
+sudo bash /tmp/gct.sh --domain quant.example.com
+```
+
+其他参数：`--repo`（私有仓库可带 token）、`--ref`、`--dir`、`--source`（离线：本机源码目录或 `.tar.gz` 源码包）、`--username`、`--password`、`--yes`、`--skip-docker-install`。完整说明见[云端部署指南](deploy/DEPLOY.md)。
+
+On a fresh Linux server, run the one-liner above as root or with sudo. It installs Git and Docker on demand, clones the repository to `/opt/gate-crossex` (falling back to `~/gate-crossex`), writes `cloud.env`, builds and starts the stack, then prints the URL and initial credentials. **Re-running the same command upgrades in place** — the checkout is fetched and hard-reset to the latest commit while the untracked `cloud.env` and `.local-data/` are preserved. Switch to the two-step form when the installer needs interactive input, and see the [cloud deployment guide](deploy/DEPLOY.md) for every flag.
 
 ## 首次使用 | First use
 

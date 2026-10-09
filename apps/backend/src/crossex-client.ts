@@ -155,8 +155,13 @@ export type GateCrossExOrder = z.infer<typeof GateOrderSchema>;
 const GateTradeSchema = z.object({
   transaction_id: z.string(), order_id: z.string(), text: z.string(), symbol: z.string(),
   exchange_type: z.string(), business_type: z.string(), side: z.string(), qty: z.string(), price: z.string(),
-  fee: z.string(), fee_coin: z.string(), fee_rate: z.string(), match_role: z.string(), rpnl: z.string(),
-  position_mode: z.string(), position_side: z.string(), create_time: z.string(),
+  fee: z.string(),
+  // Spot fills arrive through the same trade feed but omit several futures-only descriptors
+  // (funding PnL, match role, fee-rate breakdown). Tolerate their absence so a spot fill is never
+  // dropped from the execution ledger because a cosmetic field is missing.
+  fee_coin: lenientOrderText, fee_rate: lenientOrderText, match_role: lenientOrderText,
+  rpnl: lenientOrderText, position_mode: lenientOrderText, position_side: lenientOrderText,
+  create_time: z.string(),
 });
 export type GateCrossExTrade = z.infer<typeof GateTradeSchema>;
 
@@ -175,6 +180,11 @@ export interface ReadOnlyCrossExGateway {
   queryRiskLimits(symbols: string[]): Promise<GateCrossExRiskLimit[]>;
   queryPositions(credentials: GateCredentials): Promise<GateCrossExPosition[]>;
   queryPortfolio(credentials: GateCredentials): Promise<GateCrossExPortfolio>;
+  /**
+   * Optional: Gate's isolated spot account lives outside the CrossEx account tree, so only the
+   * real client (and transfer flows) expose it; scripted read-only fakes may omit it.
+   */
+  querySpotAccounts?(credentials: GateCredentials): Promise<GateSpotAccount[]>;
 }
 
 export const CrossExOrderRequestSchema = z.object({
@@ -271,7 +281,7 @@ export interface TradingCrossExGateway extends ReadOnlyCrossExGateway {
 
 export interface PortfolioOperationsCrossExGateway {
   queryAccount(credentials: GateCredentials, exchangeType?: string): Promise<GateCrossExAccount>;
-  querySpotAccounts(credentials: GateCredentials): Promise<GateSpotAccount[]>;
+  querySpotAccounts(credentials: GateCredentials, exchangeType?: string): Promise<GateSpotAccount[]>;
   queryTransferCoins(coin?: string): Promise<GateTransferCoin[]>;
   createTransfer(credentials: GateCredentials, transfer: CrossExTransferRequest): Promise<GateTransferResponse>;
   queryTransfers(credentials: GateCredentials, query: { coin?: string; limit: number }): Promise<GateTransferRecord[]>;
@@ -391,9 +401,18 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
     return this.signedRequest('GET', ACCOUNT_ENDPOINT, queryString, '', credentials, GateAccountSchema, 'INVALID_ACCOUNT_RESPONSE');
   }
 
-  async querySpotAccounts(credentials: GateCredentials): Promise<GateSpotAccount[]> {
+  async querySpotAccounts(credentials: GateCredentials, exchangeType?: string): Promise<GateSpotAccount[]> {
+    // Same exchange_type filter as /futures/accounts: lets unified-account deployments scope the
+    // spot book query; undefined keeps the legacy unfiltered call.
+    const parsedExchange = exchangeType === undefined
+      ? null
+      : IsolatedExchangeTypeSchema.safeParse(exchangeType.toUpperCase());
+    if (parsedExchange !== null && !parsedExchange.success) throw new GateApiError(0, 'INVALID_EXCHANGE_TYPE');
+    const queryString = parsedExchange?.success
+      ? new URLSearchParams({ exchange_type: parsedExchange.data }).toString()
+      : '';
     return this.signedRequest(
-      'GET', SPOT_ACCOUNTS_ENDPOINT, '', '', credentials,
+      'GET', SPOT_ACCOUNTS_ENDPOINT, queryString, '', credentials,
       z.array(GateSpotAccountSchema), 'INVALID_SPOT_ACCOUNTS_RESPONSE', false, 'normal',
     );
   }

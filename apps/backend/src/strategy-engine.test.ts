@@ -6,7 +6,7 @@ import type Database from 'better-sqlite3';
 import { loadConfig } from './config.js';
 import { openDatabase } from './database.js';
 import { DEFAULT_CREDENTIAL_PROFILE, MemoryCredentialVault, type GateCredentials } from './credential-vault.js';
-import { GateApiError, type CrossExOrderRequest, type GateCrossExAccount, type GateCrossExOrder, type GateCrossExPortfolio, type GateCrossExRiskLimit, type GateCrossExSymbol, type GateFeeRate, type GateOrderActionResponse, type TradingCrossExGateway } from './crossex-client.js';
+import { GateApiError, type CrossExOrderRequest, type GateCrossExAccount, type GateCrossExOrder, type GateCrossExPortfolio, type GateCrossExRiskLimit, type GateCrossExSymbol, type GateFeeRate, type GateOrderActionResponse, type GateSpotAccount, type TradingCrossExGateway } from './crossex-client.js';
 import type { LiveMarket } from './market-hub.js';
 import { StrategyEngine, type MarketSource, type StrategyEngineOptions } from './strategy-engine.js';
 import { TradingRuntime } from './trading-runtime.js';
@@ -26,6 +26,7 @@ class ScriptedGateway implements TradingCrossExGateway {
   accountAssets: GateCrossExAccount['assets'] = [];
   accountMode: 'CROSS_EXCHANGE' | 'ISOLATED_EXCHANGE' = 'CROSS_EXCHANGE';
   isolatedAvailableMargins: Record<string, string> = {};
+  spotAccounts: GateSpotAccount[] = [];
   holdCancellations = false;
   private readonly failCreateBudget = new Map<string, number>();
   private readonly remoteStates = new Map<string, string>();
@@ -52,6 +53,9 @@ class ScriptedGateway implements TradingCrossExGateway {
     };
   }
   async queryPositions(): Promise<GateCrossExPortfolio['positions']> { return this.positions; }
+  async querySpotAccounts(): Promise<GateSpotAccount[]> {
+    return this.spotAccounts;
+  }
   async queryPortfolio(): Promise<GateCrossExPortfolio> { throw new GateApiError(0, 'NOT_SCRIPTED'); }
   async querySymbols(): Promise<GateCrossExSymbol[]> { return []; }
   async queryRiskLimits(symbols: string[]): Promise<GateCrossExRiskLimit[]> {
@@ -172,12 +176,14 @@ class StubMarkets implements MarketSource {
     ask: string,
     updatedAt = new Date().toISOString(),
     receivedAt = updatedAt,
+    fundingRate = '0.0001',
+    nextFundingAt = new Date(Date.now() + 3_600_000).toISOString(),
   ): void {
     const [venue = 'GATE', , asset = 'BTC'] = symbol.split('_');
     this.markets.set(symbol, {
       symbol, venue: venue as LiveMarket['venue'], asset, lastPrice: bid, bidPrice: bid, bidSize: '10',
       askPrice: ask, askSize: '10', open24h: bid, high24h: ask, low24h: bid, volume24h: '100',
-      quoteVolume24h: '100000', fundingRate: '0.0001', nextFundingAt: new Date(Date.now() + 3_600_000).toISOString(),
+      quoteVolume24h: '100000', fundingRate, nextFundingAt,
       openInterest: '1000', openInterestValue: '1000000', receivedAt, updatedAt,
       source: 'gate_crossex_websocket',
     });
@@ -190,6 +196,28 @@ class StubMarkets implements MarketSource {
   }
 
   market(symbol: string): LiveMarket | null { return this.markets.get(symbol) ?? null; }
+  /** Test hook simulating the market hub sweeping a registered symbol. */
+  remove(symbol: string): void { this.markets.delete(symbol); }
+  /** Test hook simulating the market hub's dynamic registration of an unknown symbol. */
+  ensureHandler: ((symbol: string) => boolean) | null = null;
+  ensureMarket(symbol: string): boolean { return this.ensureHandler ? this.ensureHandler(symbol) : false; }
+  /** Symbols passed to each watchQuotes call, in order. */
+  readonly watchQuotesCalls: string[][] = [];
+  /** How many watchQuotes releases completed (idempotent, so release-once counts once). */
+  quoteWatchReleases = 0;
+  /** Test hook invoked on each subscription, e.g. to deliver the first live ticker frames. */
+  onWatchQuotes: ((symbols: string[]) => void) | null = null;
+  watchQuotes(symbols: string[]): () => void {
+    const watched = [...symbols];
+    this.watchQuotesCalls.push(watched);
+    this.onWatchQuotes?.(watched);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.quoteWatchReleases += 1;
+    };
+  }
   connectionState(): ReturnType<NonNullable<MarketSource['connectionState']>> { return this.state; }
   setConnectionState(state: ReturnType<NonNullable<MarketSource['connectionState']>>): void { this.state = state; }
 }
@@ -465,6 +493,161 @@ describe('strategy engine', () => {
     })).rejects.toMatchObject({
       code: 'strategy_order_below_minimum_notional', statusCode: 400,
     });
+  });
+
+  it('suggests the executable minimum quantity when a clip is below the minimum notional', async () => {
+    const { engine, database, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '0.3121', '0.3123');
+    markets.set('OKX_FUTURE_BTC_USDT', '0.3120', '0.3122');
+    database.prepare("UPDATE crossex_instruments SET min_size = '0.01', min_notional = '5', lot_size = '0.01' WHERE symbol LIKE '%_FUTURE_BTC_USDT'").run();
+
+    await expect(engine.startStrategy({
+      ...takerTakerConfig, totalAmount: '1', perOrderQuantity: '1',
+    })).rejects.toMatchObject({
+      code: 'strategy_order_below_minimum_notional',
+      statusCode: 400,
+      label: 'BINANCE_FUTURE_BTC_USDT: 0.3121 < 5, min qty ~16.03 @ price 0.3121',
+    });
+  });
+
+  it('waits for the first live quote of dynamically ensured markets before launching', async () => {
+    const { engine, markets } = await createHarness({ marketDataWaitTimeoutMs: 5_000 });
+    // Simulate the market hub: ensureMarket registers a zero-priced placeholder first and the
+    // first real ticker frame lands a moment later.
+    markets.ensureHandler = (symbol) => {
+      if (markets.market(symbol)) return true;
+      markets.set(symbol, '0', '0');
+      setTimeout(() => markets.set(symbol, '100000', '100001'), 150);
+      return true;
+    };
+
+    const record = await engine.startStrategy(takerTakerConfig);
+    expect(record).toMatchObject({ status: 'RUNNING', kind: 'position' });
+  });
+
+  it('rejects a launch whose ensured markets never deliver a live quote', async () => {
+    const { engine, markets } = await createHarness({ marketDataWaitTimeoutMs: 250 });
+    markets.ensureHandler = (symbol) => {
+      if (!markets.market(symbol)) markets.set(symbol, '0', '0');
+      return true;
+    };
+
+    await expect(engine.startStrategy(takerTakerConfig)).rejects.toMatchObject({
+      code: 'strategy_market_data_unavailable', statusCode: 409,
+      // The rejection must name both legs so the user can tell which feed is dead.
+      label: 'BINANCE_FUTURE_BTC_USDT, OKX_FUTURE_BTC_USDT',
+    });
+  });
+
+  it('re-ensures a symbol swept during the launch wait and still launches', async () => {
+    const { engine, markets } = await createHarness({ marketDataWaitTimeoutMs: 5_000 });
+    let ensureCalls = 0;
+    markets.ensureHandler = (symbol) => {
+      ensureCalls += 1;
+      if (ensureCalls <= 2) {
+        // Initial registration from startStrategy: zero-priced placeholder only.
+        if (!markets.market(symbol)) markets.set(symbol, '0', '0');
+        return true;
+      }
+      // Re-ensure from the wait loop delivers the live frame immediately.
+      markets.set(symbol, '100000', '100001');
+      return true;
+    };
+    // The market hub sweeps both placeholders before their first live frame; the wait loop must
+    // re-ensure them instead of timing out.
+    setTimeout(() => { markets.remove('BINANCE_FUTURE_BTC_USDT'); markets.remove('OKX_FUTURE_BTC_USDT'); }, 50);
+
+    const record = await engine.startStrategy(takerTakerConfig);
+    expect(record).toMatchObject({ status: 'RUNNING' });
+    expect(ensureCalls).toBeGreaterThanOrEqual(3);
+  });
+
+  it('subscribes both strategy legs to live quotes so the launch wait can succeed', async () => {
+    const { engine, markets } = await createHarness({ marketDataWaitTimeoutMs: 5_000 });
+    // ensureMarket only registers a zero-priced placeholder: without a ticker subscription the
+    // launch wait would never observe a live price and time out.
+    markets.ensureHandler = (symbol) => {
+      if (markets.market(symbol)) return true;
+      markets.set(symbol, '0', '0');
+      return true;
+    };
+    // The upstream only streams tickers for symbols the engine subscribed to: the first live
+    // frame arrives only after watchQuotes.
+    markets.onWatchQuotes = (symbols) => {
+      setTimeout(() => {
+        for (const symbol of symbols) markets.set(symbol, '100000', '100001');
+      }, 100);
+    };
+
+    const record = await engine.startStrategy(takerTakerConfig);
+    expect(record).toMatchObject({ status: 'RUNNING', kind: 'position' });
+    expect(markets.watchQuotesCalls).toEqual([['BINANCE_FUTURE_BTC_USDT', 'OKX_FUTURE_BTC_USDT']]);
+  });
+
+  it('releases the leg quote subscription exactly once when a strategy stops', async () => {
+    const { engine, markets } = await createHarness({ marketDataWaitTimeoutMs: 5_000 });
+    markets.ensureHandler = (symbol) => {
+      if (!markets.market(symbol)) markets.set(symbol, '0', '0');
+      return true;
+    };
+    markets.onWatchQuotes = (symbols) => {
+      setTimeout(() => {
+        for (const symbol of symbols) markets.set(symbol, '100000', '100001');
+      }, 50);
+    };
+
+    const record = await engine.startStrategy(takerTakerConfig);
+    expect(record.status).toBe('RUNNING');
+    expect(markets.quoteWatchReleases).toBe(0);
+
+    await engine.stopStrategy(record.id);
+    expect(markets.quoteWatchReleases).toBe(1);
+    // A repeated stop must not release the same subscription twice.
+    await engine.stopStrategy(record.id);
+    expect(markets.quoteWatchReleases).toBe(1);
+  });
+
+  it('QA supplement: releases the leg quote watch when resume fails after the fresh-price wait', async () => {
+    const { engine, database, markets } = await createHarness({ marketDataWaitTimeoutMs: 5_000 });
+    markets.ensureHandler = (symbol) => {
+      if (!markets.market(symbol)) markets.set(symbol, '0', '0');
+      return true;
+    };
+    markets.onWatchQuotes = (symbols) => {
+      // Only the resume's subscription triggers the concurrent mutation; the initial launch
+      // must stay uncontended so the pause below sees exactly one running strategy.
+      const isResumeWatch = markets.watchQuotesCalls.length === 2;
+      setTimeout(() => {
+        for (const symbol of symbols) markets.set(symbol, '100000', '100001');
+        if (!isResumeWatch) return;
+        // A concurrent mutation consumes the final running-strategy slot while the resume is
+        // still waiting for its first live frames, so the post-wait re-check must reject.
+        // Blocker rows carry a valid config because listStrategies re-parses every config_json.
+        const now = new Date().toISOString();
+        const blockerConfig = JSON.stringify(takerTakerConfig);
+        for (let index = 0; index < 10; index += 1) {
+          database.prepare(`INSERT INTO execution_strategies (id, kind, environment, status, config_json,
+            progress, filled_quantity, filled_left, filled_right, open_position, credential_profile_id,
+            credential_profile_label, created_at, updated_at, stopped_at)
+            VALUES (?, 'position', 'live', 'RUNNING', ?, 0, '0', '0', '0', '0', NULL, 'Blocker', ?, ?, NULL)`)
+            .run(`BLOCK-${index}`, blockerConfig, now, now);
+        }
+      }, 100);
+    };
+
+    const record = await engine.startStrategy({ ...takerTakerConfig, totalAmount: '0.2' });
+    expect(engine.pauseRunningStrategiesForCredentialChange(DEFAULT_CREDENTIAL_PROFILE)).toBe(1);
+    expect(markets.quoteWatchReleases).toBe(1);
+    // Re-arm the zero-priced placeholders so the resume must pass through the fresh-price wait
+    // (and therefore through its post-wait re-checks) before it can succeed.
+    markets.set('BINANCE_FUTURE_BTC_USDT', '0', '0');
+    markets.set('OKX_FUTURE_BTC_USDT', '0', '0');
+
+    await expect(engine.resumeStrategy(record.id, DEFAULT_CREDENTIAL_PROFILE))
+      .rejects.toMatchObject({ code: 'too_many_running_strategies', statusCode: 409 });
+    // The subscription taken during the failed resume must not leak: the release is dropped
+    // even though no actor was ever created.
+    expect(markets.quoteWatchReleases).toBe(2);
   });
 
   it('rejects a paired strategy when its full target exceeds available margin', async () => {
@@ -1395,6 +1578,45 @@ describe('strategy engine', () => {
     ]));
   });
 
+  it('defaults auto all-futures spreads to 1× leverage when the config omits it', async () => {
+    const { engine, gateway, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100150', '100151');
+    markets.set('OKX_FUTURE_BTC_USDT', '99999', '100000');
+
+    const record = await engine.startStrategy({
+      kind: 'auto', asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'OKX', leftSide: 'SELL', rightSide: 'BUY',
+      entryBps: '10', takeProfitBps: '2', maxPosition: '0.1', perOrderQuantity: '0.1', reduceOnly: false,
+      executionMethod: 'TAKER_TAKER',
+    });
+
+    expect(record.status).toBe('RUNNING');
+    expect(gateway.leverageUpdates).toEqual([
+      { symbol: 'BINANCE_FUTURE_BTC_USDT', leverage: '1' },
+      { symbol: 'OKX_FUTURE_BTC_USDT', leverage: '1' },
+    ]);
+    await engine.stopStrategy(record.id);
+  });
+
+  it('applies the configured per-leg leverage to auto all-futures spreads', async () => {
+    const { engine, gateway, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100150', '100151');
+    markets.set('OKX_FUTURE_BTC_USDT', '99999', '100000');
+
+    const record = await engine.startStrategy({
+      kind: 'auto', asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'OKX', leftSide: 'SELL', rightSide: 'BUY',
+      leftLeverage: '3', rightLeverage: '5',
+      entryBps: '10', takeProfitBps: '2', maxPosition: '0.1', perOrderQuantity: '0.1', reduceOnly: false,
+      executionMethod: 'TAKER_TAKER',
+    });
+
+    expect(record.status).toBe('RUNNING');
+    expect(gateway.leverageUpdates).toEqual([
+      { symbol: 'BINANCE_FUTURE_BTC_USDT', leverage: '3' },
+      { symbol: 'OKX_FUTURE_BTC_USDT', leverage: '5' },
+    ]);
+    await engine.stopStrategy(record.id);
+  });
+
   it('does not reapply numerically equivalent leverage settings during premium preflight', async () => {
     const { engine, gateway, markets } = await createHarness();
     gateway.leverages = {
@@ -1810,5 +2032,595 @@ describe('strategy engine', () => {
     expect(runtime.strategyLogs(record.id)).toEqual(expect.arrayContaining([
       expect.objectContaining({ event: 'Strategy paused', condition: 'Account credentials changed' }),
     ]));
+  });
+});
+
+/** Convenience wrapper: set a market with an explicit funding rate (defaults keep the old shape). */
+function setMarketWithFunding(
+  markets: StubMarkets,
+  symbol: string,
+  bid: string,
+  ask: string,
+  fundingRate = '0.0001',
+  nextFundingAt?: string,
+): void {
+  const now = new Date().toISOString();
+  markets.set(symbol, bid, ask, now, now, fundingRate, nextFundingAt);
+}
+
+describe('auto signed thresholds and funding carry strategies', () => {
+  const spotFutureAutoConfig = {
+    kind: 'auto', asset: 'BTC', leftVenue: 'GATE', rightVenue: 'GATE',
+    leftSide: 'BUY', rightSide: 'SELL',
+    leftSymbol: 'GATE_SPOT_BTC_USDT', rightSymbol: 'GATE_FUTURE_BTC_USDT',
+    entryBps: '10', takeProfitBps: '2', maxPosition: '0.1', perOrderQuantity: '0.1',
+    reduceOnly: false, executionMethod: 'TAKER_TAKER',
+  } as const;
+
+  const carryConfig = {
+    kind: 'carry', asset: 'BTC', leftVenue: 'GATE', rightVenue: 'GATE',
+    leftSide: 'BUY', rightSide: 'SELL',
+    leftSymbol: 'GATE_SPOT_BTC_USDT', rightSymbol: 'GATE_FUTURE_BTC_USDT',
+    fundingDirection: 'POSITIVE', fundingAprMin: 15, basisTakeProfitBps: 5,
+    totalAmount: '0.1', perOrderQuantity: '0.1', reduceOnly: false, executionMethod: 'TAKER_TAKER',
+  } as const;
+
+  it('opens a same-venue auto position across a Gate spot and future leg with quote-sized spot buys', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    // Entry spread: perp bid 100195 − spot ask 100005 ≈ 19 bps ≥ 10 bps entry.
+    markets.set('GATE_SPOT_BTC_USDT', '99995', '100005');
+    markets.set('GATE_FUTURE_BTC_USDT', '100195', '100205');
+    const record = await engine.startStrategy(spotFutureAutoConfig);
+    expect(record.status).toBe('RUNNING');
+    // Only the perpetual leg touches the leverage layer; the spot leg is full-cash.
+    expect(gateway.leverageUpdates).toEqual([{ symbol: 'GATE_FUTURE_BTC_USDT', leverage: '1' }]);
+
+    const entryTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 2);
+    const [spotOrder, perpOrder] = gateway.createdOrders;
+    // The spot market buy is sized in quote currency at the spot mid (100000 × 0.1).
+    expect(spotOrder).toMatchObject({
+      symbol: 'GATE_SPOT_BTC_USDT', side: 'BUY', type: 'MARKET', time_in_force: 'IOC',
+      quote_qty: '10000', reduce_only: 'false',
+    });
+    expect(perpOrder).toMatchObject({
+      symbol: 'GATE_FUTURE_BTC_USDT', side: 'SELL', type: 'MARKET', time_in_force: 'IOC',
+      qty: '0.1', reduce_only: 'false',
+    });
+    ackOrder(runtime, 'remote-1', 'FILLED', '0.1', '100005');
+    ackOrder(runtime, 'remote-2', 'FILLED', '0.1', '100195');
+    await entryTick;
+    await waitFor(() => runtime.getStrategy(record.id).openPosition === '0.1');
+
+    // Spread regression: exit spread = (perp ask − spot bid)/spot bid ≈ 1.0 bps ≤ 2 bps.
+    markets.set('GATE_FUTURE_BTC_USDT', '100000', '100005');
+    const exitTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 4);
+    const exits = gateway.createdOrders.slice(2);
+    expect(exits.find((order) => order.symbol === 'GATE_SPOT_BTC_USDT')).toMatchObject({ side: 'SELL', reduce_only: 'true' });
+    expect(exits.find((order) => order.symbol === 'GATE_FUTURE_BTC_USDT')).toMatchObject({ side: 'BUY', reduce_only: 'true' });
+    ackOrder(runtime, 'remote-3', 'FILLED', '0.1', '100005');
+    ackOrder(runtime, 'remote-4', 'FILLED', '0.1', '100005');
+    await exitTick;
+    await waitFor(() => runtime.getStrategy(record.id).openPosition === '0');
+    expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+  });
+
+  it('enters an auto position on a negative entry threshold and closes it when the spread regresses', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    // Spread = OKX bid 100099 − BINANCE ask 100151 ≈ −5.19 bps ≤ −5 → enter at a bounded cost.
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100150', '100151');
+    markets.set('OKX_FUTURE_BTC_USDT', '100099', '100100');
+    const record = await engine.startStrategy({
+      kind: 'auto', asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'OKX',
+      leftSide: 'BUY', rightSide: 'SELL', entryBps: '-5', takeProfitBps: '2',
+      maxPosition: '0.1', perOrderQuantity: '0.1', reduceOnly: false, executionMethod: 'TAKER_TAKER',
+    });
+
+    const entryTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 2);
+    expect(gateway.createdOrders[0]).toMatchObject({ symbol: 'BINANCE_FUTURE_BTC_USDT', side: 'BUY', qty: '0.1' });
+    expect(gateway.createdOrders[1]).toMatchObject({ symbol: 'OKX_FUTURE_BTC_USDT', side: 'SELL', qty: '0.1' });
+    ackOrder(runtime, 'remote-1', 'FILLED', '0.1', '100151');
+    ackOrder(runtime, 'remote-2', 'FILLED', '0.1', '100099');
+    await entryTick;
+    await waitFor(() => runtime.getStrategy(record.id).openPosition === '0.1');
+
+    // Spread regresses to ≈ 0.1 bps ≤ 2 → reduce-only exit of the bounded-cost position.
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100100', '100101');
+    markets.set('OKX_FUTURE_BTC_USDT', '100100', '100101');
+    const exitTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 4);
+    const exits = gateway.createdOrders.slice(2);
+    expect(exits.find((order) => order.symbol === 'BINANCE_FUTURE_BTC_USDT')).toMatchObject({ side: 'SELL', reduce_only: 'true' });
+    expect(exits.find((order) => order.symbol === 'OKX_FUTURE_BTC_USDT')).toMatchObject({ side: 'BUY', reduce_only: 'true' });
+    ackOrder(runtime, 'remote-3', 'FILLED', '0.1', '100100');
+    ackOrder(runtime, 'remote-4', 'FILLED', '0.1', '100100');
+    await exitTick;
+    await waitFor(() => runtime.getStrategy(record.id).openPosition === '0');
+    expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+  });
+
+  it('closes both legs and stops the auto strategy when the stop-loss threshold is hit', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100150', '100151');
+    markets.set('OKX_FUTURE_BTC_USDT', '99999', '100000');
+    const record = await engine.startStrategy({
+      kind: 'auto', asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'OKX', leftSide: 'SELL', rightSide: 'BUY',
+      entryBps: '10', takeProfitBps: '2', stopLossBps: 30, maxPosition: '0.1', perOrderQuantity: '0.1',
+      reduceOnly: false, executionMethod: 'TAKER_TAKER',
+    });
+
+    const entryTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 2);
+    ackOrder(runtime, 'remote-1', 'FILLED', '0.1', '100150');
+    ackOrder(runtime, 'remote-2', 'FILLED', '0.1', '100000');
+    await entryTick;
+    await waitFor(() => runtime.getStrategy(record.id).openPosition === '0.1');
+
+    // Adverse move: spread = (100400 − 100000)/100000 = 40 bps ≥ 30 bps stop-loss.
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100400', '100401');
+    const stopTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 4);
+    const exits = gateway.createdOrders.slice(2);
+    expect(exits.find((order) => order.symbol === 'BINANCE_FUTURE_BTC_USDT')).toMatchObject({ side: 'BUY', type: 'MARKET', reduce_only: 'true' });
+    expect(exits.find((order) => order.symbol === 'OKX_FUTURE_BTC_USDT')).toMatchObject({ side: 'SELL', type: 'MARKET', reduce_only: 'true' });
+    ackOrder(runtime, 'remote-3', 'FILLED', '0.1', '100401');
+    ackOrder(runtime, 'remote-4', 'FILLED', '0.1', '100000');
+    await stopTick;
+    await waitFor(() => runtime.getStrategy(record.id).status === 'STOPPED');
+    expect(engine.listActiveStrategyIds()).not.toContain(record.id);
+    expect(runtime.strategyLogs(record.id).some((log) => log.event === 'Stop-loss triggered')).toBe(true);
+    // A stopped strategy must not trade again.
+    await engine.tick();
+    expect(gateway.createdOrders).toHaveLength(4);
+  });
+
+  it('rejects same-venue auto strategies that pair two futures markets', async () => {
+    const { engine } = await createHarness();
+    await expect(engine.startStrategy({
+      kind: 'auto', asset: 'BTC', leftVenue: 'GATE', rightVenue: 'GATE', leftSide: 'SELL', rightSide: 'BUY',
+      entryBps: '10', takeProfitBps: '2', maxPosition: '0.1', perOrderQuantity: '0.1',
+      reduceOnly: false, executionMethod: 'TAKER_TAKER',
+    })).rejects.toMatchObject({ name: 'ZodError' });
+  });
+
+  it('tops up a partially filled leg instead of leaving a hedged imbalance', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100150', '100151');
+    markets.set('OKX_FUTURE_BTC_USDT', '99999', '100000');
+    const record = await engine.startStrategy(takerTakerConfig);
+
+    const entryTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 2);
+    ackOrder(runtime, 'remote-1', 'FILLED', '0.1', '100150');
+    ackOrder(runtime, 'remote-2', 'FILLED', '0.06', '100000');
+    await entryTick;
+
+    // Imbalance 0.04: the lagging right leg is topped up with a 0.04 market buy.
+    await waitFor(() => gateway.createdOrders.length === 3);
+    expect(gateway.createdOrders[2]).toMatchObject({
+      symbol: 'OKX_FUTURE_BTC_USDT', side: 'BUY', type: 'MARKET', qty: '0.04', reduce_only: 'false',
+    });
+    ackOrder(runtime, 'remote-3', 'FILLED', '0.04', '100000');
+    await waitFor(() => runtime.getStrategy(record.id).filledQuantity === '0.1');
+    expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+  });
+
+  it('holds a carry strategy flat while the funding APR is below the configured minimum', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    // 0.0001 × 3 × 365 × 100 = 10.95% APR < 15% minimum.
+    markets.set('GATE_SPOT_BTC_USDT', '99995', '100005');
+    markets.set('GATE_FUTURE_BTC_USDT', '100195', '100205');
+    const record = await engine.startStrategy(carryConfig);
+
+    await engine.tick();
+    expect(gateway.createdOrders).toHaveLength(0);
+    expect(runtime.strategyLogs(record.id).some((log) => log.event === 'Waiting for funding threshold')).toBe(true);
+    expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+  });
+
+  it('blocks a positive carry entry when spot USDT cannot cover the full notional plus margin', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    markets.set('GATE_SPOT_BTC_USDT', '99995', '100005');
+    setMarketWithFunding(markets, 'GATE_FUTURE_BTC_USDT', '100195', '100205', '0.001');
+    gateway.spotAccounts = [{ currency: 'USDT', available: '100', locked: '0' }];
+    const record = await engine.startStrategy(carryConfig);
+
+    await engine.tick();
+    expect(gateway.createdOrders).toHaveLength(0);
+    expect(runtime.strategyLogs(record.id).some((log) => log.event === 'Carry entry gate blocked')).toBe(true);
+    expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+  });
+
+  it('opens a positive carry with a quote-sized spot buy and a perp short after the gate passes', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    markets.set('GATE_SPOT_BTC_USDT', '99995', '100005');
+    setMarketWithFunding(markets, 'GATE_FUTURE_BTC_USDT', '100195', '100205', '0.001');
+    gateway.spotAccounts = [{ currency: 'USDT', available: '1000000', locked: '0' }];
+    const record = await engine.startStrategy(carryConfig);
+    expect(record.id.startsWith('CARRY-')).toBe(true);
+    // Carry must never touch the account leverage preset.
+    expect(gateway.leverageUpdates).toHaveLength(0);
+
+    const entryTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 2);
+    const [spotOrder, perpOrder] = gateway.createdOrders;
+    expect(spotOrder).toMatchObject({ symbol: 'GATE_SPOT_BTC_USDT', side: 'BUY', type: 'MARKET', quote_qty: '10000' });
+    expect(perpOrder).toMatchObject({ symbol: 'GATE_FUTURE_BTC_USDT', side: 'SELL', type: 'MARKET', qty: '0.1' });
+    expect(runtime.strategyLogs(record.id).some((log) => log.event === 'Carry entry gate passed')).toBe(true);
+    ackOrder(runtime, 'remote-1', 'FILLED', '0.1', '100005');
+    ackOrder(runtime, 'remote-2', 'FILLED', '0.1', '100195');
+    await entryTick;
+    await waitFor(() => runtime.getStrategy(record.id).openPosition === '0.1');
+  });
+
+  it('blocks a negative carry entry when the spot inventory is below the configured amount', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    markets.set('GATE_SPOT_BTC_USDT', '99995', '100005');
+    setMarketWithFunding(markets, 'GATE_FUTURE_BTC_USDT', '100195', '100205', '-0.001');
+    gateway.spotAccounts = [
+      { currency: 'USDT', available: '1000000', locked: '0' },
+      { currency: 'BTC', available: '0.05', locked: '0' },
+    ];
+    const record = await engine.startStrategy({
+      ...carryConfig, fundingDirection: 'NEGATIVE', leftSide: 'SELL', rightSide: 'BUY', inventoryCheck: true,
+    });
+
+    await engine.tick();
+    expect(gateway.createdOrders).toHaveLength(0);
+    expect(runtime.strategyLogs(record.id).some((log) => log.event === 'Carry entry gate blocked')).toBe(true);
+  });
+
+  it('opens a negative carry by selling spot inventory and buying the perpetual', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    markets.set('GATE_SPOT_BTC_USDT', '99995', '100005');
+    setMarketWithFunding(markets, 'GATE_FUTURE_BTC_USDT', '100195', '100205', '-0.001');
+    gateway.spotAccounts = [
+      { currency: 'USDT', available: '1000000', locked: '0' },
+      { currency: 'BTC', available: '0.2', locked: '0' },
+    ];
+    const record = await engine.startStrategy({
+      ...carryConfig, fundingDirection: 'NEGATIVE', leftSide: 'SELL', rightSide: 'BUY', inventoryCheck: true,
+    });
+
+    const entryTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 2);
+    const [spotOrder, perpOrder] = gateway.createdOrders;
+    // A spot market SELL is sized in base quantity — no quote conversion.
+    expect(spotOrder).toMatchObject({ symbol: 'GATE_SPOT_BTC_USDT', side: 'SELL', type: 'MARKET', qty: '0.1' });
+    expect(spotOrder.quote_qty).toBeUndefined();
+    expect(perpOrder).toMatchObject({ symbol: 'GATE_FUTURE_BTC_USDT', side: 'BUY', type: 'MARKET', qty: '0.1' });
+    ackOrder(runtime, 'remote-1', 'FILLED', '0.1', '99995');
+    ackOrder(runtime, 'remote-2', 'FILLED', '0.1', '100195');
+    await entryTick;
+    await waitFor(() => runtime.getStrategy(record.id).openPosition === '0.1');
+  });
+
+  it('accrues funding at each settlement while the carry position is open', async () => {
+    let now = Date.now();
+    const { engine, runtime, gateway, markets } = await createHarness({ now: () => now });
+    const timestamp = new Date(now).toISOString();
+    const nextSettlement = new Date(now + 8 * 3_600_000).toISOString();
+    markets.set('GATE_SPOT_BTC_USDT', '99995', '100005', timestamp, timestamp);
+    markets.set('GATE_FUTURE_BTC_USDT', '100195', '100205', timestamp, timestamp, '0.001', nextSettlement);
+    gateway.spotAccounts = [{ currency: 'USDT', available: '1000000', locked: '0' }];
+    const record = await engine.startStrategy(carryConfig);
+
+    const entryTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 2);
+    ackOrder(runtime, 'remote-1', 'FILLED', '0.1', '100005');
+    ackOrder(runtime, 'remote-2', 'FILLED', '0.1', '100195');
+    await entryTick;
+
+    // The latch tick records the entry reference metrics and arms the accrual clock.
+    await engine.tick();
+    let metrics = runtime.getStrategy(record.id).carryMetrics;
+    expect(metrics).not.toBeNull();
+    expect(Number(metrics?.entryFundingApr)).toBeCloseTo(109.5, 6);
+    expect(Number(metrics?.basisEntryBps)).toBeCloseTo(20, 6);
+    expect(Number(metrics?.fundingCollectedUsdt)).toBeCloseTo(0, 9);
+
+    // Cross the settlement: one period of |rate| × perp notional is collected (0.001 × 0.1 × 100200).
+    now += 8 * 3_600_000 + 1_000;
+    const refreshed = new Date(now).toISOString();
+    markets.set('GATE_SPOT_BTC_USDT', '99995', '100005', refreshed, refreshed);
+    markets.set('GATE_FUTURE_BTC_USDT', '100195', '100205', refreshed, refreshed, '0.001', nextSettlement);
+    await engine.tick();
+
+    metrics = runtime.getStrategy(record.id).carryMetrics;
+    expect(Number(metrics?.fundingCollectedUsdt)).toBeCloseTo(10.02, 6);
+    expect(metrics?.nextFundingAccrualAt).not.toBeNull();
+    expect(Date.parse(metrics?.nextFundingAccrualAt ?? '')).toBeGreaterThan(now);
+    expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+    expect(gateway.createdOrders).toHaveLength(2);
+  });
+
+  it('closes both carry legs on basis take-profit and reports net PnL as funding + basis − fees', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    markets.set('GATE_SPOT_BTC_USDT', '99995', '100005');
+    setMarketWithFunding(markets, 'GATE_FUTURE_BTC_USDT', '100195', '100205', '0.001');
+    gateway.spotAccounts = [{ currency: 'USDT', available: '1000000', locked: '0' }];
+    const record = await engine.startStrategy(carryConfig);
+
+    const entryTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 2);
+    ackOrder(runtime, 'remote-1', 'FILLED', '0.1', '100005');
+    ackOrder(runtime, 'remote-2', 'FILLED', '0.1', '100195');
+    ingestFill(runtime, 'remote-1', 'GATE_SPOT_BTC_USDT', 'BUY', '0.1', '100005');
+    ingestFill(runtime, 'remote-2', 'GATE_FUTURE_BTC_USDT', 'SELL', '0.1', '100195');
+    await entryTick;
+    await engine.tick(); // latch the entry reference metrics
+
+    // Basis collapses from 20 bps to 0: perp bid 100005 = spot ask 100005 ≤ 5 bps take-profit.
+    setMarketWithFunding(markets, 'GATE_FUTURE_BTC_USDT', '100005', '100015', '0.001');
+    const exitTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 4);
+    const exits = gateway.createdOrders.slice(2);
+    expect(exits.find((order) => order.symbol === 'GATE_SPOT_BTC_USDT')).toMatchObject({ side: 'SELL', reduce_only: 'true' });
+    expect(exits.find((order) => order.symbol === 'GATE_FUTURE_BTC_USDT')).toMatchObject({ side: 'BUY', reduce_only: 'true' });
+    ackOrder(runtime, 'remote-3', 'FILLED', '0.1', '100005');
+    ackOrder(runtime, 'remote-4', 'FILLED', '0.1', '100005');
+    ingestFill(runtime, 'remote-3', 'GATE_SPOT_BTC_USDT', 'SELL', '0.1', '100005');
+    ingestFill(runtime, 'remote-4', 'GATE_FUTURE_BTC_USDT', 'BUY', '0.1', '100005');
+    await exitTick;
+    await waitFor(() => runtime.getStrategy(record.id).status === 'COMPLETED');
+
+    const metrics = runtime.getStrategy(record.id).carryMetrics;
+    expect(Number(metrics?.basisEntryBps)).toBeCloseTo(20, 6);
+    expect(Number(metrics?.basisCurrentBps)).toBeCloseTo(0, 6);
+    expect(Number(metrics?.basisPnlUsdt)).toBeCloseTo(20, 6);
+    expect(Number(metrics?.feesPaidUsdt)).toBeCloseTo(0.04, 6);
+    expect(Number(metrics?.netPnlUsdt)).toBeCloseTo(19.96, 6);
+    expect(runtime.strategyLogs(record.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ event: 'Basis take-profit triggered' }),
+      expect.objectContaining({ event: 'Strategy completed' }),
+    ]));
+    expect(engine.listActiveStrategyIds()).not.toContain(record.id);
+  });
+
+  it('rejects invalid carry configurations at the schema boundary', async () => {
+    const { engine, runtime } = await createHarness();
+    // carry must not carry an entry threshold.
+    await expect(engine.startStrategy({ ...carryConfig, entryBps: '10' })).rejects.toMatchObject({ name: 'ZodError' });
+    // Selling spot inventory without holding it requires the inventory check.
+    await expect(engine.startStrategy({
+      ...carryConfig, fundingDirection: 'NEGATIVE', leftSide: 'SELL', rightSide: 'BUY',
+    })).rejects.toMatchObject({ name: 'ZodError' });
+    // The left symbol must belong to the left venue (multi-venue spot legs, b-plan).
+    await expect(engine.startStrategy({ ...carryConfig, leftSymbol: 'BINANCE_SPOT_BTC_USDT' }))
+      .rejects.toMatchObject({ name: 'ZodError' });
+    expect(runtime.listStrategies()).toHaveLength(0);
+  });
+
+  it('repairs a carry entry whose perpetual leg failed to submit', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    markets.set('GATE_SPOT_BTC_USDT', '99995', '100005');
+    setMarketWithFunding(markets, 'GATE_FUTURE_BTC_USDT', '100195', '100205', '0.001');
+    gateway.spotAccounts = [{ currency: 'USDT', available: '1000000', locked: '0' }];
+    gateway.failCreate('GATE_FUTURE_BTC_USDT', 1);
+    const record = await engine.startStrategy(carryConfig);
+
+    const entryTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 1);
+    expect(gateway.createdOrders[0]).toMatchObject({ symbol: 'GATE_SPOT_BTC_USDT', side: 'BUY', quote_qty: '10000' });
+    ackOrder(runtime, 'remote-1', 'FILLED', '0.1', '100005');
+    await entryTick;
+
+    // The hedge repair tops up the lagging perpetual leg with a full 0.1 short.
+    await waitFor(() => gateway.createdOrders.length === 2);
+    expect(gateway.createdOrders[1]).toMatchObject({
+      symbol: 'GATE_FUTURE_BTC_USDT', side: 'SELL', type: 'MARKET', qty: '0.1', reduce_only: 'false',
+    });
+    ackOrder(runtime, 'remote-2', 'FILLED', '0.1', '100195');
+    await waitFor(() => runtime.getStrategy(record.id).filledQuantity === '0.1');
+    expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+    expect(runtime.strategyLogs(record.id).some((log) => log.event === 'Hedging filled quantity')).toBe(true);
+  });
+
+  // ─── QA acceptance supplements (increment-3 independent verification) ───
+
+  it('QA supplement: opens a positive carry with a BINANCE spot leg, sizing the buy in quote currency', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    markets.set('BINANCE_SPOT_BTC_USDT', '99995', '100005');
+    setMarketWithFunding(markets, 'GATE_FUTURE_BTC_USDT', '100195', '100205', '0.001');
+    gateway.spotAccounts = [{ currency: 'USDT', available: '1000000', locked: '0' }];
+    const record = await engine.startStrategy({
+      ...carryConfig, leftVenue: 'BINANCE', leftSymbol: 'BINANCE_SPOT_BTC_USDT',
+    });
+    expect(record.id.startsWith('CARRY-')).toBe(true);
+
+    const entryTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 2);
+    const [spotOrder, perpOrder] = gateway.createdOrders;
+    // The BINANCE spot market buy is sized in quote currency at the spot mid (100000 × 0.1).
+    expect(spotOrder).toMatchObject({ symbol: 'BINANCE_SPOT_BTC_USDT', side: 'BUY', type: 'MARKET', quote_qty: '10000' });
+    expect(perpOrder).toMatchObject({ symbol: 'GATE_FUTURE_BTC_USDT', side: 'SELL', type: 'MARKET', qty: '0.1' });
+    ackOrder(runtime, 'remote-1', 'FILLED', '0.1', '100005');
+    ackOrder(runtime, 'remote-2', 'FILLED', '0.1', '100195');
+    await entryTick;
+    await waitFor(() => runtime.getStrategy(record.id).openPosition === '0.1');
+  });
+
+  it('QA supplement: a negative carry with a BINANCE spot leg must not clear its inventory check against the Gate spot account', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    markets.set('BINANCE_SPOT_BTC_USDT', '99995', '100005');
+    setMarketWithFunding(markets, 'GATE_FUTURE_BTC_USDT', '100195', '100205', '-0.001');
+    // TradingRuntime.querySpotAccounts() calls the Gate-only /spot/accounts endpoint, so these
+    // balances describe the GATE spot account. The user's BINANCE-side inventory is invisible to
+    // this call: a per-venue inventory gate can never pass (nor fail) on this data. The carry
+    // gate must therefore block the entry instead of treating Gate inventory as BINANCE inventory.
+    gateway.spotAccounts = [
+      { currency: 'USDT', available: '1000000', locked: '0' },
+      { currency: 'BTC', available: '0.2', locked: '0' },
+    ];
+    const record = await engine.startStrategy({
+      ...carryConfig, leftVenue: 'BINANCE', leftSymbol: 'BINANCE_SPOT_BTC_USDT',
+      fundingDirection: 'NEGATIVE', leftSide: 'SELL', rightSide: 'BUY', inventoryCheck: true,
+    });
+
+    await engine.tick();
+    expect(gateway.createdOrders).toHaveLength(0);
+    expect(runtime.strategyLogs(record.id).some((log) => log.event === 'Carry entry gate blocked')).toBe(true);
+  });
+
+  it('QA supplement round 2: a positive carry with a BINANCE spot leg is blocked when the reported venue USDT balance cannot cover the spot notional', async () => {
+    const { engine, runtime, gateway, database, markets } = await createHarness();
+    markets.set('BINANCE_SPOT_BTC_USDT', '99995', '100005');
+    setMarketWithFunding(markets, 'GATE_FUTURE_BTC_USDT', '100195', '100205', '0.001');
+    gateway.spotAccounts = [{ currency: 'USDT', available: '1000000', locked: '0' }];
+    // Reconciled BINANCE balance far below the spot notional (0.1 × ~100005).
+    database.prepare(`INSERT INTO live_balances (venue, coin, balance, available_balance, equity, unrealized_pnl, updated_at)
+      VALUES ('BINANCE', 'USDT', '1000', '1000', '1000', '0', ?)`).run(new Date().toISOString());
+    const record = await engine.startStrategy({
+      ...carryConfig, leftVenue: 'BINANCE', leftSymbol: 'BINANCE_SPOT_BTC_USDT',
+    });
+
+    await engine.tick();
+    expect(gateway.createdOrders).toHaveLength(0);
+    expect(runtime.strategyLogs(record.id).some((log) => log.event === 'Carry entry gate blocked')).toBe(true);
+  });
+
+  // ─── c-plan: cross-venue carry (architecture v2) ───
+
+  it('opens a cross-venue positive carry (BINANCE spot × OKX perpetual) gated on each venue balance', async () => {
+    const { engine, runtime, gateway, database, markets } = await createHarness();
+    markets.set('BINANCE_SPOT_BTC_USDT', '99995', '100005');
+    setMarketWithFunding(markets, 'OKX_FUTURE_BTC_USDT', '100195', '100205', '0.001');
+    // Neither leg sits on Gate: both sides of the gate route through the reconciled live
+    // balances instead of the Gate-only /spot/accounts endpoint (left empty on purpose).
+    const insert = database.prepare(`INSERT INTO live_balances (venue, coin, balance, available_balance, equity, unrealized_pnl, updated_at)
+      VALUES (?, ?, '1000000', '1000000', '1000000', '0', ?)`);
+    const now = new Date().toISOString();
+    insert.run('BINANCE', 'USDT', now);
+    insert.run('OKX', 'USDT', now);
+    const record = await engine.startStrategy({
+      ...carryConfig,
+      leftVenue: 'BINANCE', leftSymbol: 'BINANCE_SPOT_BTC_USDT',
+      rightVenue: 'OKX', rightSymbol: 'OKX_FUTURE_BTC_USDT',
+    });
+    expect(record.id.startsWith('CARRY-')).toBe(true);
+    expect(gateway.leverageUpdates).toHaveLength(0);
+
+    const entryTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 2);
+    const [spotOrder, perpOrder] = gateway.createdOrders;
+    expect(spotOrder).toMatchObject({ symbol: 'BINANCE_SPOT_BTC_USDT', side: 'BUY', type: 'MARKET', quote_qty: '10000' });
+    expect(perpOrder).toMatchObject({ symbol: 'OKX_FUTURE_BTC_USDT', side: 'SELL', type: 'MARKET', qty: '0.1' });
+    expect(runtime.strategyLogs(record.id).some((log) => log.event === 'Carry entry gate passed')).toBe(true);
+    ackOrder(runtime, 'remote-1', 'FILLED', '0.1', '100005');
+    ackOrder(runtime, 'remote-2', 'FILLED', '0.1', '100195');
+    await entryTick;
+    await waitFor(() => runtime.getStrategy(record.id).openPosition === '0.1');
+  });
+
+  it('blocks a cross-venue positive carry when the perpetual venue margin balance is insufficient', async () => {
+    const { engine, runtime, gateway, database, markets } = await createHarness();
+    markets.set('BINANCE_SPOT_BTC_USDT', '99995', '100005');
+    setMarketWithFunding(markets, 'OKX_FUTURE_BTC_USDT', '100195', '100205', '0.001');
+    const insert = database.prepare(`INSERT INTO live_balances (venue, coin, balance, available_balance, equity, unrealized_pnl, updated_at)
+      VALUES (?, ?, ?, ?, ?, '0', ?)`);
+    const now = new Date().toISOString();
+    // The spot notional (0.1 × ~100005) is covered, but the OKX margin (0.1 × ~100200) is not.
+    insert.run('BINANCE', 'USDT', '1000000', '1000000', '1000000', now);
+    insert.run('OKX', 'USDT', '1000', '1000', '1000', now);
+    const record = await engine.startStrategy({
+      ...carryConfig,
+      leftVenue: 'BINANCE', leftSymbol: 'BINANCE_SPOT_BTC_USDT',
+      rightVenue: 'OKX', rightSymbol: 'OKX_FUTURE_BTC_USDT',
+    });
+
+    await engine.tick();
+    expect(gateway.createdOrders).toHaveLength(0);
+    expect(runtime.strategyLogs(record.id).some((log) => log.event === 'Carry entry gate blocked')).toBe(true);
+  });
+
+  it('annualizes funding with the venue settlement interval and accrues on a 4h clock', async () => {
+    let now = Date.now();
+    const { engine, runtime, gateway, database, markets } = await createHarness({
+      now: () => now,
+      fundingIntervalHours: () => 4,
+    });
+    const timestamp = new Date(now).toISOString();
+    const nextSettlement = new Date(now + 4 * 3_600_000).toISOString();
+    markets.set('BINANCE_SPOT_BTC_USDT', '99995', '100005', timestamp, timestamp);
+    setMarketWithFunding(markets, 'OKX_FUTURE_BTC_USDT', '100195', '100205', '0.0001', nextSettlement);
+    markets.set('OKX_FUTURE_BTC_USDT', '100195', '100205', timestamp, timestamp, '0.0001', nextSettlement);
+    const insert = database.prepare(`INSERT INTO live_balances (venue, coin, balance, available_balance, equity, unrealized_pnl, updated_at)
+      VALUES (?, ?, '1000000', '1000000', '1000000', '0', ?)`);
+    insert.run('BINANCE', 'USDT', timestamp);
+    insert.run('OKX', 'USDT', timestamp);
+    const record = await engine.startStrategy({
+      ...carryConfig,
+      leftVenue: 'BINANCE', leftSymbol: 'BINANCE_SPOT_BTC_USDT',
+      rightVenue: 'OKX', rightSymbol: 'OKX_FUTURE_BTC_USDT',
+    });
+
+    const entryTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 2);
+    ackOrder(runtime, 'remote-1', 'FILLED', '0.1', '100005');
+    ackOrder(runtime, 'remote-2', 'FILLED', '0.1', '100195');
+    await entryTick;
+    // Latch tick: 0.0001 × (24/4) × 365 × 100 = 21.9% APR on the 4h venue cadence.
+    await engine.tick();
+    let metrics = runtime.getStrategy(record.id).carryMetrics;
+    expect(Number(metrics?.entryFundingApr)).toBeCloseTo(21.9, 6);
+
+    // Cross the 4h settlement: one period of |rate| × perp notional (0.0001 × 0.1 × 100200).
+    now += 4 * 3_600_000 + 1_000;
+    const refreshed = new Date(now).toISOString();
+    markets.set('BINANCE_SPOT_BTC_USDT', '99995', '100005', refreshed, refreshed);
+    markets.set('OKX_FUTURE_BTC_USDT', '100195', '100205', refreshed, refreshed, '0.0001', nextSettlement);
+    await engine.tick();
+
+    metrics = runtime.getStrategy(record.id).carryMetrics;
+    expect(Number(metrics?.fundingCollectedUsdt)).toBeCloseTo(1.002, 6);
+    expect(Date.parse(metrics?.nextFundingAccrualAt ?? '')).toBeGreaterThan(now);
+    expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+  });
+
+  it('warns once and falls back to the 8h cadence when the venue funding interval is unknown', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    markets.set('BINANCE_SPOT_BTC_USDT', '99995', '100005');
+    setMarketWithFunding(markets, 'OKX_FUTURE_BTC_USDT', '100195', '100205', '0.0001');
+    const record = await engine.startStrategy({
+      ...carryConfig,
+      leftVenue: 'BINANCE', leftSymbol: 'BINANCE_SPOT_BTC_USDT',
+      rightVenue: 'OKX', rightSymbol: 'OKX_FUTURE_BTC_USDT',
+    });
+
+    // 0.0001 on the 8h fallback = 10.95% APR < 15% minimum, so the entry stays flat.
+    await engine.tick();
+    await engine.tick();
+    const warningCount = runtime.strategyLogs(record.id)
+      .filter((log) => log.event === 'Funding interval unknown').length;
+    expect(warningCount).toBe(1);
+    expect(runtime.strategyLogs(record.id).some((log) => log.event === 'Waiting for funding threshold')).toBe(true);
+    expect(gateway.createdOrders).toHaveLength(0);
+  });
+
+  it('QA supplement v2: a cross-venue negative carry (BINANCE spot + OKX perp) verifies inventory on the spot venue and opens both legs', async () => {
+    const { engine, runtime, gateway, database, markets } = await createHarness();
+    markets.set('BINANCE_SPOT_BTC_USDT', '99995', '100005');
+    setMarketWithFunding(markets, 'OKX_FUTURE_BTC_USDT', '100195', '100205', '-0.001');
+    // Reconciled BINANCE inventory covers the configured amount (0.1 BTC).
+    database.prepare(`INSERT INTO live_balances (venue, coin, balance, available_balance, equity, unrealized_pnl, updated_at)
+      VALUES ('BINANCE', 'BTC', '0.2', '0.2', '0.2', '0', ?)`).run(new Date().toISOString());
+    const record = await engine.startStrategy({
+      ...carryConfig, leftVenue: 'BINANCE', leftSymbol: 'BINANCE_SPOT_BTC_USDT',
+      rightVenue: 'OKX', rightSymbol: 'OKX_FUTURE_BTC_USDT',
+      fundingDirection: 'NEGATIVE', leftSide: 'SELL', rightSide: 'BUY', inventoryCheck: true,
+    });
+
+    const entryTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 2);
+    const [spotOrder, perpOrder] = gateway.createdOrders;
+    // Spot market SELL is sized in base quantity on BINANCE; the perp BUY routes to OKX.
+    expect(spotOrder).toMatchObject({ symbol: 'BINANCE_SPOT_BTC_USDT', side: 'SELL', type: 'MARKET', qty: '0.1' });
+    expect(perpOrder).toMatchObject({ symbol: 'OKX_FUTURE_BTC_USDT', side: 'BUY', type: 'MARKET', qty: '0.1' });
+    ackOrder(runtime, 'remote-1', 'FILLED', '0.1', '99995');
+    ackOrder(runtime, 'remote-2', 'FILLED', '0.1', '100195');
+    await entryTick;
+    await waitFor(() => runtime.getStrategy(record.id).openPosition === '0.1');
   });
 });

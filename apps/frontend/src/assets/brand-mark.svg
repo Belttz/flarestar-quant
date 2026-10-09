@@ -1,10 +1,20 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="-112 -112 224 224" fill="none">
-  <circle cx="0" cy="0" r="100" stroke="#000000" stroke-width="12" />
+  <defs>
+    <linearGradient id="xsl-g" x1="-84" y1="-84" x2="84" y2="84" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#22d3ee" />
+      <stop offset="0.55" stop-color="#6366f1" />
+      <stop offset="1" stop-color="#c026d3" />
+    </linearGradient>
+    <linearGradient id="xsl-s" x1="-78" y1="-78" x2="78" y2="78" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#67e8f9" />
+      <stop offset="1" stop-color="#e879f9" />
+    </linearGradient>
+  </defs>
+  <circle cx="0" cy="0" r="100" stroke="url(#xsl-g)" stroke-width="9" opacity="0.92" />
   <path
-    d="M-76.10 17.10L0-59L76.10 17.10M-66.98 39.98L0-27L66.98 39.98M-52.60 57.60L0 5L52.60 57.60"
-    stroke="#000000"
-    stroke-width="12"
-    stroke-linecap="round"
-    stroke-linejoin="round"
+    d="M0 -80 C5.5 -31 31 -5.5 80 0 C31 5.5 5.5 31 0 80 C-5.5 31 -31 5.5 -80 0 C-31 -5.5 -5.5 -31 0 -80 Z"
+    fill="url(#xsl-s)"
   />
+  <circle cx="40" cy="-40" r="11" fill="#22d3ee" />
+  <circle cx="40" cy="-40" r="4.5" fill="#0b0f17" />
 </svg>

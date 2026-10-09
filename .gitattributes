@@ -1,0 +1,18 @@
+# Keep the two deployment targets from corrupting each other's scripts.
+#
+# Linux/macOS: `curl -fsSL .../bootstrap.sh | bash` breaks on CRLF (the shell sees
+# `\r` as part of the command). These files must be stored AND checked out as LF.
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Windows: cmd.exe mis-parses multi-line blocks (if/for with parentheses) when the
+# .bat file has LF-only endings, so these are checked out as CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Windows PowerShell 5.1 reads these as ANSI unless they carry a UTF-8 BOM.
+# Never let a text filter strip that BOM.
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf

@@ -30,9 +30,11 @@ describe('database migrations', () => {
 
     expect(readDatabaseStatus(first)).toEqual({
       state: 'ok',
-      migrationCount: 20,
-      currentMigration: '0020_strategy_account_backfill.sql',
+      migrationCount: 23,
+      currentMigration: '0023_portfolio_equity_samples.sql',
     });
+    const strategyMetricsColumns = first.prepare('PRAGMA table_info(execution_strategies)').all() as Array<{ name: string }>;
+    expect(strategyMetricsColumns.map((column) => column.name)).toContain('metrics_json');
     const orderColumns = first.prepare('PRAGMA table_info(execution_orders)').all() as Array<{ name: string }>;
     expect(orderColumns.map((column) => column.name)).toContain('failure_reason');
     const positionColumns = first.prepare('PRAGMA table_info(live_positions)').all() as Array<{ name: string }>;
@@ -41,6 +43,10 @@ describe('database migrations', () => {
     expect(strategyColumns.map((column) => column.name)).toEqual(expect.arrayContaining([
       'credential_profile_id', 'credential_profile_label',
     ]));
+    const equitySampleColumns = first.prepare('PRAGMA table_info(portfolio_equity_samples)').all() as Array<{ name: string }>;
+    expect(equitySampleColumns.map((column) => column.name)).toEqual(expect.arrayContaining([
+      'granularity', 'bucket_start', 'sampled_at', 'equity', 'unrealized_pnl',
+    ]));
     if (process.platform !== 'win32') {
       expect(statSync(location.directory).mode & 0o777).toBe(0o700);
       expect(statSync(location.path).mode & 0o777).toBe(0o600);
@@ -48,7 +54,7 @@ describe('database migrations', () => {
     first.close();
 
     const reopened = openDatabase(location.path, migrationsDir);
-    expect(readDatabaseStatus(reopened).migrationCount).toBe(20);
+    expect(readDatabaseStatus(reopened).migrationCount).toBe(23);
     reopened.close();
   });
 
@@ -143,7 +149,7 @@ describe('database migrations', () => {
     const database = openDatabase(location.path, resolve(process.cwd(), '../../migrations'));
     const columns = database.prepare('PRAGMA table_info(audit_events)').all() as Array<{ name: string }>;
     expect(columns.map((column) => column.name)).toContain('correlation_id');
-    expect(readDatabaseStatus(database).currentMigration).toBe('0020_strategy_account_backfill.sql');
+    expect(readDatabaseStatus(database).currentMigration).toBe('0023_portfolio_equity_samples.sql');
     database.close();
   });
 
@@ -207,6 +213,7 @@ describe('database migrations', () => {
       strategyLogsDeleted: 1,
       fillsDeleted: 2,
       ordersDeleted: 2,
+      portfolioEquitySamplesDeleted: 0,
     });
     expect(database.prepare('SELECT id FROM execution_strategy_logs ORDER BY id').all())
       .toEqual([{ id: 'log-running' }]);

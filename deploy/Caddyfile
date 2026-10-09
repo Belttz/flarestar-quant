@@ -1,0 +1,3 @@
+{$GCT_DOMAIN} {
+	reverse_proxy gate-crossex:17840
+}

@@ -13,6 +13,7 @@ import {
   isTerminalOrderState,
   type CreateStrategyInput,
   type ExecutionOrder,
+  type StrategyCarryMetrics,
   type StrategyRecord,
   type UpdatePremiumTakeProfitInput,
   unresolvedOrderDetails,
@@ -24,6 +25,12 @@ export interface MarketSource {
   market(symbol: string): LiveMarket | null;
   /** Register a catalog-known symbol on demand so its ticker streams; false when unknown. */
   ensureMarket?(symbol: string): boolean;
+  /**
+   * Subscribe the given symbols to live ticker frames and return an idempotent release. The
+   * engine holds one subscription per running strategy: without it, dynamically ensured symbols
+   * never receive a WebSocket subscription and the launch wait for fresh prices cannot succeed.
+   */
+  watchQuotes?(symbols: string[]): () => void;
   /** Current upstream public-stream state, when the source can expose it. */
   connectionState?(): 'connecting' | 'healthy' | 'reconnecting' | 'stale' | 'disconnected';
 }
@@ -43,6 +50,18 @@ export interface StrategyEngineOptions {
   futureQuoteToleranceMs?: number;
   /** Cooldown between hedge-repair attempts. */
   repairCooldownMs?: number;
+  /**
+   * How long strategy launch waits for both legs' first live ticker frame before rejecting with
+   * `strategy_market_data_unavailable`. A dynamically ensured symbol starts as a zero-priced
+   * placeholder, so an immediate check would reject tradable strategies.
+   */
+  marketDataWaitTimeoutMs?: number;
+  /**
+   * Funding settlement interval in hours for one executable perpetual symbol, from the funding
+   * overview cache. Returning null/undefined (or omitting the dependency) falls back to Gate's
+   * 8h cadence for APR annualization and the accrual clock, with a strategy-log warning.
+   */
+  fundingIntervalHours?: (symbol: string) => number | null | undefined;
   now?: () => number;
 }
 
@@ -59,7 +78,7 @@ interface MakerQuote {
 interface StrategyActor {
   id: string;
   config: CreateStrategyInput;
-  kind: 'position' | 'auto' | 'premium';
+  kind: 'position' | 'auto' | 'premium' | 'carry';
   status: string;
   busy: boolean;
   queue: Promise<void>;
@@ -76,6 +95,34 @@ interface StrategyActor {
   unresolvedOrders: UnresolvedOrderReport[];
   createdAt: number;
   lastCloseAt: number;
+  /** auto: latched once a stop-loss exit clip was submitted; the strategy stops when flat. */
+  stopLossArmed: boolean;
+  /** carry: in-memory accounting state; reset when the backend restarts (re-estimated from fills). */
+  carry: CarryRuntimeState | null;
+  /** Serialized metrics of the last write, so unchanged snapshots do not touch the database. */
+  lastCarryMetricsJson: string | null;
+  /** Releases the leg-symbol ticker subscription taken at launch; null once already released. */
+  quoteWatchRelease: (() => void) | null;
+}
+
+/** In-memory carry accounting (§7-3 field semantics; persisted via strategy metrics). */
+interface CarryRuntimeState {
+  fundingCollectedUsdt: Decimal;
+  basisEntryBps: Decimal | null;
+  basisCurrentBps: Decimal | null;
+  entryFundingApr: Decimal | null;
+  entrySpotNotionalUsdt: Decimal | null;
+  nextFundingAccrualAt: number | null;
+  exited: boolean;
+  /** Last entry-gate outcome, used to log only state transitions instead of every tick. */
+  lastGatePassed: boolean | null;
+}
+
+function emptyCarryState(): CarryRuntimeState {
+  return {
+    fundingCollectedUsdt: ZERO, basisEntryBps: null, basisCurrentBps: null, entryFundingApr: null,
+    entrySpotNotionalUsdt: null, nextFundingAccrualAt: null, exited: false, lastGatePassed: null,
+  };
 }
 
 interface LegDefinition {
@@ -100,6 +147,24 @@ const RUNG_EPSILON = new Decimal('1e-9');
 const BPS = new Decimal(10_000);
 /** Keep dust-repair orders clear of a moving venue's exact minimum-notional boundary. */
 const MIN_NOTIONAL_REPAIR_BUFFER = new Decimal('1.1');
+/** Poll cadence while waiting for a strategy symbol's first live ticker frame. */
+const MARKET_WAIT_POLL_MS = 100;
+/** Fallback funding settlement cadence (8h) for symbols whose venue interval is unknown. */
+const FUNDING_PERIOD_MS = 8 * 3_600_000;
+/** Bounds the catch-up loop after a long suspension so one tick cannot accrue unbounded periods. */
+const MAX_FUNDING_ACCRUAL_CATCHUP = 40;
+/** Legacy carry fallback prefix (rows created before cross-venue carry was unlocked). */
+const GATE_SPOT_SYMBOL_PREFIX = 'GATE_SPOT_';
+
+function isSpotSymbol(symbol: string): boolean {
+  return /^[A-Z0-9]+_SPOT_/.test(symbol);
+}
+
+/** Annualize a funding rate into a percentage: |rate| × (24/interval) periods/day × 365 × 100. */
+function fundingAprFromRate(rate: Decimal, intervalHours: number): Decimal {
+  const settlementsPerDay = 24 / intervalHours;
+  return rate.abs().mul(settlementsPerDay).mul(365).mul(100);
+}
 
 function symbolFor(venue: string, asset: string): string {
   const quote = venue === 'KRAKEN' ? 'USD' : venue === 'HYPERLIQUID' || venue === 'DERIBIT' || venue === 'LIGHTER' ? 'USDC' : 'USDT';
@@ -109,11 +174,15 @@ function symbolFor(venue: string, asset: string): string {
 
 function legsOf(config: CreateStrategyInput): { left: LegDefinition; right: LegDefinition } {
   // Premium strategies hedge the ADR (left) with the local listing (right); other kinds trade the
-  // same asset on both venues.
+  // same asset on both venues. Explicit symbols win (auto spot legs, carry legs); carry falls
+  // back to the legacy Gate-only pair for rows persisted before cross-venue carry was unlocked.
   const rightAsset = config.kind === 'premium' ? config.hedgeAsset ?? config.asset : config.asset;
+  const leftSymbol = config.leftSymbol
+    ?? (config.kind === 'carry' ? `${GATE_SPOT_SYMBOL_PREFIX}${config.asset}_USDT` : symbolFor(config.leftVenue, config.asset));
+  const rightSymbol = config.rightSymbol ?? symbolFor(config.rightVenue, rightAsset);
   return {
-    left: { leg: 'left', venue: config.leftVenue, side: config.leftSide, symbol: symbolFor(config.leftVenue, config.asset) },
-    right: { leg: 'right', venue: config.rightVenue, side: config.rightSide, symbol: symbolFor(config.rightVenue, rightAsset) },
+    left: { leg: 'left', venue: config.leftVenue, side: config.leftSide, symbol: leftSymbol },
+    right: { leg: 'right', venue: config.rightVenue, side: config.rightSide, symbol: rightSymbol },
   };
 }
 
@@ -248,6 +317,9 @@ export class StrategyEngine {
   private readonly openStrategyOrderIdsStatement;
   private readonly instrumentConstraintsStatement;
   private readonly latestLegOrderStatement;
+  private readonly strategyFeesStatement;
+  /** Symbols whose missing funding interval already produced the 8h fallback warning. */
+  private readonly intervalFallbackWarned = new Set<string>();
   private stopped = false;
 
   constructor(
@@ -265,6 +337,9 @@ export class StrategyEngine {
       marketMaxTransportLagMs: options.marketMaxTransportLagMs ?? 3_000,
       futureQuoteToleranceMs: options.futureQuoteToleranceMs ?? 2_000,
       repairCooldownMs: options.repairCooldownMs ?? 3_000,
+      marketDataWaitTimeoutMs: options.marketDataWaitTimeoutMs ?? 10_000,
+      // A missing adapter reports null so carry accounting falls back to the 8h Gate cadence.
+      fundingIntervalHours: options.fundingIntervalHours ?? (() => null),
       now: options.now ?? Date.now,
     };
     this.strategyOrderRowsStatement = database.prepare(`SELECT strategy_leg AS leg, symbol, side, quantity, executed_quantity, strategy_clip, reduce_only
@@ -278,6 +353,10 @@ export class StrategyEngine {
       FROM execution_orders
       WHERE strategy_id = ? AND strategy_leg = ? AND symbol = ? AND side = ?
       ORDER BY created_at DESC, rowid DESC LIMIT 1`);
+    this.strategyFeesStatement = database.prepare(`SELECT COALESCE(fill.fee, '0') AS fee
+      FROM execution_fills AS fill
+      JOIN execution_orders AS strategy_order ON strategy_order.id = fill.order_id
+      WHERE strategy_order.strategy_id = ?`);
     this.unsubscribers.push(this.runtime.onFill((fill) => {
       if (!fill.strategyId) return;
       this.invalidateLedger(fill.strategyId);
@@ -317,6 +396,7 @@ export class StrategyEngine {
         { unresolvedOrders: unresolvedOrderDetails(quiesced.unresolved) });
     }
     for (const actor of this.actors.values()) actor.suspended = true;
+    for (const actor of this.actors.values()) this.releaseQuoteWatch(actor);
     this.actors.clear();
     // A process may have exited while a pause/stop was waiting for remote cancellation. Once every
     // persisted order is confirmed terminal, finish that state transition before any RUNNING
@@ -356,6 +436,7 @@ export class StrategyEngine {
     const result = await this.runtime.quiesceOpenOrders({ timeoutMs: this.options.orderTimeoutMs });
     if (result.unresolved.length === 0) {
       for (const actor of this.actors.values()) actor.quotes.clear();
+      for (const actor of this.actors.values()) this.releaseQuoteWatch(actor);
       this.actors.clear();
     }
     return result.unresolved;
@@ -386,6 +467,7 @@ export class StrategyEngine {
       for (const record of running) update.run(updatedAt, record.id);
     })();
     for (const actor of this.actors.values()) actor.suspended = true;
+    for (const actor of this.actors.values()) this.releaseQuoteWatch(actor);
     this.actors.clear();
     this.ledgerCache.clear();
     for (const record of running) {
@@ -408,8 +490,9 @@ export class StrategyEngine {
     for (const { order, reason } of result.unresolved) {
       if (!order.strategyId) continue;
       this.runtime.addStrategyLog(order.strategyId, 'error', 'Shutdown cancellation pending',
-        'Remote cancellation not confirmed', '—', `${order.id} · ${reason}`);
+        'Remote cancellation not confirmed', '—',         `${order.id} · ${reason}`);
     }
+    for (const actor of this.actors.values()) this.releaseQuoteWatch(actor);
     this.actors.clear();
     this.ledgerCache.clear();
   }
@@ -428,7 +511,11 @@ export class StrategyEngine {
     if (input.kind === 'premium' && input.grid) {
       throw new StrategyEngineError('premium_grid_mode_removed', 400);
     }
-    if (input.kind === 'auto' && input.takeProfitBps && input.entryBps && new Decimal(input.takeProfitBps).gte(new Decimal(input.entryBps))) {
+    // Auto thresholds are signed, so the classic "take profit below entry" sanity check only
+    // applies to positive entries; negative entries enter cheap and always profit on regression.
+    if (input.kind === 'auto' && input.takeProfitBps && input.entryBps
+      && new Decimal(input.entryBps).gt(0)
+      && new Decimal(input.takeProfitBps).gte(new Decimal(input.entryBps))) {
       throw new StrategyEngineError('take_profit_must_be_below_entry', 400);
     }
     if (input.kind === 'premium' && !input.grid && !input.reduceOnly
@@ -443,64 +530,82 @@ export class StrategyEngine {
     const running = this.runtime.listStrategies().filter((strategy) => strategy.status === 'RUNNING');
     if (running.length >= 10) throw new StrategyEngineError('too_many_running_strategies', 409);
     let marginPreflight = { requiredMargin: '0', availableMargin: '0' };
-    if (input.closePlan) {
-      for (const target of input.closePlan.targets) {
-        if (!this.markets.market(target.symbol) && !this.markets.ensureMarket?.(target.symbol)) {
-          throw new StrategyEngineError('unknown_strategy_market', 400);
+    // The engine owns its legs' ticker subscriptions: nothing else watches strategy symbols, so
+    // without subscribing here the fresh-price wait below would always time out on a dynamic
+    // symbol. The subscription lives from here until the runtime actor takes ownership; any
+    // failure in between (validation, margin preflight, persistence) releases it in `finally`.
+    let launchQuoteWatchRelease: (() => void) | null = null;
+    try {
+      if (input.closePlan) {
+        for (const target of input.closePlan.targets) {
+          if (!this.markets.market(target.symbol) && !this.markets.ensureMarket?.(target.symbol)) {
+            throw new StrategyEngineError('unknown_strategy_market', 400);
+          }
         }
-      }
-      this.validateClosePlanOrderSizes(input);
-      await this.runtime.prepareReduceOnlyStrategy(input.closePlan.targets.map((target) => ({
-        symbol: target.symbol,
-        venue: target.symbol.split('_', 1)[0] ?? '',
-        side: target.side,
-        leverage: '1',
-        estimatedQuantity: target.quantity,
-        estimatedPrice: '0',
-        positionSide: target.positionSide,
-      })));
-    } else {
-      const legs = legsOf(input);
-      for (const leg of [legs.left, legs.right]) {
-        if (!this.markets.market(leg.symbol) && !this.markets.ensureMarket?.(leg.symbol)) {
-          throw new StrategyEngineError('unknown_strategy_market', 400);
+        this.validateClosePlanOrderSizes(input);
+        await this.runtime.prepareReduceOnlyStrategy(input.closePlan.targets.map((target) => ({
+          symbol: target.symbol,
+          venue: target.symbol.split('_', 1)[0] ?? '',
+          side: target.side,
+          leverage: '1',
+          estimatedQuantity: target.quantity,
+          estimatedPrice: '0',
+          positionSide: target.positionSide,
+        })));
+      } else {
+        const legs = legsOf(input);
+        for (const leg of [legs.left, legs.right]) {
+          if (!this.markets.market(leg.symbol) && !this.markets.ensureMarket?.(leg.symbol)) {
+            throw new StrategyEngineError('unknown_strategy_market', 400);
+          }
         }
+        launchQuoteWatchRelease = this.markets.watchQuotes?.([legs.left.symbol, legs.right.symbol]) ?? null;
+        // Dynamic symbols may still be waiting for their first ticker frame; wait for live prices
+        // instead of rejecting a tradable strategy at the first size/price check below.
+        await this.awaitFreshMarketPair(legs);
+        this.validateStrategyOrderSizes(input, legs);
+        marginPreflight = await this.prepareStrategy(input, legs);
       }
-      this.validateStrategyOrderSizes(input, legs);
-      marginPreflight = await this.prepareStrategy(input, legs);
+      const prefix = input.closePlan ? 'CLOSE' : input.kind === 'auto' ? 'AUTO' : input.kind === 'premium' ? 'PREM' : input.kind === 'carry' ? 'CARRY' : 'PAIR';
+      const id = `${prefix}-${randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase()}`;
+      const now = new Date().toISOString();
+      this.database.prepare(`INSERT INTO execution_strategies (id, kind, environment, status, config_json, progress,
+        filled_quantity, filled_left, filled_right, open_position, credential_profile_id,
+        credential_profile_label, created_at, updated_at, stopped_at)
+        VALUES (?, ?, 'live', 'RUNNING', ?, 0, '0', '0', '0', '0', ?, ?, ?, ?, NULL)`)
+        .run(id, input.kind, JSON.stringify(input), account?.profileId ?? null, account?.label ?? null, now, now);
+      const shortPremium = input.leftSide === 'SELL';
+      const hedgeModeLabel = input.hedgeMode === 'EQUAL_NOTIONAL' ? 'equal-notional hedge' : 'share-ratio hedge';
+      const startCondition = input.closePlan
+        ? `${input.closePlan.orderCount} reduce-only slices · ${input.closePlan.intervalSeconds}s interval`
+        : input.kind === 'premium'
+        ? input.grid
+          ? `Grid ${input.gridLevels} × ${input.gridStepPct}% from ${input.entryPremiumPct}% premium · ${hedgeModeLabel}`
+          : input.reduceOnly
+            ? `Reduce existing positions at ${shortPremium ? '≥' : '≤'} ${input.entryPremiumPct}% premium · ${hedgeModeLabel}`
+            : `Enter ${shortPremium ? '≥' : '≤'} ${input.entryPremiumPct}% · exit ${shortPremium ? '≤' : '≥'} ${input.takeProfitPremiumPct}% premium · ${hedgeModeLabel}`
+        : input.kind === 'auto'
+          ? `Enter ${input.entryBps && new Decimal(input.entryBps).lt(0) ? '≤' : '≥'} ${input.entryBps} bps · exit ${input.takeProfitBps ? `≤ ${input.takeProfitBps} bps` : 'on take profit'}${input.stopLossBps ? ` · stop-loss ${input.stopLossBps} bps` : ''}`
+          : input.kind === 'carry'
+            ? `${input.fundingDirection} funding carry · APR ≥ ${input.fundingAprMin}% · basis take-profit ${input.basisTakeProfitBps} bps`
+            : `Enter ≥ ${input.entryBps} bps`;
+      this.runtime.addStrategyLog(id, 'info', 'Strategy started', startCondition,
+        input.closePlan ? `${input.closePlan.targets.length} position${input.closePlan.targets.length === 1 ? '' : 's'}` : `${input.perOrderQuantity} ${input.asset}`,
+        input.closePlan
+          ? 'Timed reduce-only close · existing positions validated before scheduling'
+          : input.reduceOnly
+          ? 'Reduce-only mode · existing positions validated on both legs'
+          : `Leverage ${input.leftLeverage ?? '1'}× / ${input.rightLeverage ?? '1'}× · reserved margin ${marginPreflight.requiredMargin} of ${marginPreflight.availableMargin}`);
+      const record = this.runtime.getStrategy(id);
+      const actor = this.attach(record);
+      // Keep the legs' ticker subscription alive for the whole strategy lifetime.
+      actor.quoteWatchRelease = launchQuoteWatchRelease;
+      launchQuoteWatchRelease = null;
+      this.runtime.emitStrategyUpdate(record);
+      return record;
+    } finally {
+      launchQuoteWatchRelease?.();
     }
-    const prefix = input.closePlan ? 'CLOSE' : input.kind === 'auto' ? 'AUTO' : input.kind === 'premium' ? 'PREM' : 'PAIR';
-    const id = `${prefix}-${randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase()}`;
-    const now = new Date().toISOString();
-    this.database.prepare(`INSERT INTO execution_strategies (id, kind, environment, status, config_json, progress,
-      filled_quantity, filled_left, filled_right, open_position, credential_profile_id,
-      credential_profile_label, created_at, updated_at, stopped_at)
-      VALUES (?, ?, 'live', 'RUNNING', ?, 0, '0', '0', '0', '0', ?, ?, ?, ?, NULL)`)
-      .run(id, input.kind, JSON.stringify(input), account?.profileId ?? null, account?.label ?? null, now, now);
-    const shortPremium = input.leftSide === 'SELL';
-    const hedgeModeLabel = input.hedgeMode === 'EQUAL_NOTIONAL' ? 'equal-notional hedge' : 'share-ratio hedge';
-    const startCondition = input.closePlan
-      ? `${input.closePlan.orderCount} reduce-only slices · ${input.closePlan.intervalSeconds}s interval`
-      : input.kind === 'premium'
-      ? input.grid
-        ? `Grid ${input.gridLevels} × ${input.gridStepPct}% from ${input.entryPremiumPct}% premium · ${hedgeModeLabel}`
-        : input.reduceOnly
-          ? `Reduce existing positions at ${shortPremium ? '≥' : '≤'} ${input.entryPremiumPct}% premium · ${hedgeModeLabel}`
-          : `Enter ${shortPremium ? '≥' : '≤'} ${input.entryPremiumPct}% · exit ${shortPremium ? '≤' : '≥'} ${input.takeProfitPremiumPct}% premium · ${hedgeModeLabel}`
-      : input.kind === 'auto'
-        ? `Enter ≥ ${input.entryBps} bps · exit ≤ ${input.takeProfitBps} bps`
-        : `Enter ≥ ${input.entryBps} bps`;
-    this.runtime.addStrategyLog(id, 'info', 'Strategy started', startCondition,
-      input.closePlan ? `${input.closePlan.targets.length} position${input.closePlan.targets.length === 1 ? '' : 's'}` : `${input.perOrderQuantity} ${input.asset}`,
-      input.closePlan
-        ? 'Timed reduce-only close · existing positions validated before scheduling'
-        : input.reduceOnly
-        ? 'Reduce-only mode · existing positions validated on both legs'
-        : `Leverage ${input.leftLeverage}× / ${input.rightLeverage}× · reserved margin ${marginPreflight.requiredMargin} of ${marginPreflight.availableMargin}`);
-    const record = this.runtime.getStrategy(id);
-    this.attach(record);
-    this.runtime.emitStrategyUpdate(record);
-    return record;
   }
 
   async stopStrategy(id: string): Promise<StrategyRecord> {
@@ -550,56 +655,72 @@ export class StrategyEngine {
     }
 
     const config = record.config;
-    if (config.closePlan) {
-      for (const target of config.closePlan.targets) {
-        if (!this.markets.market(target.symbol) && !this.markets.ensureMarket?.(target.symbol)) {
-          throw new StrategyEngineError('unknown_strategy_market', 400);
+    // The subscription lives from here until the runtime actor takes ownership; any failure in
+    // between (fresh-price wait, size checks, the post-wait re-checks, persistence) — including a
+    // concurrent request consuming the final running slot while the wait runs — releases it.
+    let resumeQuoteWatchRelease: (() => void) | null = null;
+    try {
+      if (config.closePlan) {
+        for (const target of config.closePlan.targets) {
+          if (!this.markets.market(target.symbol) && !this.markets.ensureMarket?.(target.symbol)) {
+            throw new StrategyEngineError('unknown_strategy_market', 400);
+          }
         }
-      }
-      this.validateClosePlanOrderSizes(config);
-      await this.runtime.prepareReduceOnlyStrategy(config.closePlan.targets.map((target) => ({
-        symbol: target.symbol,
-        venue: target.symbol.split('_', 1)[0] ?? '',
-        side: target.side,
-        leverage: '1',
-        estimatedQuantity: target.quantity,
-        estimatedPrice: '0',
-        positionSide: target.positionSide,
-      })));
-    } else {
-      const legs = legsOf(config);
-      for (const leg of [legs.left, legs.right]) {
-        if (!this.markets.market(leg.symbol) && !this.markets.ensureMarket?.(leg.symbol)) {
-          throw new StrategyEngineError('unknown_strategy_market', 400);
+        this.validateClosePlanOrderSizes(config);
+        await this.runtime.prepareReduceOnlyStrategy(config.closePlan.targets.map((target) => ({
+          symbol: target.symbol,
+          venue: target.symbol.split('_', 1)[0] ?? '',
+          side: target.side,
+          leverage: '1',
+          estimatedQuantity: target.quantity,
+          estimatedPrice: '0',
+          positionSide: target.positionSide,
+        })));
+      } else {
+        const legs = legsOf(config);
+        for (const leg of [legs.left, legs.right]) {
+          if (!this.markets.market(leg.symbol) && !this.markets.ensureMarket?.(leg.symbol)) {
+            throw new StrategyEngineError('unknown_strategy_market', 400);
+          }
         }
+        // The engine owns its legs' ticker subscriptions: nothing else watches strategy symbols,
+        // so without subscribing here the fresh-price wait below would always time out on a
+        // dynamic symbol.
+        resumeQuoteWatchRelease = this.markets.watchQuotes?.([legs.left.symbol, legs.right.symbol]) ?? null;
+        await this.awaitFreshMarketPair(legs);
+        this.validateStrategyOrderSizes(config, legs);
+        await this.prepareStrategy(config, legs);
       }
-      this.validateStrategyOrderSizes(config, legs);
-      await this.prepareStrategy(config, legs);
-    }
 
-    // Re-check after the asynchronous account and order preflights. Another request may have
-    // locked trading, resumed this strategy, or consumed the final running-strategy slot in the
-    // meantime.
-    if (!this.session.liveTradingEnabled) throw new StrategyEngineError('live_trading_locked', 403);
-    const current = this.runtime.getStrategy(id);
-    if (current.status !== 'PAUSED') throw new StrategyEngineError('strategy_not_paused', 409);
-    if (current.accountProfileId !== null && current.accountProfileId !== credentialProfileId) {
-      throw new StrategyEngineError('strategy_account_not_active', 409);
-    }
-    if (this.runtime.listStrategies().filter((strategy) => strategy.status === 'RUNNING').length >= 10) {
-      throw new StrategyEngineError('too_many_running_strategies', 409);
-    }
+      // Re-check after the asynchronous account and order preflights. Another request may have
+      // locked trading, resumed this strategy, or consumed the final running-strategy slot in the
+      // meantime.
+      if (!this.session.liveTradingEnabled) throw new StrategyEngineError('live_trading_locked', 403);
+      const current = this.runtime.getStrategy(id);
+      if (current.status !== 'PAUSED') throw new StrategyEngineError('strategy_not_paused', 409);
+      if (current.accountProfileId !== null && current.accountProfileId !== credentialProfileId) {
+        throw new StrategyEngineError('strategy_account_not_active', 409);
+      }
+      if (this.runtime.listStrategies().filter((strategy) => strategy.status === 'RUNNING').length >= 10) {
+        throw new StrategyEngineError('too_many_running_strategies', 409);
+      }
 
-    const now = new Date().toISOString();
-    const updated = this.database.prepare(`UPDATE execution_strategies
-      SET status = 'RUNNING', stopped_at = NULL, updated_at = ?
-      WHERE id = ? AND status = 'PAUSED'`).run(now, id);
-    if (updated.changes !== 1) throw new StrategyEngineError('strategy_not_paused', 409);
-    this.runtime.addStrategyLog(id, 'info', 'Strategy resumed', 'Manual resume', '—', 'Preflight passed · monitoring live spreads');
-    const resumed = this.runtime.getStrategy(id);
-    this.attach(resumed);
-    this.runtime.emitStrategyUpdate(resumed);
-    return resumed;
+      const now = new Date().toISOString();
+      const updated = this.database.prepare(`UPDATE execution_strategies
+        SET status = 'RUNNING', stopped_at = NULL, updated_at = ?
+        WHERE id = ? AND status = 'PAUSED'`).run(now, id);
+      if (updated.changes !== 1) throw new StrategyEngineError('strategy_not_paused', 409);
+      this.runtime.addStrategyLog(id, 'info', 'Strategy resumed', 'Manual resume', '—', 'Preflight passed · monitoring live spreads');
+      const resumed = this.runtime.getStrategy(id);
+      const actor = this.attach(resumed);
+      // Keep the legs' ticker subscription alive for the whole strategy lifetime.
+      actor.quoteWatchRelease = resumeQuoteWatchRelease;
+      resumeQuoteWatchRelease = null;
+      this.runtime.emitStrategyUpdate(resumed);
+      return resumed;
+    } finally {
+      resumeQuoteWatchRelease?.();
+    }
   }
 
   async updatePremiumTakeProfit(id: string, raw: unknown): Promise<StrategyRecord> {
@@ -679,7 +800,20 @@ export class StrategyEngine {
     await Promise.all([...this.actors.values()].map((actor) => actor.queue.catch(() => undefined)));
   }
 
+  /** Releases a strategy's leg-symbol quote subscription exactly once; safe to call repeatedly. */
+  private releaseQuoteWatch(actor: StrategyActor): void {
+    const release = actor.quoteWatchRelease;
+    if (!release) return;
+    actor.quoteWatchRelease = null;
+    try {
+      release();
+    } catch { /* A broken release must never break strategy teardown. */ }
+  }
+
   private attach(record: StrategyRecord, suspended = false): StrategyActor {
+    // Replacing a stale actor must not leak its leg quote subscription.
+    const existing = this.actors.get(record.id);
+    if (existing) this.releaseQuoteWatch(existing);
     this.invalidateLedger(record.id);
     const actor: StrategyActor = {
       id: record.id, config: record.config, kind: record.kind, status: record.status,
@@ -687,6 +821,10 @@ export class StrategyEngine {
       lastRepairAt: 0, failureCount: 0, cooldownUntil: 0, lastQuoteAt: 0,
       suspended, quiesceTarget: null, quiesceReason: null, unresolvedOrders: [], createdAt: Date.parse(record.createdAt),
       lastCloseAt: Date.parse(record.updatedAt),
+      stopLossArmed: false,
+      carry: record.kind === 'carry' ? emptyCarryState() : null,
+      lastCarryMetricsJson: null,
+      quoteWatchRelease: null,
     };
     this.actors.set(record.id, actor);
     return actor;
@@ -734,7 +872,7 @@ export class StrategyEngine {
         symbol: legs.left.symbol,
         venue: legs.left.venue,
         side: legs.left.side,
-        leverage: config.leftLeverage,
+        leverage: config.leftLeverage ?? '1',
         estimatedQuantity: target.toString(),
         estimatedPrice: leftPrice.toString(),
       },
@@ -742,7 +880,8 @@ export class StrategyEngine {
         symbol: legs.right.symbol,
         venue: legs.right.venue,
         side: legs.right.side,
-        leverage: config.rightLeverage,
+        // Carry reserves margin at the configured contract leverage preset.
+        leverage: config.kind === 'carry' ? config.contractLeverage ?? '1' : config.rightLeverage ?? '1',
         estimatedQuantity: rightQuantity.toString(),
         estimatedPrice: rightPrice.toString(),
       },
@@ -751,7 +890,9 @@ export class StrategyEngine {
       await this.runtime.prepareReduceOnlyStrategy(plannedLegs);
       return { requiredMargin: '0', availableMargin: '0' };
     }
-    return this.runtime.prepareStrategyMargin(plannedLegs);
+    // Carry must not touch the account leverage preset: the perp leg trades at whatever the user
+    // configured, and the engine only reserves margin against that preset.
+    return this.runtime.prepareStrategyMargin(plannedLegs, { mutateLeverage: config.kind !== 'carry' });
   }
 
   private enqueue(actor: StrategyActor, work: () => Promise<void>): void {
@@ -785,6 +926,37 @@ export class StrategyEngine {
     const right = this.freshMarket(rightSymbol);
     if (!left || !right) return null;
     return { left, right };
+  }
+
+  /**
+   * Wait until both legs expose a fresh, non-zero executable price before validating a launch.
+   * A dynamically ensured symbol registers as a zero-priced placeholder until its first ticker
+   * frame arrives, so checking immediately after `ensureMarket` would reject perfectly tradable
+   * strategies with `strategy_market_data_unavailable`. Poll instead and reject only once the
+   * wait budget is exhausted (upstream down, unknown symbol, or a genuinely dead feed).
+   */
+  private async awaitFreshMarketPair(
+    legs: { left: LegDefinition; right: LegDefinition },
+  ): Promise<void> {
+    const deadline = this.options.now() + this.options.marketDataWaitTimeoutMs;
+    const executablePrice = (market: LiveMarket, side: 'BUY' | 'SELL') =>
+      new Decimal(side === 'BUY' ? market.askPrice : market.bidPrice);
+    for (;;) {
+      const pair = this.freshMarketPair(legs.left.symbol, legs.right.symbol);
+      if (pair
+        && executablePrice(pair.left, legs.left.side).gt(0)
+        && executablePrice(pair.right, legs.right.side).gt(0)) return;
+      if (this.options.now() >= deadline) {
+        throw new StrategyEngineError('strategy_market_data_unavailable', 409,
+          `${legs.left.symbol}, ${legs.right.symbol}`);
+      }
+      // The symbol may have been swept between the caller's ensure and this wait; re-ensuring is
+      // idempotent and keeps a slow subscription from turning into a hard launch failure.
+      for (const leg of [legs.left, legs.right]) {
+        if (!this.markets.market(leg.symbol)) this.markets.ensureMarket?.(leg.symbol);
+      }
+      await new Promise((resolveWait) => setTimeout(resolveWait, MARKET_WAIT_POLL_MS));
+    }
   }
 
   private strategyLedger(strategyId: string): StrategyLedgerCache {
@@ -947,6 +1119,9 @@ export class StrategyEngine {
   private orderSizeError(symbol: string, quantity: Decimal, price?: Decimal): StrategyEngineError | null {
     const constraints = this.constraintsFor(symbol);
     if (!constraints.minSize || !constraints.lotSize) {
+      // Spot instruments may be absent from the local instrument catalog; the exchange remains the
+      // authority for spot size limits, so a missing catalog row must not block spot strategies.
+      if (isSpotSymbol(symbol)) return null;
       return new StrategyEngineError('strategy_instrument_constraints_unavailable', 409, symbol);
     }
     const minimum = new Decimal(constraints.minSize);
@@ -969,10 +1144,13 @@ export class StrategyEngine {
       const minimumNotional = new Decimal(constraints.minNotional);
       const notional = quantity.mul(price);
       if (minimumNotional.gt(0) && notional.lt(minimumNotional)) {
+        // Give the user an executable fix, not just a rejection: the smallest quantity that
+        // clears the minimum at the current price, rounded away from zero for safety.
+        const minimumQuantity = minimumNotional.div(price).toSignificantDigits(4, Decimal.ROUND_UP);
         return new StrategyEngineError(
           'strategy_order_below_minimum_notional',
           400,
-          `${symbol}: ${notional.toString()} < ${constraints.minNotional}`,
+          `${symbol}: ${notional.toString()} < ${constraints.minNotional}, min qty ~${minimumQuantity.toString()} @ price ${price.toString()}`,
         );
       }
     }
@@ -1092,6 +1270,7 @@ export class StrategyEngine {
       stopped_at = ?, updated_at = ? WHERE id = ?`).run(now, now, actor.id);
     this.runtime.addStrategyLog(actor.id, 'info', 'Strategy completed',
       `${actor.config.closePlan?.orderCount ?? 0} timed close slices`, '100%', 'All reduce-only close orders filled');
+    this.releaseQuoteWatch(actor);
     this.actors.delete(actor.id);
     this.runtime.emitStrategyUpdate(this.runtime.getStrategy(actor.id));
   }
@@ -1184,7 +1363,7 @@ export class StrategyEngine {
 
   /** Maximum matched quantity the strategy may accumulate, in left-leg units. */
   private strategyTarget(config: CreateStrategyInput): Decimal {
-    if (config.kind === 'position') return new Decimal(config.totalAmount ?? '0');
+    if (config.kind === 'position' || config.kind === 'carry') return new Decimal(config.totalAmount ?? '0');
     if (config.kind === 'premium' && config.grid) {
       return new Decimal(config.perOrderQuantity).mul(config.gridLevels ?? 0);
     }
@@ -1254,6 +1433,46 @@ export class StrategyEngine {
         result = `0 ${actor.config.asset} remaining`;
         details = 'All opened exposure was closed; this strategy will not re-enter';
       }
+    } else if (actor.kind === 'auto' && actor.stopLossArmed) {
+      const quoteOrderIds = new Set([...actor.quotes.values()].map((quote) => quote.orderId));
+      const noOpenOrders = this.openStrategyOrders(actor.id, quoteOrderIds).length === 0;
+      const flat = exposure.left.abs().lte(QUANTITY_EPSILON)
+        && exposure.right.abs().lte(QUANTITY_EPSILON);
+      if (noOpenOrders && flat) {
+        if (!(await this.cancelQuotes(actor))) return;
+        actor.status = 'STOPPED';
+        const now = new Date().toISOString();
+        this.database.prepare(`UPDATE execution_strategies SET status = 'STOPPED', open_position = '0',
+          stopped_at = ?, updated_at = ? WHERE id = ?`).run(now, now, actor.id);
+        this.runtime.addStrategyLog(actor.id, 'info', 'Strategy stopped', 'Stop-loss exit complete',
+          `0 ${actor.config.asset} remaining`, 'Both legs closed after the stop-loss triggered; manual restart required');
+        this.releaseQuoteWatch(actor);
+        this.actors.delete(actor.id);
+        this.runtime.emitStrategyUpdate(this.runtime.getStrategy(actor.id));
+        return;
+      }
+    } else if (actor.kind === 'carry' && (actor.carry?.exited ?? false)) {
+      const state = actor.carry!;
+      const quoteOrderIds = new Set([...actor.quotes.values()].map((quote) => quote.orderId));
+      const noOpenOrders = this.openStrategyOrders(actor.id, quoteOrderIds).length === 0;
+      const flat = exposure.left.abs().lte(QUANTITY_EPSILON)
+        && exposure.right.abs().lte(QUANTITY_EPSILON)
+        && exposure.rightShares.abs().lte(QUANTITY_EPSILON);
+      if (noOpenOrders && flat) {
+        if (!(await this.cancelQuotes(actor))) return;
+        const metrics = this.persistCarryMetrics(actor, state);
+        actor.status = 'COMPLETED';
+        const now = new Date().toISOString();
+        this.database.prepare(`UPDATE execution_strategies SET status = 'COMPLETED', progress = 100,
+          open_position = '0', stopped_at = ?, updated_at = ? WHERE id = ?`).run(now, now, actor.id);
+        this.runtime.addStrategyLog(actor.id, 'info', 'Strategy completed', 'Basis take-profit cycle complete',
+          `${metrics.fundingCollectedUsdt} USDT funding collected`,
+          `Net PnL ${metrics.netPnlUsdt} USDT (basis ${metrics.basisPnlUsdt} + funding ${metrics.fundingCollectedUsdt} − fees ${metrics.feesPaidUsdt})`);
+        this.releaseQuoteWatch(actor);
+        this.actors.delete(actor.id);
+        this.runtime.emitStrategyUpdate(this.runtime.getStrategy(actor.id));
+        return;
+      }
     }
     if (condition === null) return;
     if (!(await this.cancelQuotes(actor))) return;
@@ -1262,6 +1481,7 @@ export class StrategyEngine {
     this.database.prepare(`UPDATE execution_strategies SET status = 'COMPLETED', progress = 100,
       open_position = '0', stopped_at = ?, updated_at = ? WHERE id = ?`).run(now, now, actor.id);
     this.runtime.addStrategyLog(actor.id, 'info', 'Strategy completed', condition, result, details);
+    this.releaseQuoteWatch(actor);
     this.actors.delete(actor.id);
     this.runtime.emitStrategyUpdate(this.runtime.getStrategy(actor.id));
   }
@@ -1345,6 +1565,7 @@ export class StrategyEngine {
       this.runtime.addStrategyLog(actor.id, 'error', 'Strategy paused', '—', '—',
         actor.quiesceReason ?? 'Safety pause');
     }
+    this.releaseQuoteWatch(actor);
     this.actors.delete(actor.id);
     this.runtime.emitStrategyUpdate(this.runtime.getStrategy(actor.id));
     return true;
@@ -1417,14 +1638,321 @@ export class StrategyEngine {
     if (!this.actors.has(actor.id) || actor.status !== 'RUNNING') return;
     if (actor.busy || actor.status !== 'RUNNING') return;
     if (this.options.now() < actor.cooldownUntil) return;
-    if (actor.config.executionMethod === 'MAKER_TAKER') {
+    if (actor.kind === 'auto' && actor.config.stopLossBps && !actor.stopLossArmed) {
+      if (await this.maybeTriggerAutoStopLoss(actor)) {
+        await this.checkCompletion(actor);
+        return;
+      }
+    }
+    if (actor.kind === 'auto' && actor.stopLossArmed) {
+      // A latched stop-loss exit only unwinds; no new entries, no maker quotes.
+      await this.continueAutoStopLossExit(actor);
+    } else if (actor.config.executionMethod === 'MAKER_TAKER') {
       await this.evaluateMakerQuotes(actor);
     } else if (actor.kind === 'premium') {
       await this.evaluatePremiumClip(actor);
+    } else if (actor.kind === 'carry') {
+      await this.evaluateCarryTriggers(actor);
     } else {
       await this.evaluateTakerClip(actor);
     }
     await this.checkCompletion(actor);
+  }
+
+  /**
+   * Auto stop-loss: when the live spread has moved past the configured bps in the adverse
+   * direction relative to the signed entry threshold, close the entire open position with one
+   * reduce-only taker clip. The strategy itself stops once that exit has fully filled.
+   */
+  private async maybeTriggerAutoStopLoss(actor: StrategyActor): Promise<boolean> {
+    const stopLoss = actor.config.stopLossBps;
+    if (!stopLoss || actor.stopLossArmed) return false;
+    const exposure = this.legExposures(actor.id, actor.config);
+    const matched = this.matchedQuantity(exposure);
+    if (!matched.gt(QUANTITY_EPSILON)) return false;
+    const entry = this.entrySpreadBps(actor.config);
+    if (!entry) return false;
+    const entryLevel = new Decimal(actor.config.entryBps ?? '0');
+    const stop = new Decimal(stopLoss);
+    const adverse = entryLevel.gte(0) ? entry.spread.gte(stop) : entry.spread.lte(stop.neg());
+    if (!adverse) return false;
+    actor.stopLossArmed = true;
+    this.runtime.addStrategyLog(actor.id, 'warning', 'Stop-loss triggered',
+      `Spread ${entry.spread.toFixed(2)} bps hit the ${stopLoss} bps stop-loss`,
+      matched.toString(), 'Closing both legs with market orders; the strategy stops when flat');
+    await this.executeTakerClip(actor, 'exit', matched,
+      `Spread ${entry.spread.toFixed(2)} bps hit the ${stopLoss} bps stop-loss`);
+    return true;
+  }
+
+  /** Unwind the remainder of a latched stop-loss exit in configured per-order clips. */
+  private async continueAutoStopLossExit(actor: StrategyActor): Promise<void> {
+    const exposure = this.legExposures(actor.id, actor.config);
+    const matched = this.matchedQuantity(exposure);
+    if (!matched.gt(QUANTITY_EPSILON)) return;
+    await this.executeTakerClip(actor, 'exit',
+      Decimal.min(new Decimal(actor.config.perOrderQuantity), matched), 'Stop-loss exit in progress');
+  }
+
+  /**
+   * Carry trigger evaluation: funding accrual and basis take-profit while a position is open,
+   * funding-APR screening plus quote/inventory gating before entry. Entry is one full-amount
+   * taker clip (left spot leg, right perpetual leg; sides derive from the funding direction).
+   */
+  private async evaluateCarryTriggers(actor: StrategyActor): Promise<void> {
+    const config = actor.config;
+    const direction = config.fundingDirection ?? 'POSITIVE';
+    const state = actor.carry ?? (actor.carry = emptyCarryState());
+    if (state.exited) return;
+    const legs = legsOf(config);
+    const rightMarket = this.freshMarket(legs.right.symbol);
+    if (!rightMarket) return;
+
+    const exposure = this.legExposures(actor.id, config);
+    // One leg of the entry clip failed: never re-enter on top of a partial clip — the hedge
+    // repair pass (reconcileExposure) tops up the lagging leg first.
+    if (exposure.left.plus(exposure.right).abs().gt(QUANTITY_EPSILON)) return;
+    const perpQuantity = exposure.right.abs();
+    const matched = this.matchedQuantity(exposure);
+    const fundingRate = new Decimal(rightMarket.fundingRate || '0');
+    // Venue-specific settlement cadence (BINANCE 4h, Gate 8h, …) drives both the annualized APR
+    // and the accrual clock; an unknown interval falls back to 8h with a one-time warning.
+    const fundingIntervalHours = this.carryFundingIntervalHours(actor, legs.right.symbol);
+
+    if (matched.gt(QUANTITY_EPSILON)) {
+      // Latch the entry reference metrics on the first tick where both legs are open.
+      if (state.basisEntryBps === null) {
+        const leftMarket = this.freshMarket(legs.left.symbol);
+        if (!leftMarket) return;
+        const spotMid = new Decimal(leftMarket.bidPrice).plus(leftMarket.askPrice).div(2);
+        const perpMid = new Decimal(rightMarket.bidPrice).plus(rightMarket.askPrice).div(2);
+        if (!spotMid.gt(0) || !perpMid.gt(0)) return;
+        state.basisEntryBps = perpMid.minus(spotMid).div(spotMid).mul(BPS);
+        state.entryFundingApr = fundingAprFromRate(fundingRate, fundingIntervalHours);
+        state.entrySpotNotionalUsdt = new Decimal(config.totalAmount ?? '0').mul(spotMid);
+        // Accrue from the exchange's next settlement; fall back to the cached interval when unknown.
+        const nextSettlement = Date.parse(rightMarket.nextFundingAt);
+        state.nextFundingAccrualAt = Number.isFinite(nextSettlement) && nextSettlement > this.options.now()
+          ? nextSettlement
+          : this.options.now() + fundingIntervalHours * 3_600_000;
+        this.runtime.addStrategyLog(actor.id, 'info', 'Carry position opened',
+          `Entry basis ${state.basisEntryBps.toFixed(2)} bps · entry funding APR ${state.entryFundingApr.toFixed(2)}%`,
+          `${config.totalAmount ?? '0'} ${config.asset}`,
+          'Accruing funding each settlement until the basis take-profit triggers');
+      }
+      // Funding accrual: |rate| × perp notional per settlement while the perp leg is open.
+      const perpMid = new Decimal(rightMarket.bidPrice).plus(rightMarket.askPrice).div(2);
+      let accruals = 0;
+      while (state.nextFundingAccrualAt !== null && perpQuantity.gt(QUANTITY_EPSILON)
+        && this.options.now() >= state.nextFundingAccrualAt && accruals < MAX_FUNDING_ACCRUAL_CATCHUP) {
+        state.fundingCollectedUsdt = state.fundingCollectedUsdt
+          .plus(fundingRate.abs().mul(perpQuantity.mul(perpMid)));
+        state.nextFundingAccrualAt += fundingIntervalHours * 3_600_000;
+        accruals += 1;
+      }
+      const leftMarket = this.freshMarket(legs.left.symbol);
+      if (leftMarket) {
+        const spotAsk = new Decimal(leftMarket.askPrice);
+        const perpBid = new Decimal(rightMarket.bidPrice);
+        if (spotAsk.gt(0) && perpBid.gt(0)) {
+          state.basisCurrentBps = perpBid.minus(spotAsk).div(spotAsk).mul(BPS);
+          const takeProfit = new Decimal(config.basisTakeProfitBps ?? '20');
+          // Positive carry exits when the basis converges down to the level; negative carry when
+          // it converges up to −level. Either way |basis| closing in is the take-profit.
+          const triggered = direction === 'POSITIVE'
+            ? state.basisCurrentBps.lte(takeProfit)
+            : state.basisCurrentBps.gte(takeProfit.neg());
+          if (triggered) {
+            state.exited = true;
+            this.runtime.addStrategyLog(actor.id, 'info', 'Basis take-profit triggered',
+              `Basis ${state.basisCurrentBps.toFixed(2)} bps ${direction === 'POSITIVE' ? '≤' : '≥'} ${direction === 'POSITIVE' ? '' : '−'}${takeProfit.toString()} bps`,
+              matched.toString(), 'Closing both carry legs');
+            await this.executeTakerClip(actor, 'exit', matched,
+              `Basis ${state.basisCurrentBps.toFixed(2)} bps hit the ±${takeProfit.toString()} bps take-profit`);
+            this.persistCarryMetrics(actor, state);
+            return;
+          }
+        }
+      }
+      this.persistCarryMetrics(actor, state);
+      return;
+    }
+
+    // Entry screening: the annualized funding rate must clear the configured APR in the
+    // configured direction before any order is placed.
+    const signMatches = direction === 'POSITIVE' ? fundingRate.gt(0) : fundingRate.lt(0);
+    const apr = fundingAprFromRate(fundingRate, fundingIntervalHours);
+    const aprMin = config.fundingAprMin ?? 15;
+    if (!(signMatches && apr.gte(new Decimal(aprMin)))) {
+      if (state.lastGatePassed !== false) {
+        state.lastGatePassed = false;
+        this.runtime.addStrategyLog(actor.id, 'info', 'Waiting for funding threshold',
+          `Funding APR ${apr.toFixed(2)}% · needs ${direction === 'POSITIVE' ? '≥' : '≤ −'}${aprMin}%`,
+          '—', 'No position is opened while the funding condition is unmet');
+      }
+      return;
+    }
+    const gate = await this.carryEntryGate(actor, legs);
+    if (gate !== 'pass') {
+      if (state.lastGatePassed !== false) {
+        state.lastGatePassed = false;
+        this.runtime.addStrategyLog(actor.id, 'warning', 'Carry entry gate blocked',
+          direction === 'POSITIVE' ? 'USDT available below spot notional + contract margin' : 'Spot inventory below the configured amount',
+          `${config.totalAmount ?? '0'} ${config.asset}`,
+          gate === 'unavailable' ? 'Spot account balances unavailable; retrying' : 'Waiting for account balances to cover the entry');
+      }
+      return;
+    }
+    if (state.lastGatePassed !== true) {
+      state.lastGatePassed = true;
+      this.runtime.addStrategyLog(actor.id, 'info', 'Carry entry gate passed',
+        `Funding APR ${apr.toFixed(2)}% ≥ ${aprMin}%`,
+        `${config.totalAmount ?? '0'} ${config.asset}`,
+        direction === 'POSITIVE' ? 'Buying spot and selling the perpetual' : 'Selling spot inventory and buying the perpetual');
+    }
+    await this.executeTakerClip(actor, 'entry', new Decimal(config.totalAmount ?? '0'),
+      `Funding APR ${apr.toFixed(2)}% ≥ ${aprMin}% · ${direction}`);
+    this.persistCarryMetrics(actor, state);
+  }
+
+  /**
+   * Cached funding settlement interval in hours for the perpetual leg's symbol, falling back to
+   * Gate's 8h cadence. The fallback is logged once per symbol per engine so a silently wrong
+   * annualization stays visible without flooding the strategy log.
+   */
+  private carryFundingIntervalHours(actor: StrategyActor, symbol: string): number {
+    const reported = this.options.fundingIntervalHours(symbol);
+    if (typeof reported === 'number' && Number.isFinite(reported) && reported > 0) return reported;
+    if (!this.intervalFallbackWarned.has(symbol)) {
+      this.intervalFallbackWarned.add(symbol);
+      this.runtime.addStrategyLog(actor.id, 'warning', 'Funding interval unknown',
+        `No cached funding interval for ${symbol}; assuming 8h`,
+        '—', 'Funding APR and the accrual clock use the Gate default until the venue interval is reported');
+    }
+    return FUNDING_PERIOD_MS / 3_600_000;
+  }
+
+  /**
+   * Carry entry gate, routed per leg by its own venue (architecture v2 §T08). POSITIVE: the spot
+   * notional is checked against the spot venue's quote balance and the contract margin against
+   * the perpetual venue's balance — Gate legs go through the legacy /spot/accounts call, other
+   * venues through their reconciled live balance (an unreported balance is not blocking: the
+   * venue itself rejects an unfunded market order; when both legs sit on Gate one combined
+   * USDT check covers notional + margin). NEGATIVE: base inventory must be verifiable on the
+   * spot venue itself — Gate via /spot/accounts, other venues via their reconciled live
+   * balance; an unknown venue balance blocks the entry ('unavailable') instead of clearing it
+   * against Gate-side inventory.
+   */
+  private async carryEntryGate(
+    actor: StrategyActor,
+    legs: { left: LegDefinition; right: LegDefinition },
+  ): Promise<'pass' | 'fail' | 'unavailable'> {
+    const config = actor.config;
+    const total = new Decimal(config.totalAmount ?? '0');
+    if (!total.gt(0)) return 'fail';
+    const direction = config.fundingDirection ?? 'POSITIVE';
+    const spotVenue = legs.left.venue;
+    const perpVenue = legs.right.venue;
+    const spotQuote = legs.left.symbol.split('_')[3] ?? 'USDT';
+    const gateAccounts = async (): Promise<Awaited<ReturnType<TradingRuntime['querySpotAccounts']>> | null> => {
+      try {
+        return await this.runtime.querySpotAccounts();
+      } catch {
+        return null;
+      }
+    };
+    /** Reconciled live balance for one venue+coin, or null when the portfolio has not reported it. */
+    const venueBalance = (venue: string, coin: string) => this.runtime.listBalances()
+      .find((balance) => balance.venue === venue && balance.coin === coin) ?? null;
+    /** Gate-side USDT coverage check via /spot/accounts; null means the source is unavailable. */
+    const gateUsdtAvailable = async (): Promise<Decimal | null> => {
+      const accounts = await gateAccounts();
+      if (!accounts) return null;
+      const usdt = accounts.find((account) => account.currency === 'USDT');
+      return usdt ? new Decimal(usdt.available) : new Decimal(0);
+    };
+
+    if (direction === 'POSITIVE') {
+      const spotPrice = this.executablePrice(legs.left.symbol, 'BUY');
+      const perpPrice = this.executablePrice(legs.right.symbol, 'SELL');
+      if (!spotPrice || !perpPrice) return 'unavailable';
+      const spotNotional = total.mul(spotPrice);
+      const contractMargin = total.mul(perpPrice).div(new Decimal(config.contractLeverage ?? '1'));
+      // Both legs on Gate: one combined check against the same USDT book.
+      if (spotVenue === 'GATE' && perpVenue === 'GATE') {
+        const available = await gateUsdtAvailable();
+        if (available === null) return 'unavailable';
+        return available.gte(spotNotional.plus(contractMargin)) ? 'pass' : 'fail';
+      }
+      if (spotVenue === 'GATE') {
+        const available = await gateUsdtAvailable();
+        if (available === null) return 'unavailable';
+        if (!available.gte(spotNotional)) return 'fail';
+      } else {
+        // Non-Gate spot leg: /spot/accounts only describes Gate, so the venue-side notional is
+        // enforced through the reconciled live balance when available.
+        const balance = venueBalance(spotVenue, spotQuote);
+        if (balance && !new Decimal(balance.availableBalance).gte(spotNotional)) return 'fail';
+      }
+      if (perpVenue === 'GATE') {
+        const available = await gateUsdtAvailable();
+        if (available === null) return 'unavailable';
+        return available.gte(contractMargin) ? 'pass' : 'fail';
+      }
+      const marginBalance = venueBalance(perpVenue, legs.right.symbol.split('_')[3] ?? 'USDT');
+      if (marginBalance && !new Decimal(marginBalance.availableBalance).gte(contractMargin)) return 'fail';
+      return 'pass';
+    }
+    if (spotVenue === 'GATE') {
+      const accounts = await gateAccounts();
+      if (!accounts) return 'unavailable';
+      const base = accounts.find((account) => account.currency === config.asset);
+      return base && new Decimal(base.available).gte(total) ? 'pass' : 'fail';
+    }
+    // A non-Gate inventory check can never be answered by Gate's /spot/accounts: without a
+    // reconciled venue balance the entry stays blocked and retried on the next tick.
+    const balance = venueBalance(spotVenue, config.asset);
+    if (!balance) return 'unavailable';
+    return new Decimal(balance.availableBalance).gte(total) ? 'pass' : 'fail';
+  }
+
+  /** Basis PnL in USDT: entry spot notional × (entry basis − current basis) × direction sign. */
+  private carryBasisPnlUsdt(config: CreateStrategyInput, state: CarryRuntimeState): Decimal {
+    if (state.basisEntryBps === null || state.basisCurrentBps === null || state.entrySpotNotionalUsdt === null) return ZERO;
+    const convergence = state.basisEntryBps.minus(state.basisCurrentBps)
+      .mul((config.fundingDirection ?? 'POSITIVE') === 'POSITIVE' ? ONE : ONE.neg());
+    return state.entrySpotNotionalUsdt.mul(convergence).div(BPS);
+  }
+
+  /** Sum of strategy-linked fill fees, treated as USDT outflow. */
+  private strategyFeesPaidUsdt(strategyId: string): Decimal {
+    return (this.strategyFeesStatement.all(strategyId) as Array<{ fee: string }>)
+      .reduce((sum, row) => sum.plus(new Decimal(row.fee || '0')), ZERO);
+  }
+
+  /** Serialize the carry accounting snapshot and write it only when a value changed. */
+  private persistCarryMetrics(actor: StrategyActor, state: CarryRuntimeState): StrategyCarryMetrics {
+    const feesPaidUsdt = this.strategyFeesPaidUsdt(actor.id);
+    const basisPnlUsdt = this.carryBasisPnlUsdt(actor.config, state);
+    const netPnlUsdt = state.fundingCollectedUsdt.plus(basisPnlUsdt).minus(feesPaidUsdt);
+    const metrics: StrategyCarryMetrics = {
+      fundingCollectedUsdt: state.fundingCollectedUsdt.toString(),
+      basisEntryBps: (state.basisEntryBps ?? ZERO).toString(),
+      basisCurrentBps: (state.basisCurrentBps ?? ZERO).toString(),
+      basisPnlUsdt: basisPnlUsdt.toString(),
+      feesPaidUsdt: feesPaidUsdt.toString(),
+      netPnlUsdt: netPnlUsdt.toString(),
+      entryFundingApr: (state.entryFundingApr ?? ZERO).toString(),
+      nextFundingAccrualAt: state.nextFundingAccrualAt === null
+        ? null
+        : new Date(state.nextFundingAccrualAt).toISOString(),
+    };
+    const serialized = JSON.stringify(metrics);
+    if (actor.lastCarryMetricsJson !== serialized) {
+      actor.lastCarryMetricsJson = serialized;
+      this.runtime.updateStrategyMetrics(actor.id, metrics);
+    }
+    return metrics;
   }
 
   /**
@@ -1562,12 +2090,17 @@ export class StrategyEngine {
     if (imbalance.abs().gt(QUANTITY_EPSILON)) return;
     const matched = this.matchedQuantity(exposure);
     const perOrder = new Decimal(actor.config.perOrderQuantity);
+    const entryLevel = new Decimal(actor.config.entryBps ?? '0');
+    // Signed entry: a positive threshold enters when the spread is at least that wide, a negative
+    // threshold enters when the spread is at most that negative (bounded opening cost).
+    const entryTriggered = entry !== null
+      && (entryLevel.gte(0) ? entry.spread.gte(entryLevel) : entry.spread.lte(entryLevel));
 
-    if (entry && entry.spread.gte(new Decimal(actor.config.entryBps ?? '0'))) {
+    if (entry && entryTriggered) {
       const capacity = this.remainingEntryCapacity(actor, exposure);
       const quantity = Decimal.min(perOrder, capacity);
       if (quantity.gt(QUANTITY_EPSILON)) {
-        await this.executeTakerClip(actor, 'entry', quantity, `Spread ${entry.spread.toFixed(2)} bps ≥ ${actor.config.entryBps} bps`);
+        await this.executeTakerClip(actor, 'entry', quantity, `Spread ${entry.spread.toFixed(2)} bps ${entryLevel.gte(0) ? '≥' : '≤'} ${actor.config.entryBps} bps`);
         return;
       }
     }
@@ -1591,6 +2124,19 @@ export class StrategyEngine {
     };
   }
 
+  /**
+   * Gate spot market buys must be sized in quote currency: convert the requested base quantity at
+   * the current spot mid so the ledger (which tracks base quantities) and the venue order agree.
+   * Returns null for non-spot orders and for spot orders without a usable mid.
+   */
+  private spotMarketBuyQuoteQty(symbol: string, quantity: Decimal): Decimal | null {
+    if (!isSpotSymbol(symbol)) return null;
+    const market = this.freshMarket(symbol);
+    if (!market) return null;
+    const mid = new Decimal(market.bidPrice).plus(market.askPrice).div(2);
+    return mid.gt(0) ? quantity.mul(mid) : null;
+  }
+
   private async executeTakerClip(actor: StrategyActor, intent: QuoteIntent, quantity: Decimal, condition: string, rightQuantityOverride?: Decimal): Promise<void> {
     const legs = this.legsForIntent(actor, intent);
     // Default hedge sizing is the strategy's fixed conversion; premium callers override it for
@@ -1603,6 +2149,13 @@ export class StrategyEngine {
       await this.pause(actor, `Order-size compliance check failed: ${sizeError.label ?? sizeError.code}`);
       return;
     }
+    const leftQuoteQty = legs.left.side === 'BUY' ? this.spotMarketBuyQuoteQty(legs.left.symbol, quantity) : null;
+    const rightQuoteQty = legs.right.side === 'BUY' ? this.spotMarketBuyQuoteQty(legs.right.symbol, rightQuantity) : null;
+    if ((isSpotSymbol(legs.left.symbol) && legs.left.side === 'BUY' && leftQuoteQty === null)
+      || (isSpotSymbol(legs.right.symbol) && legs.right.side === 'BUY' && rightQuoteQty === null)) {
+      await this.pause(actor, 'Spot market data unavailable for quote-quantity conversion; review the spot leg quotes');
+      return;
+    }
     const clip = `clip-${randomUUID().replaceAll('-', '').slice(0, 12)}`;
     actor.busy = true;
     try {
@@ -1613,9 +2166,11 @@ export class StrategyEngine {
         `${quantity.toString()} ${actor.config.asset}`, 'Submitting both taker legs');
       const submissions = await Promise.allSettled([
         this.runtime.createOrder({ symbol: legs.left.symbol, side: legs.left.side, type: 'MARKET', timeInForce: 'IOC',
-          quantity: quantity.toString(), reduceOnly }, { strategyId: actor.id, strategyLeg: 'left', strategyClip: clip }),
+          quantity: quantity.toString(), ...(leftQuoteQty !== null ? { quoteQty: leftQuoteQty.toString() } : {}), reduceOnly },
+        { strategyId: actor.id, strategyLeg: 'left', strategyClip: clip }),
         this.runtime.createOrder({ symbol: legs.right.symbol, side: legs.right.side, type: 'MARKET', timeInForce: 'IOC',
-          quantity: rightQuantity.toString(), reduceOnly }, { strategyId: actor.id, strategyLeg: 'right', strategyClip: clip }),
+          quantity: rightQuantity.toString(), ...(rightQuoteQty !== null ? { quoteQty: rightQuoteQty.toString() } : {}), reduceOnly },
+        { strategyId: actor.id, strategyLeg: 'right', strategyClip: clip }),
       ]);
       const accepted = submissions.filter((entry): entry is PromiseFulfilledResult<ExecutionOrder> => entry.status === 'fulfilled');
       const rejected = submissions.filter((entry): entry is PromiseRejectedResult => entry.status === 'rejected');

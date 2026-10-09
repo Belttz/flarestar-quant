@@ -4,14 +4,14 @@ import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import fastifyStatic from '@fastify/static';
 import websocket from '@fastify/websocket';
-import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import type Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Decimal } from 'decimal.js';
 import { z } from 'zod';
-import { PublicMarketDataError, type PublicMarketDataGateway } from '@gate-crossex/public-data';
+import { PublicMarketDataError, type PublicMarketDataGateway, type VenueBookTicker } from '@gate-crossex/public-data';
 import { reconcilePortfolioSnapshots, stalePortfolioReconciliation } from '@gate-crossex/domain';
 import {
   BorosUpstreamMarketFeesResponseSchema,
@@ -20,11 +20,18 @@ import {
   CrossExTransferRequestSchema,
   canonicalizeCrossExTransfer,
   crossExTransferRouteError,
+  downsampleEquityPoints,
+  equityGranularityForRange,
+  equityRangeWindow,
+  PortfolioEquityRangeSchema,
   UserPreferencesSchema,
   type UserPreferencesResponse,
   type UnresolvedOrder,
+  type PortfolioEquitySeriesResponse,
 } from '@gate-crossex/shared-types';
 import type {
+  AssetClass,
+  AssetSuperClass,
   BorosStrategiesResponse,
   CandleInterval,
   CandleSeriesResponse,
@@ -45,6 +52,8 @@ import type {
   MarketCatalogAsset,
   MarketCatalogResponse,
   MarketCatalogVenue,
+  OpportunityResponse,
+  PortfolioBalance,
   PortfolioFuturesPosition,
   PortfolioSnapshot,
   ReconciliationReportList,
@@ -64,12 +73,14 @@ import {
   type SelectableCredentialStorageProvider,
 } from './credential-vault.js';
 import { OneTimeCsrfTokens } from './csrf.js';
-import { GateApiError, type GateCrossExAccount, type GateCrossExPortfolio, type GateCrossExPosition, type GateCrossExRiskLimit, type GateCrossExSymbol, type GateTransferRecord, type GateAccountBookRecord, type PortfolioOperationsCrossExGateway, type ReadOnlyCrossExGateway, type TradingCrossExGateway } from './crossex-client.js';
+import { AuthSessionStore, AuthUserStore, LoginThrottle, SESSION_COOKIE_NAME, SESSION_TTL_MS } from './auth-store.js';
+import { GateApiError, type GateCrossExAccount, type GateCrossExPortfolio, type GateCrossExPosition, type GateCrossExRiskLimit, type GateCrossExSymbol, type GateSpotAccount, type GateTransferRecord, type GateAccountBookRecord, type PortfolioOperationsCrossExGateway, type ReadOnlyCrossExGateway, type TradingCrossExGateway } from './crossex-client.js';
 import { CandleStore } from './candle-store.js';
 import { FundingHistoryService } from './funding-history.js';
 import { FundingOverviewService } from './funding-overview.js';
 import { canonicalMarketAsset } from './market-asset-aliases.js';
-import { CrossExMarketHub, CANDLE_INTERVALS, type MarketDefinition, type MarketHubMessage } from './market-hub.js';
+import { CrossExMarketHub, CANDLE_INTERVALS, type LiveMarket, type MarketDefinition, type MarketHubMessage } from './market-hub.js';
+import { OpportunityService, type SpreadPairType, type SpotSymbolEntry } from './opportunity-service.js';
 import { StrategyEngine, StrategyEngineError, type StrategyEngineOptions } from './strategy-engine.js';
 import { TradingSession } from './trading-session.js';
 import { TradingRuntime, TradingRuntimeError, unresolvedOrderDetails } from './trading-runtime.js';
@@ -93,6 +104,9 @@ import {
   replaceInstrumentCatalog,
   replaceRiskLimits,
   listReconciliationReports,
+  readPortfolioEquityFirstSampleAt,
+  readPortfolioEquitySeries,
+  recordPortfolioEquitySample,
   savePortfolioSnapshot,
   saveReconciliationReport,
   saveActiveCredentialProfile,
@@ -122,7 +136,9 @@ const BOROS_STRATEGIES_CACHE_MS = 30_000;
 const CATALOG_VENUES = ['GATE', 'BINANCE', 'OKX', 'BYBIT', 'KRAKEN', 'HYPERLIQUID', 'DERIBIT', 'LIGHTER'] as const;
 const QUOTE_PREFERENCE = ['USDT', 'USDC', 'USD'] as const;
 const CROSSEX_FUTURE_SYMBOL = /^(GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_([A-Z0-9]+)_(USDT|USDC|USD)$/;
-const STRATEGY_ID = /^(AUTO|PAIR|PREM|CLOSE)-[A-Z0-9]{8}$/;
+/** Spot exposure across all connected venues; carry, spread and trade pages trade these symbols. */
+const CROSSEX_SPOT_SYMBOL = /^(GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_SPOT_([A-Z0-9]+)_(USDT|USDC)$/;
+const STRATEGY_ID =/^(AUTO|PAIR|PREM|CLOSE|CARRY)-[A-Z0-9]{8}$/;
 const FundingHistoryRequestSchema = z.object({
   symbols: z.array(z.string().regex(CROSSEX_FUTURE_SYMBOL)).min(1).max(50),
   durationDays: z.union([z.literal(1), z.literal(7), z.literal(30)]).default(30),
@@ -135,6 +151,11 @@ const FundingHistorySeriesRequestSchema = z.object({
   symbols: z.array(z.string().regex(CROSSEX_FUTURE_SYMBOL)).min(1).max(7),
   durationDays: z.union([z.literal(1), z.literal(7), z.literal(30)]),
 });
+/** Hard cap on equity points per response so `all` cannot ship unbounded payloads. */
+const PORTFOLIO_EQUITY_MAX_POINTS = 720;
+const PortfolioEquityQuerySchema = z.object({
+  range: PortfolioEquityRangeSchema.default('24h'),
+});
 
 interface DerivedMarketCatalog {
   fetchedAt: string;
@@ -142,31 +163,41 @@ interface DerivedMarketCatalog {
   liveSymbols: Set<string>;
 }
 
-/** Group live FUTURE instruments by asset with one venue entry each (preferred quote first). */
+/** Group live FUTURE and SPOT instruments by asset with one venue entry per (venue, business). */
 function deriveMarketCatalog(items: CrossExInstrument[], fetchedAt: string): DerivedMarketCatalog {
   const assets = new Map<string, Map<string, MarketCatalogVenue>>();
   const liveSymbols = new Set<string>();
+  const quoteRank = (value: string) => {
+    const index = (QUOTE_PREFERENCE as readonly string[]).indexOf(value);
+    return index === -1 ? QUOTE_PREFERENCE.length : index;
+  };
   for (const item of items) {
-    if (item.businessType !== 'FUTURE' || item.state !== 'live') continue;
-    const match = CROSSEX_FUTURE_SYMBOL.exec(item.symbol);
+    if (item.state !== 'live' || (item.businessType !== 'FUTURE' && item.businessType !== 'SPOT')) continue;
+    const match = item.businessType === 'FUTURE'
+      ? CROSSEX_FUTURE_SYMBOL.exec(item.symbol)
+      : CROSSEX_SPOT_SYMBOL.exec(item.symbol);
     if (!match) continue;
     const [, venue, nativeAsset, quote] = match;
     if (!venue || !nativeAsset || !quote || !(CATALOG_VENUES as readonly string[]).includes(venue)) continue;
     const asset = canonicalMarketAsset(venue, item.businessType, nativeAsset);
     liveSymbols.add(item.symbol);
     const venues = assets.get(asset) ?? new Map<string, MarketCatalogVenue>();
-    const existing = venues.get(venue);
-    const rank = (value: string) => { const index = (QUOTE_PREFERENCE as readonly string[]).indexOf(value); return index === -1 ? QUOTE_PREFERENCE.length : index; };
-    if (!existing || rank(quote) < rank(existing.quote)) {
-      venues.set(venue, { venue, symbol: item.symbol, quote });
+    // Key by (venue, business) so a venue can expose both the spot and perpetual leg of one asset.
+    const rowKey = `${venue}:${item.businessType}`;
+    const existing = venues.get(rowKey);
+    if (!existing || quoteRank(quote) < quoteRank(existing.quote)) {
+      venues.set(rowKey, { venue, symbol: item.symbol, quote, business: item.businessType });
     }
     assets.set(asset, venues);
   }
+  const venueIndex = (venue: string) => (CATALOG_VENUES as readonly string[]).indexOf(venue);
+  const businessRank = (business: string) => (business === 'FUTURE' ? 0 : 1);
   const ordered = new Map<string, MarketCatalogVenue[]>();
   for (const asset of [...assets.keys()].sort()) {
     const venues = assets.get(asset);
     if (!venues) continue;
-    ordered.set(asset, [...venues.values()].sort((left, right) => (CATALOG_VENUES as readonly string[]).indexOf(left.venue) - (CATALOG_VENUES as readonly string[]).indexOf(right.venue)));
+    ordered.set(asset, [...venues.values()].sort((left, right) =>
+      venueIndex(left.venue) - venueIndex(right.venue) || businessRank(left.business) - businessRank(right.business)));
   }
   return { fetchedAt, assets: ordered, liveSymbols };
 }
@@ -229,6 +260,8 @@ export interface BuildAppOptions {
   borosStrategyFetcher?: () => Promise<unknown>;
   /** Test seam for the public Boros market fee configuration endpoint. */
   borosMarketFeeFetcher?: (marketIds: number[]) => Promise<unknown>;
+  /** Test seam: skips the operator session gate (functional tests exercise routes directly). */
+  authDisabled?: boolean;
   /** Engine timing overrides; tests shorten the remote-confirmation timeout. */
   strategyEngineOptions?: StrategyEngineOptions;
 }
@@ -451,6 +484,34 @@ function normalizePortfolio(portfolio: GateCrossExPortfolio, fetchedAt: string):
     fetchedAt,
     source: 'gate_crossex_authenticated_rest',
   };
+}
+
+/**
+ * Gate's isolated spot account lives outside the CrossEx account tree, so its balances never
+ * appear in the CrossEx portfolio assets. Convert /spot/accounts rows into venue='SPOT'
+ * portfolio balances: the trade page's spot-holdings tab and its spot quote-balance chain both
+ * read venue==='SPOT' rows from the authenticated snapshot. Unparseable or all-zero rows are
+ * dropped, never fabricated; margin/liability fields are structural zeros for spot accounts.
+ */
+function spotBalanceRows(accounts: GateSpotAccount[]): PortfolioBalance[] {
+  const rows: PortfolioBalance[] = [];
+  for (const account of accounts) {
+    const available = Number(account.available);
+    const locked = Number(account.locked);
+    if (!Number.isFinite(available) || !Number.isFinite(locked) || available < 0 || locked < 0) continue;
+    if (available === 0 && locked === 0) continue;
+    rows.push({
+      venue: 'SPOT',
+      coin: account.currency,
+      balance: new Decimal(account.available).plus(account.locked).toFixed(),
+      unrealizedPnl: '0', equity: '0',
+      futuresInitialMargin: '0', futuresMaintenanceMargin: '0',
+      borrowingInitialMargin: '0', borrowingMaintenanceMargin: '0',
+      availableBalance: account.available,
+      liability: '0',
+    });
+  }
+  return rows;
 }
 
 function normalizeTransferRecords(records: GateTransferRecord[]): CrossExTransferRecord[] {
@@ -771,6 +832,23 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
    * it is a live instrument, even if its quote is not the venue-preferred one.
    */
   const marketDefinitionsFor = (symbol: string): MarketDefinition[] | null => {
+    // Spot legs (carry / spread / trade pages) are registered as the exact requested symbol;
+    // when the instrument catalog is present the symbol must be listed live there.
+    const spotMatch = CROSSEX_SPOT_SYMBOL.exec(symbol);
+    if (spotMatch) {
+      const venue = spotMatch[1];
+      const nativeAsset = spotMatch[2];
+      if (!venue || !nativeAsset) return null;
+      const catalog = derivedMarketCatalog();
+      // Without a fetched catalog only the legacy Gate spot path stays allowed (backward compat).
+      if (!catalog) {
+        return venue === 'GATE'
+          ? [{ symbol, venue: 'GATE', asset: canonicalMarketAsset('GATE', 'SPOT', nativeAsset) }]
+          : null;
+      }
+      if (!catalog.liveSymbols.has(symbol)) return null;
+      return [{ symbol, venue: venue as MarketDefinition['venue'], asset: canonicalMarketAsset(venue, 'SPOT', nativeAsset) }];
+    }
     const match = CROSSEX_FUTURE_SYMBOL.exec(symbol);
     if (!match) return null;
     const [, venue, nativeAsset] = match;
@@ -778,6 +856,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     if (!catalog || !venue || !nativeAsset) return null;
     const asset = canonicalMarketAsset(venue, 'FUTURE', nativeAsset);
     const definitions: MarketDefinition[] = (catalog.assets.get(asset) ?? [])
+      .filter((entry) => entry.business === 'FUTURE')
       .map((entry) => ({ symbol: entry.symbol, venue: entry.venue as MarketDefinition['venue'], asset }));
     if (catalog.liveSymbols.has(symbol) && !definitions.some((definition) => definition.symbol === symbol)) {
       definitions.push({ symbol, venue: venue as MarketDefinition['venue'], asset });
@@ -791,15 +870,28 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     return definitions !== null && marketHub.ensureMarkets(definitions) && marketHub.market(symbol) !== null;
   };
 
+  // Funding overview must exist before the strategy engine: carry accounting asks its cache for
+  // the perpetual leg's settlement interval (BINANCE 4h vs Gate 8h) at evaluation time.
+  const fundingOverviewService = new FundingOverviewService(publicMarketGateway, {
+    warn: (venue, reason) => app.log.warn({ venue, reason }, 'funding overview venue fetch failed'),
+  });
+
   // Strategies may trade catalog-only tickers (e.g. stock perps) that nothing has watched yet, so
   // the engine's market source can register them on demand at launch.
   const strategyEngine = new StrategyEngine(database, tradingSession, tradingRuntime, {
     market: (symbol) => marketHub.market(symbol),
     ensureMarket: ensureMarketKnown,
+    // The engine holds one ticker subscription per running strategy so its legs keep streaming
+    // even when no browser page is watching them; releases are ref-counted in the hub.
+    watchQuotes: (symbols) => marketHub.watchQuotes(symbols),
     // Unit/injected hubs may deliberately supply static market objects without starting a socket.
     // Production passes startMarketStream=true, where stream health must gate every strategy.
     ...(options.startMarketStream ? { connectionState: () => marketHub.connectionState() } : {}),
-  }, options.strategyEngineOptions);
+  }, {
+    ...options.strategyEngineOptions,
+    fundingIntervalHours: options.strategyEngineOptions?.fundingIntervalHours
+      ?? ((symbol) => fundingOverviewService.fundingIntervalFor(symbol)),
+  });
 
   const quiesceForCredentialMutation = async (): Promise<void> => {
     const previous = tradingSession.current;
@@ -872,6 +964,36 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   await app.register(formbody, { bodyLimit: 16 * 1024 });
   await app.register(websocket);
 
+  // Cloud-deployment operator authentication (see auth-store.ts). The account is
+  // seeded exactly once from config; afterwards the password lives as a scrypt
+  // hash in SQLite and is rotated through POST /api/auth/change-password.
+  const authUsers = new AuthUserStore(database);
+  authUsers.ensureSeeded(config.authUsername, config.authBootstrapPassword);
+  const authSessions = new AuthSessionStore();
+  const loginThrottle = new LoginThrottle();
+
+  const readSessionCookie = (request: FastifyRequest): string | null => {
+    const header = request.headers.cookie;
+    if (!header) return null;
+    for (const part of header.split(';')) {
+      const separator = part.indexOf('=');
+      if (separator === -1) continue;
+      if (part.slice(0, separator).trim() === SESSION_COOKIE_NAME) {
+        try {
+          return decodeURIComponent(part.slice(separator + 1).trim());
+        } catch {
+          return null;
+        }
+      }
+    }
+    return null;
+  };
+  const isSecureRequest = (request: FastifyRequest): boolean =>
+    request.protocol === 'https' || request.headers['x-forwarded-proto'] === 'https';
+  const sessionCookieHeader = (token: string, request: FastifyRequest): string =>
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(SESSION_TTL_MS / 1_000)}${isSecureRequest(request) ? '; Secure' : ''}`;
+  const clearedSessionCookieHeader = `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`;
+
   const frontendIndexPath = join(config.frontendDistPath, 'index.html');
   const frontendAssetsPath = join(config.frontendDistPath, 'assets');
   if (existsSync(frontendIndexPath) && existsSync(frontendAssetsPath)) {
@@ -891,29 +1013,163 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         .type('text/html; charset=utf-8')
         .send(frontendIndex)
     );
-    app.get('/', sendFrontend);
-    app.get('/portfolio', sendFrontend);
-    app.get('/funding-rates', sendFrontend);
+    // Every path the history router resolves must serve the app shell, otherwise a hard load or a
+    // refresh lands on a 404 while in-app navigation keeps working — exactly how the funding-top
+    // board shipped broken. One list instead of a scatter of registrations, and app.test.ts
+    // asserts each entry answers 200, so adding a board to the frontend without registering it
+    // here fails the suite instead of the user.
+    const clientRoutePaths = [
+      '/',
+      '/portfolio',
+      '/tools/trading-fees',
+      '/funding-rates',
+      '/strategies/paired-position',
+      '/strategies/price-difference',
+      '/strategies/sk-hynix-premium',
+      '/strategies/spot-perp-carry',
+      '/strategies/boros',
+      '/opportunities',
+      '/opportunities/funding',
+      '/opportunities/funding-top',
+      '/opportunities/spread',
+    ];
+    for (const clientRoutePath of clientRoutePaths) app.get(clientRoutePath, sendFrontend);
     app.get('/funding-rates/:asset', async (request, reply) => {
       const parsed = z.object({ asset: z.string().regex(/^[A-Z0-9]{1,20}$/i) }).safeParse(request.params);
       if (!parsed.success) return reply.code(404).send({ error: 'frontend_route_not_found' });
       return sendFrontend(request, reply);
     });
-    app.get('/strategies/paired-position', sendFrontend);
-    app.get('/strategies/price-difference', sendFrontend);
-    app.get('/strategies/sk-hynix-premium', sendFrontend);
-    app.get('/strategies/boros', sendFrontend);
   }
 
   const candleStore = new CandleStore(database, marketHub, publicMarketGateway, {
     warn: (details, message) => app.log.warn(details, message),
   });
 
-  const fundingOverviewService = new FundingOverviewService(publicMarketGateway, {
-    warn: (venue, reason) => app.log.warn({ venue, reason }, 'funding overview venue fetch failed'),
-  });
   const fundingHistoryService = new FundingHistoryService(database, publicMarketGateway, {
     warn: (symbol, reason) => app.log.warn({ symbol, reason }, 'funding history fetch failed'),
+  });
+
+  // Executable spot symbols per canonical asset across every connected venue, CATALOG_VENUES
+  // order with the preferred quote first, from the cached instrument catalog. The opportunities
+  // board uses this to register spot hedge legs on demand and to list candidate spot venues.
+  let derivedSpotCatalog: { fetchedAt: string; symbolsByAsset: Map<string, SpotSymbolEntry[]> } | null = null;
+  const spotSymbolsByAsset = (): ReadonlyMap<string, readonly SpotSymbolEntry[]> => {
+    const cached = readInstrumentCatalog(database);
+    if (!cached) return new Map();
+    if (!derivedSpotCatalog || derivedSpotCatalog.fetchedAt !== cached.fetchedAt) {
+      const symbolsByAsset = new Map<string, SpotSymbolEntry[]>();
+      for (const item of cached.items) {
+        if (item.businessType !== 'SPOT' || item.state !== 'live') continue;
+        const match = CROSSEX_SPOT_SYMBOL.exec(item.symbol);
+        const venue = match?.[1];
+        const nativeAsset = match?.[2];
+        if (!venue || !nativeAsset || !(CATALOG_VENUES as readonly string[]).includes(venue)) continue;
+        const asset = canonicalMarketAsset(venue, 'SPOT', nativeAsset);
+        const entries = symbolsByAsset.get(asset) ?? [];
+        entries.push({ venue, symbol: item.symbol });
+        symbolsByAsset.set(asset, entries);
+      }
+      const venueIndex = (venue: string) => (CATALOG_VENUES as readonly string[]).indexOf(venue);
+      const quoteRank = (symbol: string) => (symbol.endsWith('_USDT') ? 0 : 1);
+      for (const entries of symbolsByAsset.values()) {
+        entries.sort((left, right) =>
+          venueIndex(left.venue) - venueIndex(right.venue)
+          || quoteRank(left.symbol) - quoteRank(right.symbol)
+          || left.symbol.localeCompare(right.symbol));
+      }
+      derivedSpotCatalog = { fetchedAt: cached.fetchedAt, symbolsByAsset };
+    }
+    return derivedSpotCatalog.symbolsByAsset;
+  };
+
+  // --- Spread board REST base view -------------------------------------------------------------
+  // The CrossEx hub only contains markets someone subscribed to (the upstream caps WS
+  // subscriptions at 100 symbols per channel per connection), so a spread board scanning the raw
+  // hub would depend on browsing behavior. A ~30s TTL bulk REST sweep of each connected venue's
+  // all-market bookTicker feed fills that gap: hub live prices win, REST rows fill every other
+  // symbol. The strategy engine keeps reading the hub only — this view never feeds execution.
+  const REST_SPREAD_VIEW_TTL_MS = 30_000;
+  const REST_SPREAD_VENUES = ['GATE', 'BINANCE', 'OKX', 'BYBIT'] as const;
+  let restSpreadCache: { fetchedAt: number; markets: Map<string, LiveMarket> } | null = null;
+  let restSpreadInFlight: Promise<Map<string, LiveMarket>> | null = null;
+  const bookTickerMarket = (ticker: VenueBookTicker, fetchedAt: string): LiveMarket => ({
+    symbol: `${ticker.venue}_${ticker.business}_${ticker.base}_${ticker.quote}`,
+    venue: ticker.venue,
+    asset: ticker.base,
+    lastPrice: ticker.lastPrice ?? ticker.bidPrice,
+    bidPrice: ticker.bidPrice,
+    bidSize: '0',
+    askPrice: ticker.askPrice,
+    askSize: '0',
+    open24h: '0', high24h: '0', low24h: '0',
+    // LiveMarket keeps amounts as Decimal strings, so a venue that publishes nothing keeps the
+    // historical '0' placeholder; the opportunity board's stats layer maps '0' back to null.
+    volume24h: ticker.volume24h ?? '0',
+    quoteVolume24h: ticker.quoteVolume24h ?? '0',
+    fundingRate: '0', nextFundingAt: '',
+    openInterest: '0',
+    openInterestValue: ticker.openInterestValue ?? '0',
+    receivedAt: fetchedAt, updatedAt: fetchedAt, source: 'rest_book_ticker',
+  });
+  const restSpreadMarkets = (): Promise<Map<string, LiveMarket>> => {
+    const sweep = publicMarketGateway.queryVenueBookTickers?.bind(publicMarketGateway);
+    if (!sweep) return Promise.resolve(new Map());
+    if (restSpreadCache && Date.now() - restSpreadCache.fetchedAt < REST_SPREAD_VIEW_TTL_MS) {
+      return Promise.resolve(restSpreadCache.markets);
+    }
+    if (restSpreadInFlight) return restSpreadInFlight;
+    restSpreadInFlight = (async () => {
+      const fetchedAt = new Date().toISOString();
+      const results = await Promise.allSettled(REST_SPREAD_VENUES.map((venue) => sweep(venue)));
+      const markets = new Map<string, LiveMarket>();
+      let succeeded = 0;
+      results.forEach((result, index) => {
+        const venue = REST_SPREAD_VENUES[index]!;
+        if (result.status === 'rejected') {
+          app.log.warn({ venue, reason: result.reason instanceof Error ? result.reason.message : String(result.reason) }, 'spread board rest sweep failed');
+          return;
+        }
+        succeeded += 1;
+        for (const ticker of result.value) {
+          // Keep the catalog's canonical asset spelling so same-asset grouping stays correct.
+          const market = bookTickerMarket(
+            { ...ticker, base: canonicalMarketAsset(ticker.venue, ticker.business, ticker.base) },
+            fetchedAt,
+          );
+          if (!markets.has(market.symbol)) markets.set(market.symbol, market);
+        }
+      });
+      // A total upstream outage must not blank the board for a whole TTL cycle: keep the last
+      // good sweep, and when there is none, leave the cache unset so the next request retries.
+      if (succeeded > 0 || !restSpreadCache) restSpreadCache = { fetchedAt: Date.now(), markets };
+      return restSpreadCache.markets;
+    })().finally(() => {
+      restSpreadInFlight = null;
+    });
+    return restSpreadInFlight;
+  };
+  const spreadMarkets = async (): Promise<ReadonlyArray<LiveMarket>> => {
+    let restMarkets: Map<string, LiveMarket>;
+    try {
+      restMarkets = await restSpreadMarkets();
+    } catch (error) {
+      app.log.warn({ reason: error instanceof Error ? error.message : String(error) }, 'spread board rest sweep failed');
+      restMarkets = restSpreadCache?.markets ?? new Map();
+    }
+    // Hub live prices win over the REST snapshot; REST rows fill every unsubscribed symbol,
+    // including hub placeholders whose registration has not produced a quote yet.
+    const merged = new Map(restMarkets);
+    for (const market of marketHub.snapshot().markets) {
+      if (Number(market.bidPrice) > 0 && Number(market.askPrice) > 0) merged.set(market.symbol, market);
+    }
+    return [...merged.values()];
+  };
+
+  const opportunityService = new OpportunityService({
+    fundingOverview: fundingOverviewService,
+    hub: marketHub,
+    spreadMarkets,
+    spotSymbolsByAsset,
   });
 
   let portfolioRefreshInFlight: { generation: number; promise: Promise<LivePortfolioSnapshot> } | null = null;
@@ -933,6 +1189,18 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         if (refreshCredentialGeneration !== credentialGeneration) {
           throw new TradingRuntimeError('credential_context_changed', 409);
         }
+        // Gate's isolated spot account is outside the CrossEx snapshot; fetch it alongside and
+        // merge as venue='SPOT' rows below. A spot-accounts failure degrades to a snapshot
+        // without them — it must never block the CrossEx refresh.
+        const spotAccounts = crossExGateway.querySpotAccounts
+          ? await crossExGateway.querySpotAccounts(credentials).catch((error) => {
+              app.log.warn({ reason: error instanceof Error ? error.message : String(error) }, 'spot accounts fetch failed; portfolio snapshot continues without SPOT balances');
+              return null;
+            })
+          : null;
+        if (refreshCredentialGeneration !== credentialGeneration) {
+          throw new TradingRuntimeError('credential_context_changed', 409);
+        }
         const fetchedAt = new Date().toISOString();
         const snapshot = normalizePortfolio(portfolio, fetchedAt);
         const recoveredExecutionFillCount = tradingRuntime.reconcileExecutionFills(snapshot.recentFills);
@@ -945,6 +1213,12 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
           equity: balance.equity,
           unrealizedPnl: balance.unrealizedPnl,
         })), fetchedAt);
+        // The live_balances ledger above stays the futures/margin book as before; venue='SPOT'
+        // rows join the persisted snapshot only (trade page spot holdings + spot quote balance).
+        snapshot.balances = [
+          ...snapshot.balances.filter((balance) => balance.venue !== 'SPOT'),
+          ...spotBalanceRows(spotAccounts ?? []),
+        ];
         const provider = await credentialVault.getProvider(DEFAULT_CREDENTIAL_PROFILE) ?? credentialVault.provider;
         upsertCredentialMetadata(database, {
           id: profileId,
@@ -955,6 +1229,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         });
         const reconciliation = reconcilePortfolioSnapshots(randomUUID(), fetchedAt, previous, snapshot);
         savePortfolioSnapshot(database, snapshot);
+        // Persist the equity-curve sample alongside the snapshot: equity comes from the same
+        // snapshot the asset page reads, so curve and KPI can never drift. The repository
+        // debounces manual refresh spam to at most one sample per minute.
+        const equitySample = recordPortfolioEquitySample(database, snapshot, Date.parse(fetchedAt));
         saveReconciliationReport(database, reconciliation);
         addAuditEvent(database, 'portfolio_read_only_snapshot_refreshed', {
           balanceCount: snapshot.balances.length,
@@ -965,6 +1243,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
           recoveredExecutionFillCount,
           reconciliationStatus: reconciliation.status,
           reconciliationIssueCount: reconciliation.issues.length,
+          equitySampleRecorded: equitySample.recorded,
         });
         return livePortfolio.reconcile({
           snapshot,
@@ -1052,6 +1331,92 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       request.log.warn({ origin, host: request.headers.host }, 'rejected unexpected browser origin');
       return reply.code(403).send({ error: 'unexpected_origin_rejected' });
     }
+  });
+
+  // Session gate: every /api route (except the auth handshake) and the terminal
+  // WebSocket upgrade require a valid session cookie. Static frontend assets stay
+  // public so the SPA can render the login screen.
+  if (!options.authDisabled) app.addHook('onRequest', async (request, reply) => {
+    const path = request.url.split('?')[0] ?? request.url;
+    if (!path.startsWith('/api/') && path !== '/ws/stream') return;
+    if (path === '/api/auth/login' || path === '/api/auth/session') return;
+    const token = readSessionCookie(request);
+    if (!token || !authSessions.validate(token)) {
+      return reply.code(401).send({ error: 'unauthenticated' });
+    }
+  });
+
+  const LoginRequestSchema = z.object({
+    username: z.string().min(1).max(64),
+    password: z.string().min(1).max(200),
+  });
+  const ChangePasswordRequestSchema = z.object({
+    currentPassword: z.string().min(1).max(200),
+    newPassword: z.string().min(1).max(200),
+  });
+  const assertNewPasswordStrength = (password: string): string | null => {
+    if (password.length < 8) return 'new_password_too_short';
+    if (!/[A-Za-z]/.test(password) || !/\d/.test(password)) return 'new_password_weak';
+    return null;
+  };
+
+  app.post('/api/auth/login', {
+    config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+  }, async (request, reply) => {
+    const throttle = loginThrottle.check(request.ip);
+    if (!throttle.allowed) {
+      request.log.warn({ ip: request.ip }, 'login rejected: too many recent failures');
+      reply.header('Retry-After', String(throttle.retryAfterSeconds));
+      return reply.code(429).send({ error: 'login_attempts_exceeded', retryAfterSeconds: throttle.retryAfterSeconds });
+    }
+    const parsed = LoginRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_login_request' });
+    if (!authUsers.verify(parsed.data.username, parsed.data.password)) {
+      loginThrottle.recordFailure(request.ip);
+      request.log.warn({ ip: request.ip }, 'login rejected: invalid credentials');
+      return reply.code(401).send({ error: 'invalid_credentials' });
+    }
+    loginThrottle.recordSuccess(request.ip);
+    const token = authSessions.issue();
+    reply.header('Set-Cookie', sessionCookieHeader(token, request));
+    request.log.info({ username: parsed.data.username }, 'operator signed in');
+    return { authenticated: true, username: parsed.data.username };
+  });
+
+  app.get('/api/auth/session', async (request, reply) => {
+    const token = readSessionCookie(request);
+    if (token && authSessions.validate(token)) {
+      return { authenticated: true, username: authUsers.username() };
+    }
+    return reply.code(401).send({ error: 'unauthenticated' });
+  });
+
+  app.post('/api/auth/logout', async (request, reply) => {
+    const token = readSessionCookie(request);
+    if (token) authSessions.revoke(token);
+    reply.header('Set-Cookie', clearedSessionCookieHeader);
+    return { authenticated: false, username: null };
+  });
+
+  app.post('/api/auth/change-password', {
+    config: { rateLimit: { max: 5, timeWindow: '1 minute' } },
+  }, async (request, reply) => {
+    const parsed = ChangePasswordRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_password_change_request' });
+    const username = authUsers.username() ?? config.authUsername;
+    if (!authUsers.verify(username, parsed.data.currentPassword)) {
+      request.log.warn({ ip: request.ip }, 'password change rejected: current password mismatch');
+      return reply.code(401).send({ error: 'invalid_current_password' });
+    }
+    const weakness = assertNewPasswordStrength(parsed.data.newPassword);
+    if (weakness) return reply.code(400).send({ error: weakness });
+    if (parsed.data.newPassword === parsed.data.currentPassword) {
+      return reply.code(400).send({ error: 'new_password_unchanged' });
+    }
+    authUsers.updatePassword(parsed.data.newPassword);
+    authSessions.revokeAllExcept(readSessionCookie(request));
+    request.log.info({ username }, 'operator password changed');
+    return { ok: true };
   });
 
   app.get('/health', async (): Promise<HealthResponse> => {
@@ -1425,7 +1790,19 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     return { preferences: readUserPreferences(database) };
   });
 
-  app.get('/api/markets', async () => marketHub.snapshot());
+  app.get('/api/markets', async (request) => {
+    // includeRest=1 opts into the merged full-market view: hub live prices first, bulk REST
+    // bookTicker rows filling every unsubscribed symbol — the same price basis the opportunities
+    // board scans. The default response stays hub-only so freshness-sensitive consumers keep
+    // their exact semantics.
+    if ((request.query as { includeRest?: string }).includeRest !== '1') return marketHub.snapshot();
+    const markets = await spreadMarkets();
+    return {
+      connectionState: marketHub.snapshot().connectionState,
+      updatedAt: new Date().toISOString(),
+      markets,
+    };
+  });
 
   app.get('/api/boros/strategies', {
     config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
@@ -1651,7 +2028,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     return { logs: tradingRuntime.strategyLogs(parsed.data.id) };
   });
 
-  const MarketWatchSymbolSchema = z.string().regex(/^(GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_[A-Z0-9]+_(USDT|USDC|USD)$/);
+  // Gate spot legs are first-class watch targets (trade page spot tab, carry legs, auto spot
+  // legs): the upstream Crossex WS accepts GATE_SPOT_* names directly (verified against the live
+  // endpoint), so they ride the same watch messages as futures symbols.
+  const MarketWatchSymbolSchema = z.string().regex(/^(GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_[A-Z0-9]+_(USDT|USDC|USD)$|^(GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_SPOT_[A-Z0-9]+_(USDT|USDC)$/);
   const WatchMessageSchema = z.union([
     z.object({
       type: z.literal('watch.quotes'),
@@ -1948,6 +2328,108 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     }
     await fundingOverviewService.ensureFresh();
     return fundingOverviewService.buildResponse(catalog) satisfies FundingOverviewResponse;
+  });
+
+  // Comma-separated spread-board filters: `venues` holds uppercase venue ids (GATE,BINANCE) and
+  // `markets` holds `spot`/`perp`. Blank and whitespace-only items read as "not supplied", which
+  // means "no restriction"; anything else that is not a known token is a 400.
+  const VENUE_TOKEN_PATTERN = /^[A-Z0-9_-]{1,20}$/;
+  const MARKET_TOKEN_PATTERN = /^(spot|perp)$/i;
+  /** Fine-grained asset classes, matching `AssetClass` in @gate-crossex/shared-types. */
+  const ASSET_CLASS_TOKEN_PATTERN = /^(stock|etf|index|forex|commodity|pre_ipo|coin|token|contract)$/i;
+  /** Asset super classes behind the RWA / Crypto filter. */
+  const ASSET_SUPER_CLASS_TOKEN_PATTERN = /^(rwa|crypto)$/i;
+
+  /** Split a comma-separated query value into trimmed tokens; null marks an invalid token. */
+  function parseCsvTokens(value: string | undefined, pattern: RegExp): string[] | null {
+    if (value === undefined) return [];
+    const tokens = value.split(',').map((token) => token.trim()).filter((token) => token !== '');
+    return tokens.every((token) => pattern.test(token)) ? tokens : null;
+  }
+
+  /**
+   * markets=spot selects rows carrying a spot leg, markets=perp selects perpetual-only rows.
+   * Supplying both (or neither) selects everything, so no whitelist is sent to the service.
+   */
+  function pairTypesFromMarkets(markets: string[]): SpreadPairType[] | undefined {
+    const spot = markets.some((token) => token.toLowerCase() === 'spot');
+    const perp = markets.some((token) => token.toLowerCase() === 'perp');
+    if (spot === perp) return undefined;
+    return [spot ? 'SPOT_PERP' : 'PERP_PERP'];
+  }
+
+  const OpportunityQuerySchema = z.object({
+    funding: z.literal('1').optional(),
+    spread: z.literal('1').optional(),
+    minApr: z.coerce.number().min(0).optional(),
+    minBps: z.coerce.number().optional(),
+    asset: z.string().trim().regex(/^[A-Z0-9]{1,20}$/).optional(),
+    // expand=1 returns one row per (asset, spot venue, perpetual venue) combination.
+    expand: z.literal('1').optional(),
+    venues: z.string().max(400).optional()
+      .refine((value) => parseCsvTokens(value, VENUE_TOKEN_PATTERN) !== null),
+    markets: z.string().max(100).optional()
+      .refine((value) => parseCsvTokens(value, MARKET_TOKEN_PATTERN) !== null),
+    // Asset-class filters: a CSV of fine-grained classes and/or super classes. Both are applied
+    // server side before the row cap, and an unknown token is a 400 rather than a silent no-op.
+    assetClass: z.string().max(400).optional()
+      .refine((value) => parseCsvTokens(value, ASSET_CLASS_TOKEN_PATTERN) !== null),
+    assetSuperClass: z.string().max(100).optional()
+      .refine((value) => parseCsvTokens(value, ASSET_SUPER_CLASS_TOKEN_PATTERN) !== null),
+    // pre-IPO three-state switch; `all` (the default) never hides a row.
+    preIpo: z.enum(['all', 'only', 'exclude']).optional(),
+    sort: z.enum(['spread', 'apr', 'volume', 'oi', 'asset', 'default']).optional(),
+    dir: z.enum(['asc', 'desc']).optional(),
+    offset: z.coerce.number().int().min(0).optional(),
+    /** Page size; `limit` stays supported as an alias for older clients. */
+    pageSize: z.coerce.number().int().min(1).max(200).optional(),
+    limit: z.coerce.number().int().min(1).max(200).default(50),
+  });
+
+  app.get('/api/opportunities', async (request, reply) => {
+    const query = OpportunityQuerySchema.safeParse(request.query);
+    if (!query.success) return reply.code(400).send({ error: 'invalid_opportunities_query' });
+    let catalog = derivedMarketCatalog();
+    if (!catalog) {
+      try {
+        await fetchInstrumentCatalog();
+        catalog = derivedMarketCatalog();
+      } catch (error) {
+        const errorCode = error instanceof GateApiError ? error.label : 'PUBLIC_DATA_ERROR';
+        recordMarketDataFailure(database, 'gate_crossex_instruments', new Date().toISOString(), errorCode);
+        request.log.warn({ reason: errorCode }, 'opportunities catalog discovery failed');
+      }
+      if (!catalog) return reply.code(502).send({ error: 'market_catalog_unavailable' });
+    } else if (Date.now() - Date.parse(catalog.fetchedAt) > MARKET_CATALOG_FRESH_MS) {
+      void fetchInstrumentCatalog().catch((error: unknown) => {
+        request.log.warn({ reason: error instanceof GateApiError ? error.label : 'PUBLIC_DATA_ERROR' }, 'opportunities catalog refresh failed');
+      });
+    }
+    const venues = parseCsvTokens(query.data.venues, VENUE_TOKEN_PATTERN) ?? [];
+    const markets = parseCsvTokens(query.data.markets, MARKET_TOKEN_PATTERN) ?? [];
+    const pairTypes = pairTypesFromMarkets(markets);
+    const assetClasses = (parseCsvTokens(query.data.assetClass, ASSET_CLASS_TOKEN_PATTERN) ?? [])
+      .map((token) => token.toUpperCase()) as AssetClass[];
+    const assetSuperClasses = (parseCsvTokens(query.data.assetSuperClass, ASSET_SUPER_CLASS_TOKEN_PATTERN) ?? [])
+      .map((token) => token.toUpperCase()) as AssetSuperClass[];
+    return await opportunityService.list({ assets: catalog.assets }, {
+      funding: query.data.funding === '1',
+      spread: query.data.spread === '1',
+      ...(query.data.minApr !== undefined ? { minApr: query.data.minApr } : {}),
+      ...(query.data.minBps !== undefined ? { minBps: query.data.minBps } : {}),
+      ...(query.data.asset !== undefined ? { asset: query.data.asset } : {}),
+      // An empty selection means "every venue" / "every shape": no whitelist is forwarded.
+      ...(venues.length > 0 ? { venues: [...new Set(venues.map((venue) => venue.toUpperCase()))] } : {}),
+      ...(pairTypes !== undefined ? { pairTypes } : {}),
+      ...(assetClasses.length > 0 ? { assetClasses } : {}),
+      ...(assetSuperClasses.length > 0 ? { assetSuperClasses } : {}),
+      ...(query.data.preIpo !== undefined ? { preIpo: query.data.preIpo } : {}),
+      ...(query.data.sort !== undefined ? { sort: query.data.sort } : {}),
+      ...(query.data.dir !== undefined ? { dir: query.data.dir } : {}),
+      offset: query.data.offset ?? 0,
+      expand: query.data.expand === '1',
+      limit: query.data.pageSize ?? query.data.limit,
+    }) satisfies OpportunityResponse;
   });
 
   app.post('/api/markets/funding-history', {
@@ -2571,6 +3053,38 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       }
       return reply.code(502).send({ error: 'portfolio_snapshot_unavailable' });
     }
+  });
+
+  // Equity curve for the asset page. Served from the persisted sample table only — it never
+  // triggers a remote portfolio read — so an un-sampled terminal returns an empty state.
+  // Known limitation: the curve only grows while the terminal runs; gaps appear whenever it
+  // is closed and 7d/30d ranges fill in over the first days of usage.
+  app.get('/api/crossex/portfolio-equity', {
+    preHandler: async (request, reply) => {
+      if (request.headers['x-gct-read-intent'] !== 'portfolio-equity') {
+        return reply.code(403).send({ error: 'missing_read_intent' });
+      }
+    },
+  }, async (request, reply) => {
+    const parsed = PortfolioEquityQuerySchema.safeParse(request.query);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_portfolio_equity_range' });
+    const range = parsed.data.range;
+    const granularity = equityGranularityForRange(range);
+    const now = Date.now();
+    const { fromMs } = equityRangeWindow(range, now);
+    const points = downsampleEquityPoints(
+      readPortfolioEquitySeries(database, granularity, fromMs),
+      PORTFOLIO_EQUITY_MAX_POINTS,
+    );
+    const firstSampleAtMs = readPortfolioEquityFirstSampleAt(database);
+    const response: PortfolioEquitySeriesResponse = {
+      range,
+      granularity,
+      points,
+      firstSampleAt: firstSampleAtMs === null ? null : new Date(firstSampleAtMs).toISOString(),
+      fetchedAt: new Date(now).toISOString(),
+    };
+    return response;
   });
 
   app.get('/api/crossex/positions-snapshot', {

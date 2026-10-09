@@ -23,7 +23,7 @@ class ErrorBoundary extends Component<{ children: ReactNode }, ErrorBoundaryStat
     if (!this.state.failed) return this.props.children;
     return <main className="fatal-error" role="alert">
       <div>
-        <p>All In One · Gate CrossEx</p>
+        <p>星闪量化 FlareStar Quant · Gate CrossEx</p>
         <h1>The interface could not be loaded.</h1>
         <span>Your local backend and trading strategies may still be running. Reload the page; if the problem continues, run <code>./run doctor</code> and inspect <code>./run logs</code>.</span>
         <button onClick={() => window.location.reload()}>Reload interface</button>

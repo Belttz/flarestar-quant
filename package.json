@@ -1,7 +1,7 @@
 {
   "name": "gate-crossex-terminal",
   "private": true,
-  "version": "0.2.5",
+  "version": "0.3.0",
   "license": "AGPL-3.0-only",
   "type": "module",
   "workspaces": [
@@ -17,7 +17,8 @@
     "test:e2e:run": "playwright test",
     "lint": "eslint .",
     "benchmark:db": "node scripts/benchmark-database.mjs",
-    "test:bootstrap": "node --test scripts/bootstrap-installer.test.mjs scripts/check-for-update.test.mjs",
+    "test:bootstrap": "node --test scripts/bootstrap-installer.test.mjs scripts/check-for-update.test.mjs scripts/launcher.test.mjs scripts/test-deploy-scripts.mjs",
+    "test:deploy": "node --test scripts/test-deploy-scripts.mjs",
     "test:release": "node --test scripts/release-installer.test.mjs",
     "release:bundle:macos": "node scripts/build-release-bundle.mjs",
     "release:bundle:windows": "node scripts/build-release-bundle-windows.mjs",

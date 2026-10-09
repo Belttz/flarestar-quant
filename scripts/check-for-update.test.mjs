@@ -32,7 +32,7 @@ test('reports a newer published release using the configured GitHub repository',
     },
     savedSource: null,
   });
-  assert.equal(requestedUrl, 'https://api.github.com/repos/your-quantguy/gate-crossex/releases/latest');
+  assert.equal(requestedUrl, 'https://api.github.com/repos/Belttz/flarestar-quant/releases/latest');
   assert.deepEqual(update, { currentVersion, latestTag: 'v999.0.0' });
 });
 
@@ -53,7 +53,7 @@ test('skips update checks for a pinned bootstrap source ref', async () => {
       requested = true;
       return { ok: true, json: async () => ({ tag_name: 'v999.0.0' }) };
     },
-    savedSource: { ref: 'v0.1.2', repository: 'your-quantguy/gate-crossex' },
+    savedSource: { ref: 'v0.1.2', repository: 'Belttz/flarestar-quant' },
   });
   assert.equal(requested, false);
   assert.equal(update, null);

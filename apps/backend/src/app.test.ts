@@ -1,19 +1,20 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocketServer } from 'ws';
 import type WebSocketDefault from 'ws';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { FastifyInstance } from 'fastify';
 import type Database from 'better-sqlite3';
-import { PublicMarketDataError, type FundingStatVenue, type PublicMarketDataGateway, type VenueContractSize, type VenueFundingStat } from '@gate-crossex/public-data';
-import type { CrossExTransferRequest, FundingOverviewResponse, PublicMarketSnapshot } from '@gate-crossex/shared-types';
+import { PublicMarketDataError, type FundingStatVenue, type PublicMarketDataGateway, type VenueBookTicker, type VenueContractSize, type VenueFundingStat } from '@gate-crossex/public-data';
+import type { CrossExTransferRequest, FundingOverviewResponse, MarketSnapshot, OpportunityResponse, PublicMarketSnapshot } from '@gate-crossex/shared-types';
 import type { Candle, CandleInterval } from '@gate-crossex/shared-types';
 import { buildApp } from './app.js';
 import { loadConfig } from './config.js';
 import { DEFAULT_CREDENTIAL_PROFILE, EnvFileCredentialVault, MemoryCredentialVault, type CredentialVault, type GateCredentials } from './credential-vault.js';
 import { GateApiError, type CrossExOrderRequest, type GateCrossExAccount, type GateCrossExOrder, type GateCrossExPortfolio, type GateCrossExRiskLimit, type GateCrossExSymbol, type GateFeeRate, type GateOrderActionResponse, type GateSpotAccount, type GateTransferCoin, type GateTransferRecord, type GateAccountBookRecord, type GateTransferResponse, type TradingCrossExGateway } from './crossex-client.js';
 import { openDatabase } from './database.js';
+import { recordPortfolioEquitySample } from './repositories.js';
 import { CrossExMarketHub } from './market-hub.js';
 import { TradingSession } from './trading-session.js';
 
@@ -86,8 +87,11 @@ class FakeCrossExGateway implements TradingCrossExGateway {
   transferCoinQueryCount = 0;
   failSymbols = false;
   failPortfolio = false;
+  failSpotAccounts = false;
   /** When set, cancel requests are accepted but the remote order keeps reporting OPEN. */
   holdCancellations = false;
+  /** When set, Gate refuses every cancel with a definitive 4xx after the request is recorded. */
+  failCancellations = false;
   private readonly remoteOrders = new Map<string, { request: CrossExOrderRequest; state: string }>();
   private portfolioBlock: Promise<void> | null = null;
   private positionsBlock: Promise<void> | null = null;
@@ -100,6 +104,7 @@ class FakeCrossExGateway implements TradingCrossExGateway {
 
   async querySpotAccounts(credentials: GateCredentials): Promise<GateSpotAccount[]> {
     this.receivedCredentials.push({ ...credentials });
+    if (this.failSpotAccounts) throw new GateApiError(0, 'NETWORK_ERROR');
     return [
       { currency: 'USDT', available: '250.125', locked: '10' },
       { currency: 'USDC', available: '42.50000001', locked: '0' },
@@ -180,6 +185,7 @@ class FakeCrossExGateway implements TradingCrossExGateway {
   async cancelOrder(credentials: GateCredentials, orderId: string): Promise<GateOrderActionResponse> {
     this.receivedCredentials.push({ ...credentials });
     this.cancelledOrders.push(orderId);
+    if (this.failCancellations) throw new GateApiError(400, 'ORDER_CANCEL_REFUSED');
     const existing = this.remoteOrders.get(orderId);
     if (existing && !this.holdCancellations) existing.state = 'CANCELLED';
     return { order_id: orderId, text: '' };
@@ -305,6 +311,16 @@ class FakePublicMarketGateway implements PublicMarketDataGateway {
     return [];
   }
 
+  bookTickers: VenueBookTicker[] = [];
+  bookTickerQueryCount = 0;
+  failBookTickers = false;
+
+  async queryVenueBookTickers(venue: FundingStatVenue): Promise<VenueBookTicker[]> {
+    this.bookTickerQueryCount += 1;
+    if (this.failBookTickers) throw new PublicMarketDataError('NETWORK_ERROR');
+    return this.bookTickers.filter((ticker) => ticker.venue === venue);
+  }
+
   async queryFundingHistory(): Promise<Array<{ timestamp: number; rate: string }>> {
     this.fundingHistoryQueryCount += 1;
     return [
@@ -380,11 +396,14 @@ async function createTestApp(options: {
   borosStrategyFetcher?: () => Promise<unknown>;
   borosMarketFeeFetcher?: (marketIds: number[]) => Promise<unknown>;
   strategyEngineOptions?: { orderTimeoutMs?: number };
+  /** Serves the app shell from this directory; the client routes only exist when it is set. */
+  frontendDistDir?: string;
 } = {}): Promise<TestContext> {
   const directory = options.directory ?? mkdtempSync(join(tmpdir(), 'gate-crossex-app-'));
   const config = loadConfig({
     GCT_DATA_DIR: directory,
     GCT_MIGRATIONS_DIR: resolve(process.cwd(), '../../migrations'),
+    ...(options.frontendDistDir ? { GCT_FRONTEND_DIST_DIR: options.frontendDistDir } : {}),
   });
   const database = openDatabase(config.databasePath, config.migrationsDir);
   const vault = new MemoryCredentialVault();
@@ -407,6 +426,7 @@ async function createTestApp(options: {
     borosStrategyFetcher: options.borosStrategyFetcher,
     borosMarketFeeFetcher: options.borosMarketFeeFetcher,
     strategyEngineOptions: options.strategyEngineOptions,
+    authDisabled: true,
     logger: false,
   });
   const context = { app, database, vault, gateway, publicMarketGateway, tradingSession, directory };
@@ -526,7 +546,7 @@ describe('local backend', () => {
       authenticatedTradingEnabled: false,
       tradingMode: 'unset',
       mode: 'live',
-      database: { migrationCount: 20, currentMigration: '0020_strategy_account_backfill.sql' },
+      database: { migrationCount: 23, currentMigration: '0023_portfolio_equity_samples.sql' },
       security: {
         credentialStorage: 'memory_test_only',
         credentialEntryPath: '/secure/credentials',
@@ -796,6 +816,71 @@ describe('local backend', () => {
     expect(cancelled.statusCode).toBe(200);
     expect(cancelled.json()).toMatchObject({ state: 'PENDING_CANCEL' });
     expect(gateway.cancelledOrders).toEqual(['live-1']);
+  });
+
+  it('cancels a resting GATE_SPOT order through the same DELETE route and acks PENDING_CANCEL', async () => {
+    const { app, gateway } = await createTestApp({ liveTradingEnabled: true });
+    const order = await app.inject({ method: 'POST', url: '/api/trading/orders', headers: {
+      host: '127.0.0.1:17840', 'x-gct-trading-intent': 'place-order',
+    }, payload: {
+      symbol: 'GATE_SPOT_BTC_USDT', side: 'BUY', type: 'LIMIT', timeInForce: 'GTC', quantity: '0.001', price: '100', reduceOnly: false,
+    } });
+    expect(order.statusCode).toBe(200);
+    expect(order.json()).toMatchObject({ symbol: 'GATE_SPOT_BTC_USDT', remoteOrderId: 'live-1', state: 'NEW' });
+
+    const cancelled = await app.inject({ method: 'DELETE', url: `/api/trading/orders/${order.json().id}`, headers: {
+      host: '127.0.0.1:17840', 'x-gct-trading-intent': 'cancel-order',
+    } });
+    expect(cancelled.statusCode).toBe(200);
+    expect(cancelled.json()).toMatchObject({ id: order.json().id, symbol: 'GATE_SPOT_BTC_USDT', state: 'PENDING_CANCEL' });
+    // The cancel route is business-agnostic: a spot order reaches the identical gateway call.
+    expect(gateway.cancelledOrders).toEqual(['live-1']);
+  });
+
+  it('maps a Gate-refused spot-order cancel to a 502 gate_cancel_rejected error', async () => {
+    const { app, gateway } = await createTestApp({ liveTradingEnabled: true });
+    const order = await app.inject({ method: 'POST', url: '/api/trading/orders', headers: {
+      host: '127.0.0.1:17840', 'x-gct-trading-intent': 'place-order',
+    }, payload: {
+      symbol: 'GATE_SPOT_BTC_USDT', side: 'BUY', type: 'LIMIT', timeInForce: 'GTC', quantity: '0.001', price: '100', reduceOnly: false,
+    } });
+    expect(order.statusCode).toBe(200);
+    gateway.failCancellations = true;
+
+    const refused = await app.inject({ method: 'DELETE', url: `/api/trading/orders/${order.json().id}`, headers: {
+      host: '127.0.0.1:17840', 'x-gct-trading-intent': 'cancel-order',
+    } });
+    expect(refused.statusCode).toBe(502);
+    expect(refused.json()).toEqual({ error: 'gate_cancel_rejected', label: 'ORDER_CANCEL_REFUSED' });
+    // The cancel did reach the gateway, and the ledger row keeps its pre-cancel state.
+    expect(gateway.cancelledOrders).toEqual(['live-1']);
+    const snapshot = await app.inject({ method: 'GET', url: '/api/trading/snapshot', headers: { host: '127.0.0.1:17840' } });
+    expect(snapshot.json().orders).toEqual([expect.objectContaining({ id: order.json().id, state: 'NEW' })]);
+  });
+
+  it('sizes spot market buys by quote_qty while spot sells keep base qty', async () => {
+    const { app, gateway } = await createTestApp({ liveTradingEnabled: true });
+    const headers = { host: '127.0.0.1:17840', 'x-gct-trading-intent': 'place-order' };
+    // Manual spot buy (trade-route): quantity rides along as a price-derived estimate and
+    // quote_qty is the authoritative size — the gateway request must carry quote_qty only.
+    const buy = await app.inject({ method: 'POST', url: '/api/trading/orders', headers, payload: {
+      symbol: 'GATE_SPOT_BTC_USDT', side: 'BUY', type: 'MARKET', timeInForce: 'IOC',
+      quantity: '0.001', quoteQty: '100', reduceOnly: false,
+    } });
+    expect(buy.statusCode).toBe(200);
+    expect(gateway.createdOrders[0]).toMatchObject({
+      symbol: 'GATE_SPOT_BTC_USDT', side: 'BUY', type: 'MARKET', quote_qty: '100',
+    });
+    expect(gateway.createdOrders[0]).not.toHaveProperty('qty');
+
+    // Spot sells and every other order keep sizing in base quantity.
+    const sell = await app.inject({ method: 'POST', url: '/api/trading/orders', headers, payload: {
+      symbol: 'GATE_SPOT_BTC_USDT', side: 'SELL', type: 'MARKET', timeInForce: 'IOC',
+      quantity: '0.002', reduceOnly: false,
+    } });
+    expect(sell.statusCode).toBe(200);
+    expect(gateway.createdOrders[1]).toMatchObject({ symbol: 'GATE_SPOT_BTC_USDT', side: 'SELL', qty: '0.002' });
+    expect(gateway.createdOrders[1]).not.toHaveProperty('quote_qty');
   });
 
   it('reads leverage in locked mode and only updates it with explicit live intent', async () => {
@@ -1536,20 +1621,55 @@ describe('local backend', () => {
       { venue: 'BINANCE', symbol: 'BINANCE_FUTURE_BTC_USDT', quote: 'USDT' },
     ] });
     expect(body.assets.find((entry) => entry.asset === 'SOL')?.venues).toEqual([
-      { venue: 'KRAKEN', symbol: 'KRAKEN_FUTURE_SOL_USD', quote: 'USD' },
+      { venue: 'KRAKEN', symbol: 'KRAKEN_FUTURE_SOL_USD', quote: 'USD', business: 'FUTURE' },
     ]);
     expect(body.assets.find((entry) => entry.asset === 'SKHYNIX')?.venues).toEqual([
-      { venue: 'GATE', symbol: 'GATE_FUTURE_SKHYNIX_USDT', quote: 'USDT' },
-      { venue: 'HYPERLIQUID', symbol: 'HYPERLIQUID_FUTURE_SKHX_USDC', quote: 'USDC' },
+      { venue: 'GATE', symbol: 'GATE_FUTURE_SKHYNIX_USDT', quote: 'USDT', business: 'FUTURE' },
+      { venue: 'HYPERLIQUID', symbol: 'HYPERLIQUID_FUTURE_SKHX_USDC', quote: 'USDC', business: 'FUTURE' },
     ]);
     expect(body.assets.some((entry) => entry.asset === 'SKHX')).toBe(false);
     expect(body.assets.find((entry) => entry.asset === 'SKHY')?.venues).toEqual([
-      { venue: 'HYPERLIQUID', symbol: 'HYPERLIQUID_FUTURE_SKHY_USDC', quote: 'USDC' },
+      { venue: 'HYPERLIQUID', symbol: 'HYPERLIQUID_FUTURE_SKHY_USDC', quote: 'USDC', business: 'FUTURE' },
     ]);
     // ZETA is not part of the hub's seed watchlist; suspended instruments are excluded entirely.
     expect(body.assets.find((entry) => entry.asset === 'ZETA')?.streamed).toBe(false);
     expect(body.assets.some((entry) => entry.asset === 'ETH')).toBe(false);
     expect(gateway.symbolQueryCount).toBe(1);
+  });
+
+  it('derives spot catalog rows alongside futures and accepts multi-venue spot watches', async () => {
+    const { app, gateway } = await createTestApp();
+    gateway.extraSymbols = [
+      catalogSymbol('GATE_FUTURE_BTC_USDT', 'GATE'),
+      { ...catalogSymbol('GATE_SPOT_BTC_USDT', 'GATE'), business_type: 'SPOT' },
+      { ...catalogSymbol('BINANCE_SPOT_BTC_USDT', 'BINANCE'), business_type: 'SPOT' },
+      { ...catalogSymbol('BINANCE_SPOT_BTC_USDC', 'BINANCE'), business_type: 'SPOT' },
+      { ...catalogSymbol('OKX_SPOT_ETH_USDT', 'OKX'), business_type: 'SPOT', state: 'suspend' },
+    ];
+    const headers = { host: '127.0.0.1:17840' };
+    const response = await app.inject({ method: 'GET', url: '/api/markets/catalog', headers });
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as { assets: Array<{ asset: string; venues: Array<{ venue: string; symbol: string; quote: string; business: string }> }> };
+    const btc = body.assets.find((entry) => entry.asset === 'BTC');
+    // Rows group by venue in CATALOG_VENUES order, futures before spot within each venue.
+    // (The fake gateway always lists BINANCE_FUTURE_BTC_USDT as a seed instrument.)
+    expect(btc?.venues).toEqual([
+      { venue: 'GATE', symbol: 'GATE_FUTURE_BTC_USDT', quote: 'USDT', business: 'FUTURE' },
+      { venue: 'GATE', symbol: 'GATE_SPOT_BTC_USDT', quote: 'USDT', business: 'SPOT' },
+      { venue: 'BINANCE', symbol: 'BINANCE_FUTURE_BTC_USDT', quote: 'USDT', business: 'FUTURE' },
+      { venue: 'BINANCE', symbol: 'BINANCE_SPOT_BTC_USDT', quote: 'USDT', business: 'SPOT' },
+    ]);
+    expect(body.assets.some((entry) => entry.asset === 'ETH')).toBe(false);
+
+    // A live multi-venue spot symbol resolves through the market-definitions path; non-live or
+    // out-of-catalog spot symbols are rejected with unknown_market_symbol.
+    const accepted = await app.inject({ method: 'GET', url: '/api/markets/BINANCE_SPOT_BTC_USDT/candles?limit=30', headers });
+    expect(accepted.statusCode).toBe(200);
+    expect(accepted.json()).toMatchObject({ symbol: 'BINANCE_SPOT_BTC_USDT' });
+    const notLive = await app.inject({ method: 'GET', url: '/api/markets/OKX_SPOT_ETH_USDT/candles?limit=30', headers });
+    expect(notLive.statusCode).toBe(404);
+    const unknownVenue = await app.inject({ method: 'GET', url: '/api/markets/KRAKEN_SPOT_BTC_USDT/candles?limit=30', headers });
+    expect(unknownVenue.statusCode).toBe(404);
   });
 
   it('serves the all-pairs funding overview joined onto the catalog and caches venue sweeps', async () => {
@@ -1591,6 +1711,388 @@ describe('local backend', () => {
     expect(body.venueStatus.every((status) => status.status === 'error')).toBe(true);
     const btc = body.assets.find((entry) => entry.asset === 'BTC');
     expect(btc?.venues.every((venue) => venue.fundingRate === null)).toBe(true);
+  });
+
+  it('serves ranked funding and spread opportunities with an executable Gate spot leg', async () => {
+    const { app, gateway } = await createTestApp();
+    gateway.extraSymbols = [
+      catalogSymbol('GATE_FUTURE_BTC_USDT', 'GATE'),
+      { ...catalogSymbol('GATE_SPOT_BTC_USDT', 'GATE'), business_type: 'SPOT' },
+    ];
+    const headers = { host: '127.0.0.1:17840' };
+
+    const response = await app.inject({ method: 'GET', url: '/api/opportunities?funding=1&spread=1', headers });
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as OpportunityResponse;
+    expect(body.cacheStatus).toBe('fresh');
+    // Funding board: |rate8h| annualized and descending — GATE (0.00013 → 14.235) before
+    // BINANCE (0.0001 → 10.95), both positive with a connected spot hedge leg.
+    expect(body.funding.map((row) => row.venue)).toEqual(['GATE', 'BINANCE']);
+    expect(body.funding[0]).toMatchObject({
+      asset: 'BTC', symbol: 'GATE_FUTURE_BTC_USDT', direction: 'POSITIVE',
+      spotSymbol: 'GATE_SPOT_BTC_USDT', spotVenues: ['GATE'], executable: true,
+    });
+    expect(body.funding[0]?.fundingApr).toBeCloseTo(14.235, 6);
+    expect(body.funding[1]?.fundingApr).toBeCloseTo(10.95, 6);
+    // Spread board: same-quote pairs, best orientation first, strictly descending bps.
+    expect(body.spread.length).toBeGreaterThan(0);
+    for (let index = 1; index < body.spread.length; index += 1) {
+      expect(body.spread[index - 1]?.spreadBps).toBeGreaterThanOrEqual(body.spread[index]?.spreadBps);
+    }
+    for (const row of body.spread) {
+      expect(['SPOT_PERP', 'PERP_PERP']).toContain(row.pairType);
+      expect(row.leftSymbol.split('_')[3]).toBe(row.rightSymbol.split('_')[3]);
+      expect(row.leftSymbol).not.toBe(row.rightSymbol);
+      // Cross-venue perpetual pairs only: same-venue perps are one instrument, not a spread.
+      if (row.pairType === 'PERP_PERP') expect(row.leftVenue).not.toBe(row.rightVenue);
+      expect(row.executable).toBe(true);
+    }
+
+    const filtered = await app.inject({ method: 'GET', url: '/api/opportunities?funding=1&spread=1&minApr=12&asset=BTC&limit=1', headers });
+    expect(filtered.statusCode).toBe(200);
+    const filteredBody = filtered.json() as OpportunityResponse;
+    expect(filteredBody.funding).toHaveLength(1);
+    expect(filteredBody.funding[0]?.venue).toBe('GATE');
+    expect(filteredBody.funding[0]?.fundingApr).toBeGreaterThanOrEqual(12);
+    expect(filteredBody.spread).toHaveLength(1);
+    expect((await app.inject({ method: 'GET', url: '/api/opportunities?minApr=abc', headers })).statusCode).toBe(400);
+  });
+
+  it('marks funding opportunities without a connected Gate spot leg as not executable', async () => {
+    const { app, gateway } = await createTestApp();
+    gateway.extraSymbols = [catalogSymbol('GATE_FUTURE_BTC_USDT', 'GATE')];
+    const headers = { host: '127.0.0.1:17840' };
+    const response = await app.inject({ method: 'GET', url: '/api/opportunities?funding=1', headers });
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as OpportunityResponse;
+    expect(body.funding[0]).toMatchObject({ venue: 'GATE', spotSymbol: null, spotVenues: [], executable: false });
+    expect(body.spread).toEqual([]);
+  });
+
+  it('fills the spread board from the REST sweep even when the hub never registered the pair', async () => {
+    const { app, publicMarketGateway } = await createTestApp();
+    // Nothing is streamed or registered for SIREN; only the bulk REST sweep knows its quotes.
+    publicMarketGateway.bookTickers = [
+      { venue: 'GATE', business: 'FUTURE', base: 'SIREN', quote: 'USDT', bidPrice: '0.120', askPrice: '0.121', lastPrice: '0.1205' },
+      { venue: 'BYBIT', business: 'FUTURE', base: 'SIREN', quote: 'USDT', bidPrice: '0.125', askPrice: '0.126', lastPrice: null },
+      // Rows without a two-sided book must never reach the board.
+      { venue: 'OKX', business: 'FUTURE', base: 'SIREN', quote: 'USDT', bidPrice: '0', askPrice: '0', lastPrice: null },
+    ];
+    const headers = { host: '127.0.0.1:17840' };
+    const response = await app.inject({ method: 'GET', url: '/api/opportunities?spread=1', headers });
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as OpportunityResponse;
+    // The seeded demo markets also rank; the SIREN pair must be on the board despite its
+    // symbols never having been registered on the hub.
+    const siren = body.spread.find((row) => row.asset === 'SIREN');
+    expect(siren).toMatchObject({
+      pairType: 'PERP_PERP',
+      asset: 'SIREN',
+      leftSymbol: 'BYBIT_FUTURE_SIREN_USDT',
+      rightSymbol: 'GATE_FUTURE_SIREN_USDT',
+      sellBid: '0.125',
+      buyAsk: '0.121',
+      executable: true,
+    });
+    // Rows without a two-sided book must never reach the board.
+    expect(body.spread.some((row) => row.leftSymbol === 'OKX_FUTURE_SIREN_USDT' || row.rightSymbol === 'OKX_FUTURE_SIREN_USDT')).toBe(false);
+    // The sweep result must be cached so a second request does not re-hit the venue feeds.
+    expect(publicMarketGateway.bookTickerQueryCount).toBe(4);
+    await app.inject({ method: 'GET', url: '/api/opportunities?spread=1', headers });
+    expect(publicMarketGateway.bookTickerQueryCount).toBe(4);
+  });
+
+  it('filters the spread board by the venues and markets query parameters', async () => {
+    const { app, publicMarketGateway } = await createTestApp();
+    // Only perpetual rows exist for SIREN, so it is a deterministic PERP_PERP fixture.
+    publicMarketGateway.bookTickers = [
+      { venue: 'GATE', business: 'FUTURE', base: 'SIREN', quote: 'USDT', bidPrice: '0.120', askPrice: '0.121', lastPrice: '0.1205' },
+      { venue: 'BYBIT', business: 'FUTURE', base: 'SIREN', quote: 'USDT', bidPrice: '0.125', askPrice: '0.126', lastPrice: null },
+    ];
+    const headers = { host: '127.0.0.1:17840' };
+
+    const perpOnly = await app.inject({ method: 'GET', url: '/api/opportunities?spread=1&markets=perp', headers });
+    expect(perpOnly.statusCode).toBe(200);
+    const perpBody = perpOnly.json() as OpportunityResponse;
+    expect(perpBody.spread.length).toBeGreaterThan(0);
+    expect(perpBody.spread.every((row) => row.pairType === 'PERP_PERP')).toBe(true);
+    expect(perpBody.spread.find((row) => row.asset === 'SIREN')).toBeDefined();
+
+    const spotOnly = await app.inject({ method: 'GET', url: '/api/opportunities?spread=1&markets=spot', headers });
+    expect(spotOnly.statusCode).toBe(200);
+    const spotBody = spotOnly.json() as OpportunityResponse;
+    expect(spotBody.spread.every((row) => row.pairType === 'SPOT_PERP')).toBe(true);
+    expect(spotBody.spread.some((row) => row.asset === 'SIREN')).toBe(false);
+
+    const byVenue = await app.inject({ method: 'GET', url: '/api/opportunities?spread=1&venues=GATE,BYBIT', headers });
+    expect(byVenue.statusCode).toBe(200);
+    const venueBody = byVenue.json() as OpportunityResponse;
+    expect(venueBody.spread.length).toBeGreaterThan(0);
+    for (const row of venueBody.spread) {
+      expect(['GATE', 'BYBIT']).toContain(row.leftVenue);
+      expect(['GATE', 'BYBIT']).toContain(row.rightVenue);
+    }
+    expect(venueBody.spread.find((row) => row.asset === 'SIREN')).toBeDefined();
+
+    // Blank values read as "not supplied" (no restriction); unknown tokens are rejected.
+    expect((await app.inject({ method: 'GET', url: '/api/opportunities?spread=1&venues=&markets=', headers })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'GET', url: '/api/opportunities?spread=1&venues=NOT_A_VENUE!', headers })).statusCode).toBe(400);
+    expect((await app.inject({ method: 'GET', url: '/api/opportunities?spread=1&markets=swap', headers })).statusCode).toBe(400);
+  });
+
+  it('accepts, rejects and normalizes every shape of the venues and markets query parameters', async () => {
+    const { app, publicMarketGateway } = await createTestApp();
+    // Deterministic PERP_PERP fixture: only perpetual rows exist for SIREN, and OKX owns the
+    // unfiltered board's top row so the venue filter can be proven to change the ranking.
+    publicMarketGateway.bookTickers = [
+      { venue: 'GATE', business: 'FUTURE', base: 'SIREN', quote: 'USDT', bidPrice: '0.120', askPrice: '0.121', lastPrice: '0.1205' },
+      { venue: 'BYBIT', business: 'FUTURE', base: 'SIREN', quote: 'USDT', bidPrice: '0.125', askPrice: '0.126', lastPrice: null },
+      { venue: 'OKX', business: 'FUTURE', base: 'SIREN', quote: 'USDT', bidPrice: '0.130', askPrice: '0.131', lastPrice: null },
+    ];
+    const headers = { host: '127.0.0.1:17840' };
+    const get = async (query: string) => {
+      const response = await app.inject({ method: 'GET', url: `/api/opportunities?spread=1&${query}`, headers });
+      expect(response.statusCode).toBe(200);
+      return (response.json() as OpportunityResponse).spread;
+    };
+    const statusOf = async (query: string) =>
+      (await app.inject({ method: 'GET', url: `/api/opportunities?spread=1&${query}`, headers })).statusCode;
+
+    const unfiltered = await get('asset=SIREN');
+
+    // Duplicate tokens collapse; blank / whitespace-only tokens read as "not supplied".
+    expect(await get('asset=SIREN&venues=GATE,GATE,%20,GATE')).toEqual(await get('asset=SIREN&venues=GATE'));
+    expect(await get('asset=SIREN&venues=%20,%20%20')).toEqual(unfiltered);
+    expect(await get('asset=SIREN&venues=')).toEqual(unfiltered);
+
+    // Lowercase and mixed-case venue tokens are rejected: the contract is uppercase venue ids.
+    expect(await statusOf('asset=SIREN&venues=gate')).toBe(400);
+    expect(await statusOf('asset=SIREN&venues=GATE,gate')).toBe(400);
+    // Over-long tokens and over-long values are rejected too (20 chars per token, 400 total).
+    expect(await statusOf('asset=SIREN&venues=ABCDEFGHIJKLMNOPQRSTU')).toBe(400);
+    expect(await statusOf(`asset=SIREN&venues=${'GATE,'.repeat(81)}GATE`)).toBe(400);
+    // Illegal characters (`!`, spaces inside a token, script-ish input) are rejected.
+    expect(await statusOf('asset=SIREN&venues=NOT_A_VENUE!')).toBe(400);
+    expect(await statusOf('asset=SIREN&venues=GATE%20BINANCE')).toBe(400);
+    expect(await statusOf('asset=SIREN&venues=<script>')).toBe(400);
+
+    // A well-formed but unknown venue is accepted and simply matches nothing: 200 + empty board.
+    expect(await get('asset=SIREN&venues=NOT_A_VENUE')).toEqual([]);
+
+    // markets is case-insensitive and `spot,perp` means "no restriction".
+    expect(await get('asset=SIREN&markets=spot,perp')).toEqual(unfiltered);
+    expect(await get('asset=SIREN&markets=PERP,SPOT')).toEqual(unfiltered);
+    expect(await get('asset=SIREN&markets=SPOT')).toEqual(await get('asset=SIREN&markets=spot'));
+    expect(await get('asset=SIREN&markets=')).toEqual(unfiltered);
+    // SIREN has no spot leg, so a spot-only board is legitimately empty while perp-only is not.
+    expect(await get('asset=SIREN&markets=spot')).toEqual([]);
+    expect((await get('asset=SIREN&markets=perp')).length).toBe(unfiltered.length);
+    expect(await statusOf('asset=SIREN&markets=swap')).toBe(400);
+  });
+
+  it('applies the venues and markets filters before the row cap on /api/opportunities', async () => {
+    const { app, publicMarketGateway } = await createTestApp();
+    publicMarketGateway.bookTickers = [
+      { venue: 'GATE', business: 'FUTURE', base: 'SIREN', quote: 'USDT', bidPrice: '0.120', askPrice: '0.121', lastPrice: '0.1205' },
+      { venue: 'BYBIT', business: 'FUTURE', base: 'SIREN', quote: 'USDT', bidPrice: '0.125', askPrice: '0.126', lastPrice: null },
+      { venue: 'OKX', business: 'FUTURE', base: 'SIREN', quote: 'USDT', bidPrice: '0.130', askPrice: '0.131', lastPrice: null },
+    ];
+    const headers = { host: '127.0.0.1:17840' };
+    const get = async (query: string) => {
+      const response = await app.inject({ method: 'GET', url: `/api/opportunities?spread=1&${query}`, headers });
+      expect(response.statusCode).toBe(200);
+      return (response.json() as OpportunityResponse).spread;
+    };
+
+    // Unfiltered top row: sell OKX at 0.130, buy GATE at 0.121 → ~743.8 bps.
+    const top = await get('asset=SIREN&limit=1');
+    expect(top).toHaveLength(1);
+    expect(top[0]).toMatchObject({ pairType: 'PERP_PERP', leftVenue: 'OKX', rightVenue: 'GATE' });
+    expect(top[0]?.spreadBps).toBeCloseTo(((0.130 - 0.121) / 0.121) * 10_000, 6);
+
+    // Deselecting OKX must NOT shrink a capped board to nothing: the cap serves the filtered set,
+    // so limit=1 returns the best GATE/BYBIT row (~330.6 bps) instead of the OKX row's slot.
+    const filteredTop = await get('asset=SIREN&venues=GATE,BYBIT&limit=1');
+    expect(filteredTop).toHaveLength(1);
+    expect(filteredTop[0]).toMatchObject({ pairType: 'PERP_PERP', leftVenue: 'BYBIT', rightVenue: 'GATE' });
+    expect(filteredTop[0]?.spreadBps).toBeCloseTo(((0.125 - 0.121) / 0.121) * 10_000, 6);
+    expect(filteredTop[0]?.spreadBps).not.toBeCloseTo(top[0]?.spreadBps ?? 0, 6);
+
+    // venues AND minBps AND asset AND limit together.
+    expect(await get('asset=SIREN&venues=GATE,BYBIT&minBps=400&limit=5')).toEqual([]);
+    expect(await get('asset=SIREN&venues=GATE,BYBIT&minBps=300&limit=5')).toHaveLength(1);
+    // The same floor without the venue filter still admits the OKX row.
+    expect((await get('asset=SIREN&minBps=400&limit=5')).length).toBeGreaterThan(0);
+  });
+
+  it('never lets the spread venues and markets filters reach the funding board', async () => {
+    const { app, gateway } = await createTestApp();
+    gateway.extraSymbols = [
+      catalogSymbol('OKX_FUTURE_BTC_USDT', 'OKX'),
+      { ...catalogSymbol('GATE_SPOT_BTC_USDT', 'GATE'), business_type: 'SPOT' },
+    ];
+    const headers = { host: '127.0.0.1:17840' };
+    const board = async (query: string) => {
+      const response = await app.inject({ method: 'GET', url: `/api/opportunities?funding=1&spread=1&${query}`, headers });
+      expect(response.statusCode).toBe(200);
+      return response.json() as OpportunityResponse;
+    };
+
+    const plain = await board('');
+    const filtered = await board('venues=NOT_A_VENUE&markets=perp');
+    expect(plain.funding.length).toBeGreaterThan(0);
+    expect(filtered.funding).toEqual(plain.funding);
+    // …while the spread board really was filtered by the same request.
+    expect(filtered.spread).toEqual([]);
+    expect(plain.spread.length).toBeGreaterThan(0);
+  });
+
+  it('serves asset-class, pre-IPO, sort and paging parameters on /api/opportunities', async () => {
+    const { app, gateway } = await createTestApp();
+    gateway.extraSymbols = [
+      catalogSymbol('OKX_FUTURE_BTC_USDT', 'OKX'),
+      { ...catalogSymbol('GATE_SPOT_BTC_USDT', 'GATE'), business_type: 'SPOT' },
+    ];
+    const headers = { host: '127.0.0.1:17840' };
+
+    const crypto = await app.inject({ method: 'GET', url: '/api/opportunities?funding=1&assetSuperClass=crypto', headers });
+    expect(crypto.statusCode).toBe(200);
+    const cryptoBody = crypto.json() as OpportunityResponse;
+    expect(cryptoBody.funding.length).toBeGreaterThan(0);
+    for (const row of cryptoBody.funding) expect(row.assetSuperClass).toBe('CRYPTO');
+
+    // BTC is a coin, so an RWA-only request leaves the board empty without failing.
+    const rwa = await app.inject({ method: 'GET', url: '/api/opportunities?funding=1&assetSuperClass=RWA', headers });
+    expect(rwa.statusCode).toBe(200);
+    const rwaBody = rwa.json() as OpportunityResponse;
+    expect(rwaBody.funding).toEqual([]);
+    expect(rwaBody.totals.funding).toBe(0);
+
+    // Paging echoes the window and reports the total of the un-paged board.
+    const full = await app.inject({ method: 'GET', url: '/api/opportunities?funding=1', headers });
+    expect(full.statusCode).toBe(200);
+    const fullBody = full.json() as OpportunityResponse;
+    const paged = await app.inject({ method: 'GET', url: '/api/opportunities?funding=1&limit=1&offset=1', headers });
+    expect(paged.statusCode).toBe(200);
+    const pagedBody = paged.json() as OpportunityResponse;
+    expect(pagedBody.offset).toBe(1);
+    expect(pagedBody.limit).toBe(1);
+    expect(pagedBody.totals.funding).toBe(fullBody.funding.length);
+    expect(pagedBody.funding).toHaveLength(Math.max(0, fullBody.funding.length - 1));
+
+    const byAsset = await app.inject({ method: 'GET', url: '/api/opportunities?funding=1&sort=asset&dir=asc', headers });
+    expect(byAsset.statusCode).toBe(200);
+    const assets = (byAsset.json() as OpportunityResponse).funding.map((row) => row.asset);
+    expect([...assets].sort()).toEqual(assets);
+
+    // Unknown tokens and out-of-range values are rejected rather than silently ignored.
+    for (const query of [
+      'assetClass=NOT_A_CLASS',
+      'assetSuperClass=stocks',
+      'preIpo=sometimes',
+      'sort=price',
+      'dir=sideways',
+      'offset=-1',
+      'pageSize=0',
+      'pageSize=999',
+    ]) {
+      const rejected = await app.inject({ method: 'GET', url: `/api/opportunities?funding=1&${query}`, headers });
+      expect(rejected.statusCode, query).toBe(400);
+      expect(rejected.json()).toEqual({ error: 'invalid_opportunities_query' });
+    }
+  });
+
+  it('prefers pageSize over the legacy limit alias and echoes the effective paging window', async () => {
+    const { app, gateway } = await createTestApp();
+    gateway.extraSymbols = [
+      catalogSymbol('OKX_FUTURE_BTC_USDT', 'OKX'),
+      { ...catalogSymbol('GATE_SPOT_BTC_USDT', 'GATE'), business_type: 'SPOT' },
+    ];
+    const headers = { host: '127.0.0.1:17840' };
+
+    const full = await app.inject({ method: 'GET', url: '/api/opportunities?funding=1', headers });
+    expect(full.statusCode).toBe(200);
+    const total = (full.json() as OpportunityResponse).totals.funding;
+    expect(total).toBeGreaterThanOrEqual(1);
+
+    // pageSize wins when both aliases travel: the echoed window is pageSize's, not limit's,
+    // which is observable even on a single-row board.
+    const both = await app.inject({ method: 'GET', url: '/api/opportunities?funding=1&pageSize=1&limit=200', headers });
+    expect(both.statusCode).toBe(200);
+    const bothBody = both.json() as OpportunityResponse;
+    expect(bothBody.limit).toBe(1);
+    expect(bothBody.offset).toBe(0);
+    expect(bothBody.funding).toHaveLength(Math.min(1, total));
+
+    // Without pageSize the legacy limit alias still applies.
+    const legacy = await app.inject({ method: 'GET', url: '/api/opportunities?funding=1&limit=2&offset=1', headers });
+    expect(legacy.statusCode).toBe(200);
+    const legacyBody = legacy.json() as OpportunityResponse;
+    expect(legacyBody.limit).toBe(2);
+    expect(legacyBody.offset).toBe(1);
+    expect(legacyBody.funding).toHaveLength(Math.max(0, Math.min(2, total - 1)));
+    expect(legacyBody.totals.funding).toBe(total);
+
+    // An offset past the end of the filtered board is empty but keeps the total.
+    const past = await app.inject({ method: 'GET', url: '/api/opportunities?funding=1&pageSize=50&offset=5000', headers });
+    expect(past.statusCode).toBe(200);
+    const pastBody = past.json() as OpportunityResponse;
+    expect(pastBody.funding).toEqual([]);
+    expect(pastBody.totals.funding).toBe(total);
+  });
+
+  it('carries REST-swept 24h volume onto the spread board rows', async () => {
+    const { app, publicMarketGateway } = await createTestApp();
+    publicMarketGateway.bookTickers = [
+      {
+        venue: 'GATE', business: 'FUTURE', base: 'SIREN', quote: 'USDT',
+        bidPrice: '0.120', askPrice: '0.121', lastPrice: '0.1205',
+        volume24h: '5000000', quoteVolume24h: '605000', openInterestValue: null,
+      },
+      {
+        venue: 'BYBIT', business: 'FUTURE', base: 'SIREN', quote: 'USDT',
+        bidPrice: '0.125', askPrice: '0.126', lastPrice: null,
+        volume24h: '8800000', quoteVolume24h: '1100000', openInterestValue: '420000',
+      },
+    ];
+    const headers = { host: '127.0.0.1:17840' };
+    const response = await app.inject({ method: 'GET', url: '/api/opportunities?spread=1', headers });
+    expect(response.statusCode).toBe(200);
+    const siren = (response.json() as OpportunityResponse).spread.find((row) => row.asset === 'SIREN');
+    expect(siren).toBeDefined();
+    // left = BYBIT (sells at 0.125), right = GATE (buys at 0.121).
+    expect(siren?.leftStats?.quoteVolume24h).toBe('1100000');
+    expect(siren?.leftStats?.openInterestValue).toBe('420000');
+    expect(siren?.rightStats?.quoteVolume24h).toBe('605000');
+    expect(siren?.rightStats?.openInterestValue).toBeNull();
+  });
+
+  it('merges REST book rows into /api/markets only when includeRest=1', async () => {
+    const { app, publicMarketGateway } = await createTestApp();
+    publicMarketGateway.bookTickers = [
+      { venue: 'GATE', business: 'SPOT', base: 'SIREN', quote: 'USDT', bidPrice: '0.1192', askPrice: '0.1194', lastPrice: '0.1193' },
+      { venue: 'BYBIT', business: 'FUTURE', base: 'SIREN', quote: 'USDT', bidPrice: '0.125', askPrice: '0.126', lastPrice: null },
+    ];
+    const headers = { host: '127.0.0.1:17840' };
+
+    // Default snapshot stays hub-only: no SIREN rows without a REST opt-in.
+    const hubOnly = await app.inject({ method: 'GET', url: '/api/markets', headers });
+    expect(hubOnly.statusCode).toBe(200);
+    expect((hubOnly.json() as MarketSnapshot).markets.some((market) => market.asset === 'SIREN')).toBe(false);
+
+    const merged = await app.inject({ method: 'GET', url: '/api/markets?includeRest=1', headers });
+    expect(merged.statusCode).toBe(200);
+    const body = merged.json() as MarketSnapshot;
+    const spot = body.markets.find((market) => market.symbol === 'GATE_SPOT_SIREN_USDT');
+    // The REST row is a full LiveMarket: real bid/ask/last plus the rest_book_ticker marker.
+    expect(spot).toMatchObject({
+      symbol: 'GATE_SPOT_SIREN_USDT', venue: 'GATE', asset: 'SIREN',
+      bidPrice: '0.1192', askPrice: '0.1194', lastPrice: '0.1193', source: 'rest_book_ticker',
+    });
+    expect(body.markets.find((market) => market.symbol === 'BYBIT_FUTURE_SIREN_USDT'))
+      .toMatchObject({ bidPrice: '0.125', askPrice: '0.126', source: 'rest_book_ticker' });
+    // Hub markets remain in the merged view.
+    expect(body.markets.length).toBeGreaterThanOrEqual(2);
   });
 
   it('serves and caches realized funding history only for catalog symbols', async () => {
@@ -1846,6 +2348,112 @@ describe('local backend', () => {
     });
     expect(emptyReports.json()).toEqual({ reports: [] });
     expect(invalidReports.statusCode).toBe(400);
+  });
+
+  it('serves the portfolio equity curve behind the read-intent gate', async () => {
+    const { app, database } = await createTestApp();
+    const headers = { host: '127.0.0.1:17840', 'x-gct-read-intent': 'portfolio-equity' };
+    const noIntent = await app.inject({
+      method: 'GET', url: '/api/crossex/portfolio-equity?range=7d', headers: { host: '127.0.0.1:17840' },
+    });
+    expect(noIntent.statusCode).toBe(403);
+    expect(noIntent.json()).toEqual({ error: 'missing_read_intent' });
+
+    const invalid = await app.inject({ method: 'GET', url: '/api/crossex/portfolio-equity?range=1h', headers });
+    expect(invalid.statusCode).toBe(400);
+    expect(invalid.json()).toEqual({ error: 'invalid_portfolio_equity_range' });
+
+    // No samples yet — the empty state, never an error.
+    const empty = await app.inject({ method: 'GET', url: '/api/crossex/portfolio-equity?range=24h', headers });
+    expect(empty.statusCode).toBe(200);
+    expect(empty.json()).toMatchObject({ range: '24h', granularity: 'raw', points: [], firstSampleAt: null });
+    expect(empty.json().fetchedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+
+    const sampledAt = Date.now();
+    // UTC-midnight bucket the sample aggregates into; it is also the oldest bucket_start
+    // across granularities and therefore the reported firstSampleAt.
+    const dayBucket = Math.floor(sampledAt / 86_400_000) * 86_400_000;
+    recordPortfolioEquitySample(database, {
+      account: { marginBalance: '1500' },
+      futuresPositions: [{ unrealizedPnl: '20' }],
+      marginPositions: [{ unrealizedPnl: '100' }],
+    }, sampledAt);
+
+    const day = await app.inject({ method: 'GET', url: '/api/crossex/portfolio-equity?range=24h', headers });
+    expect(day.statusCode).toBe(200);
+    expect(day.json()).toEqual({
+      range: '24h',
+      granularity: 'raw',
+      points: [{ time: sampledAt, equity: '1500', unrealizedPnl: '120' }],
+      firstSampleAt: new Date(dayBucket).toISOString(),
+      fetchedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+    });
+
+    // `all` reads the day buckets instead of the raw points.
+    const all = await app.inject({ method: 'GET', url: '/api/crossex/portfolio-equity?range=all', headers });
+    expect(all.statusCode).toBe(200);
+    expect(all.json()).toMatchObject({
+      range: 'all',
+      granularity: 'day',
+      points: [{ time: dayBucket, equity: '1500', unrealizedPnl: '120' }],
+    });
+  });
+
+  it('records an equity sample when the portfolio reconciles', async () => {
+    const { app, vault } = await createTestApp();
+    await vault.set(DEFAULT_CREDENTIAL_PROFILE, { apiKey: 'equity-key', apiSecret: 'equity-secret' });
+    const refresh = await app.inject({
+      method: 'GET', url: '/api/crossex/portfolio-snapshot',
+      headers: { host: '127.0.0.1:17840', 'x-gct-read-intent': 'portfolio-snapshot' },
+    });
+    expect(refresh.statusCode).toBe(200);
+
+    // Equity is the snapshot's marginBalance (1500), matching the asset-page KPI; the
+    // unrealized PnL sums the fixture's futures (20) and margin (100) positions.
+    const curve = await app.inject({
+      method: 'GET', url: '/api/crossex/portfolio-equity?range=24h',
+      headers: { host: '127.0.0.1:17840', 'x-gct-read-intent': 'portfolio-equity' },
+    });
+    expect(curve.statusCode).toBe(200);
+    expect(curve.json()).toMatchObject({
+      range: '24h',
+      granularity: 'raw',
+      points: [{ time: expect.any(Number), equity: '1500', unrealizedPnl: '120' }],
+    });
+    expect(curve.json().firstSampleAt).not.toBeNull();
+  });
+
+  it('merges the isolated Gate spot account into the snapshot as venue SPOT balances', async () => {
+    const { app, vault } = await createTestApp();
+    await vault.set(DEFAULT_CREDENTIAL_PROFILE, { apiKey: 'spot-key', apiSecret: 'spot-secret' });
+    const response = await app.inject({
+      method: 'GET', url: '/api/crossex/portfolio-snapshot',
+      headers: { host: '127.0.0.1:17840', 'x-gct-read-intent': 'portfolio-snapshot' },
+    });
+    expect(response.statusCode).toBe(200);
+    const balances = response.json().snapshot.balances as Array<{ venue: string; coin: string; balance: string; availableBalance: string; liability: string }>;
+    // available + locked with exact decimal math; zero-total rows are dropped, not fabricated.
+    expect(balances).toContainEqual(expect.objectContaining({
+      venue: 'SPOT', coin: 'USDT', balance: '260.125', availableBalance: '250.125', liability: '0',
+    }));
+    expect(balances).toContainEqual(expect.objectContaining({
+      venue: 'SPOT', coin: 'USDC', balance: '42.50000001', availableBalance: '42.50000001',
+    }));
+    // The CrossEx account rows survive the merge alongside the SPOT rows.
+    expect(balances.some((balance) => balance.venue !== 'SPOT')).toBe(true);
+  });
+
+  it('keeps the portfolio snapshot alive when the spot account fetch fails', async () => {
+    const { app, gateway, vault } = await createTestApp();
+    await vault.set(DEFAULT_CREDENTIAL_PROFILE, { apiKey: 'spot-fail-key', apiSecret: 'spot-fail-secret' });
+    gateway.failSpotAccounts = true;
+    const response = await app.inject({
+      method: 'GET', url: '/api/crossex/portfolio-snapshot',
+      headers: { host: '127.0.0.1:17840', 'x-gct-read-intent': 'portfolio-snapshot' },
+    });
+    expect(response.statusCode).toBe(200);
+    const balances = response.json().snapshot.balances as Array<{ venue: string }>;
+    expect(balances).not.toContainEqual(expect.objectContaining({ venue: 'SPOT' }));
   });
 
   it('single-flights concurrent portfolio reconciliations from multiple local tabs', async () => {
@@ -2282,6 +2890,7 @@ describe('local backend', () => {
     const app = await buildApp({
       config, database, credentialVault: vault, crossExGateway: gateway,
       publicMarketGateway, tradingSession, startMarketStream: false, logger: false,
+      authDisabled: true,
     });
     resources.push({ app, database, vault, gateway, publicMarketGateway, tradingSession, directory });
 
@@ -2489,5 +3098,44 @@ describe('local backend', () => {
     expect(response.statusCode).toBe(400);
     expect(gateway.receivedCredentials).toEqual([]);
     expect(await vault.get(DEFAULT_CREDENTIAL_PROFILE)).toBeNull();
+  });
+});
+
+// The history router resolves these paths client-side, so a hard load (refresh, pasted link, or a
+// new tab) asks the server for them directly. A missing registration therefore behaves like a
+// broken page while in-app navigation still works — the funding-top board shipped exactly that way.
+describe('frontend client routes', () => {
+  it('serves the app shell for every path the history router resolves', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'gate-crossex-app-'));
+    const frontendDistDir = join(directory, 'frontend-dist');
+    mkdirSync(join(frontendDistDir, 'assets'), { recursive: true });
+    writeFileSync(join(frontendDistDir, 'index.html'), '<!doctype html><html><body>app shell</body></html>');
+    const { app } = await createTestApp({ directory, frontendDistDir });
+    const headers = { host: '127.0.0.1:17840' };
+    const clientPaths = [
+      '/',
+      '/portfolio',
+      '/tools/trading-fees',
+      '/funding-rates',
+      '/funding-rates/BTC',
+      '/strategies/paired-position',
+      '/strategies/price-difference',
+      '/strategies/sk-hynix-premium',
+      '/strategies/spot-perp-carry',
+      '/strategies/boros',
+      '/opportunities',
+      '/opportunities/funding',
+      '/opportunities/funding-top',
+      '/opportunities/spread',
+    ];
+    for (const clientPath of clientPaths) {
+      const response = await app.inject({ method: 'GET', url: clientPath, headers });
+      expect(response.statusCode, `${clientPath} must serve the app shell`).toBe(200);
+      expect(response.headers['content-type'], clientPath).toContain('text/html');
+      expect(response.body, clientPath).toContain('app shell');
+    }
+    // An unregistered path must still 404 rather than silently serving the shell as a catch-all.
+    const unknown = await app.inject({ method: 'GET', url: '/not-a-client-route', headers });
+    expect(unknown.statusCode).toBe(404);
   });
 });

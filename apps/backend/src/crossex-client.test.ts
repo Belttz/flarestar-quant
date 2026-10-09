@@ -370,6 +370,38 @@ describe('Gate APIv4 signing', () => {
     ]);
   });
 
+  it('cancels spot and future orders through the same signed DELETE /crossex/orders/:id route', async () => {
+    const calls: Array<{ url: string; method: string; body: string | undefined }> = [];
+    const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), method: init?.method ?? '', body: init?.body === undefined ? undefined : String(init.body) });
+      expect(new Headers(init?.headers).get('SIGN')).toMatch(/^[a-f0-9]{128}$/);
+      return new Response(JSON.stringify({ order_id: 'gate-1', text: 'gct-1' }));
+    });
+    const client = new GateCrossExClient(fetchMock as typeof fetch, () => 1_700_000_000_000, undefined, 0);
+    const credentials = { apiKey: 'test-api-key', apiSecret: 'test-secret' };
+
+    const spotCancel = await client.cancelOrder(credentials, 'GATE_SPOT_BTC_USDT-1');
+    const futureCancel = await client.cancelOrder(credentials, 'BINANCE_FUTURE_BTC_USDT-2');
+
+    expect(spotCancel).toMatchObject({ order_id: 'gate-1', text: 'gct-1' });
+    expect(futureCancel).toMatchObject({ order_id: 'gate-1', text: 'gct-1' });
+    // One universal cancel route for both businesses: identical URL shape, signed, no body.
+    expect(calls).toEqual([
+      { url: 'https://api.gateio.ws/api/v4/crossex/orders/GATE_SPOT_BTC_USDT-1', method: 'DELETE', body: undefined },
+      { url: 'https://api.gateio.ws/api/v4/crossex/orders/BINANCE_FUTURE_BTC_USDT-2', method: 'DELETE', body: undefined },
+    ]);
+  });
+
+  it('refuses to build a cancel request for an order id outside the documented charset', async () => {
+    const fetchMock = vi.fn(async () => new Response('{}'));
+    const client = new GateCrossExClient(fetchMock as typeof fetch, () => 1_700_000_000_000, undefined, 0);
+
+    await expect(client.cancelOrder({ apiKey: 'test-api-key', apiSecret: 'test-secret' }, '../accounts'))
+      .rejects.toMatchObject({ label: 'INVALID_ORDER_ID' });
+    // The malformed id never reaches the wire: the path component stays fully controlled.
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('stops reading an oversized authenticated response stream at the byte limit', async () => {
     let cancelled = false;
     const stream = new ReadableStream<Uint8Array>({

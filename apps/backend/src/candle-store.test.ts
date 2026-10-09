@@ -45,6 +45,22 @@ describe('candle backfill scheduling', () => {
     database.close();
   });
 
+  it('allows backfill for all futures venues and only for spot venues with fetchers', () => {
+    const database = openDatabase(':memory:', resolve(process.cwd(), '../../migrations'));
+    const store = new CandleStore(database, fakeHub(), gateway(async () => []));
+    for (const venue of ['GATE', 'BINANCE', 'OKX', 'BYBIT', 'KRAKEN', 'HYPERLIQUID', 'DERIBIT', 'LIGHTER']) {
+      expect(store.canBackfill(`${venue}_FUTURE_BTC_USDT`)).toBe(true);
+    }
+    expect(store.canBackfill('GATE_SPOT_BTC_USDT')).toBe(true);
+    expect(store.canBackfill('BINANCE_SPOT_BTC_USDT')).toBe(true);
+    expect(store.canBackfill('OKX_SPOT_BTC_USDT')).toBe(true);
+    expect(store.canBackfill('BYBIT_SPOT_BTC_USDT')).toBe(true);
+    // Venues without a spot candle fetcher degrade to websocket-only history.
+    expect(store.canBackfill('DERIBIT_SPOT_BTC_USDC')).toBe(false);
+    expect(store.canBackfill('KRAKEN_SPOT_BTC_USDT')).toBe(false);
+    database.close();
+  });
+
   it('allows at most two concurrent venue backfills', async () => {
     const database = openDatabase(':memory:', resolve(process.cwd(), '../../migrations'));
     const releases: Array<() => void> = [];

@@ -1,0 +1,50 @@
+# 星闪量化 FlareStar Quant 云端部署 compose：应用容器 + Caddy 自动 HTTPS 反向代理。
+# 用法见 deploy/DEPLOY.md；配置放 cloud.env（参考 deploy/cloud.env.example）。
+services:
+  gate-crossex:
+    build: .
+    init: true
+    read_only: true
+    expose:
+      - "17840"
+    environment:
+      # 进程必须监听容器网卡；对外只经 Caddy 的 80/443 暴露。
+      GCT_HOST: 0.0.0.0
+      GCT_PORT: 17840
+      GCT_ALLOWED_HOSTS: ${GCT_DOMAIN}
+      GCT_FRONTEND_ORIGIN: https://${GCT_DOMAIN}
+      GCT_DISABLE_OS_KEYCHAIN: "1"
+      GCT_CREDENTIAL_ENV_PATH: /app/.local-data/credentials.env
+      # 操作员登录（云端已启用）。密码仅首次启动用于种子化，之后请在界面里修改。
+      GCT_AUTH_USERNAME: ${GCT_AUTH_USERNAME:-Belttz}
+      GCT_AUTH_PASSWORD: ${GCT_AUTH_PASSWORD:-}
+      GCT_SKIP_UPDATE_CHECK: "1"
+    volumes:
+      - gate-crossex-data:/app/.local-data
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      GCT_DOMAIN: ${GCT_DOMAIN}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - gate-crossex
+
+volumes:
+  gate-crossex-data:
+  caddy-data:
+  caddy-config:

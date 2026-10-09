@@ -8,7 +8,7 @@ import { compactPrice } from './number-format.js';
 
 export type Side = 'Buy' | 'Sell';
 export type OrderType = 'Limit' | 'Market';
-export type Workspace = 'Trade' | 'Strategy' | 'Funding Rates' | 'Portfolio' | 'Trading Fees';
+export type Workspace = 'Trade' | 'Strategy' | 'Funding Rates' | 'Opportunities' | 'Portfolio' | 'Trading Fees';
 export type NavigationLabel = Workspace | 'Boros by Pendle';
 export type StrategyKind = StrategyConfig['kind'];
 export type FundingMetric = 'Per interval' | 'APR' | '24h' | '7d' | '30d';
@@ -145,9 +145,22 @@ export function liveMarketFor(snapshot: MarketSnapshot | null, exchangeId: strin
   return snapshot?.markets.find((item) => item.venue === exchangeId.toUpperCase() && item.asset === asset) ?? null;
 }
 
+/** Business line of a local ledger symbol; SPOT only when the venue business segment says so. */
+export type OrderBusiness = 'SPOT' | 'FUTURE';
+
+/**
+ * Single source of truth for splitting executions by business, aligned verbatim with the
+ * backend's trading-runtime isSpotSymbol (`/^[A-Z0-9]+_SPOT_/`). Ledger symbols are structured
+ * VENUE_BUSINESS_ASSET_QUOTE, so the prefix test is authoritative; anything unparseable degrades
+ * to FUTURE instead of guessing. Every front-end business split must go through this helper.
+ */
+export function orderBusiness(symbol: string): OrderBusiness {
+  return /^[A-Z0-9]+_SPOT_/.test(symbol) ? 'SPOT' : 'FUTURE';
+}
+
 export function symbolParts(symbol: string) {
   const parts = symbol.split('_');
-  return { venue: parts[0] ?? '', asset: parts[2] ?? symbol, quote: parts[3] ?? 'USDT' };
+  return { venue: parts[0] ?? '', business: orderBusiness(symbol), asset: parts[2] ?? symbol, quote: parts[3] ?? 'USDT' };
 }
 
 export function signedPortfolioQuantity(position: { positionSide: string; quantity: string } | undefined): number {
@@ -166,7 +179,11 @@ export function incrementalExposure(existingQuantity: number, plannedQuantity: n
 /**
  * Risk tiers lower the permitted leverage as position notional grows. At a selected leverage the
  * largest usable position is the furthest tier boundary whose leverage ceiling still permits it.
+ * Upstream reports 999,999,999 as an "unlimited" sentinel; treating it as a real cap rendered a
+ * 999,999,999 order maximum, so sentinel-and-beyond tiers never constrain the ticket.
  */
+const UNLIMITED_RISK_LIMIT_VALUE = 999_999_999;
+
 export function maxPositionValueAtLeverage(
   tiers: CrossExRiskLimitTier[] | null | undefined,
   leverage: number,
@@ -177,6 +194,7 @@ export function maxPositionValueAtLeverage(
     const maxPositionValue = Number(tier.maxRiskLimitValue);
     return Number.isFinite(tierLeverage) && tierLeverage >= leverage
       && Number.isFinite(maxPositionValue) && maxPositionValue > 0
+      && maxPositionValue < UNLIMITED_RISK_LIMIT_VALUE
       ? [maxPositionValue]
       : [];
   });
@@ -275,14 +293,9 @@ export function classifyLeverageMargin(
 
 export const navItems: { label: NavigationLabel; glyph: string }[] = [
   { label: 'Trade', glyph: '⌁' }, { label: 'Strategy', glyph: '⇄' }, { label: 'Funding Rates', glyph: '%' },
+  { label: 'Opportunities', glyph: '✦' },
   { label: 'Boros by Pendle', glyph: '◐' },
   { label: 'Portfolio', glyph: '◒' },
-];
-
-/** Strategies listed under the nav "Strategy" dropdown; each opens its own dedicated page. */
-export const strategyPages: Array<{ kind: StrategyKind | 'boros'; glyph: string; label: string; detail: string }> = [
-  { kind: 'position', glyph: '◎', label: 'Cross-exchange hedge', detail: 'Execute a fixed two-venue position, then stop' },
-  { kind: 'premium', glyph: '≒', label: 'SK hynix premium bot', detail: 'Trade the SK hynix ADR premium vs the Korean listing' },
 ];
 
 /** SK hynix ADR premium pair: one Korean-listed share converts to ten US ADR shares. */
@@ -316,6 +329,11 @@ export function formatAmount(value: number, digits = 2): string {
 
 export function signedAmount(value: number, digits = 2): string {
   return `${value >= 0 ? '+' : '-'}${formatAmount(Math.abs(value), digits)}`;
+}
+
+/** Money cell that keeps the sign outside the currency symbol: -$40, never $-40. */
+export function formatUsd(value: number): string {
+  return `${value < 0 ? '-' : ''}$${formatAmount(Math.abs(value))}`;
 }
 
 /** Venue payloads carry numbers as strings; empty or malformed values must read as absent, not 0. */
@@ -382,30 +400,65 @@ export interface TicketInput {
   t: (key: string) => string;
 }
 
-export function ticketIssues({ orderType, price, amount, referencePrice, quote, instrument, t }: TicketInput): string[] {
-  const issues: string[] = [];
-  if (!isPositiveDecimal(amount)) issues.push(t('Enter a valid amount'));
-  if (orderType === 'Limit' && !isPositiveDecimal(price)) issues.push(t('Enter a valid price'));
+/** Which ticket field a validation message belongs to; amount issues render next to the amount input. */
+export type TicketIssueField = 'amount' | 'price' | 'general';
+
+export interface TicketIssue {
+  field: TicketIssueField;
+  message: string;
+}
+
+export function ticketIssues({ orderType, price, amount, referencePrice, quote, instrument, t }: TicketInput): TicketIssue[] {
+  const issues: TicketIssue[] = [];
+  if (!isPositiveDecimal(amount)) issues.push({ field: 'amount', message: t('Enter a valid amount') });
+  if (orderType === 'Limit' && !isPositiveDecimal(price)) issues.push({ field: 'price', message: t('Enter a valid price') });
   if (issues.length > 0 || !instrument) return issues;
   if (isPositiveDecimal(instrument.minSize) && Number(amount) < Number(instrument.minSize)) {
-    issues.push(`${t('Below minimum size')}: ${instrument.minSize}`);
+    issues.push({ field: 'amount', message: `${t('Below minimum size')}: ${instrument.minSize}` });
   } else if (!isMultipleOfStep(amount, instrument.lotSize)) {
-    issues.push(`${t('Amount not a multiple of lot size')} (${instrument.lotSize})`);
+    issues.push({ field: 'amount', message: `${t('Amount not a multiple of lot size')} (${instrument.lotSize})` });
   }
   if (orderType === 'Limit' && !isMultipleOfStep(price, instrument.tickSize)) {
-    issues.push(`${t('Price not a multiple of tick size')} (${instrument.tickSize})`);
+    issues.push({ field: 'price', message: `${t('Price not a multiple of tick size')} (${instrument.tickSize})` });
   }
   const sizeCap = orderType === 'Market' ? instrument.maxMarketSize : instrument.maxLimitSize;
   if (sizeCap && isPositiveDecimal(sizeCap) && Number(amount) > Number(sizeCap)) {
-    issues.push(`${t('Above maximum order size')}: ${sizeCap}`);
+    issues.push({ field: 'amount', message: `${t('Above maximum order size')}: ${sizeCap}` });
   }
   if (instrument.minNotional && isPositiveDecimal(instrument.minNotional)) {
     const reference = orderType === 'Limit' ? Number(price) : referencePrice;
     if (reference > 0 && reference * Number(amount) < Number(instrument.minNotional)) {
-      issues.push(`${t('Below minimum notional')}: ${instrument.minNotional} ${quote}`);
+      issues.push({ field: 'amount', message: `${t('Below minimum notional')}: ${instrument.minNotional} ${quote}` });
     }
   }
   return issues;
+}
+
+export interface MinimumNotionalIssueInput {
+  instrument: CrossExInstrument | undefined;
+  /** Per-order quantity in base units for this leg. */
+  quantity: number;
+  /** Executable-side reference price (ask for buys, bid for sells); 0 when no live quote exists. */
+  price: number;
+  asset: string;
+  venueName: string;
+  t: (key: string) => string;
+}
+
+/**
+ * Pre-submit mirror of the engine's minimum-notional rejection for strategy forms: instead of
+ * letting the backend refuse the launch, surface the executable per-order minimum quantity per
+ * leg while the user is still editing the form.
+ */
+export function minimumNotionalIssue({ instrument, quantity, price, asset, venueName, t }: MinimumNotionalIssueInput): string | null {
+  if (!instrument || !(Number(instrument.minNotional) > 0) || !(quantity > 0) || !(price > 0)) return null;
+  const minNotional = Number(instrument.minNotional);
+  if (quantity * price >= minNotional) return null;
+  // Suggest a quantity rounded up to a practical precision so the hint is directly actionable.
+  const minimumQuantityRaw = minNotional / price;
+  const decimals = minimumQuantityRaw < 1 ? 4 : 2;
+  const minimumQuantity = Math.ceil(minimumQuantityRaw * 10 ** decimals - 1e-9) / 10 ** decimals;
+  return `${venueName}: ${t('Each order needs at least')} ${minimumQuantity} ${asset} (${t('minimum notional')} ${instrument.minNotional})`;
 }
 
 export function VenueIcon({ id, short }: { id: string; short: string }) {

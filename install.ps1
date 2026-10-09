@@ -240,7 +240,7 @@ function Start-AndWait([string]$InstalledTaskName, [int]$Port) {
 function Install-GateCrossEx {
     if ($env:OS -ne 'Windows_NT') { throw 'This installer currently supports Windows only.' }
 
-    $RepoSlug = Get-Setting 'GCT_REPO_SLUG' 'your-quantguy/gate-crossex'
+    $RepoSlug = Get-Setting 'GCT_REPO_SLUG' 'Belttz/flarestar-quant'
     $ReleaseTag = Get-Setting 'GCT_RELEASE_TAG' 'latest'
     $Root = [IO.Path]::GetFullPath((Get-Setting 'GCT_INSTALL_ROOT' (Join-Path $env:LOCALAPPDATA 'Gate CrossEx'))).TrimEnd('\')
     $Marker = Join-Path $Root '.gate-crossex-install-root'

@@ -4,9 +4,9 @@ import { feeComparisonRows, normalizeTicker, resolveCatalogTicker } from './fee-
 describe('fee comparison', () => {
   const catalog = [{
     asset: 'BTC', streamed: true, venues: [
-      { venue: 'GATE', symbol: 'GATE_FUTURE_BTC_USDT', quote: 'USDT' },
-      { venue: 'BINANCE', symbol: 'BINANCE_FUTURE_BTC_USDT', quote: 'USDT' },
-      { venue: 'OKX', symbol: 'OKX_FUTURE_BTC_USDT', quote: 'USDT' },
+      { venue: 'GATE', symbol: 'GATE_FUTURE_BTC_USDT', quote: 'USDT', business: 'FUTURE' as const },
+      { venue: 'BINANCE', symbol: 'BINANCE_FUTURE_BTC_USDT', quote: 'USDT', business: 'FUTURE' as const },
+      { venue: 'OKX', symbol: 'OKX_FUTURE_BTC_USDT', quote: 'USDT', business: 'FUTURE' as const },
     ],
   }];
   const fees = [

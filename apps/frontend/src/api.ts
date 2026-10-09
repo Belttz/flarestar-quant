@@ -1,4 +1,6 @@
 import {
+  AuthChangePasswordResponseSchema,
+  AuthSessionResponseSchema,
   AuthenticatedPortfolioSnapshotSchema,
   BorosStrategiesResponseSchema,
   CandleSeriesResponseSchema,
@@ -19,6 +21,8 @@ import {
   MarketCatalogResponseSchema,
   MarketSizeUnitsSchema,
   MarketSnapshotSchema,
+  OpportunityResponseSchema,
+  PortfolioEquitySeriesResponseSchema,
   PublicMarketSnapshotResponseSchema,
   StrategiesResponseSchema,
   StrategyLogsResponseSchema,
@@ -65,7 +69,10 @@ import {
   type MarketCatalogResponse,
   type MarketSizeUnits,
   type MarketSnapshot,
+  type OpportunityResponse,
   type OrderBookSnapshot,
+  type PortfolioEquityRange,
+  type PortfolioEquitySeriesResponse,
   type PrivateStreamStatus,
   type PublicTrade,
   type PublicMarketSnapshot,
@@ -120,7 +127,10 @@ export type {
   MarketCatalogResponse,
   MarketSizeUnits,
   MarketSnapshot,
+  OpportunityResponse,
   OrderBookSnapshot,
+  PortfolioEquityRange,
+  PortfolioEquitySeriesResponse,
   PrivateStreamStatus,
   PublicTrade,
   PublicMarketSnapshot,
@@ -238,6 +248,9 @@ async function requestOnce<T>(
     throw new ApiError(response.status, failure.error ?? 'rate_limit_exceeded', cooldown);
   }
   if (!response.ok) {
+    if (response.status === 401 && failure.error === 'unauthenticated') {
+      window.dispatchEvent(new CustomEvent('gct:session-expired'));
+    }
     throw new ApiError(response.status, failure.error ?? 'request_failed', undefined, failure.label, failure.details);
   }
   const parsed = schema.safeParse(rawPayload);
@@ -275,11 +288,74 @@ function cachedRead<T>(ttlMs: number, load: () => Promise<T>): () => Promise<T> 
 }
 
 export const api = {
-  markets: () => request(MarketSnapshotSchema, '/api/markets'),
+  auth: {
+    session: () => request(AuthSessionResponseSchema, '/api/auth/session'),
+    login: (username: string, password: string) => request(AuthSessionResponseSchema, '/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ username, password }),
+    }),
+    logout: () => request(AuthSessionResponseSchema, '/api/auth/logout', { method: 'POST' }),
+    changePassword: (currentPassword: string, newPassword: string) => request(AuthChangePasswordResponseSchema, '/api/auth/change-password', {
+      method: 'POST',
+      body: JSON.stringify({ currentPassword, newPassword }),
+    }),
+  },
+  // includeRest=1 merges the backend's bulk REST bookTicker rows into the hub snapshot so every
+  // catalog symbol carries a price, not only the ones a WebSocket subscription has covered.
+  markets: (options: { includeRest?: boolean } = {}) =>
+    request(MarketSnapshotSchema, options.includeRest ? '/api/markets?includeRest=1' : '/api/markets'),
   borosStrategies: () => request(BorosStrategiesResponseSchema, '/api/boros/strategies'),
   marketCatalog: () => request(MarketCatalogResponseSchema, '/api/markets/catalog'),
   publicMarketSnapshot: (symbol: string) => request(PublicMarketSnapshotResponseSchema, `/api/crossex/instruments/${encodeURIComponent(symbol)}/market-snapshot`),
   fundingOverview: () => request(FundingOverviewResponseSchema, '/api/markets/funding-overview'),
+  opportunities: (options: {
+    funding?: boolean;
+    spread?: boolean;
+    minApr?: number;
+    minBps?: number;
+    asset?: string;
+    /** One row per (asset, spot venue, perpetual venue) combination instead of collapsed rows. */
+    expand?: boolean;
+    /** Spread board venue whitelist, uppercase venue ids; omitted means every venue. */
+    venues?: readonly string[];
+    /** Spread board market filter: `spot` keeps rows with a spot leg, `perp` keeps perpetual-only rows. */
+    markets?: readonly ('spot' | 'perp')[];
+    /** Fine-grained asset-class whitelist (`STOCK`, `COIN`, …); omitted means every class. */
+    assetClass?: readonly string[];
+    /** Asset super-class whitelist (`RWA` / `CRYPTO`); omitted means both. */
+    assetSuperClass?: readonly string[];
+    /** Three-state pre-IPO switch; omitted means `all`, which never hides a row. */
+    preIpo?: 'all' | 'only' | 'exclude';
+    /** Sort column; omitted keeps the board's own ranking. */
+    sort?: 'spread' | 'apr' | 'volume' | 'oi' | 'asset' | 'default';
+    /** Sort direction; omitted means `desc`. */
+    dir?: 'asc' | 'desc';
+    /** First row to return (server-side paging). */
+    offset?: number;
+    /** Page size; sent as `pageSize` so the legacy `limit` alias stays free for older clients. */
+    pageSize?: number;
+    limit?: number;
+  } = {}) => {
+    const params = new URLSearchParams();
+    if (options.funding !== false) params.set('funding', '1');
+    if (options.spread !== false) params.set('spread', '1');
+    if (options.minApr !== undefined) params.set('minApr', String(options.minApr));
+    if (options.minBps !== undefined) params.set('minBps', String(options.minBps));
+    if (options.asset) params.set('asset', options.asset);
+    if (options.expand) params.set('expand', '1');
+    // Only non-default selections travel: an empty (or full) selection keeps the query clean.
+    if (options.venues && options.venues.length > 0) params.set('venues', options.venues.join(','));
+    if (options.markets && options.markets.length > 0) params.set('markets', options.markets.join(','));
+    if (options.assetClass && options.assetClass.length > 0) params.set('assetClass', options.assetClass.join(','));
+    if (options.assetSuperClass && options.assetSuperClass.length > 0) params.set('assetSuperClass', options.assetSuperClass.join(','));
+    if (options.preIpo && options.preIpo !== 'all') params.set('preIpo', options.preIpo);
+    if (options.sort && options.sort !== 'default') params.set('sort', options.sort);
+    if (options.dir && options.dir !== 'desc') params.set('dir', options.dir);
+    if (options.offset !== undefined && options.offset > 0) params.set('offset', String(options.offset));
+    if (options.pageSize !== undefined) params.set('pageSize', String(options.pageSize));
+    else params.set('limit', String(options.limit ?? 50));
+    return request(OpportunityResponseSchema, `/api/opportunities?${params}`);
+  },
   fundingHistory: (symbols: string[], durationDays: 1 | 7 | 30) => request(FundingHistoryResponseSchema, '/api/markets/funding-history', {
     method: 'POST',
     headers: { 'x-gct-read-intent': 'funding-history' },
@@ -303,6 +379,11 @@ export const api = {
   portfolioSnapshot: () => request(AuthenticatedPortfolioSnapshotSchema, '/api/crossex/portfolio-snapshot', {
     headers: { 'x-gct-read-intent': 'portfolio-snapshot' },
   }),
+  // Served from the persisted equity-sample table only; never triggers a remote portfolio read.
+  portfolioEquity: (range: PortfolioEquityRange) =>
+    request(PortfolioEquitySeriesResponseSchema, `/api/crossex/portfolio-equity?range=${encodeURIComponent(range)}`, {
+      headers: { 'x-gct-read-intent': 'portfolio-equity' },
+    }),
   transferCoins: () => request(CrossExTransferCoinsResponseSchema, '/api/crossex/transfer-coins'),
   transferBalances: () => request(CrossExTransferBalancesResponseSchema, '/api/crossex/transfer-balances', {
     headers: { 'x-gct-read-intent': 'transfer-balances' },
@@ -324,7 +405,9 @@ export const api = {
     side: 'BUY' | 'SELL';
     type: 'LIMIT' | 'MARKET';
     timeInForce: string;
-    quantity: string;
+    quantity?: string;
+    /** Gate spot market buys are sized in quote currency; the backend then ignores quantity. */
+    quoteQty?: string;
     price?: string;
     reduceOnly: boolean;
     positionSide?: 'NONE' | 'LONG' | 'SHORT';

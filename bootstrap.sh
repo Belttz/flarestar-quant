@@ -16,7 +16,7 @@ if [ -f "$INSTALL_DIR/.gate-crossex-source.json" ]; then
   SAVED_REPO="$(sed -n 's/^[[:space:]]*"repository":[[:space:]]*"\([^"]*\)".*/\1/p' "$INSTALL_DIR/.gate-crossex-source.json" | head -n 1)"
   SAVED_REF="$(sed -n 's/^[[:space:]]*"ref":[[:space:]]*"\([^"]*\)".*/\1/p' "$INSTALL_DIR/.gate-crossex-source.json" | head -n 1)"
 fi
-REPO_SLUG="${GCT_REPO_SLUG:-${SAVED_REPO:-your-quantguy/gate-crossex}}"
+REPO_SLUG="${GCT_REPO_SLUG:-${SAVED_REPO:-Belttz/flarestar-quant}}"
 SOURCE_REF="${GCT_SOURCE_REF:-${SAVED_REF:-main}}"
 NODE_VERSION="${GCT_NODE_VERSION:-24.18.0}"
 MODE="${1:-install}"

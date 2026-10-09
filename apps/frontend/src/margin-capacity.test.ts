@@ -98,6 +98,13 @@ describe('CrossEx leverage-tier position capacity', () => {
     expect(maxPositionValueAtLeverage(tiers, 30)).toBeNull();
   });
 
+  it('treats the 999,999,999 unlimited sentinel as no cap instead of an absurd maximum', () => {
+    const sentinelTier = { tier: '9', minRiskLimitValue: '500000', maxRiskLimitValue: '999999999', quickCalAmount: '0', leverageMax: '50', maintenanceRate: '0.05' };
+    expect(maxPositionValueAtLeverage([sentinelTier], 25)).toBeNull();
+    // A real tier beside the sentinel still caps the position.
+    expect(maxPositionValueAtLeverage([sentinelTier, ...tiers], 25)).toBe(100000);
+  });
+
   it('checks the projected final position rather than only incremental exposure', () => {
     expect(projectedPositionValue(4, 2, 100)).toBe(600);
     expect(projectedPositionValue(-4, 2, 100)).toBe(200);

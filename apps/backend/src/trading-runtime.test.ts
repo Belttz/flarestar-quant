@@ -20,6 +20,8 @@ import {
   type TradingCrossExGateway,
 } from './crossex-client.js';
 import { CreateStrategyInputSchema, TradingRuntime, isTerminalOrderState, type TradingRuntimeOptions } from './trading-runtime.js';
+import { replaceInstrumentCatalog } from './repositories.js';
+import type { CrossExInstrument } from '@gate-crossex/shared-types';
 
 function remoteOrder(overrides: Partial<GateCrossExOrder> & { order_id: string; state: string }): GateCrossExOrder {
   return {
@@ -151,22 +153,98 @@ const pairedStrategyInput = {
   perOrderQuantity: '10', reduceOnly: false, executionMethod: 'TAKER_TAKER',
 } as const;
 
+const carryStrategyInput = {
+  kind: 'carry', asset: 'BTC', leftVenue: 'GATE', rightVenue: 'GATE',
+  leftSymbol: 'GATE_SPOT_BTC_USDT', rightSymbol: 'GATE_FUTURE_BTC_USDT',
+  leftSide: 'BUY', rightSide: 'SELL', totalAmount: '100',
+  perOrderQuantity: '10', executionMethod: 'TAKER_TAKER',
+} as const;
+
+function catalogInstrument(symbol: string, venue: string, business: string, state = 'live'): CrossExInstrument {
+  return {
+    symbol, exchangeType: venue, businessType: business, state,
+    minSize: '0.001', minNotional: '5', lotSize: '0.001', tickSize: '0.01',
+    maxNumOrders: '100', maxMarketSize: '120', maxLimitSize: '1000',
+    contractSize: null, liquidationFee: null, defaultLeverage: null, delistTime: '0',
+  };
+}
+
+describe('carry input validation', () => {
+  it('accepts a cross-venue carry: BINANCE spot left leg against an OKX perpetual right leg', () => {
+    const parsed = CreateStrategyInputSchema.parse({
+      ...carryStrategyInput,
+      leftVenue: 'BINANCE', leftSymbol: 'BINANCE_SPOT_BTC_USDT',
+      rightVenue: 'OKX', rightSymbol: 'OKX_FUTURE_BTC_USDT',
+    });
+    expect(parsed.leftSymbol).toBe('BINANCE_SPOT_BTC_USDT');
+    expect(parsed.rightSymbol).toBe('OKX_FUTURE_BTC_USDT');
+  });
+
+  it('accepts a cross-venue carry with a non-USDT quote: GATE spot against KRAKEN_FUTURE_*_USD', () => {
+    const parsed = CreateStrategyInputSchema.parse({
+      ...carryStrategyInput,
+      rightVenue: 'KRAKEN', rightSymbol: 'KRAKEN_FUTURE_BTC_USD',
+    });
+    expect(parsed.rightSymbol).toBe('KRAKEN_FUTURE_BTC_USD');
+  });
+
+  it('accepts a same-venue carry on any single venue', () => {
+    const parsed = CreateStrategyInputSchema.parse({
+      ...carryStrategyInput,
+      leftVenue: 'BINANCE', leftSymbol: 'BINANCE_SPOT_BTC_USDT',
+      rightVenue: 'BINANCE', rightSymbol: 'BINANCE_FUTURE_BTC_USDT',
+    });
+    expect(parsed.rightVenue).toBe('BINANCE');
+  });
+
+  it('rejects a carry whose right symbol does not belong to the right venue', () => {
+    const mismatched = CreateStrategyInputSchema.safeParse({
+      ...carryStrategyInput, rightVenue: 'OKX',
+    });
+    expect(mismatched.success).toBe(false);
+  });
+
+  it('rejects a carry whose left spot symbol does not belong to the left venue', () => {
+    const mismatched = CreateStrategyInputSchema.safeParse({
+      ...carryStrategyInput, leftVenue: 'BINANCE',
+    });
+    expect(mismatched.success).toBe(false);
+  });
+
+  it('still requires one base asset across the carry legs', () => {
+    const mixedBase = CreateStrategyInputSchema.safeParse({
+      ...carryStrategyInput, leftVenue: 'BINANCE', leftSymbol: 'BINANCE_SPOT_ETH_USDT',
+    });
+    expect(mixedBase.success).toBe(false);
+  });
+
+  it('allows a same-venue auto strategy across businesses on any connected venue', () => {
+    const parsed = CreateStrategyInputSchema.safeParse({
+      ...pairedStrategyInput,
+      kind: 'auto', leftVenue: 'BINANCE', rightVenue: 'BINANCE',
+      leftSymbol: 'BINANCE_SPOT_BTC_USDT', rightSymbol: 'BINANCE_FUTURE_BTC_USDT',
+      maxPosition: '100', takeProfitBps: '10',
+    });
+    expect(parsed.success).toBe(true);
+  });
+});
+
 describe('strategy input validation', () => {
   it('allows a negative opening-cost threshold for paired funding arbitrage', () => {
     expect(CreateStrategyInputSchema.parse(pairedStrategyInput).entryBps).toBe('-5');
   });
 
-  it('keeps the continuous price-difference bot threshold positive', () => {
-    const result = CreateStrategyInputSchema.safeParse({
+  it('allows signed entry thresholds for the continuous price-difference bot', () => {
+    // Auto now trades both spread directions: a negative entry buys the rich leg at a bounded
+    // opening cost, mirroring the position kind's negative spread allowance.
+    const negative = CreateStrategyInputSchema.safeParse({
       ...pairedStrategyInput,
       kind: 'auto',
       maxPosition: '100',
-      takeProfitBps: '1',
+      takeProfitBps: '10',
     });
-    expect(result.success).toBe(false);
-    if (!result.success) expect(result.error.issues).toEqual(expect.arrayContaining([
-      expect.objectContaining({ path: ['entryBps'], message: 'entry threshold must be greater than zero for auto strategies' }),
-    ]));
+    expect(negative.success).toBe(true);
+    if (negative.success) expect(negative.data.entryBps).toBe('-5');
   });
 });
 
@@ -260,6 +338,42 @@ describe('trading runtime order submission', () => {
     const { runtime } = await createHarness({}, { liveTradingEnabled: false });
     await expect(runtime.createOrder(marketOrderInput)).rejects.toMatchObject({ code: 'live_trading_locked' });
     expect(runtime.listOrders()).toHaveLength(0);
+  });
+
+  it('rejects a spot order outside the live instrument catalog before submission', async () => {
+    const { runtime, database, gateway } = await createHarness();
+    replaceInstrumentCatalog(database, [
+      catalogInstrument('BINANCE_SPOT_BTC_USDT', 'BINANCE', 'SPOT', 'suspend'),
+    ], '2026-09-01T00:00:00.000Z');
+
+    await expect(runtime.createOrder({
+      symbol: 'BINANCE_SPOT_BTC_USDT', side: 'BUY', type: 'LIMIT', timeInForce: 'GTC',
+      quantity: '0.1', price: '100',
+    })).rejects.toMatchObject({ code: 'unknown_market_symbol', statusCode: 400 });
+    expect(gateway.createRequests).toHaveLength(0);
+    expect(runtime.listOrders()).toHaveLength(0);
+  });
+
+  it('accepts a spot order listed live in the instrument catalog', async () => {
+    const { runtime, database } = await createHarness();
+    replaceInstrumentCatalog(database, [
+      catalogInstrument('BINANCE_SPOT_BTC_USDT', 'BINANCE', 'SPOT'),
+    ], '2026-09-01T00:00:00.000Z');
+
+    const order = await runtime.createOrder({
+      symbol: 'BINANCE_SPOT_BTC_USDT', side: 'BUY', type: 'LIMIT', timeInForce: 'GTC',
+      quantity: '0.1', price: '100',
+    });
+    expect(order.state).toBe('NEW');
+  });
+
+  it('fails open for spot orders when no instrument catalog has been fetched', async () => {
+    const { runtime } = await createHarness();
+    const order = await runtime.createOrder({
+      symbol: 'GATE_SPOT_BTC_USDT', side: 'BUY', type: 'LIMIT', timeInForce: 'GTC',
+      quantity: '0.1', price: '100',
+    });
+    expect(order.state).toBe('NEW');
   });
 });
 
@@ -554,5 +668,50 @@ describe('private event ingestion guards', () => {
     expect(database.prepare(`SELECT order_id, fee, realized_pnl FROM execution_fills WHERE id = 'rest-fill-1'`).get())
       .toEqual({ order_id: order.id, fee: '0.505', realized_pnl: '100' });
     expect(snapshots).toHaveLength(1);
+  });
+});
+
+describe('spot order cancellation', () => {
+  const spotLimitInput = {
+    symbol: 'GATE_SPOT_BTC_USDT', side: 'BUY', type: 'LIMIT', timeInForce: 'GTC', quantity: '0.1', price: '100',
+  } as const;
+
+  it('moves a resting GATE_SPOT order to PENDING_CANCEL and keeps the ledger row', async () => {
+    const { runtime, gateway, database } = await createHarness();
+    const order = await runtime.createOrder(spotLimitInput);
+    expect(order.state).toBe('NEW');
+
+    const cancelled = await runtime.cancelOrder(order.id);
+    expect(cancelled.state).toBe('PENDING_CANCEL');
+    expect(gateway.cancelledOrderIds).toEqual(['remote-1']);
+    // The row is retained in the ledger with its cancellation state.
+    expect(database.prepare('SELECT id, state FROM execution_orders WHERE id = ?').get(order.id))
+      .toEqual({ id: order.id, state: 'PENDING_CANCEL' });
+    expect(runtime.listOrders()).toHaveLength(1);
+  });
+
+  it('refuses a cancel for a terminal GATE_SPOT order with order_not_cancellable', async () => {
+    const { runtime, gateway } = await createHarness();
+    const order = await runtime.createOrder(spotLimitInput);
+    runtime.ingestPrivateEvent({ channel: 'order', payload: {
+      order_id: 'remote-1', state: 'FILLED', executed_qty: '0.1', executed_avg_price: '100',
+      update_time: '1783600002000',
+    } });
+    expect(runtime.getOrder(order.id).state).toBe('FILLED');
+
+    await expect(runtime.cancelOrder(order.id))
+      .rejects.toMatchObject({ code: 'order_not_cancellable', statusCode: 409 });
+    expect(gateway.cancelledOrderIds).toEqual([]);
+  });
+
+  it('treats a repeat cancel of a PENDING_CANCEL GATE_SPOT order as idempotent without a second gateway call', async () => {
+    const { runtime, gateway } = await createHarness();
+    const order = await runtime.createOrder(spotLimitInput);
+
+    const first = await runtime.cancelOrder(order.id);
+    expect(first.state).toBe('PENDING_CANCEL');
+    const second = await runtime.cancelOrder(order.id);
+    expect(second).toMatchObject({ id: order.id, state: 'PENDING_CANCEL' });
+    expect(gateway.cancelledOrderIds).toHaveLength(1);
   });
 });

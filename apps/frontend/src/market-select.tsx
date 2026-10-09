@@ -3,8 +3,16 @@ import { api } from './api.js';
 import type { FundingOverviewResponse, FundingOverviewVenueEntry, LiveMarket, MarketCatalogAsset, MarketSnapshot } from './api.js';
 import { marketQuoteForVenue, marketSymbol } from './market-symbol.js';
 
-const UNFILTERED_LIMIT = 60;
-const FILTERED_LIMIT = 150;
+/** Rows rendered when the list first opens; scroll/search grows the window on demand. */
+const RENDER_BATCH = 60;
+/** Grow the rendered window when the user scrolls (or arrows) within this distance of the end. */
+const RENDER_GROW_AHEAD_PX = 160;
+/**
+ * Cap on symbols the visible batch may add to the shared quote watch. The upstream WebSocket
+ * budget is 100 symbols per channel per connection with 12 connections total; the selector stays
+ * well below it and rows beyond the cap keep their REST snapshot price.
+ */
+export const SELECTOR_WATCH_CAP = 120;
 
 interface MarketSelectProps {
   asset: string;
@@ -20,9 +28,31 @@ interface MarketSelectProps {
   assetName: (asset: string) => string;
   assetIcon: (asset: string) => string;
   onSelect: (asset: string) => void;
+  /** Receives the rendered batch's symbols (deduped, capped) so their quotes stream live. */
+  onVisibleSymbols?: (symbols: string[]) => void;
   t: (key: string) => string;
   /** Keep the trading-page price and 24h columns unless a simpler picker is requested. */
   showMarketStats?: boolean;
+  /** Render-test hook: mount with the dropdown already open (static markup cannot click). */
+  defaultOpen?: boolean;
+}
+
+/**
+ * Deduped symbols of the rendered rows in display order, capped at `cap`. Symbols past the cap
+ * are intentionally left to the REST snapshot price instead of stressing the WS budget.
+ */
+export function visibleWatchSymbols(rows: MarketCatalogAsset[], cap = SELECTOR_WATCH_CAP): string[] {
+  const symbols: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of rows) {
+    for (const venue of entry.venues) {
+      if (seen.has(venue.symbol)) continue;
+      seen.add(venue.symbol);
+      symbols.push(venue.symbol);
+      if (symbols.length >= cap) return symbols;
+    }
+  }
+  return symbols;
 }
 
 function orderedVenues(entry: MarketCatalogAsset, preferredVenue: string) {
@@ -31,13 +61,17 @@ function orderedVenues(entry: MarketCatalogAsset, preferredVenue: string) {
 }
 
 function referenceMarket(markets: Map<string, LiveMarket>, entry: MarketCatalogAsset, preferredVenue: string): LiveMarket | null {
+  // Any market carrying a real quote qualifies: pending registrations push all-zero
+  // placeholders that fail the price test naturally, while streamed and seeded rows both
+  // carry prices, so registered-but-not-yet-pushed markets still show a price column.
+  const quoted = (market: LiveMarket): boolean => Number(market.lastPrice) > 0 || Number(market.bidPrice) > 0;
   const preferredSymbol = entry.venues.find((venue) => venue.venue === preferredVenue)?.symbol;
   const preferred = preferredSymbol ? markets.get(preferredSymbol) : null;
-  if (preferred?.source === 'gate_crossex_websocket') return preferred;
+  if (preferred && quoted(preferred)) return preferred;
   let fallback: LiveMarket | null = null;
   for (const venue of orderedVenues(entry, preferredVenue)) {
     const market = markets.get(venue.symbol);
-    if (!market || market.source !== 'gate_crossex_websocket') continue;
+    if (!market || !quoted(market)) continue;
     // GATE reports open24h equal to the last price, flattening the 24h change to 0.00% — prefer
     // a venue whose open is real so the change column carries information.
     const open = Number(market.open24h);
@@ -69,11 +103,13 @@ function formatRowPrice(price: number): string {
   return price.toLocaleString('en-US', { maximumSignificantDigits: 4 });
 }
 
-export function MarketSelect({ asset, label, venue, subtitle, icon, catalog, marketSnapshot, favorites, assetName, assetIcon, onSelect, t, showMarketStats = true }: MarketSelectProps) {
-  const [open, setOpen] = useState(false);
+export function MarketSelect({ asset, label, venue, subtitle, icon, catalog, marketSnapshot, favorites, assetName, assetIcon, onSelect, onVisibleSymbols, t, showMarketStats = true, defaultOpen = false }: MarketSelectProps) {
+  const [open, setOpen] = useState(defaultOpen);
   const [query, setQuery] = useState('');
   const [highlight, setHighlight] = useState(0);
   const [bulkOverview, setBulkOverview] = useState<FundingOverviewResponse | null>(null);
+  /** Size of the rendered list window; scroll/keyboard navigation grows it to the full catalog. */
+  const [visibleCount, setVisibleCount] = useState(RENDER_BATCH);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const listRef = useRef<HTMLUListElement | null>(null);
@@ -143,9 +179,45 @@ export function MarketSelect({ asset, label, venue, subtitle, icon, catalog, mar
       needle === '' || entry.asset.toLowerCase().includes(needle) || assetName(entry.asset).toLowerCase().includes(needle));
     const rank = (entry: MarketCatalogAsset) => favoriteAssets.has(entry.asset) ? 0 : entry.streamed ? 1 : 2;
     const ordered = [...matches].sort((left, right) => rank(left) - rank(right) || left.asset.localeCompare(right.asset));
-    const limit = needle === '' ? UNFILTERED_LIMIT : FILTERED_LIMIT;
-    return { rows: ordered.slice(0, limit), total: ordered.length };
-  }, [catalog, query, favoriteAssets, assetName]);
+    // No hard cap: the full match list is reachable by scrolling; only the rendered window is
+    // virtualized in batches so a multi-thousand-row catalog never lands in the DOM at once.
+    return { rows: ordered.slice(0, Math.min(visibleCount, ordered.length)), total: ordered.length };
+  }, [catalog, query, favoriteAssets, assetName, visibleCount]);
+
+  useEffect(() => {
+    // A fresh open or a new search term starts from the first batch again.
+    setVisibleCount(RENDER_BATCH);
+  }, [open, query]);
+
+  // Live-quote streaming for the rendered batch: report its symbols (deduped, capped) to the
+  // shared quote watch, and release the share when the dropdown closes or the component unmounts.
+  // Rows past the cap keep their REST snapshot price instead of stressing the WS budget.
+  const onVisibleSymbolsRef = useRef(onVisibleSymbols);
+  onVisibleSymbolsRef.current = onVisibleSymbols;
+  const reportedSymbolsRef = useRef<string[] | null>(null);
+  const reportVisibleSymbols = (symbols: string[] | null) => {
+    const next = symbols ?? [];
+    const last = reportedSymbolsRef.current;
+    if (last && last.length === next.length && last.every((symbol, index) => symbol === next[index])) return;
+    reportedSymbolsRef.current = next;
+    onVisibleSymbolsRef.current?.(next);
+  };
+  useEffect(() => {
+    if (!open) {
+      reportVisibleSymbols([]);
+      return;
+    }
+    reportVisibleSymbols(visibleWatchSymbols(rows));
+  });
+  useEffect(() => () => reportVisibleSymbols([]), []);
+
+  /** Grow the rendered window as the list approaches its end — the whole catalog stays reachable. */
+  const growRenderedWindow = () => setVisibleCount((current) => Math.min(current + RENDER_BATCH, total));
+  const onListScroll = (event: React.UIEvent<HTMLUListElement>) => {
+    const element = event.currentTarget;
+    if (element.scrollHeight - element.scrollTop - element.clientHeight > RENDER_GROW_AHEAD_PX) return;
+    growRenderedWindow();
+  };
 
   useEffect(() => {
     const selectedIndex = rows.findIndex((entry) => entry.asset === asset);
@@ -161,6 +233,8 @@ export function MarketSelect({ asset, label, venue, subtitle, icon, catalog, mar
 
   const moveHighlight = (next: number) => {
     if (rows.length === 0) return;
+    // Keyboard navigation past the rendered end grows the window instead of stopping.
+    if (next >= rows.length - 1) growRenderedWindow();
     const bounded = Math.max(0, Math.min(next, rows.length - 1));
     setHighlight(bounded);
     listRef.current?.children[bounded]?.scrollIntoView({ block: 'nearest' });
@@ -203,7 +277,7 @@ export function MarketSelect({ asset, label, venue, subtitle, icon, catalog, mar
         <em>{catalog === null ? '…' : `${total.toLocaleString('en-US')}`}</em>
       </label>
       <div className="pair-menu-head"><span>{t('Market name')}</span>{showMarketStats && <><span>{t('Price')}</span><span>24h</span></>}</div>
-      <ul id={listId} role="listbox" aria-label={t('Market name')} ref={listRef}>
+      <ul id={listId} role="listbox" aria-label={t('Market name')} ref={listRef} onScroll={onListScroll}>
         {rows.map((entry, index) => {
           const live = referenceMarket(liveBySymbol, entry, venue);
           const bulk = referenceBulkMarket(bulkBySymbol, entry, venue);
@@ -223,7 +297,7 @@ export function MarketSelect({ asset, label, venue, subtitle, icon, catalog, mar
               <span className="coin">{assetIcon(entry.asset)}</span>
               <span className="pair-row-name"><strong>{marketSymbol(entry.asset, quote, 'perpetual')}</strong><small>{assetName(entry.asset)} · {entry.venues.length}×</small></span>
               {showMarketStats && <>
-                <span className="pair-row-price">{formatRowPrice(price)}</span>
+                <span className="pair-row-price" title={live?.source === 'rest_book_ticker' ? `${t('Delayed REST quote (~30s)')} · ${live.updatedAt}` : undefined}>{formatRowPrice(price)}</span>
                 <span className={`pair-row-change${change !== null && change < 0 ? ' negative' : change !== null ? ' positive' : ''}`}>
                   {change !== null ? `${change >= 0 ? '+' : ''}${change.toFixed(2)}%` : '—'}
                 </span>

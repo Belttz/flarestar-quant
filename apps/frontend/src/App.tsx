@@ -29,6 +29,7 @@ import { parseStoredFavorites } from './local-preferences.js';
 import { scopeStrategiesToAccount, strategyBelongsToAccount } from './strategy-accounts.js';
 import { DEFAULT_FRONTEND_ROUTE, frontendPath, frontendRoute, type FrontendRoute, type StrategyRouteKind } from './frontend-routes.js';
 import { LanguageContext, translate, useLanguage, type Language, type Theme } from './i18n.js';
+import { LoginPage } from './login-page.js';
 import type { FundingMetric, PairedPositionPrefill } from './route-shared.js';
 import { UnresolvedOrdersNotice } from './trading-mode-recovery.js';
 import brandMark from './assets/brand-mark.svg';
@@ -37,16 +38,18 @@ import borosMark from './assets/boros-mark.svg';
 const TradingView = lazy(() => import('./trade-route.js').then((module) => ({ default: module.TradingView })));
 const StrategyView = lazy(() => import('./strategy-route.js').then((module) => ({ default: module.StrategyView })));
 const PremiumStrategyView = lazy(() => import('./strategy-route.js').then((module) => ({ default: module.PremiumStrategyView })));
+const CarryStrategyView = lazy(() => import('./strategy-route.js').then((module) => ({ default: module.CarryStrategyView })));
 const BorosStrategyView = lazy(() => import('./boros-route.js').then((module) => ({ default: module.BorosStrategyView })));
 const FundingDetailView = lazy(() => import('./funding-route.js').then((module) => ({ default: module.FundingDetailView })));
 const FundingRatesView = lazy(() => import('./funding-route.js').then((module) => ({ default: module.FundingRatesView })));
+const OpportunitiesView = lazy(() => import('./opportunity-route.js').then((module) => ({ default: module.OpportunitiesView })));
 const PortfolioView = lazy(() => import('./portfolio-route.js').then((module) => ({ default: module.PortfolioView })));
 const FeeComparisonView = lazy(() => import('./fee-comparison-route.js').then((module) => ({ default: module.FeeComparisonView })));
-const SOURCE_CODE_URL = 'https://github.com/your-quantguy/gate-crossex';
+const SOURCE_CODE_URL = 'https://github.com/Belttz/flarestar-quant';
 const LICENSE_URL = `${SOURCE_CODE_URL}/blob/main/LICENSE`;
 const RELEASE_VERSION = `v${import.meta.env.VITE_APP_VERSION}`;
 
-type Workspace = 'Trade' | 'Strategy' | 'Funding Rates' | 'Portfolio' | 'Trading Fees';
+type Workspace = 'Trade' | 'Strategy' | 'Funding Rates' | 'Opportunities' | 'Portfolio' | 'Trading Fees';
 type NavigationLabel = Workspace | 'Boros by Pendle';
 type StrategyKind = StrategyRouteKind;
 /** Matches the backend's market-catalog freshness window; switches inside it reuse client state. */
@@ -58,6 +61,7 @@ const navItems: { label: NavigationLabel; glyph: string }[] = [
   { label: 'Trade', glyph: '⌁' },
   { label: 'Strategy', glyph: '⇄' },
   { label: 'Funding Rates', glyph: '%' },
+  { label: 'Opportunities', glyph: '✦' },
   { label: 'Boros by Pendle', glyph: '◐' },
 ];
 
@@ -70,7 +74,10 @@ function TopbarNavigationContent({ label, glyph, iconSrc }: { label: string; gly
 
 const strategyPages: Array<{ kind: StrategyKind; glyph: string; label: string; detail: string }> = [
   { kind: 'position', glyph: '◎', label: 'Cross-exchange hedge', detail: 'Execute a fixed two-venue position, then stop' },
+  { kind: 'carry', glyph: '⌛', label: 'Spot-perpetual carry bot', detail: 'Collect funding by holding spot against its perpetual, then exit when the basis converges.' },
+  { kind: 'auto', glyph: '∑', label: 'Auto price-difference bot', detail: 'Continuously capture cross-exchange spreads' },
   { kind: 'premium', glyph: '≒', label: 'SK hynix premium bot', detail: 'Trade the SK hynix ADR premium vs the Korean listing' },
+  { kind: 'boros', glyph: '◐', label: 'Boros by Pendle', detail: 'Lock a fixed funding-rate arbitrage' },
 ];
 
 const DIALOG_FOCUSABLE = [
@@ -353,6 +360,7 @@ function fallbackCatalogFromSnapshot(snapshot: MarketSnapshot | null): MarketCat
         venue: market.venue,
         symbol: market.symbol,
         quote: market.symbol.split('_').at(-1) ?? 'USDT',
+        business: market.symbol.includes('_SPOT_') ? 'SPOT' : 'FUTURE',
       });
     }
     byAsset.set(market.asset, entry);
@@ -553,6 +561,14 @@ function App() {
   const pendingWatchRef = useRef<{ symbol: string; interval: CandleInterval } | null>(null);
   const pendingQuoteSymbolsRef = useRef<string[]>([]);
   const pendingKlineWatchesRef = useRef<KlineWatch[]>([]);
+  // Quote watches are split into the active route's share and the market selector's visible-batch
+  // share; the stream always receives their union.
+  const routeQuoteSymbolsRef = useRef<string[]>([]);
+  const selectorQuoteSymbolsRef = useRef<string[]>([]);
+  const applyQuoteWatch = useCallback(() => {
+    pendingQuoteSymbolsRef.current = [...new Set([...routeQuoteSymbolsRef.current, ...selectorQuoteSymbolsRef.current])];
+    streamRef.current?.watchQuotes(pendingQuoteSymbolsRef.current);
+  }, []);
   const marketBufferRef = useRef<Map<string, LiveMarket>>(new Map());
   const lastMarketFlushAtRef = useRef(0);
   const tradeBufferRef = useRef<{ symbol: string; trades: PublicTrade[] } | null>(null);
@@ -582,6 +598,68 @@ function App() {
     setConnection(next);
     return next;
   }, []);
+
+  // Cloud-deployment operator authentication. The session cookie is HttpOnly, so the
+  // SPA only learns its validity from the backend; any 401 'unauthenticated' response
+  // dispatched by the api layer flips the whole workspace to the sign-in screen.
+  const [authState, setAuthState] = useState<'checking' | 'anonymous' | 'authenticated'>('checking');
+  const [authUsername, setAuthUsername] = useState<string | null>(null);
+  const [passwordFormOpen, setPasswordFormOpen] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmNewPassword, setConfirmNewPassword] = useState('');
+  const [passwordBusy, setPasswordBusy] = useState(false);
+  const [passwordFeedback, setPasswordFeedback] = useState<{ kind: 'error' | 'ok'; key: string } | null>(null);
+  const [loggingOut, setLoggingOut] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    api.auth.session()
+      .then((session) => {
+        if (cancelled) return;
+        setAuthUsername(session.username);
+        setAuthState('authenticated');
+      })
+      .catch(() => {
+        if (!cancelled) setAuthState('anonymous');
+      });
+    return () => { cancelled = true; };
+  }, []);
+  useEffect(() => {
+    const onExpired = () => setAuthState((current) => current === 'checking' ? current : 'anonymous');
+    window.addEventListener('gct:session-expired', onExpired);
+    return () => window.removeEventListener('gct:session-expired', onExpired);
+  }, []);
+  const submitPasswordChange = async () => {
+    if (passwordBusy) return;
+    if (newPassword !== confirmNewPassword) {
+      setPasswordFeedback({ kind: 'error', key: 'password_mismatch' });
+      return;
+    }
+    setPasswordBusy(true);
+    setPasswordFeedback(null);
+    try {
+      await api.auth.changePassword(currentPassword, newPassword);
+      setPasswordFeedback({ kind: 'ok', key: 'password_changed' });
+      setCurrentPassword('');
+      setNewPassword('');
+      setConfirmNewPassword('');
+    } catch (cause) {
+      const code = cause instanceof ApiError ? cause.code : null;
+      const known = ['invalid_current_password', 'new_password_too_short', 'new_password_weak', 'new_password_unchanged', 'weak_new_password', 'invalid_password_change_request'];
+      setPasswordFeedback({ kind: 'error', key: code !== null && known.includes(code) ? code : 'change_password_failed' });
+    } finally {
+      setPasswordBusy(false);
+    }
+  };
+  const handleLogout = async () => {
+    setLoggingOut(true);
+    try {
+      await api.auth.logout();
+    } catch {
+      // Best effort: clear the cookie client-side and reload regardless.
+    }
+    window.location.reload();
+  };
 
   useEffect(() => {
     if (backendUnavailableSince === null) {
@@ -701,16 +779,24 @@ function App() {
   const watchMarket = useCallback((symbol: string, interval: CandleInterval) => {
     // The trade view can request a watch before the stream handle exists; remember it for the
     // connect effect to flush.
-    pendingQuoteSymbolsRef.current = [symbol];
+    routeQuoteSymbolsRef.current = [symbol];
     pendingWatchRef.current = { symbol, interval };
-    streamRef.current?.watchQuotes([symbol]);
+    applyQuoteWatch();
     streamRef.current?.watchMarket(symbol, interval);
-  }, []);
+  }, [applyQuoteWatch]);
 
   const watchQuotes = useCallback((symbols: string[]) => {
-    pendingQuoteSymbolsRef.current = symbols;
-    streamRef.current?.watchQuotes(symbols);
-  }, []);
+    routeQuoteSymbolsRef.current = symbols;
+    applyQuoteWatch();
+  }, [applyQuoteWatch]);
+
+  // The market selector's visible-batch watch rides the same terminal stream alongside route
+  // watches: both shares are unioned into one watch.quotes message, so batch switches only
+  // rewrite the selector's share and released rows simply drop out of the union.
+  const watchSelectorQuotes = useCallback((symbols: string[]) => {
+    selectorQuoteSymbolsRef.current = symbols;
+    applyQuoteWatch();
+  }, [applyQuoteWatch]);
 
   const watchKlines = useCallback((watches: KlineWatch[]) => {
     pendingKlineWatchesRef.current = watches;
@@ -729,10 +815,10 @@ function App() {
     tradeBufferRef.current = null;
     setPublicTrades({ symbol: '', trades: [] });
     if (workspace !== 'Strategy') {
-      pendingQuoteSymbolsRef.current = [];
-      streamRef.current?.watchQuotes([]);
+      routeQuoteSymbolsRef.current = [];
+      applyQuoteWatch();
     }
-  }, [workspace]);
+  }, [workspace, applyQuoteWatch]);
 
   const seedCandles = useCallback((key: string, incoming: Candle[], building: boolean, replace = false) => {
     const interval = key.slice(key.lastIndexOf(':') + 1) as CandleInterval;
@@ -913,7 +999,9 @@ function App() {
   }, [terminalStreamEnabled, markBackendUnavailable, reportBackendConnectivityError]);
 
   const refreshMarketSnapshot = useCallback(async () => {
-    const snapshot = await api.markets();
+    // The merged view (hub live rows + bulk REST bookTicker rows) gives every catalog symbol a
+    // price, matching the opportunities board's basis; WebSocket updates keep overriding hub rows.
+    const snapshot = await api.markets({ includeRest: true });
     setMarketSnapshot(snapshot);
   }, []);
 
@@ -1058,22 +1146,25 @@ function App() {
     () => scopeStrategiesToAccount(strategies, connection),
     [strategies, connection],
   );
+  const opportunityBoard = route.workspace === 'Opportunities' ? route.board : 'funding';
 
   const content = useMemo(() => {
-    if (workspace === 'Trade') return <TradingView asset={selectedAsset} catalog={availableCatalog} onSelectAsset={selectAsset} marketSnapshot={marketSnapshot} tradingSnapshot={tradingSnapshot} authenticatedPortfolio={authenticatedPortfolio} balances={balances} fees={fees} orderBook={orderBook} publicTrades={publicTrades} candleSeries={candleSeries} candleBackfilling={candleBackfilling} watchMarket={watchMarket} seedCandles={seedCandles} onTradingChanged={refreshTrading} onPositionsRefresh={refreshPositions} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} favorites={favorites} onToggleFavorite={toggleFavorite} confirmOrders={confirmOrders} onSetConfirmOrders={setConfirmOrders} />;
+    if (workspace === 'Trade') return <TradingView asset={selectedAsset} catalog={availableCatalog} onSelectAsset={selectAsset} marketSnapshot={marketSnapshot} tradingSnapshot={tradingSnapshot} authenticatedPortfolio={authenticatedPortfolio} balances={balances} fees={fees} orderBook={orderBook} publicTrades={publicTrades} candleSeries={candleSeries} candleBackfilling={candleBackfilling} watchMarket={watchMarket} watchSelectorQuotes={watchSelectorQuotes} seedCandles={seedCandles} onTradingChanged={refreshTrading} onPositionsRefresh={refreshPositions} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} favorites={favorites} onToggleFavorite={toggleFavorite} confirmOrders={confirmOrders} onSetConfirmOrders={setConfirmOrders} />;
     if (workspace === 'Strategy') {
       if (strategyKind === 'premium') return <PremiumStrategyView marketSnapshot={marketSnapshot} catalog={availableCatalog} strategies={activeAccountStrategies} balances={balances} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} candleSeries={candleSeries} watchQuotes={watchQuotes} watchKlines={watchKlines} />;
+      if (strategyKind === 'carry') return <CarryStrategyView marketSnapshot={marketSnapshot} catalog={availableCatalog} strategies={activeAccountStrategies} balances={balances} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} watchQuotes={watchQuotes} />;
       if (strategyKind === 'boros') return <BorosStrategyView marketSnapshot={marketSnapshot} catalog={availableCatalog} balances={balances} fees={fees} feesReady={feesReady} strategies={activeAccountStrategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} watchQuotes={watchQuotes} />;
       return <StrategyView mode={strategyKind} prefill={positionPrefill} marketSnapshot={marketSnapshot} catalog={availableCatalog} fees={fees} strategies={activeAccountStrategies} balances={balances} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} watchQuotes={watchQuotes} />;
     }
     if (workspace === 'Funding Rates') return fundingDetailAsset
       ? <FundingDetailView asset={fundingDetailAsset} fundingOverview={fundingOverview} onFundingOverview={setFundingOverview} onBack={() => navigate({ workspace: 'Funding Rates', asset: null })} />
       : <FundingRatesView metric={fundingMetric} onMetricChange={setFundingMetric} marketSnapshot={marketSnapshot} onMarketFallback={refreshMarketSnapshot} onOpenAsset={openFundingDetail} onOpenStrategy={openFundingStrategy} fundingOverview={fundingOverview} onFundingOverview={setFundingOverview} fundingHistoryCache={fundingHistoryCache} onFundingHistoryEntries={mergeFundingHistory} />;
+    if (workspace === 'Opportunities') return <OpportunitiesView board={opportunityBoard} navigate={navigate} onOpenPairedPosition={openFundingStrategy} />;
     if (workspace === 'Portfolio') return <PortfolioView key={connection?.activeProfileId ?? 'no-active-account'} tradingSnapshot={tradingSnapshot} balances={balances} portfolio={authenticatedPortfolio} accountStream={accountStream} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onRefresh={refreshAuthenticatedPortfolio} />;
-    if (workspace === 'Trading Fees') return <FeeComparisonView catalog={availableCatalog} marketSnapshot={marketSnapshot} favorites={favorites} fees={fees} feesReady={feesReady} error={feesError} onRefresh={refreshFees} />;
+    if (workspace === 'Trading Fees') return <FeeComparisonView catalog={availableCatalog} marketSnapshot={marketSnapshot} favorites={favorites} fees={fees} feesReady={feesReady} error={feesError} onRefresh={refreshFees} watchSelectorQuotes={watchSelectorQuotes} />;
     return null;
 
-  }, [workspace, strategyKind, positionPrefill, selectedAsset, fundingMetric, fundingOverview, fundingHistoryCache, availableCatalog, selectAsset, marketSnapshot, tradingSnapshot, authenticatedPortfolio, accountStream, activeAccountStrategies, balances, fees, feesReady, feesError, orderBook, publicTrades, candleSeries, candleBackfilling, tradingMode, openModeDialog, watchMarket, watchQuotes, watchKlines, seedCandles, refreshTrading, refreshStrategies, refreshPositions, refreshMarketSnapshot, refreshFees, favorites, toggleFavorite, confirmOrders, fundingDetailAsset, openFundingDetail, openFundingStrategy, mergeFundingHistory, navigate, connection?.activeProfileId]);
+  }, [workspace, strategyKind, positionPrefill, selectedAsset, fundingMetric, fundingOverview, fundingHistoryCache, availableCatalog, selectAsset, marketSnapshot, tradingSnapshot, authenticatedPortfolio, accountStream, activeAccountStrategies, balances, fees, feesReady, feesError, orderBook, publicTrades, candleSeries, candleBackfilling, tradingMode, openModeDialog, watchMarket, watchQuotes, watchSelectorQuotes, watchKlines, seedCandles, refreshTrading, refreshStrategies, refreshPositions, refreshMarketSnapshot, refreshFees, favorites, toggleFavorite, confirmOrders, fundingDetailAsset, openFundingDetail, openFundingStrategy, mergeFundingHistory, navigate, connection?.activeProfileId, opportunityBoard]);
 
   const storageLabel = connection?.storage === 'os_keychain' ? t('OS keychain') : connection?.storage === 'env_file' ? t('Local .env file') : connection?.storage ?? '—';
   const accountStatusLabel = accountStream?.state === 'live' ? t('Account live')
@@ -1233,11 +1324,21 @@ function App() {
     setPendingAccountSwitch(null);
   }, [modeDialogOpen, tradingMode]);
 
+  if (authState === 'checking') {
+    return <LanguageContext.Provider value={{ language, theme, t, setLanguage }}>
+      <div className="login-screen" role="status">{t('Loading workspace…')}</div>
+    </LanguageContext.Provider>;
+  }
+  if (authState === 'anonymous') {
+    return <LanguageContext.Provider value={{ language, theme, t, setLanguage }}>
+      <LoginPage />
+    </LanguageContext.Provider>;
+  }
   return <LanguageContext.Provider value={{ language, theme, t, setLanguage }}><div className={`app-shell${workspace === 'Trade' ? ' trading-page' : ''}`}>
     <header className="topbar">
       <button
         className="brand"
-        aria-label="All In One by yourQuantGuy — Gate CrossEx"
+        aria-label="星闪量化 — Gate CrossEx 交易终端"
         onClick={() => navigate({ workspace: 'Trade' })}
       >
         <span className="brand-symbol" aria-hidden="true">
@@ -1245,8 +1346,8 @@ function App() {
         </span>
         <span className="brand-copy">
           <span className="brand-title">
-            <strong>All In One</strong>
-            <small>by yourQuantGuy</small>
+            <strong>星闪量化</strong>
+            <small>FlareStar Quant</small>
           </span>
           <span className="brand-edition">Gate CrossEx</span>
         </span>
@@ -1282,7 +1383,9 @@ function App() {
               ? { workspace: 'Strategy', strategyKind: 'boros' }
             : item.label === 'Funding Rates'
               ? { workspace: 'Funding Rates', asset: null }
-              : { workspace: 'Portfolio' });
+              : item.label === 'Opportunities'
+                ? { workspace: 'Opportunities', board: 'funding' }
+                : { workspace: 'Portfolio' });
         }}><TopbarNavigationContent label={item.label} glyph={item.glyph} iconSrc={item.label === 'Boros by Pendle' ? borosMark : undefined} /></button>)}
         <div className="nav-strategy nav-more" ref={moreNavRef}>
           <button ref={moreTriggerRef} className={`topbar-navigation-button ${workspace === 'Trading Fees' ? 'active' : ''}${moreMenuAt ? ' menu-open' : ''}`}
@@ -1354,6 +1457,22 @@ function App() {
                 <i />
               </label>
             </div>
+            <p className="settings-section">{t('Account security')}</p>
+            <div className="settings-account">
+              <small>{t('Signed in as')}</small>
+              <strong>{authUsername ?? '—'}</strong>
+            </div>
+            {passwordFormOpen
+              ? <div className="password-change-form">
+                <input type="password" value={currentPassword} placeholder={t('Current password')} autoComplete="current-password" onChange={(event) => setCurrentPassword(event.target.value)} />
+                <input type="password" value={newPassword} placeholder={t('New password')} autoComplete="new-password" onChange={(event) => setNewPassword(event.target.value)} />
+                <input type="password" value={confirmNewPassword} placeholder={t('Confirm new password')} autoComplete="new-password" onChange={(event) => setConfirmNewPassword(event.target.value)} />
+                {passwordFeedback && <small className={passwordFeedback.kind === 'ok' ? 'password-ok' : 'password-error'} role={passwordFeedback.kind === 'error' ? 'alert' : undefined}>{t(passwordFeedback.key)}</small>}
+                <button onClick={submitPasswordChange} disabled={passwordBusy || !currentPassword || !newPassword || !confirmNewPassword}>{passwordBusy ? t('Updating…') : t('Update password')}</button>
+                <button className="password-cancel" onClick={() => { setPasswordFormOpen(false); setPasswordFeedback(null); }}>{t('Cancel')}</button>
+              </div>
+              : <button className="settings-link" onClick={() => { setPasswordFormOpen(true); setPasswordFeedback(null); }}>{t('Change password')}<span>›</span></button>}
+            <button className="settings-link" onClick={handleLogout} disabled={loggingOut}>{loggingOut ? t('Logging out…') : t('Log out')}<span>›</span></button>
             <p className="settings-section">{t('Display')}</p>
             <div className="settings-row">
               <strong>{t('Language')}</strong>
@@ -1372,7 +1491,7 @@ function App() {
             <button className="settings-link" onClick={() => window.open('/api/system/discovery', '_blank', 'noopener')}>API<span>›</span></button>
             <p className="settings-section">{t('Open source')}</p>
             <div className="settings-account">
-              <strong>© 2026 yourQuantGuy and contributors</strong>
+              <span className="brand-title"><strong>星闪量化</strong><small>FlareStar Quant</small></span>
               <small>{t('Licensed under AGPL-3.0-only · no warranty')}</small>
             </div>
             <button className="settings-link" onClick={() => window.open(SOURCE_CODE_URL, '_blank', 'noopener')}>{t('Source code')}<span>›</span></button>
@@ -1390,7 +1509,7 @@ function App() {
         {content}
       </Suspense>
     </main>
-    <footer className="statusbar"><div>{terminalStreamEnabled ? <><span className={streamState === 'connected' ? 'connected' : ''}><i /> {t(streamState === 'connected' ? 'Backend stream connected' : 'Reconnecting backend stream')}</span><span>LIVE {t('environment')}</span><span className={marketSnapshot?.connectionState === 'healthy' ? 'connected' : ''}><i /> {t('Market data')} {t(marketSnapshot?.connectionState ?? 'connecting')}</span><span className={accountStatusConnected ? 'connected' : ''}><i /> {accountStatusLabel}</span></> : <span className={fundingOverview ? 'connected' : ''}><i /> {t('Funding Rates')}</span>}</div><div><UtcClock /><button onClick={() => window.open(`${SOURCE_CODE_URL}/issues`, '_blank', 'noopener')}>{t('Support')}</button><button onClick={() => window.open(SOURCE_CODE_URL, '_blank', 'noopener')}>{t('Source code')}</button><button onClick={() => window.open(LICENSE_URL, '_blank', 'noopener')}>AGPL-3.0</button><span title={`Release ${RELEASE_VERSION}`}>{RELEASE_VERSION}</span></div></footer>
+    <footer className="statusbar"><div>{terminalStreamEnabled ? <><span className={streamState === 'connected' ? 'connected' : ''}><i /> {t(streamState === 'connected' ? 'Backend stream connected' : 'Reconnecting backend stream')}</span><span>LIVE {t('environment')}</span><span className={marketSnapshot?.connectionState === 'healthy' ? 'connected' : ''}><i /> {t('Market data')} {t(marketSnapshot?.connectionState ?? 'connecting')}</span><span className={accountStatusConnected ? 'connected' : ''}><i /> {accountStatusLabel}</span></> : <span className={fundingOverview ? 'connected' : ''}><i /> {fundingOverview ? t('Funding data source connected') : t('Funding data source loading')}</span>}</div><div><UtcClock /><span className="footer-brand" title="星闪量化 FlareStar Quant"><img src={brandMark} alt="" /><b>星闪量化</b></span><span title={`Release ${RELEASE_VERSION}`}>{RELEASE_VERSION}</span><button onClick={() => window.open('https://becod.eu.org/', '_blank', 'noopener')}>{t('Blog')}</button></div></footer>
     <AccountManagerDialog
       open={accountManagerOpen}
       connection={connection}

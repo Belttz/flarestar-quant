@@ -14,6 +14,8 @@ export interface BackendConfig {
   allowedOrigin: string;
   allowedOrigins: ReadonlySet<string>;
   allowedHosts: ReadonlySet<string>;
+  authUsername: string;
+  authBootstrapPassword: string;
   gateRestBaseUrl: string;
   gatePublicWebSocketUrl: string;
   gatePrivateWebSocketUrl: string;
@@ -56,6 +58,12 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
     allowedOrigin,
     allowedOrigins: new Set([allowedOrigin, ...loopbackOrigins]),
     allowedHosts: new Set(['127.0.0.1', 'localhost', '::1', ...configuredHosts]),
+    // Operator login for cloud deployments. Only used to seed the auth_user table on the very
+    // first boot; afterwards the password lives as a scrypt hash in SQLite and is changed via
+    // the UI (POST /api/auth/change-password). Override before first boot with GCT_AUTH_USERNAME
+    // / GCT_AUTH_PASSWORD.
+    authUsername: environment.GCT_AUTH_USERNAME ?? 'Belttz',
+    authBootstrapPassword: environment.GCT_AUTH_PASSWORD ?? '2636489471@Be',
     gateRestBaseUrl: environment.GCT_GATE_REST_URL ?? 'https://api.gateio.ws/api/v4',
     gatePublicWebSocketUrl: environment.GCT_GATE_PUBLIC_WS_URL ?? 'wss://api.gateio.ws/ws/crossex/public',
     gatePrivateWebSocketUrl: environment.GCT_GATE_PRIVATE_WS_URL ?? 'wss://api.gateio.ws/ws/crossex',

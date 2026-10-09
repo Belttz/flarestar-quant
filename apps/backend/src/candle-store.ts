@@ -101,7 +101,9 @@ export class CandleStore {
 
   canBackfill(symbol: string): boolean {
     return typeof this.publicMarketGateway.queryCandles === 'function'
-      && /^(GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_/.test(symbol);
+      // Spot history comes from each venue's spot candlestick endpoint (GATE/BINANCE/OKX/BYBIT);
+      // futures venues use their own candlestick endpoints.
+      && (/^(GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_|^(GATE|BINANCE|OKX|BYBIT)_SPOT_/.test(symbol));
   }
 
   backfilledRecently(symbol: string, interval: CandleInterval): boolean {
