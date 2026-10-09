@@ -72,12 +72,13 @@ function TopbarNavigationContent({ label, glyph, iconSrc }: { label: string; gly
     : <span className="topbar-nav-glyph" aria-hidden="true">{glyph}</span>}{t(label)}</>;
 }
 
+// Boros by Pendle keeps its own top-level navigation entry, so it is deliberately not one of the
+// Strategy menu's modes.
 const strategyPages: Array<{ kind: StrategyKind; glyph: string; label: string; detail: string }> = [
   { kind: 'position', glyph: '◎', label: 'Cross-exchange hedge', detail: 'Execute a fixed two-venue position, then stop' },
   { kind: 'carry', glyph: '⌛', label: 'Spot-perpetual carry bot', detail: 'Collect funding by holding spot against its perpetual, then exit when the basis converges.' },
   { kind: 'auto', glyph: '∑', label: 'Auto price-difference bot', detail: 'Continuously capture cross-exchange spreads' },
   { kind: 'premium', glyph: '≒', label: 'SK hynix premium bot', detail: 'Trade the SK hynix ADR premium vs the Korean listing' },
-  { kind: 'boros', glyph: '◐', label: 'Boros by Pendle', detail: 'Lock a fixed funding-rate arbitrage' },
 ];
 
 const DIALOG_FOCUSABLE = [

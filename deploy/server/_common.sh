@@ -52,8 +52,8 @@ compose_available() {
 # 服务器端公共预检：平台、基础工具、必需文件，并解析出可用的 docker 调用方式。
 preflight_server() {
   [ "$(uname -s)" = "Linux" ] || fail "本脚本用于 Linux 服务器；Windows 请用 deploy/windows/install.bat。"
-  [ -f "$COMPOSE_FILE" ] || fail "找不到 $COMPOSE_FILE（脚本必须在项目目录内运行）。"
-  [ -f "$DOCKERFILE" ] || fail "找不到 $DOCKERFILE（脚本必须在项目目录内运行）。"
+  [ -f "$COMPOSE_FILE" ] || fail "找不到 ${COMPOSE_FILE}（脚本必须在项目目录内运行）。"
+  [ -f "$DOCKERFILE" ] || fail "找不到 ${DOCKERFILE}（脚本必须在项目目录内运行）。"
   resolve_docker
 }
 
@@ -139,5 +139,5 @@ wait_for_health() {
 }
 
 require_env_file() {
-  [ -f "$ENV_FILE" ] || fail "找不到配置文件 $ENV_FILE。请先运行 ./deploy/server/install.sh。"
+  [ -f "$ENV_FILE" ] || fail "找不到配置文件 ${ENV_FILE}。请先运行 ./deploy/server/install.sh。"
 }

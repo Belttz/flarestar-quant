@@ -2451,21 +2451,21 @@ html[data-theme='light'] .password-change-form .password-error { color: #b3425a;
 .equity-range-tabs button:hover { color: #d5dde5; }
 .equity-range-tabs button.active { color: #06100d; background: var(--green); }
 .equity-range-tabs button:focus-visible { outline: 2px solid var(--green); outline-offset: 1px; }
-.equity-since { margin: 0; padding: 9px 20px 0; color: #5f6d80; font-size: var(--text-caption); }
+.equity-since { margin: 0; padding: 9px 20px 0; color: #8493a4; font-size: var(--text-caption); }
 .equity-since time { color: #7f8c9c; }
 .equity-chart { position: relative; height: 320px; }
 .equity-chart .chart-host { position: absolute; inset: 0; }
 .equity-message { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 8px; color: #667386; text-align: center; }
 .equity-message > span { color: #405064; font-size: 20px; }
 .equity-message strong { color: #8c99a8; font-size: var(--text-small); }
-.equity-message small { max-width: 300px; color: #657285; font-size: var(--text-caption); line-height: 1.5; }
+.equity-message small { max-width: 300px; color: #8493a4; font-size: var(--text-caption); line-height: 1.5; }
 .equity-message button { height: 27px; padding: 0 10px; border: 1px solid #314052; border-radius: 4px; color: #9ba7b5; background: #111a23; font-size: var(--text-caption); cursor: pointer; }
 .equity-message.error > span { color: var(--red); }
-.equity-change { margin: 0; padding: 0 20px 4px; color: #657386; font-size: var(--text-caption); }
+.equity-change { margin: 0; padding: 0 20px 4px; color: #8493a4; font-size: var(--text-caption); }
 .equity-change strong { font-family: var(--font-mono); }
 .equity-change.positive strong { color: var(--green); }
 .equity-change.negative strong { color: var(--red); }
-.equity-note { margin: 0; padding: 7px 20px 14px; color: #5f6d80; font-size: var(--text-caption); }
+.equity-note { margin: 0; padding: 7px 20px 14px; color: #8493a4; font-size: var(--text-caption); }
 html[data-theme='light'] .equity-card { background: #ffffff; }
 html[data-theme='light'] .equity-range-tabs { border-color: #d5dee5; background: #f4f7f9; }
 html[data-theme='light'] .equity-range-tabs button { color: #62707d; }

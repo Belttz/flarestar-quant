@@ -16,10 +16,6 @@ function catalogEntry(asset: string, symbols: string[]): MarketCatalogAsset {
   };
 }
 
-function entryAsset(symbol: string): string {
-  return symbol.split('_')[2] ?? symbol;
-}
-
 describe('visibleWatchSymbols', () => {
   it('collects deduped row symbols in display order', () => {
     const rows = [

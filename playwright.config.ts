@@ -31,7 +31,9 @@ export default defineConfig({
   webServer: {
     command: 'node scripts/e2e-server.mjs',
     url: baseURL,
-    reuseExistingServer: false,
+    // Locally, prefer a server you started yourself: on Windows Playwright can hang while tearing
+    // the child process down after the run. CI still boots and owns its own server.
+    reuseExistingServer: !process.env.CI,
     timeout: 60_000,
     stdout: 'pipe',
     stderr: 'pipe',

@@ -9,7 +9,6 @@ import type {
   PreIpoFilterMode,
   SpreadOpportunity,
 } from '@gate-crossex/shared-types';
-import { ASSET_CLASS_LABEL_KEYS } from '@gate-crossex/shared-types';
 import { api } from './api.js';
 import type { FrontendQuery, FrontendRoute, OpportunityBoard } from './frontend-routes.js';
 import { ExecutionPagination } from './execution-pagination-control.js';
@@ -21,7 +20,6 @@ import {
   fundingVenueOptions,
   hedgePairedPositionPrefill,
   sortFundingHedges,
-  type AssetFundingVenueRow,
   type FundingHedgeRow,
   type FundingHedgeSortKey,
 } from './funding-hedge.js';

@@ -26,6 +26,9 @@ export default tseslint.config(
     rules: {
       // Several credential-handling paths deliberately clear local references in `finally`.
       'no-useless-assignment': 'off',
+      // A leading underscore is the agreed marker for a parameter that exists only to satisfy a
+      // callback signature (fetch mocks, event handlers) without being read in the body.
+      '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
     },
   },
   {

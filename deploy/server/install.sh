@@ -81,7 +81,7 @@ env_value() {
 collect_config() {
   local reused=0
   if [ -f "$ENV_FILE" ]; then
-    say "检测到已有配置 $ENV_FILE，沿用其中的域名与用户名（不会覆盖已有值）。"
+    say "检测到已有配置 ${ENV_FILE}，沿用其中的域名与用户名（不会覆盖已有值）。"
     local existing_domain existing_user existing_password
     existing_domain="$(env_value GCT_DOMAIN)"
     existing_user="$(env_value GCT_AUTH_USERNAME)"
@@ -114,7 +114,7 @@ collect_config() {
       printf 'GCT_AUTH_USERNAME=%s\n' "$USERNAME"
       printf 'GCT_AUTH_PASSWORD=%s\n' "$PASSWORD"
     } > "$ENV_FILE"
-    ok "已生成配置文件 $ENV_FILE（权限 600）。"
+    ok "已生成配置文件 ${ENV_FILE}（权限 600）。"
   else
     # 只补齐缺失的键，绝不覆盖已有值。
     grep -qE '^GCT_DOMAIN=' "$ENV_FILE" || printf 'GCT_DOMAIN=%s\n' "$DOMAIN" >> "$ENV_FILE"

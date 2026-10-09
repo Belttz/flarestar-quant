@@ -173,16 +173,23 @@ export function MarketSelect({ asset, label, venue, subtitle, icon, catalog, mar
     return map;
   }, [bulkOverview]);
 
-  const { rows, total } = useMemo(() => {
+  // The full ranked match list stays separate from the rendered window: keyboard navigation grows
+  // the window, and re-deriving this list on every grow would hand the highlight effect a new
+  // array identity mid-navigation.
+  const ordered = useMemo(() => {
     const needle = query.trim().toLowerCase();
     const matches = (catalog ?? []).filter((entry) =>
       needle === '' || entry.asset.toLowerCase().includes(needle) || assetName(entry.asset).toLowerCase().includes(needle));
     const rank = (entry: MarketCatalogAsset) => favoriteAssets.has(entry.asset) ? 0 : entry.streamed ? 1 : 2;
-    const ordered = [...matches].sort((left, right) => rank(left) - rank(right) || left.asset.localeCompare(right.asset));
-    // No hard cap: the full match list is reachable by scrolling; only the rendered window is
-    // virtualized in batches so a multi-thousand-row catalog never lands in the DOM at once.
-    return { rows: ordered.slice(0, Math.min(visibleCount, ordered.length)), total: ordered.length };
-  }, [catalog, query, favoriteAssets, assetName, visibleCount]);
+    return [...matches].sort((left, right) => rank(left) - rank(right) || left.asset.localeCompare(right.asset));
+  }, [catalog, query, favoriteAssets, assetName]);
+
+  // No hard cap: the full match list is reachable by scrolling; only the rendered window is
+  // virtualized in batches so a multi-thousand-row catalog never lands in the DOM at once.
+  const { rows, total } = useMemo(() => ({
+    rows: ordered.slice(0, Math.min(visibleCount, ordered.length)),
+    total: ordered.length,
+  }), [ordered, visibleCount]);
 
   useEffect(() => {
     // A fresh open or a new search term starts from the first batch again.
@@ -220,9 +227,12 @@ export function MarketSelect({ asset, label, venue, subtitle, icon, catalog, mar
   };
 
   useEffect(() => {
-    const selectedIndex = rows.findIndex((entry) => entry.asset === asset);
+    // Re-anchor only when the user's context changes (selected asset, open state, search term).
+    // Keying this on the rendered window would undo keyboard jumps: pressing End grows the window,
+    // which would hand this effect a new `rows` identity and snap the highlight back to the asset.
+    const selectedIndex = ordered.findIndex((entry) => entry.asset === asset);
     setHighlight(selectedIndex >= 0 ? selectedIndex : 0);
-  }, [asset, open, query, rows]);
+  }, [asset, open, query, ordered]);
 
   const choose = (nextAsset: string) => {
     onSelect(nextAsset);

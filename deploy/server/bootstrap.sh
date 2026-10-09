@@ -151,7 +151,7 @@ ensure_git() {
 has_installer() { [ -f "$1/deploy/server/install.sh" ]; }
 
 clone_repo() {
-  say "克隆源码：$REPO_URL（分支 $SOURCE_REF）-> $INSTALL_DIR"
+  say "克隆源码：${REPO_URL}（分支 ${SOURCE_REF}）-> ${INSTALL_DIR}"
   mkdir -p "$(dirname "$INSTALL_DIR")"
   if git clone --depth 1 --branch "$SOURCE_REF" -- "$REPO_URL" "$INSTALL_DIR" 2>/dev/null; then
     ok "克隆完成（浅克隆）。"
@@ -160,14 +160,14 @@ clone_repo() {
   # --branch 对裸 commit SHA 无效，回退到完整克隆再检出。
   warn "浅克隆失败（分支/标签可能不存在，或该 ref 是 commit SHA），改为完整克隆。"
   rm -rf "$INSTALL_DIR"
-  git clone -- "$REPO_URL" "$INSTALL_DIR" || fail "克隆失败：$REPO_URL（私有仓库请用 --repo 传入带 token 的地址）"
+  git clone -- "$REPO_URL" "$INSTALL_DIR" || fail "克隆失败：${REPO_URL}（私有仓库请用 --repo 传入带 token 的地址）"
   git -C "$INSTALL_DIR" checkout --force "$SOURCE_REF" || fail "检出失败：$SOURCE_REF"
   ok "克隆并检出完成。"
 }
 
 update_repo() {
   say "目录已存在 git 仓库，更新到最新的 $SOURCE_REF ..."
-  git -C "$INSTALL_DIR" fetch --prune --depth 1 origin "$SOURCE_REF" || fail "fetch 失败：$SOURCE_REF（检查网络与仓库权限）"
+  git -C "$INSTALL_DIR" fetch --prune --depth 1 origin "$SOURCE_REF" || fail "fetch 失败：${SOURCE_REF}（检查网络与仓库权限）"
   git -C "$INSTALL_DIR" reset --hard FETCH_HEAD
   ok "已更新到 origin/$SOURCE_REF 最新提交：$(git -C "$INSTALL_DIR" rev-parse --short HEAD)"
 }
@@ -181,7 +181,7 @@ use_local_source() {
       # 解压到持久目录而不是临时目录：安装完成后 cloud.env、docker-compose.cloud.yml
       # 还要留着给 update.sh / 日常运维用；装完即删会连带数据配置一起丢。
       if [ -e "$INSTALL_DIR" ] && [ -d "$INSTALL_DIR" ] && [ -n "$(find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
-        fail "安装目录非空，拒绝把源码包解压进去：$INSTALL_DIR（请改用 --dir 指定其它目录）"
+        fail "安装目录非空，拒绝把源码包解压进去：${INSTALL_DIR}（请改用 --dir 指定其它目录）"
       fi
       say "解压源码包 $src -> $INSTALL_DIR ..."
       mkdir -p "$INSTALL_DIR"
@@ -194,7 +194,7 @@ use_local_source() {
           INSTALL_DIR="$(find "$INSTALL_DIR" -mindepth 1 -maxdepth 1)"
         fi
       fi
-      ok "已解压到 $INSTALL_DIR。"
+      ok "已解压到 ${INSTALL_DIR}。"
       ;;
     *)
       [ -d "$src" ] || fail "--source 只能是目录或 .tar/.tar.gz/.tgz 源码包：$src"
@@ -222,7 +222,7 @@ acquire_source() {
     fail "安装路径已存在但不是目录：$INSTALL_DIR"
   fi
   if [ -d "$INSTALL_DIR" ] && [ -n "$(find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
-    fail "安装目录非空且不是本脚本创建的 git 仓库，拒绝覆盖：$INSTALL_DIR（请改用 --dir 指定其它目录）"
+    fail "安装目录非空且不是本脚本创建的 git 仓库，拒绝覆盖：${INSTALL_DIR}（请改用 --dir 指定其它目录）"
   fi
   clone_repo
 }
@@ -252,7 +252,7 @@ main() {
   bash "$install_script" ${PASSTHRU[@]+"${PASSTHRU[@]}"}
   rc=$?
   set -e
-  [ "$rc" -eq 0 ] || fail "install.sh 退出码 $rc，部署未完成。"
+  [ "$rc" -eq 0 ] || fail "install.sh 退出码 ${rc}，部署未完成。"
 }
 
 main "$@"

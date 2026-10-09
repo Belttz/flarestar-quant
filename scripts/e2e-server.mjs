@@ -18,6 +18,10 @@ const config = loadConfig({
   GCT_FRONTEND_PORT: String(PORT),
   GCT_DATA_DIR: dataDir,
   GCT_CREDENTIAL_ENV_PATH: join(dataDir, 'credentials.env'),
+  // Deterministic operator credentials: the workspace is behind the cloud sign-in gate, so every
+  // spec authenticates through POST /api/auth/login before touching the UI.
+  GCT_AUTH_USERNAME: 'e2e-operator',
+  GCT_AUTH_PASSWORD: 'e2e-operator-password-1',
   GCT_GATE_PUBLIC_WS_URL: 'ws://127.0.0.1:9',
   GCT_GATE_PRIVATE_WS_URL: 'ws://127.0.0.1:9',
   GCT_GATE_REST_URL: 'http://127.0.0.1:9',

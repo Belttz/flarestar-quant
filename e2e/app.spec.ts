@@ -1,7 +1,52 @@
 import AxeBuilder from '@axe-core/playwright';
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
+
+/** Matches the credentials scripts/e2e-server.mjs seeds for the operator account. */
+const E2E_USERNAME = 'e2e-operator';
+const E2E_PASSWORD = 'e2e-operator-password-1';
+/** Matches SESSION_COOKIE_NAME in apps/backend/src/auth-store.ts. */
+const SESSION_COOKIE_NAME = 'gct_session';
+
+/**
+ * Serial specs each get a fresh browser context, so the operator session has to be replayed into
+ * every one of them. Sign in once and reuse the cookie: POST /api/auth/login is rate limited to 10
+ * requests per minute, which a per-spec sign-in would exhaust on the eleventh spec.
+ */
+let operatorSession: { name: string; value: string; domain: string; path: string } | null = null;
+
+/**
+ * The risk disclaimer is acknowledged per backend session. A full serial run clears it in the
+ * onboarding spec, so later specs render the terminal straight away; a focused subset run
+ * (e.g. `playwright test --grep`) boots a fresh backend and must clear the blocker itself.
+ * Call this right after the spec navigates.
+ */
+async function clearDisclaimerIfPresent(page: Page): Promise<void> {
+  const dialog = page.getByRole('dialog', { name: 'Risk disclaimer' });
+  const modeBadge = page.getByRole('button', { name: 'Switch trading mode', exact: true });
+  await expect(dialog.or(modeBadge)).toBeVisible();
+  if (!await dialog.isVisible()) return;
+  await dialog.getByRole('checkbox', { name: 'I have read and understand the risks above.' }).check();
+  await dialog.getByRole('button', { name: /Continue in read-only mode/ }).click();
+  await expect(dialog).toBeHidden();
+}
 
 test.describe.serial('local trading terminal', () => {
+  // Cloud deployments gate the whole workspace behind the operator sign-in. Authenticate through
+  // the API before each spec so the shared browser context already carries the session cookie and
+  // every assertion below still exercises the terminal rather than the login screen.
+  test.beforeEach(async ({ context }) => {
+    if (operatorSession === null) {
+      const response = await context.request.post('/api/auth/login', {
+        data: { username: E2E_USERNAME, password: E2E_PASSWORD },
+      });
+      expect(response.ok(), `operator sign-in failed with HTTP ${response.status()}`).toBe(true);
+      const session = (await context.cookies()).find((cookie) => cookie.name === SESSION_COOKIE_NAME);
+      if (!session) throw new Error('operator sign-in did not issue a session cookie');
+      operatorSession = { name: session.name, value: session.value, domain: session.domain, path: session.path };
+    }
+    await context.addCookies([operatorSession]);
+  });
+
   test('onboards safely and contains modal focus', async ({ page }) => {
     await page.goto('/');
 
@@ -88,6 +133,7 @@ test.describe.serial('local trading terminal', () => {
 
   test('supports keyboard navigation for custom selectors and menus', async ({ page }) => {
     await page.goto('/');
+    await clearDisclaimerIfPresent(page);
 
     const marketTrigger = page.getByRole('button', { name: /BTCUSDT.*Bitcoin perpetual/ });
     await marketTrigger.click();
@@ -110,7 +156,8 @@ test.describe.serial('local trading terminal', () => {
     const firstStrategy = page.getByRole('menuitem', { name: /Cross-exchange hedge/ });
     await expect(firstStrategy).toBeFocused();
     await firstStrategy.press('End');
-    const finalStrategy = page.getByRole('menuitem', { name: /SK hynix premium bot/ });
+    // Assert the menu's true last item rather than a specific label, which drifts as modes are added.
+    const finalStrategy = page.getByRole('menuitem').last();
     await expect(finalStrategy).toBeFocused();
     await finalStrategy.press('Escape');
     await expect(strategyTrigger).toBeFocused();
@@ -434,6 +481,7 @@ test.describe.serial('local trading terminal', () => {
 
   test('loads route code on demand and passes automated accessibility checks', async ({ page }) => {
     await page.goto('/');
+    await clearDisclaimerIfPresent(page);
     await expect(page.getByRole('button', { name: /BTCUSDT/ })).toBeVisible();
 
     const loadedScripts = () => page.evaluate(() =>
@@ -589,6 +637,7 @@ test.describe.serial('local trading terminal', () => {
 
   test('places funding search and period controls below the filters', async ({ page }) => {
     await page.goto('/funding-rates');
+    await clearDisclaimerIfPresent(page);
 
     const toolbarOrder = await page.locator('.funding-toolbar').evaluate((toolbar) =>
       [...toolbar.children].map((child) => child.className));
@@ -719,6 +768,7 @@ test.describe.serial('local trading terminal', () => {
   test('fits a narrow viewport and matches the mobile baseline', async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto('/');
+    await clearDisclaimerIfPresent(page);
     await expect(page.getByRole('button', { name: /BTCUSDT/ })).toBeVisible();
     await expect(page.locator('.ohlc')).not.toContainText('—');
 
