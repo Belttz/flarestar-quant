@@ -71,6 +71,15 @@ function bashPath(path) {
 
 const CANNOT_CONVERT = '无法把 Windows 路径转换为 bash 路径（缺少 cygpath），请在 Linux 上运行';
 
+/**
+ * `tar` is invoked directly (not through bash), so on Windows it resolves to the runner's native
+ * bsdtar, which does not understand MSYS paths such as `/tmp/...`. Hand it a native path instead.
+ * On POSIX this is a no-op.
+ */
+function tarPath(path) {
+  return path.replaceAll('\\', '/');
+}
+
 function runBootstrap(args, options = {}) {
   const result = run(BASH, [BOOTSTRAP, ...args], options);
   // 脚本输出带 ANSI 着色，断言前先剥掉，避免颜色码干扰匹配。
@@ -224,7 +233,7 @@ describe('deploy shell scripts', () => {
     const bashTarget = bashPath(target);
     if (!bashArchive || !bashSource || !bashTarget) return t.skip(CANNOT_CONVERT);
 
-    const packed = run('tar', ['-czf', bashArchive, '-C', bashSource, '.']);
+    const packed = run('tar', ['-czf', tarPath(archive), '-C', tarPath(source), '.']);
     assert.equal(packed.status, 0, packed.stderr || packed.stdout);
 
     const result = runBootstrap(['--source', bashArchive, '--dir', bashTarget, '--domain', 'b.example.com']);
@@ -244,7 +253,7 @@ describe('deploy shell scripts', () => {
     const bashTarget = bashPath(target);
     if (!bashArchive || !bashSource || !bashTarget) return t.skip(CANNOT_CONVERT);
 
-    assert.equal(run('tar', ['-czf', bashArchive, '-C', bashSource, '.']).status, 0);
+    assert.equal(run('tar', ['-czf', tarPath(archive), '-C', tarPath(source), '.']).status, 0);
     writeFileSync(join(target, 'cloud.env'), 'GCT_DOMAIN=existing.example.com\n');
 
     const result = runBootstrap(['--source', bashArchive, '--dir', bashTarget, '--domain', 'b.example.com']);
