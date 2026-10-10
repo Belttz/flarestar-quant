@@ -126,9 +126,34 @@ export interface OpportunityServiceOptions {
   now?: () => number;
   /** GATE spot symbols a single request may newly register on the hub (architecture §7.4). */
   spotRegistrationBudget?: number;
+  /**
+   * How long a computed board is reused. Building both boards pairs thousands of markets and walks
+   * the full funding overview, so answering every page-open (and every filter keystroke) from
+   * scratch is wasteful; 30s also matches the REST book-ticker view's own TTL, so a cached board is
+   * never staler than the prices underneath it would have been anyway.
+   */
+  cacheTtlMs?: number;
+  /** Cache capacity. Paging through many filter combinations must not grow the map without bound. */
+  cacheMaxEntries?: number;
+}
+
+interface CacheEntry {
+  key: string;
+  expiresAt: number;
+  promise: Promise<OpportunityBoardRows>;
+}
+
+/** The complete row set of both boards for one filter combination, before paging. */
+export interface OpportunityBoardRows {
+  funding: FundingOpportunity[];
+  spread: SpreadOpportunity[];
+  fetchedAt: string;
+  cacheStatus: OpportunityResponse['cacheStatus'];
 }
 
 const SPOT_REGISTRATION_BUDGET_PER_REQUEST = 50;
+const DEFAULT_CACHE_TTL_MS = 30_000;
+const DEFAULT_CACHE_MAX_ENTRIES = 64;
 /** Annualization of the 8h-equivalent funding fraction, in percent: |rate8h| × 3 × 365 × 100. */
 const ANNUALIZATION_FACTOR = 3 * 365 * 100;
 const CROSSEX_ANY_SPOT_SYMBOL = /^[A-Z0-9]+_SPOT_[A-Z0-9]+_(USDT|USDC)$/;
@@ -136,6 +161,22 @@ const CROSSEX_FUTURE_SYMBOL = /^[A-Z0-9]+_FUTURE_[A-Z0-9]+_(USDT|USDC|USD)$/;
 /** Rates whose Decimal text does not parse as a number are treated as missing data. */
 function fundingAprFromRate8h(rate8h: string): number {
   return Math.abs(Number(rate8h)) * ANNUALIZATION_FACTOR;
+}
+
+/**
+ * Settlement family a quote currency belongs to, used to decide which legs may be paired.
+ *
+ * Kraken is the only connected venue that settles its perpetuals in **cash USD** while everyone
+ * else quotes stablecoins. Keying pairs on the literal quote therefore stranded Kraken in a
+ * singleton group forever — it could never form a single opportunity against another exchange,
+ * despite carrying strategies already trading its USD perpetual leg. USD and USDT are both
+ * dollar settlement (USDT being the dollar token the rest of the venue set uses), so USD joins
+ * the USDT family. USDC deliberately does **not**: it is a separate token with its own peg, and
+ * folding it in would inject its basis into every row, so the existing "no USDT ⇄ USDC pairs"
+ * guarantee stays exactly as it was.
+ */
+function quoteFamily(quote: string): string {
+  return quote === 'USD' ? 'USDT' : quote;
 }
 
 function validQuote(price: string | undefined): boolean {
@@ -185,10 +226,19 @@ function compareText(left: string, right: string, dir: SortDirection): number {
  * Asset-class, pre-IPO, sort and paging are all resolved server side: filtering happens while the
  * rows are built (before any cap is applied) and the response reports `totals` so the UI can
  * render real page numbers instead of paging inside the window it happened to receive.
+ *
+ * Boards are computed at most once per 30s per distinct filter set (`cacheTtlMs`): opening the
+ * page, flipping back to it, or changing pages reuses the last result instead of re-pairing every
+ * market. Concurrent identical requests share one computation (single-flight), and paging
+ * parameters are excluded from the cache key because they only slice an already-complete row set.
  */
 export class OpportunityService {
   private readonly now: () => number;
   private readonly spotRegistrationBudget: number;
+  private readonly cacheTtlMs: number;
+  private readonly cacheMaxEntries: number;
+  /** Cached boards keyed by filter set; `Map` insertion order doubles as the eviction order. */
+  private readonly cache = new Map<string, CacheEntry>();
 
   constructor(
     private readonly deps: OpportunityDependencies,
@@ -196,25 +246,119 @@ export class OpportunityService {
   ) {
     this.now = options.now ?? Date.now;
     this.spotRegistrationBudget = options.spotRegistrationBudget ?? SPOT_REGISTRATION_BUDGET_PER_REQUEST;
+    this.cacheTtlMs = Math.max(0, options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS);
+    this.cacheMaxEntries = Math.max(1, options.cacheMaxEntries ?? DEFAULT_CACHE_MAX_ENTRIES);
   }
 
   /** Cold funding sweeps are awaited; spread data comes from the merged full-market view. */
   async list(catalog: OpportunityCatalogView, filters: OpportunityFilters): Promise<OpportunityResponse> {
+    const offset = Math.max(0, Math.trunc(filters.offset ?? 0));
+    const limit = Math.max(0, Math.trunc(filters.limit));
     if (!filters.funding && !filters.spread) {
       return {
         funding: [],
         spread: [],
         totals: { funding: 0, spread: 0 },
-        offset: Math.max(0, Math.trunc(filters.offset ?? 0)),
-        limit: Math.max(1, Math.trunc(filters.limit)),
+        offset,
+        limit: Math.max(1, limit),
         fetchedAt: new Date(this.now()).toISOString(),
         cacheStatus: 'fresh',
       };
     }
+    const board = await this.boards(catalog, filters);
+    return {
+      funding: board.funding.slice(offset, offset + limit),
+      spread: board.spread.slice(offset, offset + limit),
+      totals: { funding: board.funding.length, spread: board.spread.length },
+      offset,
+      limit: Math.max(1, limit),
+      fetchedAt: board.fetchedAt,
+      cacheStatus: board.cacheStatus,
+    };
+  }
+
+  /** Cache-backed row computation: one in-flight computation per distinct filter set per TTL. */
+  private async boards(
+    catalog: OpportunityCatalogView,
+    filters: OpportunityFilters,
+  ): Promise<OpportunityBoardRows> {
+    const key = this.cacheKey(filters);
+    const current = this.cache.get(key);
+    if (current && current.expiresAt > this.now()) {
+      // Touch guarantees: reinserting keeps the entry newest, so paging through a board never
+      // evicts it mid-session.
+      this.cache.delete(key);
+      this.cache.set(key, current);
+      return await current.promise;
+    }
+    const computation = this.computeBoards(catalog, filters);
+    this.cache.set(key, { key, expiresAt: this.now() + this.cacheTtlMs, promise: computation });
+    this.trimCache(key);
+    try {
+      return await computation;
+    } catch (error) {
+      // Never cache a failure: the next request must be able to succeed.
+      this.cache.delete(key);
+      throw error;
+    }
+  }
+
+  /** Live cache-entry count; a test seam that also lets operators confirm the board is reusing. */
+  cacheSize(): number {
+    return this.cache.size;
+  }
+
+  /** Drop every cached board — used when the operator forces a refresh. */
+  invalidateCache(): void {
+    this.cache.clear();
+  }
+
+  /** Age out expired entries first, then the least recently touched one. */
+  private trimCache(justAddedKey: string): void {
+    const now = this.now();
+    for (const [key, entry] of this.cache) {
+      if (key !== justAddedKey && entry.expiresAt <= now) this.cache.delete(key);
+    }
+    while (this.cache.size > this.cacheMaxEntries) {
+      const oldest = this.cache.keys().next();
+      if (oldest.done === true) break;
+      this.cache.delete(oldest.value);
+    }
+  }
+
+  /**
+   * Stable serialization of every filter that can change which rows exist. Paging parameters are
+   * intentionally ignored (`list` pages the cached full row set) and categorical lists are sorted
+   * so `venues=GATE,OKX` and `venues=OKX,GATE` share one cache entry.
+   */
+  private cacheKey(filters: OpportunityFilters): string {
+    const list = (value: readonly string[] | undefined): string => (value === undefined ? '' : [...value].sort().join(','));
+    return [
+      filters.funding ? '1' : '0',
+      filters.spread ? '1' : '0',
+      filters.minApr ?? '',
+      filters.minBps ?? '',
+      (filters.asset ?? '').toUpperCase(),
+      filters.expand === true ? '1' : '0',
+      list(filters.venues),
+      list(filters.pairTypes),
+      list(filters.assetClasses),
+      list(filters.assetSuperClasses),
+      filters.preIpo ?? 'all',
+      filters.sort ?? 'default',
+      filters.dir ?? 'desc',
+    ].join('|');
+  }
+
+  /** Full row set of both boards for one filter combination, computed once per cache window. */
+  private async computeBoards(
+    catalog: OpportunityCatalogView,
+    filters: OpportunityFilters,
+  ): Promise<OpportunityBoardRows> {
     if (filters.funding) await this.deps.fundingOverview.ensureFresh();
     const overview = this.deps.fundingOverview.buildResponse(catalog);
-    // One merged-view sweep per request feeds both the spread pairing and the volume/OI lookup,
-    // so resolving 24h volume never costs an extra upstream call.
+    // One merged-view sweep per computation feeds both the spread pairing and the volume/OI
+    // lookup, so resolving 24h volume never costs an extra upstream call.
     const markets = await this.deps.spreadMarkets();
     const stats: OpportunityStatsSources = {
       statsIndex: buildMarketStatsIndex(markets),
@@ -227,14 +371,9 @@ export class OpportunityService {
     const spreadRows = filters.spread
       ? this.buildSpreadBoard(filters, markets, stats, classify)
       : [];
-    const offset = Math.max(0, Math.trunc(filters.offset ?? 0));
-    const limit = Math.max(0, Math.trunc(filters.limit));
     return {
-      funding: fundingRows.slice(offset, offset + limit),
-      spread: spreadRows.slice(offset, offset + limit),
-      totals: { funding: fundingRows.length, spread: spreadRows.length },
-      offset,
-      limit: Math.max(1, limit),
+      funding: fundingRows,
+      spread: spreadRows,
       fetchedAt: new Date(this.now()).toISOString(),
       cacheStatus: overview.cacheStatus,
     };
@@ -548,7 +687,7 @@ export class OpportunityService {
     return compareAmounts(left.spreadBps, right.spreadBps, dir);
   }
 
-  /** Group merged-view markets by asset and quote so cross-quote (USDT vs USDC) pairs never form. */
+  /** Group merged-view markets by asset and settlement family so cross-quote (USDT vs USDC) pairs never form. */
   private spreadGroups(
     markets: readonly LiveMarket[],
     assetFilter: string | undefined,
@@ -567,7 +706,9 @@ export class OpportunityService {
       // forms a pair and never reaches the sort.
       if (!assetAllowed(market.asset)) continue;
       const quote = market.symbol.slice(market.symbol.lastIndexOf('_') + 1);
-      const key = `${market.asset}:${quote}`;
+      // Same settlement family, not the same literal quote: a USD-settled perpetual must still be
+      // able to pair with the USDT leg everyone else lists (see `quoteFamily`).
+      const key = `${market.asset}:${quoteFamily(quote)}`;
       const group = groups.get(key) ?? { spot: [], perp: [] };
       (isSpot ? group.spot : group.perp).push(market);
       groups.set(key, group);

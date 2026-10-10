@@ -87,6 +87,9 @@ interface ServiceFixture {
   service: OpportunityService;
   hub: FakeHub;
   ensureFreshCalls: () => number;
+  /** Librarian clock: nothing advances it on its own, so `fetchedAt` stays pinned to `EPOCH`. */
+  advance: (milliseconds: number) => void;
+  spreadMarketCalls: () => number;
 }
 
 interface CreateServiceOptions {
@@ -97,16 +100,23 @@ interface CreateServiceOptions {
   spotByAsset?: Record<string, Array<{ venue: string; symbol: string }>>;
   spotRegistrationBudget?: number;
   failEnsure?: boolean;
+  /** Board cache overrides; the production default is a 30s TTL. */
+  cacheTtlMs?: number;
+  cacheMaxEntries?: number;
 }
 
 function createService(options: CreateServiceOptions): ServiceFixture {
   const hub = new FakeHub(options.markets ?? []);
   hub.failEnsure = options.failEnsure ?? false;
   let ensureFreshCalls = 0;
+  let spreadCalls = 0;
+  let nowMs = Date.parse(EPOCH);
   const spotByAsset = new Map(Object.entries(options.spotByAsset ?? {}));
   // Default merged view mirrors the production hub-first overlay using the same hub.
-  const spreadMarkets = async (): Promise<ReadonlyArray<LiveMarket>> =>
-    options.spreadMarkets ?? hub.snapshot().markets;
+  const spreadMarkets = async (): Promise<ReadonlyArray<LiveMarket>> => {
+    spreadCalls += 1;
+    return options.spreadMarkets ?? hub.snapshot().markets;
+  };
   const service = new OpportunityService({
     fundingOverview: {
       ensureFresh: async () => { ensureFreshCalls += 1; },
@@ -116,10 +126,18 @@ function createService(options: CreateServiceOptions): ServiceFixture {
     spreadMarkets,
     spotSymbolsByAsset: () => spotByAsset,
   }, {
-    now: () => Date.parse(EPOCH),
+    now: () => nowMs,
     ...(options.spotRegistrationBudget !== undefined ? { spotRegistrationBudget: options.spotRegistrationBudget } : {}),
+    ...(options.cacheTtlMs !== undefined ? { cacheTtlMs: options.cacheTtlMs } : {}),
+    ...(options.cacheMaxEntries !== undefined ? { cacheMaxEntries: options.cacheMaxEntries } : {}),
   });
-  return { service, hub, ensureFreshCalls: () => ensureFreshCalls };
+  return {
+    service,
+    hub,
+    ensureFreshCalls: () => ensureFreshCalls,
+    spreadMarketCalls: () => spreadCalls,
+    advance: (milliseconds: number) => { nowMs += milliseconds; },
+  };
 }
 
 const CATALOG = { assets: new Map<string, MarketCatalogVenue[]>() };
@@ -392,10 +410,11 @@ describe('opportunity service', () => {
     for (let i = 1; i < combinations.length; i += 1) {
       expect(combinations[i - 1]!.spreadBps).toBeGreaterThanOrEqual(combinations[i]!.spreadBps);
     }
-    // No cross-quote pairs, no same-symbol pairs, no pending legs.
+    // No cross-quote pairs, no same-symbol pairs, no pending legs. USDT and USD are one
+    // settlement family (see `quoteFamily`); USDC is not.
     for (const combination of combinations) {
-      expect(combination.leftSymbol.slice(combination.leftSymbol.lastIndexOf('_') + 1))
-        .toBe(combination.rightSymbol.slice(combination.rightSymbol.lastIndexOf('_') + 1));
+      const family = (symbol: string): string => symbol.slice(symbol.lastIndexOf('_') + 1).replace(/^USD$/, 'USDT');
+      expect(family(combination.leftSymbol)).toBe(family(combination.rightSymbol));
       expect(combination.leftSymbol).not.toBe(combination.rightSymbol);
       expect(Number(combination.sellBid)).toBeGreaterThan(0);
       expect(Number(combination.buyAsk)).toBeGreaterThan(0);
@@ -1010,5 +1029,177 @@ describe('cross-venue price plausibility guard', () => {
 
     const { funding } = await service.list(CATALOG, { funding: true, spread: false, limit: 50 });
     expect(funding[0]!.spotSymbol).toBeNull();
+  });
+});
+
+describe('opportunity board cross-venue pairing', () => {
+  it('pairs a USD-settled perpetual with every USD-stable leg, which is how Kraken appears', async () => {
+    const { service } = createService({
+      rows: [],
+      markets: [
+        liveMarket({ symbol: 'GATE_FUTURE_BTC_USDT', venue: 'GATE', asset: 'BTC', bidPrice: '101.5', askPrice: '102' }),
+        // Kraken settles in cash USD and has no CrossEx spot leg at all. Before the settlement
+        // family existed this sat alone in its own group and produced zero rows.
+        liveMarket({ symbol: 'KRAKEN_FUTURE_BTC_USD', venue: 'KRAKEN', asset: 'BTC', bidPrice: '100.6', askPrice: '100.7' }),
+        liveMarket({ symbol: 'GATE_SPOT_BTC_USDT', venue: 'GATE', asset: 'BTC', bidPrice: '100', askPrice: '100.2' }),
+      ],
+      spotByAsset: {},
+    });
+    const { spread } = await service.list(CATALOG, { funding: false, spread: true, limit: 50 });
+
+    expect(spread).toHaveLength(1);
+    const symbols = (spread[0]?.combinations ?? []).flatMap((entry) => [entry.leftSymbol, entry.rightSymbol]);
+    expect(symbols).toContain('KRAKEN_FUTURE_BTC_USD');
+    expect(symbols).toContain('GATE_FUTURE_BTC_USDT');
+    expect(symbols).toContain('GATE_SPOT_BTC_USDT');
+    // The Kraken pair is priced, not merely listed: GATE's perpetual bids 101.5 against Kraken
+    // asking 100.7, and that row is what makes a Kraken ⇄ other-exchange opportunity visible.
+    const krakenPair = (spread[0]?.combinations ?? []).find((entry) =>
+      [entry.leftSymbol, entry.rightSymbol].includes('KRAKEN_FUTURE_BTC_USD')
+      && [entry.leftSymbol, entry.rightSymbol].includes('GATE_FUTURE_BTC_USDT'));
+    expect(krakenPair).toMatchObject({
+      pairType: 'PERP_PERP', leftVenue: 'GATE', rightVenue: 'KRAKEN', sellBid: '101.5', buyAsk: '100.7',
+    });
+    expect(krakenPair?.spreadBps).toBeCloseTo(((101.5 - 100.7) / 100.7) * 10_000, 6);
+  });
+
+  it('still never pairs USDT with USDC', async () => {
+    const { service } = createService({
+      rows: [],
+      markets: [
+        liveMarket({ symbol: 'GATE_FUTURE_BTC_USDT', venue: 'GATE', asset: 'BTC', bidPrice: '101.5', askPrice: '102' }),
+        liveMarket({ symbol: 'OKX_FUTURE_BTC_USDC', venue: 'OKX', asset: 'BTC', bidPrice: '120', askPrice: '121' }),
+      ],
+      spotByAsset: {},
+    });
+    const { spread } = await service.list(CATALOG, { funding: false, spread: true, limit: 50 });
+    // USDC keeps its own settlement family: its peg drift must never be sold as a spread.
+    expect(spread).toHaveLength(0);
+  });
+});
+
+describe('opportunity board cache', () => {
+  const spreadBoardFilters = { funding: false, spread: true, limit: 50 } as const;
+
+  it('reuses one computation for repeated requests inside the TTL', async () => {
+    const { service, spreadMarketCalls } = createService({
+      rows: [],
+      markets: [liveMarket({ symbol: 'GATE_FUTURE_BTC_USDT', venue: 'GATE', asset: 'BTC', bidPrice: '101.5', askPrice: '102' })],
+      spotByAsset: {},
+    });
+
+    await service.list(CATALOG, spreadBoardFilters);
+    expect(spreadMarketCalls()).toBe(1);
+    // Re-opening the page inside the freshness window must not re-pair every market.
+    await service.list(CATALOG, spreadBoardFilters);
+    await service.list(CATALOG, spreadBoardFilters);
+    expect(spreadMarketCalls()).toBe(1);
+  });
+
+  it('recomputes once the 30s window has passed', async () => {
+    const { service, spreadMarketCalls, advance } = createService({
+      rows: [],
+      markets: [liveMarket({ symbol: 'GATE_FUTURE_BTC_USDT', venue: 'GATE', asset: 'BTC', bidPrice: '101.5', askPrice: '102' })],
+      spotByAsset: {},
+    });
+
+    await service.list(CATALOG, spreadBoardFilters);
+    advance(29_000);
+    await service.list(CATALOG, spreadBoardFilters);
+    expect(spreadMarketCalls()).toBe(1);
+
+    advance(2_000);
+    await service.list(CATALOG, spreadBoardFilters);
+    expect(spreadMarketCalls()).toBe(2);
+  });
+
+  it('shares one computation between concurrent identical requests', async () => {
+    const { service, spreadMarketCalls } = createService({
+      rows: [],
+      markets: [liveMarket({ symbol: 'GATE_FUTURE_BTC_USDT', venue: 'GATE', asset: 'BTC', bidPrice: '101.5', askPrice: '102' })],
+      spotByAsset: {},
+    });
+    const [first, second, third] = await Promise.all([
+      service.list(CATALOG, spreadBoardFilters),
+      service.list(CATALOG, spreadBoardFilters),
+      service.list(CATALOG, spreadBoardFilters),
+    ]);
+    expect(spreadMarketCalls()).toBe(1);
+    expect(second.fetchedAt).toBe(first.fetchedAt);
+    expect(third.fetchedAt).toBe(first.fetchedAt);
+  });
+
+  it('keys distinct filter sets separately and pages inside one cached result', async () => {
+    const { service, spreadMarketCalls, advance } = createService({
+      rows: [
+        { asset: 'BTC', venue: 'GATE', symbol: 'GATE_FUTURE_BTC_USDT', rate8h: '0.0002' },
+        { asset: 'ETH', venue: 'GATE', symbol: 'GATE_FUTURE_ETH_USDT', rate8h: '0.0001' },
+      ],
+      markets: [
+        liveMarket({ symbol: 'GATE_FUTURE_BTC_USDT', venue: 'GATE', asset: 'BTC', bidPrice: '101.5', askPrice: '102' }),
+        liveMarket({ symbol: 'BINANCE_FUTURE_BTC_USDT', venue: 'BINANCE', asset: 'BTC', bidPrice: '100.8', askPrice: '100.9' }),
+      ],
+      spotByAsset: {},
+    });
+
+    await service.list(CATALOG, { funding: true, spread: true, limit: 50 });
+    expect(spreadMarketCalls()).toBe(1);
+    // A different asset filter is a different board.
+    await service.list(CATALOG, { funding: true, spread: true, asset: 'BTC', limit: 50 });
+    expect(spreadMarketCalls()).toBe(2);
+    // Paging must not recompute: the full row set is already cached.
+    await service.list(CATALOG, { funding: true, spread: true, limit: 1, offset: 1 });
+    expect(spreadMarketCalls()).toBe(2);
+    expect(service.cacheSize()).toBe(2);
+
+    advance(31_000);
+    await service.list(CATALOG, { funding: true, spread: true, limit: 50 });
+    expect(spreadMarketCalls()).toBe(3);
+  });
+
+  it('keeps `totals` the full row count while serving a page from cache', async () => {
+    const { service } = createService({
+      rows: [
+        { asset: 'BTC', venue: 'GATE', symbol: 'GATE_FUTURE_BTC_USDT', rate8h: '0.0002' },
+        { asset: 'BTC', venue: 'BINANCE', symbol: 'BINANCE_FUTURE_BTC_USDT', rate8h: '0.0001' },
+      ],
+      spotByAsset: {},
+    });
+    const full = await service.list(CATALOG, { funding: true, spread: false, limit: 50 });
+    const page = await service.list(CATALOG, { funding: true, spread: false, limit: 1, offset: 1 });
+    expect(full.totals.funding).toBe(2);
+    expect(page.totals.funding).toBe(2);
+    expect(page.funding).toHaveLength(1);
+    expect(page.funding[0]?.venue).toBe('BINANCE');
+  });
+
+  it('drops every cached board on an explicit refresh', async () => {
+    const { service, spreadMarketCalls } = createService({
+      rows: [],
+      markets: [liveMarket({ symbol: 'GATE_FUTURE_BTC_USDT', venue: 'GATE', asset: 'BTC', bidPrice: '101.5', askPrice: '102' })],
+      spotByAsset: {},
+    });
+    await service.list(CATALOG, spreadBoardFilters);
+    service.invalidateCache();
+    expect(service.cacheSize()).toBe(0);
+    await service.list(CATALOG, spreadBoardFilters);
+    expect(spreadMarketCalls()).toBe(2);
+  });
+
+  it('evicts the oldest entry when the cache is full', async () => {
+    const { service } = createService({
+      rows: [
+        { asset: 'BTC', venue: 'GATE', symbol: 'GATE_FUTURE_BTC_USDT', rate8h: '0.0002' },
+        { asset: 'ETH', venue: 'GATE', symbol: 'GATE_FUTURE_ETH_USDT', rate8h: '0.0001' },
+        { asset: 'SOL', venue: 'GATE', symbol: 'GATE_FUTURE_SOL_USDT', rate8h: '0.0001' },
+      ],
+      spotByAsset: {},
+      cacheMaxEntries: 2,
+    });
+    for (const asset of ['BTC', 'ETH', 'SOL']) {
+      await service.list(CATALOG, { funding: true, spread: false, asset, limit: 50 });
+    }
+    // Capacity is a bound, not a promise of growth: the map must never exceed it.
+    expect(service.cacheSize()).toBe(2);
   });
 });

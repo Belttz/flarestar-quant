@@ -27,12 +27,99 @@ import { FundingHedgeTable, FundingRankingTable } from './funding-hedge-tables.j
 import { useLanguage } from './i18n.js';
 import { assetIcon, assetName, exchanges, fundingVenueName, VenueIcon, type PairedPositionPrefill } from './route-shared.js';
 
+/** Query shape accepted by `api.opportunities`, derived so the two can never drift apart. */
+export type OpportunityRequest = NonNullable<Parameters<typeof api.opportunities>[0]>;
+
+/**
+ * Client-side board cache.
+ *
+ * Both boards are expensive to build server side (every same-asset pair against a full-market
+ * sweep), so re-opening the page, flipping tabs, or paging back within the freshness window must
+ * not trigger a round trip. Rows are refreshed at most once every 30s per distinct query, which
+ * matches the backend's own board TTL; the explicit Refresh button bypasses it.
+ *
+ * Entries hold the in-flight promise rather than the resolved payload so a burst of identical
+ * requests (React's double-invoked effects, a tab switch landing on the same filters) collapses
+ * into one fetch, and a failed request is never negative-cached.
+ */
+const BOARD_CACHE_TTL_MS = 30_000;
+const BOARD_CACHE_MAX_ENTRIES = 32;
+interface BoardCacheEntry {
+  expiresAt: number;
+  promise: Promise<OpportunityResponse>;
+}
+const boardCache = new Map<string, BoardCacheEntry>();
+
+/**
+ * Stable key for one board query. Unlike the backend — which pages inside its own full row set —
+ * the client only receives the requested slice, so paging parameters belong in the key. `refresh`
+ * is a transport instruction, not part of the result identity.
+ */
+export function opportunityRequestKey(request: OpportunityRequest): string {
+  const sortedCsv = (value: readonly string[] | undefined): string =>
+    value === undefined ? '' : [...value].map((entry) => entry.toUpperCase()).sort().join(',');
+  return [
+    request.funding === false ? '0' : '1',
+    request.spread === false ? '0' : '1',
+    request.minApr ?? '',
+    request.minBps ?? '',
+    (request.asset ?? '').toUpperCase(),
+    request.expand === true ? '1' : '0',
+    sortedCsv(request.venues),
+    sortedCsv(request.markets),
+    sortedCsv(request.assetClass),
+    sortedCsv(request.assetSuperClass),
+    request.preIpo ?? 'all',
+    request.sort ?? 'default',
+    request.dir ?? 'desc',
+    request.offset ?? 0,
+    request.pageSize ?? '',
+    request.limit ?? '',
+  ].join('|');
+}
+
+/** Forget every cached board — used after a manual refresh so nothing serves a stale page. */
+export function clearOpportunityCache(): void {
+  boardCache.clear();
+}
+
+/** Cached board fetch. `force` bypasses the freshness window and the server cache. */
+export async function loadOpportunityBoard(request: OpportunityRequest, force = false): Promise<OpportunityResponse> {
+  const key = opportunityRequestKey(request);
+  const cached = boardCache.get(key);
+  if (!force && cached && cached.expiresAt > Date.now()) {
+    // Re-insert so the entry stays newest: paging through a board must not evict it mid-session.
+    boardCache.delete(key);
+    boardCache.set(key, cached);
+    return await cached.promise;
+  }
+  boardCache.delete(key);
+  // A forced request also tells the backend to recompute: with only the client window bypassed,
+  // a click landing inside the server's 30s TTL would replay its cached board.
+  const promise = api.opportunities(force ? { ...request, refresh: true } : request);
+  const entry: BoardCacheEntry = { expiresAt: Date.now() + BOARD_CACHE_TTL_MS, promise };
+  boardCache.set(key, entry);
+  try {
+    return await promise;
+  } catch (error) {
+    // A failure must be retryable immediately, so nothing negative is kept.
+    boardCache.delete(key);
+    throw error;
+  } finally {
+    while (boardCache.size > BOARD_CACHE_MAX_ENTRIES) {
+      const oldest = boardCache.keys().next();
+      if (oldest.done === true) break;
+      boardCache.delete(oldest.value);
+    }
+  }
+}
+
 /**
  * Opportunities board, split into a funding-carry ranking (/opportunities/funding) and a
  * cross-exchange spread ranking (/opportunities/spread). Each board fetches only its own data on
- * mount, on filter changes, on the manual refresh button, and soft-refreshes at most once a
- * minute while the tab is in the foreground — never a background poll (PRD boundary). Filters
- * mirror into the URL query so a reload restores the view; the tab switch navigates.
+ * mount, on filter changes, on the manual refresh button, and soft-refreshes at most once every
+ * thirty seconds while the tab is in the foreground — never a background poll (PRD boundary).
+ * Filters mirror into the URL query so a reload restores the view; the tab switch navigates.
  *
  * Both boards share one filter model (`OpportunityViewFilters`): free-text thresholds, the
  * spread-board button groups, the asset-classification chips (super class + fine class), the
@@ -40,7 +127,7 @@ import { assetIcon, assetName, exchanges, fundingVenueName, VenueIcon, type Pair
  * offset). The backend filters *before* the row cap and reports post-filter `totals`, so the
  * pager reflects every matching row, not just the fetched page.
  */
-const SOFT_REFRESH_MS = 60_000;
+const SOFT_REFRESH_MS = 30_000;
 /** Prefill safety margin: thresholds carry 80% of the observed value (PRD decision 3). */
 const SAFETY_MARGIN = 0.8;
 
@@ -581,13 +668,12 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
     else setSpreadFilters(updater);
   }, [isFundingBoard]);
 
-  const load = useCallback(() => {
-    // The ranking board reads the venue funding overview, not the opportunity endpoint.
-    if (isFundingTopBoard) {
-      setLoading(false);
-      return;
-    }
-    setLoading(true);
+  /**
+   * One board query per render of the filter state. Kept out of `load` so the fetch callback stays
+   * stable while the user types, and so the cache key can be derived once for both paths.
+   */
+  const boardRequest = useMemo<OpportunityRequest | null>(() => {
+    if (isFundingTopBoard) return null;
     const activeFilters = isFundingBoard ? fundingFilters : spreadFilters;
     const asset = activeFilters.asset.trim().toUpperCase();
     const minApr = isFundingBoard ? parseFilterNumber(fundingFilters.minApr) : null;
@@ -605,7 +691,7 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
     const page = parsePageValue(activeFilters.page);
     const pageSize = parsePageSizeValue(activeFilters.pageSize);
     const sortKey = BOARD_SORT_KEYS[board].includes(activeFilters.sort) ? activeFilters.sort : 'default';
-    api.opportunities({
+    return {
       funding: isFundingBoard,
       spread: !isFundingBoard,
       ...(minApr !== null ? { minApr } : {}),
@@ -620,11 +706,31 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
       ...(sortKey !== 'default' ? { sort: sortKey, dir: activeFilters.dir } : {}),
       offset: (page - 1) * pageSize,
       pageSize,
-    }).then((response) => {
+    };
+  }, [board, expandedAsset, fundingFilters, isFundingBoard, isFundingTopBoard, spreadFilters]);
+
+  // Monotonic generation stamp: a response landing after a newer request must not overwrite it.
+  const loadGeneration = useRef(0);
+  const load = useCallback((force = false) => {
+    // The ranking board reads the venue funding overview, not the opportunity endpoint.
+    if (boardRequest === null) {
+      setLoading(false);
+      return;
+    }
+    const generation = loadGeneration.current + 1;
+    loadGeneration.current = generation;
+    setLoading(true);
+    loadOpportunityBoard(boardRequest, force).then((response) => {
+      if (loadGeneration.current !== generation) return;
       setData(response);
       setFailed(false);
-    }).catch(() => setFailed(true)).finally(() => setLoading(false));
-  }, [board, expandedAsset, fundingFilters, isFundingBoard, isFundingTopBoard, spreadFilters]);
+    }).catch(() => {
+      if (loadGeneration.current !== generation) return;
+      setFailed(true);
+    }).finally(() => {
+      if (loadGeneration.current === generation) setLoading(false);
+    });
+  }, [boardRequest]);
 
   // The funding hedge board in perpetual mode and the ranking board read the venue funding
   // overview instead; the opportunity endpoint is not fetched for them at all.
@@ -648,12 +754,12 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
 
   useEffect(() => {
     load();
-    if (isFundingTopBoard) return undefined;
+    if (boardRequest === null) return undefined;
     const timer = window.setInterval(() => {
       if (document.visibilityState === 'visible') load();
     }, SOFT_REFRESH_MS);
     return () => window.clearInterval(timer);
-  }, [load, isFundingTopBoard]);
+  }, [load, boardRequest]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNowMs(Date.now()), 30_000);
@@ -797,9 +903,11 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
     ? (fundingOverview ? { at: fundingOverview.fetchedAt, stale: fundingOverview.cacheStatus === 'stale' } : null)
     : (data ? { at: data.fetchedAt, stale: data.cacheStatus === 'stale' } : null);
   const refreshing = loading || overviewLoading;
+  // A manual click must always produce new data: drop the client-side freshness window and ask the
+  // backend to recompute too (`refresh=1`), so "Refresh" never silently replays the cached board.
   const refreshActive = () => {
     if (isFundingTopBoard || (isFundingBoard && hedgeMode === 'perp')) loadOverview();
-    else load();
+    else load(true);
   };
   return <div className="alternate-view opportunity-view">
     <section className="view-heading strategy-heading">

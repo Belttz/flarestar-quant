@@ -398,12 +398,17 @@ async function createTestApp(options: {
   strategyEngineOptions?: { orderTimeoutMs?: number };
   /** Serves the app shell from this directory; the client routes only exist when it is set. */
   frontendDistDir?: string;
+  /** Host/Origin gate mode; unset keeps the default loopback-first posture. */
+  hostAccess?: string;
+  allowedHosts?: string;
 } = {}): Promise<TestContext> {
   const directory = options.directory ?? mkdtempSync(join(tmpdir(), 'gate-crossex-app-'));
   const config = loadConfig({
     GCT_DATA_DIR: directory,
     GCT_MIGRATIONS_DIR: resolve(process.cwd(), '../../migrations'),
     ...(options.frontendDistDir ? { GCT_FRONTEND_DIST_DIR: options.frontendDistDir } : {}),
+    ...(options.hostAccess ? { GCT_HOST_ACCESS: options.hostAccess } : {}),
+    ...(options.allowedHosts !== undefined ? { GCT_ALLOWED_HOSTS: options.allowedHosts } : {}),
   });
   const database = openDatabase(config.databasePath, config.migrationsDir);
   const vault = new MemoryCredentialVault();
@@ -1563,6 +1568,37 @@ describe('local backend', () => {
     expect(sameOriginDifferentPort.statusCode).toBe(200);
   });
 
+  it('serves a server deployment on any address while still rejecting cross-site origins', async () => {
+    const { app } = await createTestApp({ hostAccess: 'any' });
+    // Public IP, a domain and the LAN address all reach the instance — the deployment no longer
+    // has to pin whichever one happened to be configured at install time.
+    for (const host of ['203.0.113.10', 'quant.example.com', '192.168.1.20:17840']) {
+      const response = await app.inject({ method: 'GET', url: '/health', headers: { host } });
+      expect(response.statusCode).toBe(200);
+    }
+    // Same-origin requests from those addresses are the browser's normal traffic.
+    const sameOrigin = await app.inject({
+      method: 'GET', url: '/health', headers: { host: '203.0.113.10', origin: 'http://203.0.113.10' },
+    });
+    expect(sameOrigin.statusCode).toBe(200);
+    // Accepting every Host is not accepting every origin: a third-party site stays blocked, and
+    // the session cookie is SameSite=Strict on top of that.
+    const crossSite = await app.inject({
+      method: 'GET', url: '/health', headers: { host: '203.0.113.10', origin: 'https://attacker.example' },
+    });
+    expect(crossSite.statusCode).toBe(403);
+    expect(crossSite.json()).toEqual({ error: 'unexpected_origin_rejected' });
+  });
+
+  it('admits explicitly allowed hosts without switching to any-host mode', async () => {
+    const { app } = await createTestApp({ allowedHosts: 'quant.example.com, 203.0.113.10' });
+    const allowed = await app.inject({ method: 'GET', url: '/health', headers: { host: '203.0.113.10' } });
+    expect(allowed.statusCode).toBe(200);
+    const unlisted = await app.inject({ method: 'GET', url: '/health', headers: { host: '198.51.100.7' } });
+    expect(unlisted.statusCode).toBe(403);
+    expect(unlisted.json()).toEqual({ error: 'non_local_host_rejected' });
+  });
+
   it('serves a normalized public instrument catalog and caches the upstream response', async () => {
     const { app, gateway } = await createTestApp();
     const headers = { host: '127.0.0.1:17840' };
@@ -1739,9 +1775,11 @@ describe('local backend', () => {
     for (let index = 1; index < body.spread.length; index += 1) {
       expect(body.spread[index - 1]?.spreadBps).toBeGreaterThanOrEqual(body.spread[index]?.spreadBps);
     }
+    // USD (Kraken's cash settlement) and USDT are one settlement family; USDC is not.
+    const settlementFamily = (symbol: string): string => symbol.split('_')[3] === 'USD' ? 'USDT' : symbol.split('_')[3];
     for (const row of body.spread) {
       expect(['SPOT_PERP', 'PERP_PERP']).toContain(row.pairType);
-      expect(row.leftSymbol.split('_')[3]).toBe(row.rightSymbol.split('_')[3]);
+      expect(settlementFamily(row.leftSymbol)).toBe(settlementFamily(row.rightSymbol));
       expect(row.leftSymbol).not.toBe(row.rightSymbol);
       // Cross-venue perpetual pairs only: same-venue perps are one instrument, not a spread.
       if (row.pairType === 'PERP_PERP') expect(row.leftVenue).not.toBe(row.rightVenue);
@@ -1796,10 +1834,12 @@ describe('local backend', () => {
     });
     // Rows without a two-sided book must never reach the board.
     expect(body.spread.some((row) => row.leftSymbol === 'OKX_FUTURE_SIREN_USDT' || row.rightSymbol === 'OKX_FUTURE_SIREN_USDT')).toBe(false);
-    // The sweep result must be cached so a second request does not re-hit the venue feeds.
-    expect(publicMarketGateway.bookTickerQueryCount).toBe(4);
+    // The sweep result must be cached so a second request does not re-hit the venue feeds
+    // (one bulk request per venue covered by `REST_SPREAD_VENUES`).
+    const initialSweeps = publicMarketGateway.bookTickerQueryCount;
+    expect(initialSweeps).toBeGreaterThanOrEqual(4);
     await app.inject({ method: 'GET', url: '/api/opportunities?spread=1', headers });
-    expect(publicMarketGateway.bookTickerQueryCount).toBe(4);
+    expect(publicMarketGateway.bookTickerQueryCount).toBe(initialSweeps);
   });
 
   it('filters the spread board by the venues and markets query parameters', async () => {
@@ -2070,7 +2110,10 @@ describe('local backend', () => {
   it('merges REST book rows into /api/markets only when includeRest=1', async () => {
     const { app, publicMarketGateway } = await createTestApp();
     publicMarketGateway.bookTickers = [
-      { venue: 'GATE', business: 'SPOT', base: 'SIREN', quote: 'USDT', bidPrice: '0.1192', askPrice: '0.1194', lastPrice: '0.1193' },
+      // The trade page reads its 24h high/low off this row, so the bulk feed's range must survive
+      // the merge instead of degrading to the '0' placeholder that renders as `—`.
+      { venue: 'GATE', business: 'SPOT', base: 'SIREN', quote: 'USDT', bidPrice: '0.1192', askPrice: '0.1194', lastPrice: '0.1193', open24h: null, high24h: '0.1312', low24h: '0.1174' },
+      // A venue whose bulk feed omits the range keeps the placeholder.
       { venue: 'BYBIT', business: 'FUTURE', base: 'SIREN', quote: 'USDT', bidPrice: '0.125', askPrice: '0.126', lastPrice: null },
     ];
     const headers = { host: '127.0.0.1:17840' };
@@ -2088,9 +2131,10 @@ describe('local backend', () => {
     expect(spot).toMatchObject({
       symbol: 'GATE_SPOT_SIREN_USDT', venue: 'GATE', asset: 'SIREN',
       bidPrice: '0.1192', askPrice: '0.1194', lastPrice: '0.1193', source: 'rest_book_ticker',
+      high24h: '0.1312', low24h: '0.1174',
     });
     expect(body.markets.find((market) => market.symbol === 'BYBIT_FUTURE_SIREN_USDT'))
-      .toMatchObject({ bidPrice: '0.125', askPrice: '0.126', source: 'rest_book_ticker' });
+      .toMatchObject({ bidPrice: '0.125', askPrice: '0.126', source: 'rest_book_ticker', high24h: '0', low24h: '0' });
     // Hub markets remain in the merged view.
     expect(body.markets.length).toBeGreaterThanOrEqual(2);
   });

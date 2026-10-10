@@ -636,7 +636,11 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       database.prepare('DELETE FROM reconciliation_reports').run();
     })();
   }
-  const marketHub = options.marketHub ?? new CrossExMarketHub(config.gatePublicWebSocketUrl);
+  // Starved subscriptions used to be silent, which reads to a user as "that exchange has no
+  // data". Route every degradation signal of the hub into the backend log instead.
+  const marketHub = options.marketHub ?? new CrossExMarketHub(config.gatePublicWebSocketUrl, {
+    warn: (reason, detail) => app.log.warn(detail ?? {}, reason),
+  });
   const tradingSession = options.tradingSession ?? new TradingSession();
   const credentialOperationGate = new CredentialOperationGate();
   const runAuthenticatedWrite = async <T>(work: () => Promise<T>): Promise<T> => {
@@ -1088,8 +1092,12 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   // hub would depend on browsing behavior. A ~30s TTL bulk REST sweep of each connected venue's
   // all-market bookTicker feed fills that gap: hub live prices win, REST rows fill every other
   // symbol. The strategy engine keeps reading the hub only — this view never feeds execution.
+  // Only venues with a single-request full-market ticker feed are covered; other venues simply
+  // contribute no REST rows and stay hub-driven. KRAKEN joined for v0.3.1: it quotes every
+  // perpetual in USD, so without this sweep it was invisible to the spread board — its rows could
+  // only appear if someone happened to have its symbol subscribed on the hub.
   const REST_SPREAD_VIEW_TTL_MS = 30_000;
-  const REST_SPREAD_VENUES = ['GATE', 'BINANCE', 'OKX', 'BYBIT'] as const;
+  const REST_SPREAD_VENUES = ['GATE', 'BINANCE', 'OKX', 'BYBIT', 'KRAKEN'] as const;
   let restSpreadCache: { fetchedAt: number; markets: Map<string, LiveMarket> } | null = null;
   let restSpreadInFlight: Promise<Map<string, LiveMarket>> | null = null;
   const bookTickerMarket = (ticker: VenueBookTicker, fetchedAt: string): LiveMarket => ({
@@ -1101,7 +1109,12 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     bidSize: '0',
     askPrice: ticker.askPrice,
     askSize: '0',
-    open24h: '0', high24h: '0', low24h: '0',
+    // Only the venues whose bulk ticker feed publishes a 24h range get a real high/low here;
+    // the rest keep the '0' placeholder the trade page renders as `—`. The hub's live ticker
+    // rows win over these on merge, so a subscribed symbol always carries the pushed range.
+    open24h: ticker.open24h ?? '0',
+    high24h: ticker.high24h ?? '0',
+    low24h: ticker.low24h ?? '0',
     // LiveMarket keeps amounts as Decimal strings, so a venue that publishes nothing keeps the
     // historical '0' placeholder; the opportunity board's stats layer maps '0' back to null.
     volume24h: ticker.volume24h ?? '0',
@@ -1317,7 +1330,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
 
   app.addHook('onRequest', async (request, reply) => {
     const hostname = hostnameFromHeader(request.headers.host);
-    if (!hostname || !config.allowedHosts.has(hostname)) {
+    if (!hostname) return reply.code(403).send({ error: 'non_local_host_rejected' });
+    if (!config.trustAnyHost && !config.allowedHosts.has(hostname)) {
+      request.log.warn({ hostname }, 'rejected request for a host outside the allowlist');
       return reply.code(403).send({ error: 'non_local_host_rejected' });
     }
 
@@ -2380,6 +2395,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     preIpo: z.enum(['all', 'only', 'exclude']).optional(),
     sort: z.enum(['spread', 'apr', 'volume', 'oi', 'asset', 'default']).optional(),
     dir: z.enum(['asc', 'desc']).optional(),
+    // refresh=1 bypasses the 30s board cache — what the UI's manual Refresh button sends so a
+    // click always follows through even when the user is inside the freshness window.
+    refresh: z.literal('1').optional(),
     offset: z.coerce.number().int().min(0).optional(),
     /** Page size; `limit` stays supported as an alias for older clients. */
     pageSize: z.coerce.number().int().min(1).max(200).optional(),
@@ -2412,6 +2430,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       .map((token) => token.toUpperCase()) as AssetClass[];
     const assetSuperClasses = (parseCsvTokens(query.data.assetSuperClass, ASSET_SUPER_CLASS_TOKEN_PATTERN) ?? [])
       .map((token) => token.toUpperCase()) as AssetSuperClass[];
+    if (query.data.refresh === '1') opportunityService.invalidateCache();
     return await opportunityService.list({ assets: catalog.assets }, {
       funding: query.data.funding === '1',
       spread: query.data.spread === '1',

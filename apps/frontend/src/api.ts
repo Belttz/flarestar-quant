@@ -335,8 +335,11 @@ export const api = {
     /** Page size; sent as `pageSize` so the legacy `limit` alias stays free for older clients. */
     pageSize?: number;
     limit?: number;
+    /** Sends `refresh=1` so the backend recomputes instead of serving its 30s board cache. */
+    refresh?: boolean;
   } = {}) => {
     const params = new URLSearchParams();
+    if (options.refresh === true) params.set('refresh', '1');
     if (options.funding !== false) params.set('funding', '1');
     if (options.spread !== false) params.set('spread', '1');
     if (options.minApr !== undefined) params.set('minApr', String(options.minApr));
