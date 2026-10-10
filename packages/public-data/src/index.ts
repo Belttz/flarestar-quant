@@ -81,6 +81,15 @@ const KrakenFundingRowSchema = z.object({
   openInterest: z.number().optional(), suspended: z.boolean().optional(),
   last: z.number().optional(), change24h: z.number().optional(),
 });
+/** Same feed read through the bookTicker lens: `bid` / `ask` are what a spread row prices off. */
+const KrakenTickerRowSchema = z.object({
+  symbol: z.string(), pair: z.string(), tag: z.string(),
+  bid: z.number().optional(), ask: z.number().optional(),
+  last: z.number().optional(), markPrice: z.number().optional(),
+  vol24h: z.number().optional(), volumeQuote: z.number().optional(),
+  open24h: z.number().optional(), high24h: z.number().optional(), low24h: z.number().optional(),
+  openInterest: z.number().optional(), suspended: z.boolean().optional(),
+});
 const HyperliquidUniverseEntrySchema = z.object({
   name: z.string().min(1).max(120),
   isDelisted: z.boolean().optional(),
@@ -147,28 +156,51 @@ const LighterMarketDetailSchema = z.object({
 
 // --- Bulk all-market book-ticker rows (spread board REST base view). Envelopes parse strictly;
 // rows parse one at a time so a single malformed listing cannot take down a whole venue.
-// Binance's bookTicker feed carries no volume and no open interest; filling the gap would need
-// `/api/v3/ticker/24hr` + `/fapi/v1/ticker/24hr` and double the venue's QPS, which the team
-// explicitly declined. Those rows stay volume-less and the UI renders `—`.
+// Binance's bookTicker feed carries neither volume nor last price, so a second 24h-ticker sweep
+// supplies the turnover the opportunity board displays; the two are merged in
+// queryBinanceBookTickers. Open interest has no bulk source at all and stays null there.
 const BinanceBulkBookTickerRowSchema = z.object({
   symbol: z.string(), bidPrice: numeric, askPrice: numeric,
 });
+/** Binance 24h tickers — the venue's bulk source of the 24h range, session open, and volume. */
+const BinanceBulkTurnoverRowSchema = z.object({
+  symbol: z.string(), lastPrice: numeric.optional(), volume: numeric, quoteVolume: numeric,
+  openPrice: numeric.optional(), highPrice: numeric.optional(), lowPrice: numeric.optional(),
+});
+/**
+ * How long a 24h-turnover sweep stays valid. The figures move over hours while the endpoint is
+ * far heavier than bookTicker, so it is refreshed on a slow cycle instead of every board sweep.
+ */
+const BINANCE_TURNOVER_TTL_MS = 300_000;
+/**
+ * Deadline for the bulk all-market sweeps (bookTicker / 24h ticker / OI snapshots). Each downloads
+ * hundreds of kilobytes to several megabytes, and upstream sometimes needs longer than the default
+ * 8s budget: Gate's futures ticker was measured landing exactly on 8s and Binance's all-symbols
+ * spot 24h ticker — ~1.9 MB — past it. Under the default deadline those failures silently dropped a
+ * whole venue's turnover for a TTL cycle. The sweeps run in the background behind a cache, so the
+ * longer deadline costs nothing while they are healthy.
+ */
+const BULK_SWEEP_TIMEOUT_MS = 16_000;
 const OkxBookTickerRowSchema = z.object({
   instId: z.string(), bidPx: numeric.optional(), askPx: numeric.optional(), last: numeric.optional(),
   // vol24h is base-asset volume, volCcy24h is quote-currency (turnover) volume.
   vol24h: numeric.optional(), volCcy24h: numeric.optional(),
+  open24h: numeric.optional(), high24h: numeric.optional(), low24h: numeric.optional(),
 });
 const BybitBookTickerRowSchema = z.object({
   symbol: z.string(), bid1Price: numeric.optional(), ask1Price: numeric.optional(), lastPrice: numeric.optional(),
   volume24h: numeric.optional(), turnover24h: numeric.optional(), openInterestValue: numeric.optional(),
+  prevPrice24h: numeric.optional(), highPrice24h: numeric.optional(), lowPrice24h: numeric.optional(),
 });
 const GateSpotTickerRowSchema = z.object({
   currency_pair: z.string(), highest_bid: numeric.optional(), lowest_ask: numeric.optional(), last: numeric.optional(),
   base_volume: numeric.optional(), quote_volume: numeric.optional(),
+  high_24h: numeric.optional(), low_24h: numeric.optional(),
 });
 const GateFutureTickerRowSchema = z.object({
   contract: z.string(), highest_bid: numeric.optional(), lowest_ask: numeric.optional(), last: numeric.optional(),
   volume_24h_base: numeric.optional(), volume_24h_quote: numeric.optional(),
+  high_24h: numeric.optional(), low_24h: numeric.optional(),
 });
 
 /** Kraken quotes a handful of assets under legacy codes; CrossEx uses the modern ones. */
@@ -380,6 +412,28 @@ export interface VenueBookTicker {
   quoteVolume24h?: string | null;
   /** Open interest in USD; null for spot rows and for feeds without OI (Binance, Gate REST). */
   openInterestValue?: string | null;
+  /**
+   * 24h high/low (and session open) when the venue's bulk feed publishes them. The trade page's
+   * market stats read these; a feed that omits them leaves the row without a high/low, which the
+   * UI renders as `—` — the caller must not synthesise one from the last price.
+   */
+  open24h?: string | null;
+  high24h?: string | null;
+  low24h?: string | null;
+}
+
+/**
+ * One venue symbol's slice of a bulk 24h-ticker sweep. Binance publishes prices on bookTicker but
+ * turnover, session open, and the 24h range only here, so these values are merged onto the book
+ * rows. A field is null when the venue published nothing usable for it.
+ */
+interface BinanceTurnover {
+  lastPrice: string | null;
+  open24h: string | null;
+  high24h: string | null;
+  low24h: string | null;
+  volume24h: string | null;
+  quoteVolume24h: string | null;
 }
 
 export interface PublicMarketDataGateway {
@@ -551,10 +605,11 @@ async function fetchJson(
   maximumBytes = 1_000_000,
   post?: { body: string },
   signal?: AbortSignal,
+  timeoutMilliseconds = 8_000,
 ): Promise<unknown> {
   let response: Response;
   try {
-    const timeoutSignal = AbortSignal.timeout(8_000);
+    const timeoutSignal = AbortSignal.timeout(timeoutMilliseconds);
     response = await fetchImplementation(url, {
       method: post ? 'POST' : 'GET',
       headers: { Accept: 'application/json', ...(post ? { 'Content-Type': 'application/json' } : {}) },
@@ -640,6 +695,11 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
   private lighterMarketsFetchedAt = Number.NEGATIVE_INFINITY;
   private lighterMarketsLastAttemptAt = Number.NEGATIVE_INFINITY;
   private lighterMarketsInFlight: Promise<Map<string, number>> | null = null;
+  /**
+   * Cached Binance 24h turnover, refreshed on BINANCE_TURNOVER_TTL_MS rather than every sweep.
+   * Keyed by `${business}:${symbol}` because spot and perp reuse the same symbols.
+   */
+  private binanceTurnover: { fetchedAt: number; rows: ReadonlyMap<string, BinanceTurnover> } | null = null;
 
   constructor(
     private readonly fetchImplementation: typeof fetch = fetch,
@@ -791,7 +851,7 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
 
   /**
    * All-market best bid/ask sweep backing the spread board's REST base view. Only the venues
-   * with a single-request full-market ticker feed are covered (GATE, BINANCE, OKX, BYBIT);
+   * with a single-request full-market ticker feed are covered (GATE, BINANCE, OKX, BYBIT, KRAKEN);
    * other venues simply contribute no REST rows and stay hub-driven.
    */
   async queryVenueBookTickers(venue: FundingStatVenue): Promise<VenueBookTicker[]> {
@@ -799,13 +859,23 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
     if (venue === 'BINANCE') return this.queryBinanceBookTickers();
     if (venue === 'OKX') return this.queryOkxBookTickers();
     if (venue === 'BYBIT') return this.queryBybitBookTickers();
+    if (venue === 'KRAKEN') return this.queryKrakenBookTickers();
     return [];
   }
 
+  /**
+   * Fetch one bulk all-market snapshot (bookTicker / 24h ticker / OI) on the sweep deadline. These
+   * run in the background behind caches, so they get a longer budget than the default fetch.
+   */
+  private sweepJson(url: string, maximumBytes = 8_000_000, post?: { body: string }): Promise<unknown> {
+    return fetchJson(this.fetchImplementation, url, maximumBytes, post, undefined, BULK_SWEEP_TIMEOUT_MS);
+  }
+
   private async queryBinanceBookTickers(): Promise<VenueBookTicker[]> {
-    const [spotPayload, futurePayload] = await Promise.all([
-      fetchJson(this.fetchImplementation, 'https://api.binance.com/api/v3/ticker/bookTicker', 8_000_000),
-      fetchJson(this.fetchImplementation, 'https://fapi.binance.com/fapi/v1/ticker/bookTicker', 8_000_000),
+    const [spotPayload, futurePayload, turnover] = await Promise.all([
+      this.sweepJson('https://api.binance.com/api/v3/ticker/bookTicker'),
+      this.sweepJson('https://fapi.binance.com/fapi/v1/ticker/bookTicker'),
+      this.binanceTurnoverRows(),
     ]);
     const rows: VenueBookTicker[] = [];
     const collect = (payload: unknown, business: 'SPOT' | 'FUTURE'): void => {
@@ -814,14 +884,23 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
         if (!row.success) continue;
         const parsed = binanceBaseFromSymbol(row.data.symbol);
         if (!parsed) continue;
-        // bookTicker has no last price; the spread board only consumes bid/ask.
+        // bookTicker carries no last price; the spread board only consumes bid/ask.
         const bid = positiveNumberText(row.data.bidPrice);
         const ask = positiveNumberText(row.data.askPrice);
         if (bid === null || ask === null) continue;
-        // bookTicker publishes neither volume nor open interest; no extra request is made for it.
+        // Turnover, last price, and the 24h range come from the cached 24h sweep. Spot and perp
+        // reuse the same symbols (BTCUSDT on both), so the lookup keys on business to keep them
+        // apart.
+        const extra = turnover.get(`${business}:${row.data.symbol}`);
         rows.push({
-          venue: 'BINANCE', business, ...parsed, bidPrice: bid, askPrice: ask, lastPrice: null,
-          volume24h: null, quoteVolume24h: null, openInterestValue: null,
+          venue: 'BINANCE', business, ...parsed, bidPrice: bid, askPrice: ask,
+          lastPrice: extra?.lastPrice ?? null,
+          volume24h: extra?.volume24h ?? null,
+          quoteVolume24h: extra?.quoteVolume24h ?? null,
+          openInterestValue: null,
+          open24h: extra?.open24h ?? null,
+          high24h: extra?.high24h ?? null,
+          low24h: extra?.low24h ?? null,
         });
       }
     };
@@ -830,10 +909,53 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
     return rows;
   }
 
+  /**
+   * Binance's only bulk turnover source: the 24h ticker endpoint for spot and USDT-M futures.
+   * The responses are an order of magnitude larger than bookTicker and their figures move on an
+   * hourly scale, so the sweep is cached for BINANCE_TURNOVER_TTL_MS across board sweeps. A
+   * failed (or entirely unusable) sweep degrades to "no volume" — it is never cached — so the
+   * price rows keep flowing either way.
+   */
+  private async binanceTurnoverRows(): Promise<ReadonlyMap<string, BinanceTurnover>> {
+    const now = this.now();
+    const cached = this.binanceTurnover;
+    if (cached && now - cached.fetchedAt < BINANCE_TURNOVER_TTL_MS) return cached.rows;
+    const [spotPayload, futurePayload] = await Promise.all([
+      optionalPayload(this.sweepJson('https://api.binance.com/api/v3/ticker/24hr'), z.array(z.unknown()), []),
+      optionalPayload(this.sweepJson('https://fapi.binance.com/fapi/v1/ticker/24hr'), z.array(z.unknown()), []),
+    ]);
+    const rows = new Map<string, BinanceTurnover>();
+    const collect = (payload: unknown[], business: 'SPOT' | 'FUTURE'): number => {
+      let collected = 0;
+      for (const rawRow of payload) {
+        const row = BinanceBulkTurnoverRowSchema.safeParse(rawRow);
+        if (!row.success) continue;
+        // Spot and perp reuse symbol names (BTCUSDT on both), so scope the key by business.
+        rows.set(`${business}:${row.data.symbol}`, {
+          lastPrice: positiveNumberText(row.data.lastPrice),
+          open24h: positiveNumberText(row.data.openPrice),
+          high24h: positiveNumberText(row.data.highPrice),
+          low24h: positiveNumberText(row.data.lowPrice),
+          volume24h: positiveAmountText(row.data.volume),
+          quoteVolume24h: positiveAmountText(row.data.quoteVolume),
+        });
+        collected += 1;
+      }
+      return collected;
+    };
+    const spotCount = collect(spotPayload, 'SPOT');
+    const futureCount = collect(futurePayload, 'FUTURE');
+    // Only a complete sweep is worth caching: caching a half sweep (one endpoint timed out or came
+    // back unusable) would blank that business line for the whole TTL instead of one sweep. The
+    // partial rows still flow to the caller — the next sweep simply retries.
+    if (spotCount > 0 && futureCount > 0) this.binanceTurnover = { fetchedAt: now, rows };
+    return rows;
+  }
+
   private async queryOkxBookTickers(): Promise<VenueBookTicker[]> {
     const [spotPayload, swapPayload] = await Promise.all([
-      fetchJson(this.fetchImplementation, 'https://www.okx.com/api/v5/market/tickers?instType=SPOT', 8_000_000),
-      fetchJson(this.fetchImplementation, 'https://www.okx.com/api/v5/market/tickers?instType=SWAP', 8_000_000),
+      this.sweepJson('https://www.okx.com/api/v5/market/tickers?instType=SPOT'),
+      this.sweepJson('https://www.okx.com/api/v5/market/tickers?instType=SWAP'),
     ]);
     const rows: VenueBookTicker[] = [];
     const collect = (payload: unknown, business: 'SPOT' | 'FUTURE', pattern: RegExp): void => {
@@ -851,6 +973,9 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
           volume24h: positiveAmountText(row.data.vol24h),
           quoteVolume24h: positiveAmountText(row.data.volCcy24h),
           openInterestValue: null,
+          open24h: positiveNumberText(row.data.open24h),
+          high24h: positiveNumberText(row.data.high24h),
+          low24h: positiveNumberText(row.data.low24h),
         });
       }
     };
@@ -861,11 +986,7 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
 
   private async queryBybitBookTickers(): Promise<VenueBookTicker[]> {
     const request = async (category: 'spot' | 'linear'): Promise<unknown[]> => {
-      const payload = await fetchJson(
-        this.fetchImplementation,
-        `https://api.bybit.com/v5/market/tickers?category=${category}`,
-        8_000_000,
-      );
+      const payload = await this.sweepJson(`https://api.bybit.com/v5/market/tickers?category=${category}`);
       const envelope = parsePayload(z.object({ retCode: z.number(), result: z.object({ list: z.array(z.unknown()) }) }), payload);
       if (envelope.retCode !== 0) throw new PublicMarketDataError('UPSTREAM_REJECTED');
       return envelope.result.list;
@@ -889,6 +1010,9 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
           volume24h: positiveAmountText(row.data.volume24h),
           quoteVolume24h: positiveAmountText(row.data.turnover24h),
           openInterestValue: positiveAmountText(row.data.openInterestValue),
+          open24h: positiveNumberText(row.data.prevPrice24h),
+          high24h: positiveNumberText(row.data.highPrice24h),
+          low24h: positiveNumberText(row.data.lowPrice24h),
         });
       }
     };
@@ -899,8 +1023,8 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
 
   private async queryGateBookTickers(): Promise<VenueBookTicker[]> {
     const [spotPayload, futurePayload] = await Promise.all([
-      fetchJson(this.fetchImplementation, 'https://api.gateio.ws/api/v4/spot/tickers', 8_000_000),
-      fetchJson(this.fetchImplementation, 'https://api.gateio.ws/api/v4/futures/usdt/tickers', 8_000_000),
+      this.sweepJson('https://api.gateio.ws/api/v4/spot/tickers'),
+      this.sweepJson('https://api.gateio.ws/api/v4/futures/usdt/tickers'),
     ]);
     const rows: VenueBookTicker[] = [];
     for (const rawRow of parsePayload(z.array(z.unknown()), spotPayload)) {
@@ -917,6 +1041,10 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
         volume24h: positiveAmountText(row.data.base_volume),
         quoteVolume24h: positiveAmountText(row.data.quote_volume),
         openInterestValue: null,
+        // Gate's ticker feed publishes the 24h range but no session open.
+        open24h: null,
+        high24h: positiveNumberText(row.data.high_24h),
+        low24h: positiveNumberText(row.data.low_24h),
       });
     }
     for (const rawRow of parsePayload(z.array(z.unknown()), futurePayload)) {
@@ -935,6 +1063,10 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
         // Gate's futures `open_interest` mixes contract and currency units across versions, so no
         // OI is mapped here; the board's funding-overview fallback supplies the USD figure.
         openInterestValue: null,
+        // Gate's ticker feed publishes the 24h range but no session open.
+        open24h: null,
+        high24h: positiveNumberText(row.data.high_24h),
+        low24h: positiveNumberText(row.data.low_24h),
       });
     }
     return rows;
@@ -1492,9 +1624,9 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
 
   private async queryGateFundingStats(): Promise<VenueFundingStat[]> {
     const [payload, contractRows] = await Promise.all([
-      fetchJson(this.fetchImplementation, 'https://api.gateio.ws/api/v4/futures/usdt/tickers', 8_000_000),
+      this.sweepJson('https://api.gateio.ws/api/v4/futures/usdt/tickers'),
       optionalPayload(
-        fetchJson(this.fetchImplementation, 'https://api.gateio.ws/api/v4/futures/usdt/contracts', 8_000_000),
+        this.sweepJson('https://api.gateio.ws/api/v4/futures/usdt/contracts'),
         GateContractListSchema,
         [],
       ),
@@ -1534,14 +1666,14 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
   private async queryBinanceFundingStats(): Promise<VenueFundingStat[]> {
     const optionalRowsSchema = z.array(z.unknown());
     const [fundingPayload, tickerRows, fundingInfoRows] = await Promise.all([
-      fetchJson(this.fetchImplementation, 'https://fapi.binance.com/fapi/v1/premiumIndex', 4_000_000),
+      this.sweepJson('https://fapi.binance.com/fapi/v1/premiumIndex', 4_000_000),
       optionalPayload(
-        fetchJson(this.fetchImplementation, 'https://fapi.binance.com/fapi/v1/ticker/24hr', 8_000_000),
+        this.sweepJson('https://fapi.binance.com/fapi/v1/ticker/24hr'),
         optionalRowsSchema,
         [],
       ),
       optionalPayload(
-        fetchJson(this.fetchImplementation, 'https://fapi.binance.com/fapi/v1/fundingInfo', 4_000_000),
+        this.sweepJson('https://fapi.binance.com/fapi/v1/fundingInfo', 4_000_000),
         optionalRowsSchema,
         [],
       ),
@@ -1587,8 +1719,8 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
 
   private async queryOkxFundingStats(): Promise<VenueFundingStat[]> {
     const [fundingPayload, tickerPayload] = await Promise.all([
-      fetchJson(this.fetchImplementation, 'https://www.okx.com/api/v5/public/funding-rate?instId=ANY', 8_000_000),
-      fetchJson(this.fetchImplementation, 'https://www.okx.com/api/v5/market/tickers?instType=SWAP', 8_000_000),
+      this.sweepJson('https://www.okx.com/api/v5/public/funding-rate?instId=ANY'),
+      this.sweepJson('https://www.okx.com/api/v5/market/tickers?instType=SWAP'),
     ]);
     const tickerBySwap = new Map<string, z.infer<typeof OkxTickerRowSchema>>();
     for (const rawRow of parsePayload(okxEnvelope(z.unknown()), tickerPayload).data) {
@@ -1597,7 +1729,7 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
     }
     const openInterestBySwap = new Map<string, string>();
     try {
-      const openInterestPayload = await fetchJson(this.fetchImplementation, 'https://www.okx.com/api/v5/public/open-interest?instType=SWAP', 8_000_000);
+      const openInterestPayload = await this.sweepJson('https://www.okx.com/api/v5/public/open-interest?instType=SWAP');
       for (const rawRow of parsePayload(okxEnvelope(z.unknown()), openInterestPayload).data) {
         const row = OkxOpenInterestRowSchema.safeParse(rawRow);
         if (!row.success) continue;
@@ -1634,7 +1766,7 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
   }
 
   private async queryBybitFundingStats(): Promise<VenueFundingStat[]> {
-    const payload = await fetchJson(this.fetchImplementation, 'https://api.bybit.com/v5/market/tickers?category=linear', 8_000_000);
+    const payload = await this.sweepJson('https://api.bybit.com/v5/market/tickers?category=linear');
     const envelope = parsePayload(z.object({ retCode: z.number(), result: z.object({ list: z.array(z.unknown()) }) }), payload);
     if (envelope.retCode !== 0) throw new PublicMarketDataError('UPSTREAM_REJECTED');
     const stats: VenueFundingStat[] = [];
@@ -1669,7 +1801,7 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
   }
 
   private async queryKrakenFundingStats(): Promise<VenueFundingStat[]> {
-    const payload = await fetchJson(this.fetchImplementation, 'https://futures.kraken.com/derivatives/api/v3/tickers', 4_000_000);
+    const payload = await this.sweepJson('https://futures.kraken.com/derivatives/api/v3/tickers', 4_000_000);
     const envelope = parsePayload(z.object({ tickers: z.array(z.unknown()) }), payload);
     const stats: VenueFundingStat[] = [];
     for (const rawRow of envelope.tickers) {
@@ -1698,6 +1830,40 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
     return stats;
   }
 
+  /**
+   * Kraken's single all-market ticker feed, in one request. Every linear perpetual Kraken lists is
+   * quoted in **USD**, so these rows are what makes the venue visible to the spread board at all:
+   * it has no CrossEx spot leg and up to now nothing swept its prices.
+   */
+  private async queryKrakenBookTickers(): Promise<VenueBookTicker[]> {
+    const payload = await this.sweepJson('https://futures.kraken.com/derivatives/api/v3/tickers');
+    const envelope = parsePayload(z.object({ tickers: z.array(z.unknown()) }), payload);
+    const rows: VenueBookTicker[] = [];
+    for (const rawRow of envelope.tickers) {
+      const row = KrakenTickerRowSchema.safeParse(rawRow);
+      if (!row.success) continue;
+      // PF_ = linear multi-collateral perpetuals, the contracts CrossEx routes to.
+      if (row.data.tag !== 'perpetual' || !row.data.symbol.startsWith('PF_') || row.data.suspended === true) continue;
+      const [pairBase, pairQuote] = row.data.pair.split(':');
+      if (!pairBase || !pairQuote) continue;
+      const bid = positiveNumberText(row.data.bid);
+      const ask = positiveNumberText(row.data.ask);
+      if (bid === null || ask === null) continue;
+      const base = KRAKEN_ASSET_RENAMES[pairBase] ?? pairBase;
+      rows.push({
+        venue: 'KRAKEN', business: 'FUTURE', base, quote: pairQuote,
+        bidPrice: bid, askPrice: ask, lastPrice: positiveNumberText(row.data.last),
+        volume24h: positiveAmountText(row.data.vol24h),
+        quoteVolume24h: positiveAmountText(row.data.volumeQuote),
+        openInterestValue: positiveProduct(finiteNumber(row.data.openInterest), finiteNumber(row.data.markPrice)),
+        open24h: positiveNumberText(row.data.open24h),
+        high24h: positiveNumberText(row.data.high24h),
+        low24h: positiveNumberText(row.data.low24h),
+      });
+    }
+    return rows;
+  }
+
   private async queryHyperliquidFundingStats(): Promise<VenueFundingStat[]> {
     const metadata = await this.loadHyperliquidMetadata();
     const liveNativeNames = new Set(metadata.nativeNames);
@@ -1708,8 +1874,7 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
     });
     const results = await Promise.allSettled(dexes.map(async (dex) => {
       const body = dex === '' ? { type: 'metaAndAssetCtxs' } : { type: 'metaAndAssetCtxs', dex };
-      const payload = await fetchJson(
-        this.fetchImplementation,
+      const payload = await this.sweepJson(
         'https://api.hyperliquid.xyz/info',
         4_000_000,
         { body: JSON.stringify(body) },
@@ -1760,7 +1925,7 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
   }
 
   private async queryDeribitFundingStats(): Promise<VenueFundingStat[]> {
-    const payload = await fetchJson(this.fetchImplementation, 'https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=USDC&kind=future', 2_000_000);
+    const payload = await this.sweepJson('https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=USDC&kind=future', 2_000_000);
     const envelope = parsePayload(z.object({ result: z.array(z.unknown()) }), payload);
     const stats: VenueFundingStat[] = [];
     for (const rawRow of envelope.result) {
@@ -1785,10 +1950,10 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
 
   private async queryLighterFundingStats(): Promise<VenueFundingStat[]> {
     const [detailsPayload, rates] = await Promise.all([
-      fetchJson(this.fetchImplementation, `${LIGHTER_API_URL}/orderBookDetails`, 8_000_000),
+      this.sweepJson(`${LIGHTER_API_URL}/orderBookDetails`),
       // Funding stays null rather than failing the whole venue when the comparison feed is down.
       optionalPayload(
-        fetchJson(this.fetchImplementation, `${LIGHTER_API_URL}/funding-rates`, 4_000_000),
+        this.sweepJson(`${LIGHTER_API_URL}/funding-rates`, 4_000_000),
         LighterFundingRateListSchema,
         { funding_rates: [] },
       ),

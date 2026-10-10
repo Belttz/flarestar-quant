@@ -798,49 +798,170 @@ describe('bulk venue funding stats', () => {
     ]);
   });
 
-  it('sweeps Binance spot and perp bookTickers, dropping dated futures and odd quotes', async () => {
-    const fetchMock = vi.fn((url: string | URL | Request) => String(url).includes('fapi.binance.com')
-      ? response([
-        { symbol: 'ETHUSDT', bidPrice: '3120.5', askPrice: '3120.6', bidQty: '1', askQty: '1', time: 1 },
-        // Dated future (settlement suffix) and a non-stable quote are not CrossEx markets.
-        { symbol: 'BTCUSDT_260327', bidPrice: '64000', askPrice: '64001', time: 1 },
-        { symbol: 'BTCUSD', bidPrice: '64000', askPrice: '64001', time: 1 },
-      ])
-      : response([
-        { symbol: 'BTCUSDT', bidPrice: '63962.00', askPrice: '63962.10', bidQty: '1', askQty: '1', time: 1 },
-        { symbol: 'BTCTUSD', bidPrice: '63900', askPrice: '63901', time: 1 },
-      ]));
+  it('sweeps Binance spot and perp bookTickers, merging the 24h turnover sweep', async () => {
+    const fetchMock = vi.fn((url: string | URL | Request) => {
+      const target = String(url);
+      const futures = target.includes('fapi.binance.com');
+      // bookTicker prices carry no turnover or range, so a second sweep per business line fills in.
+      if (target.includes('/ticker/24hr')) {
+        return futures
+          ? response([
+            { symbol: 'ETHUSDT', lastPrice: '3120.6', volume: '9000', quoteVolume: '28000000', openPrice: '3050', highPrice: '3180.4', lowPrice: '3012.9' },
+            // Spot and perp reuse the symbol name, so the sweep must keep their turnover apart.
+            { symbol: 'BTCUSDT', lastPrice: '63963', volume: '99', quoteVolume: '6300000', openPrice: '64100', highPrice: '64980', lowPrice: '63210' },
+            { symbol: 'BTCUSDT_260327', lastPrice: '64000', volume: '5', quoteVolume: '320000', openPrice: '64000', highPrice: '64100', lowPrice: '63900' },
+          ])
+          : response([
+            { symbol: 'BTCUSDT', lastPrice: '63962.1', volume: '1500.25', quoteVolume: '96000000.5', openPrice: '63200.5', highPrice: '64500', lowPrice: '62800.25' },
+            // Dated future and a non-stable quote are not CrossEx markets, here or on bookTicker.
+            { symbol: 'BTCUSD', lastPrice: '64000', volume: '1', quoteVolume: '64000', openPrice: '64000', highPrice: '64100', lowPrice: '63900' },
+            // A zero turnover means the venue published nothing usable for this row.
+            { symbol: 'ETHUSDT', lastPrice: '3120.6', volume: '0', quoteVolume: '0', openPrice: '0', highPrice: '0', lowPrice: '0' },
+          ]);
+      }
+      return futures
+        ? response([
+          { symbol: 'ETHUSDT', bidPrice: '3120.5', askPrice: '3120.6', bidQty: '1', askQty: '1', time: 1 },
+          { symbol: 'BTCUSDT', bidPrice: '63962.5', askPrice: '63962.6', time: 1 },
+          // Dated future (settlement suffix) and a non-stable quote are not CrossEx markets.
+          { symbol: 'BTCUSDT_260327', bidPrice: '64000', askPrice: '64001', time: 1 },
+          { symbol: 'BTCUSD', bidPrice: '64000', askPrice: '64001', time: 1 },
+        ])
+        : response([
+          { symbol: 'BTCUSDT', bidPrice: '63962.00', askPrice: '63962.10', bidQty: '1', askQty: '1', time: 1 },
+          { symbol: 'BTCTUSD', bidPrice: '63900', askPrice: '63901', time: 1 },
+        ]);
+    });
     const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch);
 
     const tickers = await client.queryVenueBookTickers('BINANCE');
 
     expect(tickers).toEqual([
-      // Prices normalize through positiveNumberText, so trailing zeros drop. Binance bookTicker
-      // carries no volume and no open interest, and no extra request is made to fill them in.
+      // Prices normalize through positiveNumberText, so trailing zeros drop. Turnover keeps the
+      // upstream text verbatim; open interest has no bulk source on Binance and stays null.
       {
-        venue: 'BINANCE', business: 'SPOT', base: 'BTC', quote: 'USDT', bidPrice: '63962', askPrice: '63962.1', lastPrice: null,
-        volume24h: null, quoteVolume24h: null, openInterestValue: null,
+        venue: 'BINANCE', business: 'SPOT', base: 'BTC', quote: 'USDT', bidPrice: '63962', askPrice: '63962.1', lastPrice: '63962.1',
+        volume24h: '1500.25', quoteVolume24h: '96000000.5', openInterestValue: null,
+        open24h: '63200.5', high24h: '64500', low24h: '62800.25',
       },
       {
-        venue: 'BINANCE', business: 'FUTURE', base: 'ETH', quote: 'USDT', bidPrice: '3120.5', askPrice: '3120.6', lastPrice: null,
-        volume24h: null, quoteVolume24h: null, openInterestValue: null,
+        venue: 'BINANCE', business: 'FUTURE', base: 'ETH', quote: 'USDT', bidPrice: '3120.5', askPrice: '3120.6', lastPrice: '3120.6',
+        volume24h: '9000', quoteVolume24h: '28000000', openInterestValue: null,
+        open24h: '3050', high24h: '3180.4', low24h: '3012.9',
+      },
+      {
+        // Same symbol as the spot row above, but the perp turnover must not bleed across.
+        venue: 'BINANCE', business: 'FUTURE', base: 'BTC', quote: 'USDT', bidPrice: '63962.5', askPrice: '63962.6', lastPrice: '63963',
+        volume24h: '99', quoteVolume24h: '6300000', openInterestValue: null,
+        open24h: '64100', high24h: '64980', low24h: '63210',
       },
     ]);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('caches the Binance 24h turnover sweep across board sweeps until it expires', async () => {
+    let now = 1_783_703_500_000;
+    const fetchMock = vi.fn((url: string | URL | Request) => String(url).includes('/ticker/24hr')
+      ? response([{ symbol: 'BTCUSDT', lastPrice: '63962.1', volume: '1500', quoteVolume: '96000000' }])
+      : response([{ symbol: 'BTCUSDT', bidPrice: '63962', askPrice: '63962.1' }]));
+    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch, () => now);
+
+    await client.queryVenueBookTickers('BINANCE');
+    // Two bookTicker requests plus two turnover requests (spot and futures).
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+
+    now += 299_999;
+    const cached = await client.queryVenueBookTickers('BINANCE');
+    // Only the price sweep repeats; turnover is served from the cache.
+    expect(fetchMock).toHaveBeenCalledTimes(6);
+    expect(cached[0]).toMatchObject({ quoteVolume24h: '96000000' });
+
+    now += 1;
+    await client.queryVenueBookTickers('BINANCE');
+    // The TTL boundary re-sweeps turnover at exactly 300s.
+    expect(fetchMock).toHaveBeenCalledTimes(10);
+  });
+
+  it('does not cache a half-fetched Binance turnover sweep', async () => {
+    let now = 1_783_703_500_000;
+    const fetchMock = vi.fn((url: string | URL | Request) => {
+      const target = String(url);
+      if (target.includes('/ticker/24hr')) {
+        // Only the spot 24h ticker answers; the perp endpoint is down for this sweep.
+        return target.includes('fapi.binance.com')
+          ? Promise.reject(new Error('futures turnover endpoint down'))
+          : response([{ symbol: 'BTCUSDT', lastPrice: '63962.1', volume: '1500', quoteVolume: '96000000' }]);
+      }
+      return target.includes('fapi.binance.com')
+        ? response([{ symbol: 'ETHUSDT', bidPrice: '3120.5', askPrice: '3120.6' }])
+        : response([{ symbol: 'BTCUSDT', bidPrice: '63962', askPrice: '63962.1' }]);
+    });
+    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch, () => now);
+
+    const first = await client.queryVenueBookTickers('BINANCE');
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    // The half sweep still delivers what it has: spot turnover lands, perp degrades to null.
+    expect(first).toEqual([
+      {
+        venue: 'BINANCE', business: 'SPOT', base: 'BTC', quote: 'USDT', bidPrice: '63962', askPrice: '63962.1',
+        lastPrice: '63962.1', volume24h: '1500', quoteVolume24h: '96000000', openInterestValue: null,
+        open24h: null, high24h: null, low24h: null,
+      },
+      {
+        venue: 'BINANCE', business: 'FUTURE', base: 'ETH', quote: 'USDT', bidPrice: '3120.5', askPrice: '3120.6',
+        lastPrice: null, volume24h: null, quoteVolume24h: null, openInterestValue: null,
+        open24h: null, high24h: null, low24h: null,
+      },
+    ]);
+
+    now += 1;
+    await client.queryVenueBookTickers('BINANCE');
+    // A half sweep is never cached, so the very next sweep re-asks both turnover endpoints rather
+    // than serving the gap for a full TTL: 4 calls now, 8 in total.
+    expect(fetchMock).toHaveBeenCalledTimes(8);
+  });
+
+  it('keeps Binance price rows when the 24h turnover sweep fails', async () => {
+    const fetchMock = vi.fn((url: string | URL | Request) => {
+      const target = String(url);
+      if (target.includes('/ticker/24hr')) return Promise.reject(new Error('turnover endpoint down'));
+      // Still distinguish spot from futures so both price rows survive the failed turnover sweep.
+      return target.includes('fapi.binance.com')
+        ? response([{ symbol: 'ETHUSDT', bidPrice: '3120.5', askPrice: '3120.6' }])
+        : response([{ symbol: 'BTCUSDT', bidPrice: '63962', askPrice: '63962.1' }]);
+    });
+    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch);
+
+    const tickers = await client.queryVenueBookTickers('BINANCE');
+
+    // Degradation stays local: a missing turnover source must not take the price rows with it —
+    // the 24h range has the same source, so it degrades to null rather than a fabricated value.
+    expect(tickers).toEqual([
+      {
+        venue: 'BINANCE', business: 'SPOT', base: 'BTC', quote: 'USDT', bidPrice: '63962', askPrice: '63962.1',
+        lastPrice: null, volume24h: null, quoteVolume24h: null, openInterestValue: null,
+        open24h: null, high24h: null, low24h: null,
+      },
+      {
+        venue: 'BINANCE', business: 'FUTURE', base: 'ETH', quote: 'USDT', bidPrice: '3120.5', askPrice: '3120.6',
+        lastPrice: null, volume24h: null, quoteVolume24h: null, openInterestValue: null,
+        open24h: null, high24h: null, low24h: null,
+      },
+    ]);
   });
 
   it('sweeps OKX spot and swap tickers, dropping inverse swaps', async () => {
     const fetchMock = vi.fn((url: string | URL | Request) => String(url).includes('instType=SWAP')
       ? response({ code: '0', msg: '', data: [
-        { instId: 'ETH-USDT-SWAP', bidPx: '3120.5', askPx: '3120.7', last: '3120.6', vol24h: '12000', volCcy24h: '37500000.5', ts: '1783703477068' },
+        { instId: 'ETH-USDT-SWAP', bidPx: '3120.5', askPx: '3120.7', last: '3120.6', vol24h: '12000', volCcy24h: '37500000.5', open24h: '3050', high24h: '3180.4', low24h: '3012.9', ts: '1783703477068' },
         // Inverse (coin-margined) swap is not a CrossEx linear market.
-        { instId: 'BTC-USD-SWAP', bidPx: '64000', askPx: '64001', last: '64000', ts: '1783703477068' },
+        { instId: 'BTC-USD-SWAP', bidPx: '64000', askPx: '64001', last: '64000', open24h: '64000', high24h: '64100', low24h: '63900', ts: '1783703477068' },
         { instId: 'BTC-USDC-SWAP', bidPx: '0', askPx: '0', ts: '1783703477068' },
       ] })
       : response({ code: '0', msg: '', data: [
-        { instId: 'BTC-USDT', bidPx: '63962', askPx: '63962.2', last: '63962.1', vol24h: '900.25', volCcy24h: '57500000', ts: '1783703477068' },
+        { instId: 'BTC-USDT', bidPx: '63962', askPx: '63962.2', last: '63962.1', vol24h: '900.25', volCcy24h: '57500000', open24h: '63200.5', high24h: '64500', low24h: '62800.25', ts: '1783703477068' },
         // A zero turnover means the venue published nothing usable for this row.
-        { instId: 'BTC-USDC', bidPx: '63961', askPx: '63961.2', vol24h: '0', volCcy24h: '0', ts: '1783703477068' },
+        { instId: 'BTC-USDC', bidPx: '63961', askPx: '63961.2', vol24h: '0', volCcy24h: '0', open24h: '0', high24h: '0', low24h: '0', ts: '1783703477068' },
       ] }));
     const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch);
 
@@ -850,14 +971,17 @@ describe('bulk venue funding stats', () => {
       {
         venue: 'OKX', business: 'SPOT', base: 'BTC', quote: 'USDT', bidPrice: '63962', askPrice: '63962.2', lastPrice: '63962.1',
         volume24h: '900.25', quoteVolume24h: '57500000', openInterestValue: null,
+        open24h: '63200.5', high24h: '64500', low24h: '62800.25',
       },
       {
         venue: 'OKX', business: 'SPOT', base: 'BTC', quote: 'USDC', bidPrice: '63961', askPrice: '63961.2', lastPrice: null,
         volume24h: null, quoteVolume24h: null, openInterestValue: null,
+        open24h: null, high24h: null, low24h: null,
       },
       {
         venue: 'OKX', business: 'FUTURE', base: 'ETH', quote: 'USDT', bidPrice: '3120.5', askPrice: '3120.7', lastPrice: '3120.6',
         volume24h: '12000', quoteVolume24h: '37500000.5', openInterestValue: null,
+        open24h: '3050', high24h: '3180.4', low24h: '3012.9',
       },
     ]);
   });
@@ -865,12 +989,12 @@ describe('bulk venue funding stats', () => {
   it('sweeps Bybit spot and linear tickers, dropping dated futures and keeping PERP quoting', async () => {
     const fetchMock = vi.fn((url: string | URL | Request) => String(url).includes('category=linear')
       ? response({ retCode: 0, retMsg: 'OK', result: { list: [
-        { symbol: 'SIRENUSDT', bid1Price: '0.119', ask1Price: '0.12', lastPrice: '0.1195', volume24h: '8800000', turnover24h: '1050000.75', openInterestValue: '420000' },
+        { symbol: 'SIRENUSDT', bid1Price: '0.119', ask1Price: '0.12', lastPrice: '0.1195', volume24h: '8800000', turnover24h: '1050000.75', openInterestValue: '420000', prevPrice24h: '0.1255', highPrice24h: '0.1312', lowPrice24h: '0.1174' },
         { symbol: 'BTC-26DEC25', bid1Price: '64000', ask1Price: '64001' },
         { symbol: 'BTCUSDC', bid1Price: '0', ask1Price: '0' },
       ] } })
       : response({ retCode: 0, retMsg: 'OK', result: { list: [
-        { symbol: 'SIRENUSDT', bid1Price: '0.1192', ask1Price: '0.1194', lastPrice: '0.1193', volume24h: '1200000', turnover24h: '143000' },
+        { symbol: 'SIRENUSDT', bid1Price: '0.1192', ask1Price: '0.1194', lastPrice: '0.1193', volume24h: '1200000', turnover24h: '143000', prevPrice24h: '0.1255', highPrice24h: '0.1312', lowPrice24h: '0.1174' },
       ] } }));
     const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch);
 
@@ -880,10 +1004,12 @@ describe('bulk venue funding stats', () => {
       {
         venue: 'BYBIT', business: 'SPOT', base: 'SIREN', quote: 'USDT', bidPrice: '0.1192', askPrice: '0.1194', lastPrice: '0.1193',
         volume24h: '1200000', quoteVolume24h: '143000', openInterestValue: null,
+        open24h: '0.1255', high24h: '0.1312', low24h: '0.1174',
       },
       {
         venue: 'BYBIT', business: 'FUTURE', base: 'SIREN', quote: 'USDT', bidPrice: '0.119', askPrice: '0.12', lastPrice: '0.1195',
         volume24h: '8800000', quoteVolume24h: '1050000.75', openInterestValue: '420000',
+        open24h: '0.1255', high24h: '0.1312', low24h: '0.1174',
       },
     ]);
   });
@@ -891,11 +1017,11 @@ describe('bulk venue funding stats', () => {
   it('sweeps Gate spot and USDT-settled futures tickers into CrossEx rows', async () => {
     const fetchMock = vi.fn((url: string | URL | Request) => String(url).includes('/futures/usdt/tickers')
       ? response([
-        { contract: 'SIREN_USDT', highest_bid: '0.119', lowest_ask: '0.12', last: '0.1195', volume_24h_base: '5000000', volume_24h_quote: '595000' },
+        { contract: 'SIREN_USDT', highest_bid: '0.119', lowest_ask: '0.12', last: '0.1195', volume_24h_base: '5000000', volume_24h_quote: '595000', high_24h: '0.1312', low_24h: '0.1174' },
         { contract: 'BTC_USDC', highest_bid: '64000', lowest_ask: '64001', last: '64000' },
       ])
       : response([
-        { currency_pair: 'SIREN_USDT', highest_bid: '0.1192', lowest_ask: '0.1194', last: '0.1193', base_volume: '750000', quote_volume: '89250.5' },
+        { currency_pair: 'SIREN_USDT', highest_bid: '0.1192', lowest_ask: '0.1194', last: '0.1193', base_volume: '750000', quote_volume: '89250.5', high_24h: '0.1312', low_24h: '0.1174' },
         { currency_pair: 'SIREN_USDC', highest_bid: '0.1191', lowest_ask: '0.1195', last: '0.1192' },
       ]));
     const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch);
@@ -906,23 +1032,53 @@ describe('bulk venue funding stats', () => {
       {
         venue: 'GATE', business: 'SPOT', base: 'SIREN', quote: 'USDT', bidPrice: '0.1192', askPrice: '0.1194', lastPrice: '0.1193',
         volume24h: '750000', quoteVolume24h: '89250.5', openInterestValue: null,
+        // Gate's ticker feed carries the 24h range but no session open.
+        open24h: null, high24h: '0.1312', low24h: '0.1174',
       },
       {
         venue: 'GATE', business: 'SPOT', base: 'SIREN', quote: 'USDC', bidPrice: '0.1191', askPrice: '0.1195', lastPrice: '0.1192',
         volume24h: null, quoteVolume24h: null, openInterestValue: null,
+        open24h: null, high24h: null, low24h: null,
       },
       {
         venue: 'GATE', business: 'FUTURE', base: 'SIREN', quote: 'USDT', bidPrice: '0.119', askPrice: '0.12', lastPrice: '0.1195',
         volume24h: '5000000', quoteVolume24h: '595000', openInterestValue: null,
+        open24h: null, high24h: '0.1312', low24h: '0.1174',
       },
     ]);
+  });
+
+  it('sweeps Kraken linear perpetuals, keeping their USD quote', async () => {
+    const fetchMock = vi.fn(() => response({ tickers: [
+      {
+        symbol: 'PF_XBTUSD', pair: 'XBT:USD', tag: 'perpetual', bid: 63962, ask: 63962.4, last: 63962.2,
+        markPrice: 63962.1, vol24h: 1200.5, volumeQuote: 76750000.25, openInterest: 9000, suspended: false,
+        open24h: 63200.5, high24h: 64500.25, low24h: 62800,
+      },
+      // Spot symbols, futures with a settlement date and suspended contracts cannot be traded here.
+      { symbol: 'PI_XBTUSD', pair: 'XBT:USD', tag: 'month', bid: 64000, ask: 64001, markPrice: 64000 },
+      { symbol: 'PF_ETHUSD', pair: 'ETH:USD', tag: 'perpetual', bid: 3120.5, ask: 3120.7, markPrice: 3120.6, suspended: true },
+      { symbol: 'PF_SIRENUSD', pair: 'SIREN:USD', tag: 'perpetual', markPrice: 0.1195 },
+    ] }));
+    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch);
+
+    const tickers = await client.queryVenueBookTickers('KRAKEN');
+
+    // Kraken settles in cash USD while everyone else quotes a dollar stablecoin: the row keeps its
+    // real quote and the opportunity board folds it into the same settlement family.
+    expect(tickers).toEqual([{
+      venue: 'KRAKEN', business: 'FUTURE', base: 'BTC', quote: 'USD', bidPrice: '63962', askPrice: '63962.4', lastPrice: '63962.2',
+      volume24h: '1200.5', quoteVolume24h: '76750000.25', openInterestValue: '575658900',
+      open24h: '63200.5', high24h: '64500.25', low24h: '62800',
+    }]);
+    // XBT is Kraken's own spelling of BTC and must be renamed for cross-venue joining.
+    expect(tickers[0]?.base).toBe('BTC');
   });
 
   it('returns no REST book rows for venues without a full-market ticker sweep', async () => {
     const fetchMock = vi.fn();
     const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch);
 
-    await expect(client.queryVenueBookTickers('KRAKEN')).resolves.toEqual([]);
     await expect(client.queryVenueBookTickers('HYPERLIQUID')).resolves.toEqual([]);
     await expect(client.queryVenueBookTickers('DERIBIT')).resolves.toEqual([]);
     await expect(client.queryVenueBookTickers('LIGHTER')).resolves.toEqual([]);

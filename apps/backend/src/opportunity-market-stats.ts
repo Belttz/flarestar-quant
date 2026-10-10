@@ -16,8 +16,9 @@ import type {
  *   2. the cached funding-overview sweep supplies a USD open-interest value per (asset, venue)
  *      for every perpetual — this is what covers venues whose REST row has no OI (Gate) and the
  *      symbols nobody subscribed to
- *   3. nothing else: Binance has no bulk volume source at all (its bookTicker feed omits it and
- *      the team declined the extra `/ticker/24hr` requests), so those rows stay empty
+ *   3. nothing else: Binance's bookTicker feed omits volume, so the venue's 24h ticker endpoint is
+ *      swept alongside it and merged onto those REST rows by the public-data client; open
+ *      interest has no bulk source on Binance at all and stays empty
  *
  * Spot legs never carry open interest — that is a definition, not a gap, so it is forced to
  * `null` rather than left to chance.
