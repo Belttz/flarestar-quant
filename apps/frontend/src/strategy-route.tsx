@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { CrossExRiskLimitTier } from '@gate-crossex/shared-types';
+import { STRATEGY_LOG_CATEGORIES, type CrossExRiskLimitTier, type StrategyLogCategory } from '@gate-crossex/shared-types';
 import {
   api,
   ApiError,
@@ -14,6 +14,7 @@ import {
   type MarketCatalogAsset,
   type MarketSnapshot,
   type StrategyConfig,
+  type StrategyLog,
   type StrategyRecord,
   type TradingSnapshot,
   type TradingMode,
@@ -57,13 +58,41 @@ import {
 } from './route-shared.js';
 import { strategyAssetOptions, strategyVenueSymbol } from './strategy-asset-options.js';
 import { StrategyAssetSearch } from './strategy-asset-search.js';
-import { localizeStrategyLogCondition, localizeStrategyLogResult, prepareStrategyLogs, type DisplayStrategyLog } from './strategy-logs.js';
+import { localizeStrategyLogCondition, localizeStrategyLogResult, describeStrategyLogError, prepareStrategyLogView, type DisplayStrategyLog } from './strategy-logs.js';
 import { PositionCloseDialog, type ClosePositionTarget } from './position-close-dialog.js';
 import { prepareStrategyPositions, type StrategyPositionRow } from './strategy-positions.js';
 import { PositionsTable } from './positions-table.js';
 import { StrategyLaunchConfirmation } from './strategy-launch-confirmation.js';
 import { useLanguage, type Language } from './i18n.js';
 import { numericFutureFeeRate } from './fee-rates.js';
+import { ExecutionPagination } from './execution-pagination-control.js';
+import { executionPageWindow } from './execution-pagination.js';
+import { StrategyLogLoadMore } from './strategy-log-load-more.js';
+
+/** Execution-log page size, shared by the client pager and the server-side fetch. */
+const LOG_PAGE_SIZE = 50;
+/** Cap the automatic continuation when a category superset page yields no visible rows. */
+const LOG_EMPTY_PAGE_ATTEMPTS = 3;
+/** Tab order plus the i18n key each category label resolves through. */
+const LOG_CATEGORY_LABELS: Record<StrategyLogCategory, string> = {
+  all: 'All',
+  execution: 'Open / Close',
+  risk: 'Take-profit & risk',
+  maker: 'Maker & hedge',
+  system: 'System',
+};
+
+/** Append a page of rows, dropping ids already buffered so a re-fetch never duplicates a row. */
+function mergeStrategyLogs(existing: StrategyLog[], incoming: StrategyLog[]): StrategyLog[] {
+  const seen = new Set(existing.map((log) => log.id));
+  const merged = [...existing];
+  for (const log of incoming) {
+    if (seen.has(log.id)) continue;
+    seen.add(log.id);
+    merged.push(log);
+  }
+  return merged;
+}
 
 const PremiumHistoryChart = lazy(() => import('./charts.js').then((module) => ({ default: module.PremiumHistoryChart })));
 const PriceDifferenceHistoryChart = lazy(() => import('./charts.js').then((module) => ({ default: module.PriceDifferenceHistoryChart })));
@@ -202,6 +231,13 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   const [selectedStrategyLogs, setSelectedStrategyLogs] = useState<DisplayStrategyLog[]>([]);
   const [logLoadState, setLogLoadState] = useState<{ status: 'idle' | 'loading' | 'loaded' | 'error'; message?: string }>({ status: 'idle' });
   const logRequestRef = useRef(0);
+  const [activeLogCategory, setActiveLogCategory] = useState<StrategyLogCategory>('all');
+  const [logRawBuffer, setLogRawBuffer] = useState<StrategyLog[]>([]);
+  const [logCursor, setLogCursor] = useState<{ createdAt: string; id: string } | null>(null);
+  const [logHasMore, setLogHasMore] = useState(false);
+  const [logLoadingOlder, setLogLoadingOlder] = useState(false);
+  const [logErrorKind, setLogErrorKind] = useState<'network' | 'timeout' | 'cancelled' | 'backend' | null>(null);
+  const [logPage, setLogPage] = useState(1);
   const [stopNotice, setStopNotice] = useState<string | null>(null);
   const [editingTakeProfitId, setEditingTakeProfitId] = useState<string | null>(null);
   const [takeProfitDraft, setTakeProfitDraft] = useState('');
@@ -292,25 +328,100 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
     }
   }
 
-  async function openLogs(id: string) {
+  async function openLogs(id: string, category: StrategyLogCategory = 'all') {
     const request = ++logRequestRef.current;
     const strategy = strategies.find((candidate) => candidate.id === id);
     setSelectedLogStrategyId(id);
+    setActiveLogCategory(category);
     setSelectedStrategyLogs([]);
+    setLogRawBuffer([]);
+    setLogCursor(null);
+    setLogHasMore(false);
+    setLogLoadingOlder(false);
+    setLogErrorKind(null);
+    setLogPage(1);
     setLogLoadState({ status: 'loading' });
     try {
-      const logs = prepareStrategyLogs(
-        (await api.strategyLogs(id)).logs,
-        strategy?.config,
-      );
+      let buffer: StrategyLog[] = [];
+      let cursor: { createdAt: string; id: string } | null = null;
+      let hasMore = false;
+      // The category query returns the grouping superset, so a single page can hold only dependency
+      // rows (e.g. a lone leg). Keep pulling until the tab shows something or the log ends, bounded
+      // so a pathological category can never spin forever.
+      for (let attempt = 0; attempt < LOG_EMPTY_PAGE_ATTEMPTS; attempt += 1) {
+        const before = cursor;
+        const response = await api.strategyLogs(id, { category, limit: LOG_PAGE_SIZE, ...(before ? { before } : {}) });
+        if (request !== logRequestRef.current) return;
+        buffer = mergeStrategyLogs(buffer, response.logs);
+        cursor = response.nextCursor ?? null;
+        hasMore = (response.hasMore ?? false) && cursor !== null;
+        if (prepareStrategyLogView(buffer, category, strategy?.config).length > 0 || !hasMore) break;
+      }
       if (request !== logRequestRef.current) return;
-      setSelectedStrategyLogs(logs);
+      setLogRawBuffer(buffer);
+      setLogHasMore(hasMore);
+      setLogCursor(hasMore ? cursor : null);
+      setSelectedStrategyLogs(prepareStrategyLogView(buffer, category, strategy?.config));
       setLogLoadState({ status: 'loaded' });
     } catch (error) {
       if (request !== logRequestRef.current) return;
+      const errorKind = describeStrategyLogError(error);
       setSelectedStrategyLogs([]);
+      setLogErrorKind(errorKind);
+      // A cancelled request (dialog closed or superseded by a newer one) is not a user-facing error.
+      if (errorKind === 'cancelled') { setLogLoadState({ status: 'loaded' }); return; }
       setLogLoadState({ status: 'error', message: error instanceof ApiError ? error.message : t('Backend unavailable') });
     }
+  }
+
+  async function loadOlderLogs() {
+    const id = selectedLogStrategyId;
+    if (!id || logLoadingOlder || !logHasMore || !logCursor) return;
+    const request = logRequestRef.current;
+    const category = activeLogCategory;
+    const strategy = strategies.find((candidate) => candidate.id === id);
+    setLogLoadingOlder(true);
+    try {
+      let buffer = logRawBuffer;
+      let cursor: { createdAt: string; id: string } | null = logCursor;
+      let hasMore: boolean = logHasMore;
+      for (let attempt = 0; attempt < LOG_EMPTY_PAGE_ATTEMPTS; attempt += 1) {
+        const before = cursor;
+        if (!before) { hasMore = false; break; }
+        const visibleBefore = prepareStrategyLogView(buffer, category, strategy?.config).length;
+        const response = await api.strategyLogs(id, { category, limit: LOG_PAGE_SIZE, before });
+        if (request !== logRequestRef.current) return;
+        buffer = mergeStrategyLogs(buffer, response.logs);
+        cursor = response.nextCursor ?? null;
+        hasMore = (response.hasMore ?? false) && cursor !== null;
+        // Stop as soon as the page contributed a visible row (or the log ended); otherwise keep going.
+        if (prepareStrategyLogView(buffer, category, strategy?.config).length > visibleBefore || !hasMore) break;
+      }
+      setLogRawBuffer(buffer);
+      setLogHasMore(hasMore);
+      setLogCursor(hasMore ? cursor : null);
+      setSelectedStrategyLogs(prepareStrategyLogView(buffer, category, strategy?.config));
+      setLogPage(1);
+    } catch (error) {
+      if (request !== logRequestRef.current) return;
+      const errorKind = describeStrategyLogError(error);
+      if (errorKind === 'cancelled') return;
+      setLogErrorKind(errorKind);
+      setLogLoadState({ status: 'error', message: error instanceof ApiError ? error.message : t('Backend unavailable') });
+    } finally {
+      if (request === logRequestRef.current) setLogLoadingOlder(false);
+    }
+  }
+
+  function changeLogCategory(category: StrategyLogCategory) {
+    const id = selectedLogStrategyId;
+    if (!id || category === activeLogCategory) return;
+    void openLogs(id, category);
+  }
+
+  function retryLogs() {
+    const id = selectedLogStrategyId;
+    if (id) void openLogs(id, activeLogCategory);
   }
 
   function editTakeProfit(strategy: StrategyRecord) {
@@ -413,36 +524,131 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
       notify={(kind, title, text) => setCloseNotice({ kind, title, text })}
     />}
     {closeNotice && <div className={closeNotice.kind === 'error' ? 'toast toast-error' : 'toast'} role={closeNotice.kind === 'error' ? 'alert' : 'status'}><span>{closeNotice.kind === 'error' ? '!' : '✓'}</span><div><strong>{closeNotice.title}</strong><p>{closeNotice.text}</p></div></div>}
-    {selectedLogStrategy && <div className="execution-log-backdrop" role="presentation" onMouseDown={() => setSelectedLogStrategyId(null)}>
-      <section ref={logDialogRef} tabIndex={-1} className="execution-log-modal" role="dialog" aria-modal="true" aria-labelledby="execution-log-title" onMouseDown={(event) => event.stopPropagation()}>
-        <header><div><p className="eyebrow">{t('Strategy execution log')}</p><h2 id="execution-log-title">{selectedLogStrategy.id}</h2><span>{strategyMarketLabel(selectedLogStrategy.config)} · {selectedLogStrategy.config.closePlan ? [...new Set(selectedLogStrategy.config.closePlan.targets.map((target) => symbolParts(target.symbol).venue))].join(' ⇄ ') : selectedLogStrategy.config.leftVenue === selectedLogStrategy.config.rightVenue ? selectedLogStrategy.config.leftVenue : `${selectedLogStrategy.config.leftVenue} ⇄ ${selectedLogStrategy.config.rightVenue}`}</span></div><button data-dialog-autofocus aria-label={t('Close execution log')} onClick={() => setSelectedLogStrategyId(null)}>×</button></header>
-        <div className="execution-log-summary"><div><span>{t('Strategy')}</span><strong>{t(selectedLogStrategy.config.closePlan ? 'Hedge position strategy' : selectedLogStrategy.kind === 'auto' ? 'Auto price difference' : selectedLogStrategy.kind === 'premium' ? 'SK hynix premium bot' : selectedLogStrategy.kind === 'carry' ? 'Spot-perpetual carry bot' : 'Cross-exchange hedge')}</strong></div><div><span>{t('Status')}</span><strong className="positive">● {selectedLogStrategy.status}</strong></div><div><span>{t('Execution method')}</span><strong>{selectedLogStrategy.config.executionMethod.replaceAll('_', '–')}</strong></div></div>
-        <div className="execution-log-table">
-          <div className="execution-log-head"><span>{t('Time')}</span><span>{t('Event')}</span><span>{t('Spread / trigger')}</span><span>{t('Quantity')}</span><span>{t('Execution result')}</span><span>{t('Result')}</span></div>
-          {logLoadState.status === 'loading' && <div className="execution-log-state">{t('Loading execution log…')}</div>}
-          {logLoadState.status === 'error' && <div className="execution-log-state error">{t('Execution log unavailable')}: {logLoadState.message}</div>}
-          {logLoadState.status === 'loaded' && selectedStrategyLogs.length === 0 && <div className="execution-log-state">{t('No execution events yet.')}</div>}
-          {selectedStrategyLogs.map((log) => <div className="execution-log-row" key={log.id}>
-            <span>{new Date(log.createdAt).toLocaleTimeString(language === 'zh' ? 'zh-CN' : 'en-US')}</span>
-            <span><strong>{t(log.event)}</strong><small>{t(log.level)}</small></span>
-            <span>{localizeStrategyLogCondition(log.condition, language)}</span>
-            <span>{log.quantity}</span>
-            <span className="execution-metric">
-              {log.executionPremiumPct !== null ? <>
-                <strong className={Number(log.executionPremiumPct) >= 0 ? 'positive' : 'negative'}>{Number(log.executionPremiumPct) >= 0 ? '+' : ''}{log.executionPremiumPct}%</strong>
-                <small>{t('ADR premium')}</small>
-              </> : log.executionSpreadBps !== null ? <>
-                <strong className={Number(log.executionSpreadBps) >= 0 ? 'positive' : 'negative'}>{Number(log.executionSpreadBps) >= 0 ? '+' : ''}{log.executionSpreadBps} bps</strong>
-                <small>{t('Actual spread')}</small>
-              </> : '—'}
-            </span>
-            <span>{localizeStrategyLogResult(log.result, language)}</span>
-          </div>)}
-        </div>
-        <footer><span><i /> {t('Persistent backend log')}</span><small>{t('Showing executions for')} {selectedLogStrategy.id} {t('only')}</small></footer>
-      </section>
-    </div>}
+    {selectedLogStrategy && <StrategyExecutionLogDialog
+      strategy={selectedLogStrategy}
+      rows={selectedStrategyLogs}
+      loadState={logLoadState}
+      activeCategory={activeLogCategory}
+      onCategoryChange={changeLogCategory}
+      page={logPage}
+      onPageChange={setLogPage}
+      hasMore={logHasMore}
+      loadingOlder={logLoadingOlder}
+      onLoadOlder={() => void loadOlderLogs()}
+      errorKind={logErrorKind}
+      onRetry={retryLogs}
+      onClose={() => setSelectedLogStrategyId(null)}
+      dialogRef={logDialogRef}
+    />}
   </>;
+}
+
+/**
+ * The read-only execution-log dialog. Hoisted out of `RunningStrategiesPanel` so it can be
+ * server-rendered in tests (this workspace has no jsdom, so the modal's ARIA contract is asserted
+ * from static markup). The parent owns all state and side effects; this is a pure presentational view.
+ */
+export function StrategyExecutionLogDialog({
+  strategy,
+  rows,
+  loadState,
+  activeCategory,
+  onCategoryChange,
+  page,
+  onPageChange,
+  hasMore,
+  loadingOlder,
+  onLoadOlder,
+  errorKind,
+  onRetry,
+  onClose,
+  dialogRef,
+}: {
+  strategy: StrategyRecord;
+  rows: DisplayStrategyLog[];
+  loadState: { status: 'idle' | 'loading' | 'loaded' | 'error'; message?: string };
+  activeCategory: StrategyLogCategory;
+  onCategoryChange: (category: StrategyLogCategory) => void;
+  page: number;
+  onPageChange: (page: number) => void;
+  hasMore: boolean;
+  loadingOlder: boolean;
+  onLoadOlder: () => void;
+  errorKind: 'network' | 'timeout' | 'cancelled' | 'backend' | null;
+  onRetry: () => void;
+  onClose: () => void;
+  dialogRef: ReturnType<typeof useDialogFocus>;
+}) {
+  const { language, t } = useLanguage();
+  const config = strategy.config;
+  // Client-side windowing over the buffered rows; the pager's item count is the full visible set.
+  const logWindow = executionPageWindow(rows.length, page, LOG_PAGE_SIZE);
+  const visibleRows = rows.slice(logWindow.start, logWindow.end);
+  const venueLabel = config.closePlan
+    ? [...new Set(config.closePlan.targets.map((target) => symbolParts(target.symbol).venue))].join(' ⇄ ')
+    : config.leftVenue === config.rightVenue ? config.leftVenue : `${config.leftVenue} ⇄ ${config.rightVenue}`;
+  return <div className="execution-log-backdrop" role="presentation" onMouseDown={onClose}>
+    <section ref={dialogRef} tabIndex={-1} className="execution-log-modal" role="dialog" aria-modal="true" aria-labelledby="execution-log-title" onMouseDown={(event) => event.stopPropagation()}>
+      <header>
+        <div>
+          <p className="eyebrow">{t('Strategy execution log')}</p>
+          <h2 id="execution-log-title">{strategy.id}</h2>
+          <span>{strategyMarketLabel(config)} · {venueLabel}</span>
+        </div>
+        <button data-dialog-autofocus aria-label={t('Close execution log')} onClick={onClose}>×</button>
+      </header>
+      <div className="execution-log-summary"><div><span>{t('Strategy')}</span><strong>{t(config.closePlan ? 'Hedge position strategy' : strategy.kind === 'auto' ? 'Auto price difference' : strategy.kind === 'premium' ? 'SK hynix premium bot' : strategy.kind === 'carry' ? 'Spot-perpetual carry bot' : 'Cross-exchange hedge')}</strong></div><div><span>{t('Status')}</span><strong className="positive">● {strategy.status}</strong></div><div><span>{t('Execution method')}</span><strong>{config.executionMethod.replaceAll('_', '–')}</strong></div></div>
+      <div className="strategy-log-tabs" role="tablist" aria-label={t('Execution log category')}>
+        {STRATEGY_LOG_CATEGORIES.map((category, index) => (
+          <button key={category} type="button" role="tab" aria-selected={category === activeCategory}
+            tabIndex={category === activeCategory ? 0 : -1}
+            className={category === activeCategory ? 'active' : ''}
+            onClick={() => onCategoryChange(category)}
+            onKeyDown={(event) => {
+              if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft' && event.key !== 'Home' && event.key !== 'End') return;
+              event.preventDefault();
+              const nextIndex = event.key === 'Home' ? 0
+                : event.key === 'End' ? STRATEGY_LOG_CATEGORIES.length - 1
+                : event.key === 'ArrowRight' ? (index + 1) % STRATEGY_LOG_CATEGORIES.length
+                : (index - 1 + STRATEGY_LOG_CATEGORIES.length) % STRATEGY_LOG_CATEGORIES.length;
+              onCategoryChange(STRATEGY_LOG_CATEGORIES[nextIndex]);
+            }}>
+            {t(LOG_CATEGORY_LABELS[category])}
+          </button>
+        ))}
+      </div>
+      <div className="execution-log-table">
+        <div className="execution-log-head"><span>{t('Time')}</span><span>{t('Event')}</span><span>{t('Spread / trigger')}</span><span>{t('Quantity')}</span><span>{t('Execution result')}</span><span>{t('Result')}</span></div>
+        {loadState.status === 'loading' && <div className="execution-log-state">{t('Loading execution log…')}</div>}
+        {loadState.status === 'error' && errorKind !== 'cancelled' && <div className="execution-log-state error" role="alert">
+          <span>{errorKind === 'network' ? t('Could not reach the backend.') : errorKind === 'timeout' ? t('The request timed out.') : t('The backend returned an error.')}</span>
+          <button type="button" className="retry-logs" onClick={onRetry}>{t('Try again')}</button>
+        </div>}
+        {loadState.status === 'loaded' && visibleRows.length === 0 && <div className="execution-log-state">{activeCategory === 'all' ? t('No execution events yet.') : t('No events in this category.')}</div>}
+        {visibleRows.map((log) => <div className="execution-log-row" key={log.id}>
+          <span>{new Date(log.createdAt).toLocaleTimeString(language === 'zh' ? 'zh-CN' : 'en-US')}</span>
+          <span><strong>{t(log.event)}</strong><small>{t(log.level)}</small></span>
+          <span>{localizeStrategyLogCondition(log.condition, language)}</span>
+          <span>{log.quantity}</span>
+          <span className="execution-metric">
+            {log.executionPremiumPct !== null ? <>
+              <strong className={Number(log.executionPremiumPct) >= 0 ? 'positive' : 'negative'}>{Number(log.executionPremiumPct) >= 0 ? '+' : ''}{log.executionPremiumPct}%</strong>
+              <small>{t('ADR premium')}</small>
+            </> : log.executionSpreadBps !== null ? <>
+              <strong className={Number(log.executionSpreadBps) >= 0 ? 'positive' : 'negative'}>{Number(log.executionSpreadBps) >= 0 ? '+' : ''}{log.executionSpreadBps} bps</strong>
+              <small>{t('Actual spread')}</small>
+            </> : '—'}
+          </span>
+          <span>{localizeStrategyLogResult(log.result, language)}</span>
+        </div>)}
+      </div>
+      <div className="execution-log-pager">
+        <ExecutionPagination itemCount={rows.length} page={logWindow.page} onPageChange={onPageChange} pageSize={LOG_PAGE_SIZE} />
+        <StrategyLogLoadMore hasMore={hasMore} loading={loadingOlder} onLoad={onLoadOlder} />
+      </div>
+      <footer><span><i /> {t('Persistent backend log')}</span><small>{t('Showing executions for')} {strategy.id} {t('only')}</small></footer>
+    </section>
+  </div>;
 }
 
 interface StrategyViewProps {

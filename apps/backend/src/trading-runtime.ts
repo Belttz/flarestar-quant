@@ -17,6 +17,25 @@ import {
 import type { PrivateCrossExEvent } from './private-stream.js';
 import { readInstrumentCatalog } from './repositories.js';
 import type { TradingSession } from './trading-session.js';
+import { STRATEGY_LOG_CATEGORY_FETCH_EVENTS, type StrategyLogCategory } from '@gate-crossex/shared-types';
+
+/** A persisted execution-log row in its API shape (database column names mapped to wire names). */
+interface StrategyLogRow {
+  id: string;
+  level: string;
+  event: string;
+  condition: string;
+  quantity: string;
+  result: string;
+  createdAt: string;
+}
+
+/** One keyset page of strategy logs plus the cursor needed to continue into older rows. */
+export interface StrategyLogPage {
+  logs: StrategyLogRow[];
+  hasMore: boolean;
+  nextCursor: { createdAt: string; id: string } | null;
+}
 
 const decimalText = z.string().regex(/^\d+(?:\.\d+)?$/).refine((value) => new Decimal(value).gt(0));
 /** Premium levels may be negative (an ADR trading at a discount), so sign is allowed. */
@@ -637,6 +656,56 @@ export class TradingRuntime {
       FROM execution_strategy_logs WHERE strategy_id = ? ORDER BY created_at DESC LIMIT 200`).all(strategyId) as Array<Record<string, string>>;
     return rows.map((row) => ({ id: row.id, level: row.level, event: row.event, condition: row.condition_text,
       quantity: row.quantity, result: row.result_text, createdAt: row.created_at }));
+  }
+
+  /**
+   * Keyset-paginated slice of a strategy's execution log. Rows are ordered newest-first by
+   * `(created_at, id)`; the id tie-break keeps equal-millisecond clip legs from being skipped or
+   * duplicated across pages (the ISO timestamp is millisecond-precision and both legs of one clip
+   * can land on the same instant). `category` narrows the scan to the events — plus the grouping
+   * dependencies of `STRATEGY_LOG_CATEGORY_FETCH_EVENTS` — the filtered view needs; `'all'`
+   * selects every event. `LIMIT` fetches one extra row to detect `hasMore` without a second query.
+   */
+  strategyLogPage(
+    strategyId: string,
+    options: { category: StrategyLogCategory; limit: number; before?: { createdAt: string; id: string } },
+  ): StrategyLogPage {
+    const clauses = ['strategy_id = ?'];
+    const params: Array<string | number> = [strategyId];
+    if (options.before) {
+      clauses.push('(created_at < ? OR (created_at = ? AND id < ?))');
+      params.push(options.before.createdAt, options.before.createdAt, options.before.id);
+    }
+    if (options.category !== 'all') {
+      // A category's fetch set mixes exact names with SQL LIKE prefix patterns (a `%` suffix). The
+      // leg-level events use a pattern because their tail is a dynamic order state that no fixed
+      // IN-list can close over. Both kinds collapse into one OR term before LIMIT, so the keyset
+      // page and its ordering are unchanged.
+      const events = STRATEGY_LOG_CATEGORY_FETCH_EVENTS[options.category];
+      const exact = events.filter((event) => !event.endsWith('%'));
+      const patterns = events.filter((event) => event.endsWith('%'));
+      const eventTerms: string[] = [];
+      if (exact.length > 0) eventTerms.push(`event IN (${exact.map(() => '?').join(', ')})`);
+      eventTerms.push(...patterns.map(() => 'event LIKE ?'));
+      clauses.push(`(${eventTerms.join(' OR ')})`);
+      params.push(...exact, ...patterns);
+    }
+    const rows = this.statement(`SELECT id, level, event, condition_text, quantity, result_text, created_at
+      FROM execution_strategy_logs
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?`).all(...params, options.limit + 1) as Array<Record<string, string>>;
+
+    const hasMore = rows.length > options.limit;
+    const pageRows = hasMore ? rows.slice(0, options.limit) : rows;
+    const last = pageRows[pageRows.length - 1];
+    const nextCursor = hasMore && last ? { createdAt: last.created_at, id: last.id } : null;
+    return {
+      logs: pageRows.map((row) => ({ id: row.id, level: row.level, event: row.event, condition: row.condition_text,
+        quantity: row.quantity, result: row.result_text, createdAt: row.created_at })),
+      hasMore,
+      nextCursor,
+    };
   }
 
   listBalances(): LiveBalance[] {

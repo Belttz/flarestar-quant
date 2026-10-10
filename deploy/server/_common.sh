@@ -112,9 +112,82 @@ env_value() {
   grep -E "^$1=" "$ENV_FILE" | tail -n 1 | cut -d= -f2- || true
 }
 
+# ---------------------------------------------------------------- 域名 / IP 判定
+# 判定 IPv4 字面量（点分十进制，四段 0-255）。是 → 0。
+_is_ipv4_literal() {
+  local addr="$1"
+  # 含非数字非点字符的（字母、连字符等）一律不是 IPv4 —— 这一步把域名挡在外面。
+  case "$addr" in
+    *[!0-9.]*) return 1 ;;
+  esac
+  # 必须是恰好四段。
+  local IFS='.'
+  # shellcheck disable=SC2206  # $addr 已过滤为纯数字与点，可安全按 IFS 切分。
+  local parts=($addr)
+  [ "${#parts[@]}" -eq 4 ] || return 1
+  local octet
+  for octet in "${parts[@]}"; do
+    case "$octet" in
+      ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "${#octet}" -le 3 ] || return 1
+    # 用 10# 前缀强制按十进制解析，避免 08 / 09 被当成八进制报错。
+    [ "$((10#$octet))" -le 255 ] || return 1
+  done
+  return 0
+}
+
+# 判定 IPv6 字面量（支持 :: 压缩与 %zone）。是 → 0。
+_is_ipv6_literal() {
+  local addr="$1"
+  addr="${addr%%\%*}"          # 去掉 link-local 的 zone id（fe80::1%eth0）
+  [ -n "$addr" ] || return 1
+  case "$addr" in
+    *[!0-9A-Fa-f:]*) return 1 ;;
+  esac
+  local compressed=0
+  case "$addr" in
+    *::*::*) return 1 ;;   # 出现两个 :: 非法
+    *::*) compressed=1 ;;
+  esac
+  local IFS=':'
+  # shellcheck disable=SC2206  # 已过滤为十六进制与冒号。
+  local parts=($addr)
+  local seg count=0
+  for seg in "${parts[@]}"; do
+    [ -n "$seg" ] || continue      # 跳过 :: 产生的空段
+    [ "${#seg}" -le 4 ] || return 1
+    case "$seg" in *[!0-9A-Fa-f]*) return 1 ;; esac
+    count=$((count + 1))
+  done
+  if [ "$compressed" -eq 1 ]; then
+    # 用了 :: 压缩：总段数必须少于 8（:: 至少要吞掉一段）。
+    [ "$count" -lt 8 ] && return 0
+    return 1
+  fi
+  # 没用 ::：必须是完整的 8 段。
+  [ "$count" -eq 8 ] && return 0
+  return 1
+}
+
+# 判定参数是否为 IP 字面量（IPv4 或 IPv6）。是 → 0。
+#
+# 为什么需要它：把裸 IP 填进 GCT_DOMAIN 会得到一个「IP 站点地址」，Caddy 对 IP 站点地址
+# 拿不到证书、只监听 80 端口 —— 部署静默降级成明文 HTTP 且没有任何报错。凡是要拿 GCT_DOMAIN
+# 当域名用的地方，都必须先用本函数把 IP 识别出来。
+# 注意：绝不能把 quant.example.com / my-3.2-host.example.com 这类真域名误判为 IP。
+is_ip_literal() {
+  local candidate="$1"
+  [ -n "$candidate" ] || return 1
+  case "$candidate" in
+    *:*) _is_ipv6_literal "$candidate" && return 0; return 1 ;;
+  esac
+  _is_ipv4_literal "$candidate"
+}
+
 # 依据 cloud.env 里的 GCT_DOMAIN 决定要叠加哪些 compose 文件：
-#   - 填了域名        → 只跑基础文件（deploy/Caddyfile，含自动 HTTPS）
-#   - 域名为空        → 再叠加 no-domain 覆盖文件（deploy/Caddyfile.no-domain，仅明文 HTTP）
+#   - 填了真域名      → 只跑基础文件（deploy/Caddyfile，含自动 HTTPS）
+#   - 域名为空 / 是 IP→ 再叠加 no-domain 覆盖文件（deploy/Caddyfile.no-domain，仅明文 HTTP）
 # 由 cloud.env 单一来源判定，install / update / uninstall 三条脚本得到同一套 -f 参数。
 compose_files=()
 
@@ -126,6 +199,11 @@ resolve_compose_files() {
   local domain
   domain="$(env_value GCT_DOMAIN | tr -d '[:space:]')"
   if [ -z "$domain" ]; then
+    compose_files+=(-f "$NODOMAIN_COMPOSE_FILE")
+  elif is_ip_literal "$domain"; then
+    # 历史遗留 / 手填的 IP：对 IP 站点地址 Caddy 无法申请证书、只会监听 80，
+    # 走「域名站」分支毫无意义 —— 与空域名同路径，改用不含域名站点的 Caddyfile.no-domain。
+    warn "GCT_DOMAIN 是一个 IP 地址（${domain}），不是域名：按无域名模式处理（仅明文 HTTP，无证书）。"
     compose_files+=(-f "$NODOMAIN_COMPOSE_FILE")
   fi
 }
@@ -179,4 +257,54 @@ wait_for_health() {
 
 require_env_file() {
   [ -f "$ENV_FILE" ] || fail "找不到配置文件 ${ENV_FILE}。请先运行 ./deploy/server/install.sh。"
+}
+
+# ---------------------------------------------------------------- 部署配置防篡改
+# 受版本控制的部署配置文件。这些文件**不是**用户配置面（用户配置全在 cloud.env），
+# 对它们的手改在这套部署模型里一律视为错误：例如给站点地址加个 `http://` 前缀就能
+# 静默禁用 Caddy 的 automatic HTTPS，而因为它是脱离 git 的就地改动，git pull /
+# docker compose up --build 都不会发现，故障可以无声存活很久。能禁用 HTTPS 的改动
+# 绝不该跨过一次重新部署存活。
+DEPLOY_CONFIG_PATHS=(deploy docker-compose.cloud.yml docker-compose.cloud.nodomain.yml docker-compose.yml)
+
+# 检测被本地改动的受版本控制部署文件，并默认从 git 恢复它们（git checkout -- <path>）。
+#   - 逃生舱：GCT_KEEP_DEPLOY_CONFIG=1 时只告警、不恢复。
+#   - 仓库不是 git 仓库时静默跳过。
+#   - 绝不触碰 cloud.env / .local-data / 数据卷，也绝不 checkout 整个仓库（只限定上面那批路径）。
+# 该函数在 `set -euo pipefail` 下也必须幂等、非交互安全。
+restore_modified_deploy_config() {
+  [ -d "$REPO_ROOT/.git" ] && command -v git >/dev/null 2>&1 || return 0
+
+  # git diff 在非仓库 / 路径歧义等情况下可能非零退出；用 || true 兜住，避免 set -e 中断部署。
+  # core.fileMode=false：忽略文件权限位变化，只比对内容。部署流程本身会给脚本 chmod +x
+  # （例如 deploy/server/install.sh 变成 100755，而 git 里记录的是 100644），若不忽略，
+  # 每次部署都会把它误判成「被手改」并 git checkout 回 644，反而弄丢可执行位。
+  local modified
+  modified="$(git -C "$REPO_ROOT" -c core.fileMode=false \
+    diff --name-only -- "${DEPLOY_CONFIG_PATHS[@]}" 2>/dev/null || true)"
+  [ -n "$modified" ] || return 0
+
+  warn "检测到受版本控制的部署文件被本地改动（这些文件不应手工编辑；改域名请改 cloud.env 的 GCT_DOMAIN）："
+  local file
+  while IFS= read -r file; do
+    if [ -n "$file" ]; then warn "    - ${file}"; fi
+  done <<< "$modified"
+
+  if [ "${GCT_KEEP_DEPLOY_CONFIG:-0}" = "1" ]; then
+    warn "GCT_KEEP_DEPLOY_CONFIG=1：保留这些本地改动、未做恢复。请自行确认它们不会破坏 HTTPS 证书申请。"
+    return 0
+  fi
+
+  local restore_paths=()
+  while IFS= read -r file; do
+    if [ -n "$file" ]; then restore_paths+=("$file"); fi
+  done <<< "$modified"
+
+  warn "正在从 git 恢复上述文件（git checkout -- <path>）..."
+  if git -C "$REPO_ROOT" checkout -- "${restore_paths[@]}" 2>/dev/null; then
+    ok "已恢复被改动的部署文件：${restore_paths[*]}"
+  else
+    warn "自动恢复失败（可能有未跟踪的同名文件或权限问题）。请手动执行：git -C '${REPO_ROOT}' checkout -- ${restore_paths[*]}"
+  fi
+  return 0
 }

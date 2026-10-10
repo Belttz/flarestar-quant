@@ -2,6 +2,23 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [0.3.1] - 2026-10-11
+
+### Added
+
+- `npm run version:sync` (`scripts/sync-version.mjs`): pins every workspace manifest and `package-lock.json` to the version declared in the root `package.json`, which is now the single source of truth. Supports `--check` for CI and fails loudly on structural problems.
+- `npm run release:server` (`scripts/release-server.mjs`): one-command release helper — verifies version consistency, builds, produces `deliverables/dist/flarestar-quant-<version>-src.tar.gz` from HEAD via `git archive`, and prints the tag/push and server-upgrade commands. It never commits, tags, or pushes.
+- `npm run test:version` (`scripts/version-consistency.test.mjs`): regression test asserting workspace versions, `@gate-crossex/*` dependency ranges, the sync plan, and the `cloud.env` ignore rule.
+
+### Changed
+
+- Unified all workspace versions from the drifting `0.3.0`/`0.2.5` values to `0.3.1`, so the release-bundle version guard passes again.
+- `.gitignore` now ignores the root `cloud.env` (domain + login password) in a root-anchored way; `deploy/cloud.env.example` stays tracked.
+
+### Fixed
+
+- `/health` now reports the real application version. The endpoint previously used `process.env.npm_package_version`, which is unset when the Docker image starts the server with a bare `node`, so it always reported the hard-coded `0.1.0`; it now reads the backend package version (compiled and source layouts alike) with a safe fallback.
+
 ## [0.3.0] - 2026-10-10
 
 ### Added

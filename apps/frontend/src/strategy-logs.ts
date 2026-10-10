@@ -1,4 +1,5 @@
-import type { StrategyConfig, StrategyLog } from './api.js';
+import { ApiError, type StrategyConfig, type StrategyLog } from './api.js';
+import { STRATEGY_LOG_EVENT_CATEGORY, STRATEGY_LOG_LEG_EVENT_PREFIXES, type StrategyLogCategory } from '@gate-crossex/shared-types';
 
 export interface DisplayStrategyLog extends StrategyLog {
   executionPremiumPct: string | null;
@@ -60,7 +61,7 @@ export function localizeStrategyLogResult(result: string, language: StrategyLogL
     .replace(/\bmarket\b/gi, '市价');
 }
 
-function isFilledLeg(log: StrategyLog): boolean {
+export function isFilledLeg(log: StrategyLog): boolean {
   return log.event === 'Left leg filled' || log.event === 'Right leg filled';
 }
 
@@ -134,9 +135,14 @@ function executionPrices(result: string): number[] {
  * The execution result always stores the left-leg fill first and the right-leg fill second.
  */
 export function prepareStrategyLogs(logs: StrategyLog[], config?: StrategyLogMetricConfig): DisplayStrategyLog[] {
+  return decorateStrategyLogExecutions(groupStrategyLogs(logs), config);
+}
+
+/** Share the metric decoration between the full log and the category-filtered view. */
+function decorateStrategyLogExecutions(grouped: StrategyLog[], config?: StrategyLogMetricConfig): DisplayStrategyLog[] {
   const ratio = Number(config?.adrRatio);
 
-  return groupStrategyLogs(logs).map((log) => {
+  return grouped.map((log) => {
     const isExecution = log.event === 'Position open Executed'
       || log.event === 'Take-profit Executed'
       || log.event === 'Reduce-only Executed';
@@ -168,4 +174,46 @@ export function prepareStrategyLogs(logs: StrategyLog[], config?: StrategyLogMet
       executionSpreadBps: (((sellPrice - buyPrice) / buyPrice) * 10_000).toFixed(2),
     };
   });
+}
+
+/**
+ * Resolve a persisted or grouped event name to its display category. Leg diagnostics use a dynamic
+ * `Left leg <state>` / `Right leg <state>` shape, so they are matched by the shared
+ * `STRATEGY_LOG_LEG_EVENT_PREFIXES` (the same list the backend's `LIKE` fetch derives from, so the
+ * two can never drift); anything the backend has never emitted falls back to `system`.
+ */
+export function classifyStrategyLogEvent(event: string): Exclude<StrategyLogCategory, 'all'> {
+  const mapped = STRATEGY_LOG_EVENT_CATEGORY[event];
+  if (mapped) return mapped;
+  if (STRATEGY_LOG_LEG_EVENT_PREFIXES.some((prefix) => event.startsWith(prefix))) return 'execution';
+  return 'system';
+}
+
+export function strategyLogRowCategory(row: StrategyLog): Exclude<StrategyLogCategory, 'all'> {
+  return classifyStrategyLogEvent(row.event);
+}
+
+/**
+ * Build the rows a single category tab shows: group + derive metrics over the raw buffer first, then
+ * filter the grouped rows back down to the category. Grouping must happen before filtering — a
+ * category query returns the dependency rows (trigger + legs) so the clip can be rebuilt, and
+ * filtering the raw rows first would drop half of a pair and leak ungrouped leg diagnostics.
+ */
+export function prepareStrategyLogView(
+  rawBuffer: StrategyLog[],
+  category: StrategyLogCategory,
+  config?: StrategyLogMetricConfig,
+): DisplayStrategyLog[] {
+  const view = prepareStrategyLogs(rawBuffer, config);
+  if (category === 'all') return view;
+  return view.filter((row) => strategyLogRowCategory(row) === category);
+}
+
+/** Map an API failure to the message the log dialog shows (or `cancelled` to stay silent). */
+export function describeStrategyLogError(error: unknown): 'network' | 'timeout' | 'cancelled' | 'backend' {
+  if (!(error instanceof ApiError)) return 'backend';
+  if (error.code === 'backend_unavailable') return 'network';
+  if (error.code === 'request_timeout') return 'timeout';
+  if (error.code === 'request_cancelled') return 'cancelled';
+  return 'backend';
 }

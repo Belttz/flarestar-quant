@@ -1161,7 +1161,221 @@ describe('local backend', () => {
       ...host, 'x-gct-trading-intent': 'stop-strategy',
     } });
     expect(stop.statusCode).toBe(200);
-    expect(stop.json()).toMatchObject({ id, status: 'STOPPED' });
+      expect(stop.json()).toMatchObject({ id, status: 'STOPPED' });
+  });
+
+  // A premium strategy row is the minimal fixture the log route requires.
+  function seedLogStrategy(database: Database.Database, id: string, now: string): void {
+    const config = {
+      kind: 'premium', asset: 'SKHY', hedgeAsset: 'SKHYNIX', adrRatio: '10',
+      leftVenue: 'GATE', rightVenue: 'GATE', leftSide: 'SELL', rightSide: 'BUY',
+      entryPremiumPct: '33', takeProfitPremiumPct: '32.5', maxPosition: '5',
+      perOrderQuantity: '1', reduceOnly: false, executionMethod: 'TAKER_TAKER',
+    };
+    database.prepare(`INSERT INTO execution_strategies (id, kind, environment, status, config_json, progress,
+      filled_quantity, filled_left, filled_right, open_position, created_at, updated_at, stopped_at)
+      VALUES (?, 'premium', 'live', 'RUNNING', ?, 100, '5', '5', '5', '5', ?, ?, NULL)`)
+      .run(id, JSON.stringify(config), now, now);
+  }
+
+  it('pages execution logs with a (created_at, id) keyset cursor and reports hasMore/nextCursor', async () => {
+    const { app, database } = await createTestApp({ liveTradingEnabled: true });
+    const id = 'PREM-PAGE0001';
+    const now = new Date().toISOString();
+    seedLogStrategy(database, id, now);
+    const insert = database.prepare(`INSERT INTO execution_strategy_logs
+      (id, strategy_id, level, event, condition_text, quantity, result_text, created_at)
+      VALUES (?, ?, 'info', 'Strategy started', 'c', 'q', 'r', ?)`);
+    const stamps = ['2026-01-05T00:00:00.000Z', '2026-01-04T00:00:00.000Z', '2026-01-03T00:00:00.000Z', '2026-01-02T00:00:00.000Z', '2026-01-01T00:00:00.000Z'];
+    stamps.forEach((stamp, index) => insert.run(`log-${index}`, id, stamp));
+    const host = { host: '127.0.0.1:17840' };
+    const ids = (payload: { logs: Array<{ id: string }> }) => payload.logs.map((row) => row.id);
+
+    const first = await app.inject({ method: 'GET', url: `/api/strategies/${id}/logs?limit=2`, headers: host });
+    expect(first.statusCode).toBe(200);
+    expect(ids(first.json())).toEqual(['log-0', 'log-1']);
+    expect(first.json().hasMore).toBe(true);
+    expect(first.json().nextCursor).toEqual({ createdAt: stamps[1], id: 'log-1' });
+
+    const cursor = first.json().nextCursor as { createdAt: string; id: string };
+    const second = await app.inject({ method: 'GET',
+      url: `/api/strategies/${id}/logs?limit=2&before=${encodeURIComponent(cursor.createdAt)}&beforeId=${encodeURIComponent(cursor.id)}`, headers: host });
+    expect(ids(second.json())).toEqual(['log-2', 'log-3']);
+    expect(second.json().hasMore).toBe(true);
+
+    const secondCursor = second.json().nextCursor as { createdAt: string; id: string };
+    const third = await app.inject({ method: 'GET',
+      url: `/api/strategies/${id}/logs?limit=2&before=${encodeURIComponent(secondCursor.createdAt)}&beforeId=${encodeURIComponent(secondCursor.id)}`, headers: host });
+    expect(ids(third.json())).toEqual(['log-4']);
+    expect(third.json().hasMore).toBe(false);
+    expect(third.json().nextCursor).toBeNull();
+
+    // A bare request stays equivalent to the legacy newest-200 page.
+    const legacy = await app.inject({ method: 'GET', url: `/api/strategies/${id}/logs`, headers: host });
+    expect(legacy.statusCode).toBe(200);
+    expect(ids(legacy.json())).toEqual(['log-0', 'log-1', 'log-2', 'log-3', 'log-4']);
+    expect(legacy.json().hasMore).toBe(false);
+  });
+
+  it('keeps equal-millisecond clip legs from being skipped across a cursor page boundary', async () => {
+    const { app, database } = await createTestApp({ liveTradingEnabled: true });
+    const id = 'PREM-TIE00001';
+    const now = new Date().toISOString();
+    seedLogStrategy(database, id, now);
+    const insert = database.prepare(`INSERT INTO execution_strategy_logs
+      (id, strategy_id, level, event, condition_text, quantity, result_text, created_at)
+      VALUES (?, ?, 'info', ?, 'c', 'q', 'r', ?)`);
+    const sameInstant = '2026-02-01T00:00:00.000Z';
+    insert.run('leg-left', id, 'Left leg filled', sameInstant);
+    insert.run('leg-right', id, 'Right leg filled', sameInstant);
+    insert.run('leg-older', id, 'Entry triggered', '2026-01-31T00:00:00.000Z');
+
+    const host = { host: '127.0.0.1:17840' };
+    const first = await app.inject({ method: 'GET', url: `/api/strategies/${id}/logs?limit=2`, headers: host });
+    // Both legs share one instant, so ordering falls to the id tie-break ('leg-right' > 'leg-left').
+    expect(first.json().logs.map((row: { id: string }) => row.id)).toEqual(['leg-right', 'leg-left']);
+    expect(first.json().hasMore).toBe(true);
+    const cursor = first.json().nextCursor as { createdAt: string; id: string };
+    expect(cursor).toEqual({ createdAt: sameInstant, id: 'leg-left' });
+
+    const second = await app.inject({ method: 'GET',
+      url: `/api/strategies/${id}/logs?limit=2&before=${encodeURIComponent(cursor.createdAt)}&beforeId=${encodeURIComponent(cursor.id)}`, headers: host });
+    expect(second.json().logs.map((row: { id: string }) => row.id)).toEqual(['leg-older']);
+    expect(second.json().hasMore).toBe(false);
+
+    // The union of both pages is exactly the stored rows — no duplicate and no gap.
+    const seen = [...first.json().logs, ...second.json().logs].map((row: { id: string }) => row.id);
+    expect(seen).toHaveLength(3);
+    expect(new Set(seen).size).toBe(3);
+  });
+
+  it('filters execution logs by category, including the grouping dependency rows', async () => {
+    const { app, database } = await createTestApp({ liveTradingEnabled: true });
+    const id = 'PREM-CAT00001';
+    const now = new Date().toISOString();
+    seedLogStrategy(database, id, now);
+    const insert = database.prepare(`INSERT INTO execution_strategy_logs
+      (id, strategy_id, level, event, condition_text, quantity, result_text, created_at)
+      VALUES (?, ?, 'info', ?, 'c', 'q', 'r', ?)`);
+    insert.run('s1', id, 'Strategy started', '2026-03-01T00:00:00.000Z');
+    insert.run('r1', id, 'Take-profit triggered', '2026-03-02T00:00:00.000Z');
+    insert.run('m1', id, 'Maker quote placed', '2026-03-03T00:00:00.000Z');
+    insert.run('l1', id, 'Left leg filled', '2026-03-04T00:00:00.000Z');
+    insert.run('rr1', id, 'Right leg filled', '2026-03-05T00:00:00.000Z');
+
+    const host = { host: '127.0.0.1:17840' };
+    const risk = await app.inject({ method: 'GET', url: `/api/strategies/${id}/logs?category=risk`, headers: host });
+    expect(risk.statusCode).toBe(200);
+    // risk's own event plus the two leg rows the client needs to rebuild a take-profit clip.
+    expect(risk.json().logs.map((row: { event: string }) => row.event).sort())
+      .toEqual(['Left leg filled', 'Right leg filled', 'Take-profit triggered'].sort());
+
+    const maker = await app.inject({ method: 'GET', url: `/api/strategies/${id}/logs?category=maker`, headers: host });
+    expect(maker.json().logs.map((row: { event: string }) => row.event)).toEqual(['Maker quote placed']);
+  });
+
+  it('fetches leg diagnostics whose order state is outside the enumerated event table', async () => {
+    // The engine writes `Left leg <state>` / `Right leg <state>` from a dynamic template, so the state
+    // tail is an open set: `fail`, `remote_not_found`, and the transient open|new|pending_submit|
+    // pending_cancel states are all reachable. A closed `event IN (...)` list silently drops those
+    // rows from the execution/risk tabs while `all` still shows them — the row would be classifiable
+    // as `execution` on the client yet unreachable from the execution tab.
+    const { app, database } = await createTestApp({ liveTradingEnabled: true });
+    const id = 'PREM-LEG00001';
+    const now = new Date().toISOString();
+    seedLogStrategy(database, id, now);
+    const insert = database.prepare(`INSERT INTO execution_strategy_logs
+      (id, strategy_id, level, event, condition_text, quantity, result_text, created_at)
+      VALUES (?, ?, 'info', ?, 'clip-1', 'q', 'r', ?)`);
+    insert.run('tp1', id, 'Take-profit triggered', '2026-03-01T00:00:00.000Z');
+    insert.run('lf1', id, 'Left leg fail', '2026-03-02T00:00:00.000Z');
+    insert.run('rf1', id, 'Right leg fail', '2026-03-02T00:00:00.000Z');
+    insert.run('lo1', id, 'Left leg open', '2026-03-03T00:00:00.000Z');
+    insert.run('mk1', id, 'Maker quote placed', '2026-03-04T00:00:00.000Z');
+
+    const host = { host: '127.0.0.1:17840' };
+    const eventsIn = async (category: string): Promise<string[]> => {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/api/strategies/${id}/logs?category=${category}&limit=200`,
+        headers: host,
+      });
+      expect(response.statusCode).toBe(200);
+      return (response.json().logs as Array<{ event: string }>).map((row) => row.event);
+    };
+
+    expect((await eventsIn('all')).sort()).toEqual([
+      'Left leg fail', 'Left leg open', 'Maker quote placed', 'Right leg fail', 'Take-profit triggered',
+    ].sort());
+    expect((await eventsIn('execution')).sort()).toEqual([
+      'Left leg fail', 'Left leg open', 'Right leg fail', 'Take-profit triggered',
+    ].sort());
+    // risk must carry the same leg rows. Without them a failed leg belonging to a take-profit clip
+    // would be grouped into `Take-profit Executed` (which classifies as risk) and then be filtered
+    // out of the execution tab, while risk never fetched it — the row would vanish from both tabs.
+    expect((await eventsIn('risk')).sort()).toEqual([
+      'Left leg fail', 'Left leg open', 'Right leg fail', 'Take-profit triggered',
+    ].sort());
+    expect(await eventsIn('maker')).toEqual(['Maker quote placed']);
+  });
+
+  it('keeps the keyset cursor gapless after the leg-state LIKE branch was added', async () => {
+    // Six rows sharing one `created_at`, half of them leg states outside the enumerated table: the
+    // keyset must still visit every row exactly once with the OR'd `event LIKE ?` term in front of LIMIT.
+    const { app, database } = await createTestApp({ liveTradingEnabled: true });
+    const id = 'PREM-LEG00002';
+    const now = new Date().toISOString();
+    seedLogStrategy(database, id, now);
+    const insert = database.prepare(`INSERT INTO execution_strategy_logs
+      (id, strategy_id, level, event, condition_text, quantity, result_text, created_at)
+      VALUES (?, ?, 'info', ?, 'clip', 'q', 'r', ?)`);
+    const shared = '2026-03-10T00:00:00.000Z';
+    insert.run('a1', id, 'Left leg fail', shared);
+    insert.run('a2', id, 'Right leg fail', shared);
+    insert.run('a3', id, 'Left leg open', shared);
+    insert.run('a4', id, 'Take-profit triggered', shared);
+    insert.run('a5', id, 'Left leg filled', shared);
+    insert.run('a6', id, 'Right leg filled', shared);
+
+    const host = { host: '127.0.0.1:17840' };
+    const seen: string[] = [];
+    let cursor: { createdAt: string; id: string } | null = null;
+    for (let page = 0; page < 10; page += 1) {
+      const query = cursor
+        ? `?category=execution&limit=2&before=${encodeURIComponent(cursor.createdAt)}&beforeId=${encodeURIComponent(cursor.id)}`
+        : '?category=execution&limit=2';
+      const response = await app.inject({ method: 'GET', url: `/api/strategies/${id}/logs${query}`, headers: host });
+      expect(response.statusCode).toBe(200);
+      const payload = response.json() as {
+        logs: Array<{ id: string }>;
+        hasMore: boolean;
+        nextCursor: { createdAt: string; id: string } | null;
+      };
+      seen.push(...payload.logs.map((row) => row.id));
+      if (!payload.hasMore) break;
+      cursor = payload.nextCursor;
+    }
+
+    expect(seen).toEqual(['a6', 'a5', 'a4', 'a3', 'a2', 'a1']);
+    expect(new Set(seen).size).toBe(6);
+  });
+
+  it('rejects malformed execution-log queries with invalid_log_query', async () => {
+    const { app } = await createTestApp({ liveTradingEnabled: true });
+    const host = { host: '127.0.0.1:17840' };
+    const id = 'PREM-VAL00001';
+    const urls = [
+      `/api/strategies/${id}/logs?limit=201`,
+      `/api/strategies/${id}/logs?limit=0`,
+      `/api/strategies/${id}/logs?category=bogus`,
+      `/api/strategies/${id}/logs?before=2026-01-01T00:00:00.000Z`,
+      `/api/strategies/${id}/logs?beforeId=log-1`,
+    ];
+    for (const url of urls) {
+      const response = await app.inject({ method: 'GET', url, headers: host });
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toEqual({ error: 'invalid_log_query' });
+    }
   });
 
   it('serves merged candle series with venue backfill and validates parameters', async () => {

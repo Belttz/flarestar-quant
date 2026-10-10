@@ -10,6 +10,10 @@ import {
   StrategyConfigSchema,
   SystemDiscoverySchema,
   TerminalStreamMessageSchema,
+  STRATEGY_LOG_CATEGORIES,
+  STRATEGY_LOG_CATEGORY_FETCH_EVENTS,
+  STRATEGY_LOG_EVENT_CATEGORY,
+  STRATEGY_LOG_LEG_EVENT_PREFIXES,
   VenueSchema,
   canonicalizeCrossExTransfer,
   contiguousCandleTail,
@@ -243,5 +247,44 @@ describe('terminal stream contract', () => {
         }],
       },
     }).success).toBe(true);
+  });
+});
+
+describe('execution-log category fetch set', () => {
+  it('uses LIKE prefix patterns only for the open-ended leg diagnostics', () => {
+    const allowedPatterns = STRATEGY_LOG_LEG_EVENT_PREFIXES.map((prefix) => `${prefix}%`);
+    for (const category of STRATEGY_LOG_CATEGORIES) {
+      if (category === 'all') continue;
+      for (const entry of STRATEGY_LOG_CATEGORY_FETCH_EVENTS[category]) {
+        if (!entry.includes('%')) {
+          // An exact entry must be a real event the engine can write, otherwise it is a dead term.
+          expect(Object.keys(STRATEGY_LOG_EVENT_CATEGORY)).toContain(entry);
+          continue;
+        }
+        // A pattern must be a trailing-only wildcard, and one of the shared leg prefixes.
+        expect(entry.endsWith('%')).toBe(true);
+        expect(entry.slice(0, -1)).not.toContain('%');
+        expect(allowedPatterns).toContain(entry);
+      }
+    }
+  });
+
+  it('carries the leg patterns in both execution and risk', () => {
+    for (const category of ['execution', 'risk'] as const) {
+      for (const prefix of STRATEGY_LOG_LEG_EVENT_PREFIXES) {
+        expect(STRATEGY_LOG_CATEGORY_FETCH_EVENTS[category]).toContain(`${prefix}%`);
+      }
+    }
+  });
+
+  it('keeps every category a superset of its own enumerated events', () => {
+    for (const category of STRATEGY_LOG_CATEGORIES) {
+      if (category === 'all') continue;
+      const own = Object.keys(STRATEGY_LOG_EVENT_CATEGORY)
+        .filter((event) => STRATEGY_LOG_EVENT_CATEGORY[event] === category);
+      for (const event of own) {
+        expect(STRATEGY_LOG_CATEGORY_FETCH_EVENTS[category]).toContain(event);
+      }
+    }
   });
 });

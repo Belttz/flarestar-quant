@@ -24,6 +24,7 @@ import {
   equityGranularityForRange,
   equityRangeWindow,
   PortfolioEquityRangeSchema,
+  STRATEGY_LOG_CATEGORIES,
   UserPreferencesSchema,
   type UserPreferencesResponse,
   type UnresolvedOrder,
@@ -123,6 +124,33 @@ import {
 
 const API_DOCS_RETRIEVED_AT = '2026-08-01';
 const API_DOCS_VERSION = 'Gate CrossEx REST v1.0.2 / WebSocket v1.0.0';
+
+/**
+ * Resolve the backend package version at runtime.
+ *
+ * `process.env.npm_package_version` is only populated when the process is started
+ * through an npm script (e.g. `npm run dev`). The production Docker image launches
+ * the server with a bare `node apps/backend/dist/server.js`, so that variable is
+ * absent there and `/health` used to report the hard-coded `0.1.0` fallback. We
+ * therefore read `apps/backend/package.json` directly.
+ *
+ * The path is anchored to this module (`../package.json`), which resolves to that
+ * manifest in both supported layouts:
+ *   - compiled: `apps/backend/dist/app.js` -> `../package.json`
+ *   - source:   `apps/backend/src/app.ts`  -> `../package.json`
+ * so `tsx`/`npm run dev` and the Docker runtime agree on the reported version.
+ */
+function resolveAppVersion(): string {
+  try {
+    const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version?: unknown };
+    if (typeof manifest.version === 'string' && manifest.version.length > 0) return manifest.version;
+  } catch {
+    // Manifest unreadable (e.g. a bundled tree without package.json): fall through.
+  }
+  return process.env.npm_package_version ?? '0.0.0';
+}
+
+const APP_VERSION = resolveAppVersion();
 const MARKET_REFERENCE_CACHE_MS = 5 * 60_000;
 const STREAM_VOLATILE_EMIT_INTERVAL_MS = 200;
 const STREAM_STATUS_INTERVAL_MS = 20_000;
@@ -1439,7 +1467,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     const marketConnectionState = marketHub.connectionState();
     return {
       ok: databaseStatus.state === 'ok',
-      version: process.env.npm_package_version ?? '0.1.0',
+      version: APP_VERSION,
       environment: 'live',
       database: databaseStatus.state,
       apiDocsRetrievedAt: API_DOCS_RETRIEVED_AT,
@@ -2040,7 +2068,24 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   app.get('/api/strategies/:id/logs', async (request, reply) => {
     const parsed = z.object({ id: z.string().regex(STRATEGY_ID) }).safeParse(request.params);
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_strategy_id' });
-    return { logs: tradingRuntime.strategyLogs(parsed.data.id) };
+    const query = z.object({
+      category: z.enum(STRATEGY_LOG_CATEGORIES).default('all'),
+      limit: z.coerce.number().int().min(1).max(200).default(200),
+      before: z.iso.datetime().optional(),
+      beforeId: z.string().min(1).max(120).optional(),
+    }).safeParse(request.query);
+    if (!query.success) return reply.code(400).send({ error: 'invalid_log_query' });
+    const { category, limit, before, beforeId } = query.data;
+    // A keyset cursor is only meaningful as a pair; a lone half would silently fall back to the
+    // newest page, so reject it instead of returning the wrong rows.
+    if ((before === undefined) !== (beforeId === undefined)) {
+      return reply.code(400).send({ error: 'invalid_log_query' });
+    }
+    return tradingRuntime.strategyLogPage(parsed.data.id, {
+      category,
+      limit,
+      ...(before && beforeId ? { before: { createdAt: before, id: beforeId } } : {}),
+    });
   });
 
   // Gate spot legs are first-class watch targets (trade page spot tab, carry legs, auto spot

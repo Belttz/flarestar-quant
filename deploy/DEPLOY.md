@@ -39,9 +39,11 @@ sudo bash /tmp/gct.sh --domain quant.example.com
 重复执行同一条命令就是**升级**：已存在的 git 仓库会被 `fetch + reset --hard` 更新到最新提交，未跟踪的 `cloud.env`、`.local-data/` 数据都会保留。
 
 > 注意：上面的 `raw.githubusercontent.com` 地址要求 `deploy/server/` 这些脚本**已经推送到 `main` 分支**，否则会 404。
-> 还没推送、或不想开放仓库时，请走下面「本机已就绪」的两种走法：
-> 把源码包传到服务器后，用 `--source` 直接就地安装，例如
-> `sudo bash deploy/server/bootstrap.sh --source /root/gate-crossex-0.3.0-cloud.tar.gz --dir /opt/gate-crossex --domain quant.example.com`。
+> 还没推送、或不想开放仓库时，可以先把源码包传到服务器，再用 `--source` 安装，例如
+> `sudo bash deploy/server/bootstrap.sh --source /root/flarestar-quant-0.3.1-src.tar.gz --dir /opt/gate-crossex --domain quant.example.com`。
+
+> **`--source` 只适用于全新空目录安装**：安装目录非空时脚本会直接拒绝（避免把源码包解压覆盖到已有安装上）。
+> 已有安装想升级，请走 git 路径，见下面「发版与服务器更新」。
 
 > 提示：`--domain` 的 A 记录要先指向本机公网 IP，安全组放行 80/443。
 
@@ -87,6 +89,44 @@ docker compose -f docker-compose.cloud.yml logs -f gate-crossex
 >
 > 之后访问 `http://服务器公网IP/`。此模式仅明文 HTTP、无证书。
 
+## 发版与服务器更新
+
+本地改完代码后，用两条 npm 脚本走完整链路（**不会**自动 commit / tag / push）：
+
+```bash
+# 1. 版本号只改根 package.json 的 version，然后同步到所有 workspace 与 package-lock.json
+npm run version:sync          # 同步；npm run version:sync -- --check 只检查、有漂移即非零退出
+
+# 2. 一条命令完成「检查 → 构建 → 出包 → 打印后续步骤」
+npm run release:server
+```
+
+- **版本真源**：根 `package.json` 的 `version` 是唯一真源。所有 `apps/*`、`packages/*` 的 `version`
+  以及它们对 `@gate-crossex/*` 的依赖区间都会被 `version:sync` 同步过去（否则 `npm ci` 与发布包校验会失败）。
+  `npm run test:version` 会回归校验一致性。
+- **发布包**：`npm run release:server` 用 `git archive HEAD` 产出
+  `deliverables/dist/flarestar-quant-<version>-src.tar.gz`，顶层目录为 `flarestar-quant-<version>/`。
+  注意它**只反映已提交的 HEAD**；工作区有未提交改动时脚本会拒绝出包（除非显式加 `--allow-dirty`，且会醒目提示该包不含你的改动）。
+- **打标签**：tag 必须形如 `v<根版本>`（如 `v0.3.1`），CI（`.github/workflows/release.yml`）会校验 tag 与根版本一致：
+
+  ```bash
+  git tag v0.3.1 && git push origin main --tags
+  ```
+
+### 服务器更新（一条命令）
+
+服务器上 `/opt/gate-crossex` 已是 git clone，更新新版本只需重复执行同一条自举命令：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Belttz/flarestar-quant/main/deploy/server/bootstrap.sh | sudo bash -s -- --yes
+```
+
+- 安装目录非默认时补 `--dir <路径>`（默认 `/opt/gate-crossex`）。
+- 升级走 `git fetch --depth 1` + `git reset --hard FETCH_HEAD`，因此 **`cloud.env`（域名 + 登录口令）与
+  `.local-data/` 数据卷都会被原样保留**（它们是未跟踪文件，`reset --hard` 不碰）。
+- **不要手工编辑服务器上的 `deploy/Caddyfile`**：重新部署会自动恢复它（脚本会检测被手改的部署配置文件并还原）。
+  确需保留本地改动时，设逃生舱环境变量 `GCT_KEEP_DEPLOY_CONFIG=1` 只告警、不恢复。
+
 ## 登录与安全
 
 - 首次登录：用户名 `GCT_AUTH_USERNAME`，密码 `GCT_AUTH_PASSWORD`（仅首次启动生效）
@@ -108,10 +148,39 @@ docker compose -f docker-compose.cloud.yml logs -f gate-crossex
 - 「接受哪些访问地址」由 `GCT_HOST_ACCESS` 决定（默认 `any`：域名 / 公网 IP / 局域网地址都行）。
   想收紧成固定地址时改成 `loopback` 并配 `GCT_ALLOWED_HOSTS` / `GCT_ALLOWED_ORIGINS`。
 
+### 域名托管在 Cloudflare 等 CDN 后面时
+
+把 CDN 的 SSL/TLS 模式设为 **Full (strict)**，这是唯一正确的选项：
+
+| 模式 | 后果 |
+| --- | --- |
+| `Full (strict)` | ✓ CDN → 源站全程加密，且校验源站证书 |
+| `Flexible` | ✗ 两个问题：① CDN → 源站是**明文 HTTP**，登录口令与 Gate API 密钥会明文穿过公网；② 源站 80 端口会 308 跳转到 HTTPS，CDN 再用 HTTP 回源 → **无限重定向循环**（`https://你的域名` 反复 308） |
+| `Off` | ✗ 用户侧明文 |
+
+- 橙云（代理开启）**不影响** Caddy 签证书：Let's Encrypt 的 HTTP-01 挑战由 CDN 边缘节点转发到源站的 80 端口，照样能签发。
+  若长期签不下来，可先把橙云切成灰云（DNS only）签发成功后再切回。
+- 排障三步：
+  ```bash
+  # 1. 看 Caddy 是否真的签到了证书（应有 certificate obtained successfully）
+  docker compose --env-file cloud.env -f docker-compose.cloud.yml logs caddy | grep -iE "acme|certificate obtained"
+  # 2. 直连源站 443 看是否有真证书（把 IP / 域名换成你的）
+  curl -kI https://43.155.196.185 -H "Host: 你的域名" | head -3
+  # 3. 确认安全组放行了 80 与 443
+  ```
+- **最容易踩的坑**：`deploy/Caddyfile` 里的站点地址一旦被写成 `http://{$GCT_DOMAIN} {`，Caddy 的 automatic HTTPS 会被
+  **静默禁用** —— 443 永不监听，日志里只有
+  `server is listening only on the HTTP port, so no automatic HTTPS will be applied to this server`，
+  且**一条 ACME 记录都不会有**（因为压根没尝试签发），现象就是「域名怎么都拿不到 HTTPS 证书」。
+  这种改动脱离 git（`git pull` / `up --build` 都发现不了），而且 `docker compose up -d caddy` 不会重建容器
+  （compose 配置没变，会显示 `Container ... Running`），必须用 `restart caddy` 让进程重读 Caddyfile。
+  现在的部署流程会在升级前自动检测并恢复被就地手改的部署文件（见上文「发版与服务器更新」）。
+
 ## 日常运维
 
 ```bash
-# 升级：上传新版本包替换文件后
+# 升级：推荐服务器一条命令更新（见上面「发版与服务器更新」）；
+# 若已手工把新版本源码放到服务器，重新构建镜像即可：
 docker compose --env-file cloud.env -f docker-compose.cloud.yml up -d --build
 
 # 备份数据（数据库 + 凭证都在数据卷里）

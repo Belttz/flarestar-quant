@@ -2482,3 +2482,26 @@ html[data-theme='light'] .equity-message button { border-color: #ccd7df; color: 
   .equity-range-tabs { width: 100%; justify-content: space-between; }
   .equity-since, .equity-change, .equity-note { padding-left: 14px; padding-right: 14px; }
 }
+
+/* Execution-log category tabs reuse the strategy-history tab look, scoped to the log modal. */
+.strategy-log-tabs { min-height: 44px; display: flex; align-items: stretch; gap: 22px; overflow-x: auto; padding: 0 20px; border-bottom: 1px solid var(--line); background: #091017; }
+.strategy-log-tabs button { position: relative; flex: 0 0 auto; padding: 0; border: 0; border-bottom: 3px solid transparent; color: #8b98a8; background: transparent; font-size: var(--text-body); font-weight: 700; cursor: pointer; }
+.strategy-log-tabs button:hover { color: #b7c1cc; }
+.strategy-log-tabs button.active { border-bottom-color: var(--green); color: #dce4eb; }
+/* The error state stacks the message above a retry action. */
+.execution-log-state.error { gap: 12px; }
+.execution-log-state .retry-logs { height: 30px; padding: 0 16px; border: 1px solid #3d4652; border-radius: 5px; color: #c5ced8; background: #101821; font-size: var(--text-small); font-weight: 600; cursor: pointer; }
+.execution-log-state .retry-logs:hover { border-color: #59707f; color: #e5ebf1; }
+.execution-log-pager { display: flex; align-items: center; gap: 14px; padding: 0 20px; border-top: 1px solid var(--line); }
+.execution-log-pager:empty { display: none; }
+.execution-log-pager .execution-pagination { flex: 1 1 auto; }
+.execution-log-load-more { margin-left: auto; padding: 10px 0; }
+.execution-log-load-more button { height: 32px; padding: 0 16px; border: 1px solid #2a3744; border-radius: 5px; color: #c5ced8; background: #101821; font-size: var(--text-small); font-weight: 600; cursor: pointer; }
+.execution-log-load-more button:hover:not(:disabled) { border-color: #59707f; color: #e5ebf1; }
+.execution-log-load-more button:disabled { opacity: .6; cursor: default; }
+html[data-theme='light'] .strategy-log-tabs { background: #fff; }
+html[data-theme='light'] .strategy-log-tabs button { color: #596877; }
+html[data-theme='light'] .strategy-log-tabs button:hover { color: #40505f; }
+html[data-theme='light'] .strategy-log-tabs button.active { color: #1e2b36; }
+html[data-theme='light'] .execution-log-state .retry-logs,
+html[data-theme='light'] .execution-log-load-more button { border-color: #cbd6de; color: #40505f; background: #f5f8fa; }

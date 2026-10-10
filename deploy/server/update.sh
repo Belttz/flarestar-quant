@@ -33,6 +33,10 @@ main() {
   ensure_docker 1
   require_env_file
 
+  # 升级前：检测并恢复被本地手改的受版本控制部署文件（例如给 Caddyfile 站点地址加了
+  # `http://` 前缀而静默禁用自动 HTTPS）。放在 git pull 之前，顺带避免脏工作树挡住 --pull。
+  restore_modified_deploy_config
+
   if [ "$PULL" -eq 1 ]; then
     if [ -d "$REPO_ROOT/.git" ] && command -v git >/dev/null 2>&1; then
       say "拉取最新源码（git pull --ff-only）..."

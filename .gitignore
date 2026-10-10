@@ -5,6 +5,10 @@ dist-ts
 .env
 .env.*
 !.env.example
+# Server deployment config (domain + login password), consumed by deploy/server/*.
+# Root-anchored so deploy/cloud.env.example stays tracked.
+/cloud.env
+/cloud.env.*
 logs
 .vite
 playwright-report

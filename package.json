@@ -1,7 +1,7 @@
 {
   "name": "gate-crossex-terminal",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.3.1",
   "license": "AGPL-3.0-only",
   "type": "module",
   "workspaces": [
@@ -15,6 +15,9 @@
     "test": "npm run build:packages && npm run test --workspaces --if-present",
     "test:e2e": "npm run build && playwright test",
     "test:e2e:run": "playwright test",
+    "test:version": "node --test scripts/version-consistency.test.mjs",
+    "version:sync": "node scripts/sync-version.mjs",
+    "release:server": "node scripts/release-server.mjs",
     "lint": "eslint .",
     "benchmark:db": "node scripts/benchmark-database.mjs",
     "test:bootstrap": "node --test scripts/bootstrap-installer.test.mjs scripts/check-for-update.test.mjs scripts/launcher.test.mjs scripts/test-deploy-scripts.mjs",
@@ -22,7 +25,7 @@
     "test:release": "node --test scripts/release-installer.test.mjs",
     "release:bundle:macos": "node scripts/build-release-bundle.mjs",
     "release:bundle:windows": "node scripts/build-release-bundle-windows.mjs",
-    "verify": "npm run lint && npm run typecheck && npm test && npm run test:bootstrap && npm run test:release && npm run build && npm run test:e2e:run",
+    "verify": "npm run lint && npm run typecheck && npm run test:version && npm test && npm run test:bootstrap && npm run test:release && npm run build && npm run test:e2e:run",
     "predev": "npm run build:packages",
     "dev": "concurrently -n backend,frontend -c blue,magenta \"npm run dev -w apps/backend\" \"npm run dev -w apps/frontend\""
   },

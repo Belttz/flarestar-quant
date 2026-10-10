@@ -79,6 +79,8 @@ import {
   type PublicMarketSnapshotResponse,
   type StrategyConfig,
   type StrategyLog,
+  type StrategyLogCategory,
+  type StrategyLogsCursor,
   type StrategyRecord,
   type SystemDiscovery,
   type TerminalStreamMessage,
@@ -137,6 +139,8 @@ export type {
   PublicMarketSnapshotResponse,
   StrategyConfig,
   StrategyLog,
+  StrategyLogCategory,
+  StrategyLogsCursor,
   StrategyRecord,
   SystemDiscovery,
   TerminalStreamMessage,
@@ -452,7 +456,23 @@ export const api = {
     method: 'POST',
     headers: { 'x-gct-trading-intent': 'resume-strategy' },
   }),
-  strategyLogs: (id: string) => request(StrategyLogsResponseSchema, `/api/strategies/${encodeURIComponent(id)}/logs`),
+  strategyLogs: (
+    id: string,
+    options?: { category?: StrategyLogCategory; limit?: number; before?: StrategyLogsCursor },
+  ) => {
+    const path = `/api/strategies/${encodeURIComponent(id)}/logs`;
+    if (!options) return request(StrategyLogsResponseSchema, path);
+    const params = new URLSearchParams();
+    if (options.category !== undefined) params.set('category', options.category);
+    if (options.limit !== undefined) params.set('limit', String(options.limit));
+    if (options.before) {
+      params.set('before', options.before.createdAt);
+      params.set('beforeId', options.before.id);
+    }
+    const query = params.toString();
+    // No query string when nothing is set, so the legacy callers hit the exact same URL as before.
+    return request(StrategyLogsResponseSchema, query ? `${path}?${query}` : path);
+  },
   candles: (
     symbol: string,
     interval: CandleInterval,

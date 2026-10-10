@@ -17,6 +17,7 @@
 #
 # 可用参数 / flags:
 #   --domain <域名>       A 记录已指向本机的域名（可选；留空则只用公网 IP / 局域网访问，无 HTTPS）
+#                         注意：这里必须填真正的域名。填 IP 地址会被识别出来并告警，按「无域名」处理。
 #   --username <用户名>   操作员登录名（默认 Belttz）
 #   --password <密码>     初始密码；留空则自动生成强随机密码并回显一次
 #   --yes / -y            非交互模式，缺少必填项时直接报错
@@ -74,15 +75,37 @@ generate_password() {
   fi
 }
 
+# 就地改写 cloud.env 里的 GCT_DOMAIN 行（没有该行时追加）。仅用于把历史遗留的、会误导后续
+# 所有部署的 IP 值纠正掉；其余键一律不碰。通过临时文件 + 原子替换，避免半写入状态。
+set_env_domain() {
+  local value="$1" tmp
+  tmp="$(mktemp "${ENV_FILE}.XXXXXX")"
+  if grep -qE '^GCT_DOMAIN=' "$ENV_FILE"; then
+    awk -v v="$value" '/^GCT_DOMAIN=/{print "GCT_DOMAIN=" v; next} {print}' "$ENV_FILE" > "$tmp"
+  else
+    cat "$ENV_FILE" > "$tmp"
+    printf 'GCT_DOMAIN=%s\n' "$value" >> "$tmp"
+  fi
+  mv -f "$tmp" "$ENV_FILE"
+}
+
 collect_config() {
-  local reused=0
+  local reused=0 clear_domain_line=0
   if [ -f "$ENV_FILE" ]; then
     say "检测到已有配置 ${ENV_FILE}，沿用其中的域名与用户名（不会覆盖已有值）。"
     local existing_domain existing_user existing_password
     existing_domain="$(env_value GCT_DOMAIN)"
     existing_user="$(env_value GCT_AUTH_USERNAME)"
     existing_password="$(env_value GCT_AUTH_PASSWORD)"
-    [ -n "$existing_domain" ] && DOMAIN="$existing_domain"
+    # 已有域名照旧沿用；但历史遗留的 IP 值不能沿用——它会让每次部署都静默降级成纯 HTTP。
+    # 本次若显式传了 --domain，则以新值为准；否则稍后清空并走无域名模式。
+    if [ -n "$existing_domain" ]; then
+      if is_ip_literal "$existing_domain"; then
+        clear_domain_line=1
+      else
+        DOMAIN="$existing_domain"
+      fi
+    fi
     [ -n "$existing_user" ] && USERNAME="$existing_user"
     # 密码可能已经种子化进数据库；沿用文件里的值，避免产生「文件与实际口令不一致」的状态。
     PASSWORD="$existing_password"
@@ -93,6 +116,18 @@ collect_config() {
     printf '请输入已解析到本机的域名；直接回车表示只用公网 IP / 局域网访问（仅明文 HTTP，无证书）: '
     read -r DOMAIN || true
   fi
+
+  # 把 IP 字面量当成「没有域名」处理：Caddy 对 IP 站点地址无法申请证书，只会监听 80 端口，
+  # 部署会静默降级成明文 HTTP 且没有任何报错。若放任 IP 落进 cloud.env 的 GCT_DOMAIN，
+  # 后续每一次部署都会被它误导。这里醒目告警并按空域名（无域名模式）处理。
+  if [ -n "$DOMAIN" ] && is_ip_literal "$DOMAIN"; then
+    warn "GCT_DOMAIN 填的是一个 IP 地址（'${DOMAIN}'），不是域名。"
+    warn "IP 地址无法申请 TLS 证书，Caddy 只会监听 80 端口，访问将是明文 HTTP（口令与交易所密钥会裸奔）。"
+    warn "已按「无域名」模式处理；若要 HTTPS，请把真正的域名（A 记录指向本机）用 --domain 传入。"
+    DOMAIN=""
+    clear_domain_line=1
+  fi
+
   # 域名可选：留空 = 纯公网 IP / 局域网访问，此时走 deploy/Caddyfile.no-domain（仅明文 HTTP）。
   if [ -n "$DOMAIN" ] && ! is_valid_domain "$DOMAIN"; then
     fail "域名无效：'${DOMAIN}'。请用 --domain 指定，例如 --domain quant.example.com；或留空以纯 IP 访问。"
@@ -115,8 +150,17 @@ collect_config() {
     } > "$ENV_FILE"
     ok "已生成配置文件 ${ENV_FILE}（权限 600）。"
   else
-    # 只补齐缺失的键，绝不覆盖已有值。
-    grep -qE '^GCT_DOMAIN=' "$ENV_FILE" || printf 'GCT_DOMAIN=%s\n' "$DOMAIN" >> "$ENV_FILE"
+    # 只补齐缺失的键，绝不覆盖已有值。唯一的例外：把历史遗留的、会误导部署的 IP 域名纠正掉。
+    if [ "$clear_domain_line" -eq 1 ]; then
+      set_env_domain "$DOMAIN"
+      if [ -n "$DOMAIN" ]; then
+        ok "已把 ${ENV_FILE} 里误导性的 GCT_DOMAIN（原为 IP）更新为 ${DOMAIN}。"
+      else
+        ok "已从 ${ENV_FILE} 清除误导性的 GCT_DOMAIN（原为 IP，无法申请证书）。"
+      fi
+    else
+      grep -qE '^GCT_DOMAIN=' "$ENV_FILE" || printf 'GCT_DOMAIN=%s\n' "$DOMAIN" >> "$ENV_FILE"
+    fi
     grep -qE '^GCT_AUTH_USERNAME=' "$ENV_FILE" || printf 'GCT_AUTH_USERNAME=%s\n' "$USERNAME" >> "$ENV_FILE"
     grep -qE '^GCT_AUTH_PASSWORD=' "$ENV_FILE" || printf 'GCT_AUTH_PASSWORD=%s\n' "$PASSWORD" >> "$ENV_FILE"
     if [ -n "$DOMAIN" ] && ! grep -qE '^GCT_FRONTEND_ORIGIN=' "$ENV_FILE"; then
@@ -164,6 +208,10 @@ main() {
   ensure_docker "$SKIP_DOCKER_INSTALL"
   collect_config
 
+  # 部署前：检测并恢复被本地手改的受版本控制部署文件（例如给 Caddyfile 站点地址加了
+  # `http://` 前缀而静默禁用自动 HTTPS）。这类改动不该跨过一次重新部署存活。
+  restore_modified_deploy_config
+
   say "构建并启动容器（首次构建约 3-5 分钟）..."
   compose_env up -d --build
 
@@ -175,4 +223,7 @@ main() {
   show_summary
 }
 
-main "$@"
+# 只有被直接执行时才跑 main；被 source（例如测试里复用 collect_config）时不要触发部署。
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi

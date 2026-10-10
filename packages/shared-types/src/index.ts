@@ -1160,6 +1160,119 @@ export const StrategyLogSchema = z.object({
 });
 export type StrategyLog = z.infer<typeof StrategyLogSchema>;
 
+/** `all` is the unfiltered view; the other four are the display buckets of the execution-log tabs. */
+export const STRATEGY_LOG_CATEGORIES = ['all', 'execution', 'risk', 'maker', 'system'] as const;
+export type StrategyLogCategory = (typeof STRATEGY_LOG_CATEGORIES)[number];
+export type StrategyLogEventCategory = Exclude<StrategyLogCategory, 'all'>;
+
+/**
+ * Leg-level diagnostics share one dynamic template — `${Left|Right} leg ${state.toLowerCase()}`
+ * (strategy-engine.ts) — whose tail is any order state, including ones the table below never
+ * enumerated. Both the SQL fetch set and `classifyStrategyLogEvent` derive their prefix match from
+ * this single source so the backend and frontend can never drift apart.
+ */
+export const STRATEGY_LOG_LEG_EVENT_PREFIXES = ['Left leg ', 'Right leg '] as const;
+
+/**
+ * Maps a persisted execution event to its display category. The engine emits a small, fixed set of
+ * literal event names, so an exhaustive table beats a regex. The only dynamic shape is the
+ * per-leg diagnostic `Left leg <state>` / `Right leg <state>` (see the concrete entries below,
+ * which cover every terminal order state Gate reports); `classifyStrategyLogEvent` additionally
+ * falls back to a prefix match so a future leg state still lands in `execution`.
+ */
+export const STRATEGY_LOG_EVENT_CATEGORY: Record<string, StrategyLogEventCategory> = {
+  // Open / close: entry, exit, reduce-only and leg-level execution diagnostics.
+  'Entry triggered': 'execution',
+  'Reduce-only triggered': 'execution',
+  'Position open Executed': 'execution',
+  'Reduce-only Executed': 'execution',
+  'Leg submission failed': 'execution',
+  'Closing remaining exposure': 'execution',
+  'Residual close submission failed': 'execution',
+  'Residual close settled': 'execution',
+  'Carry position opened': 'execution',
+  'Left leg filled': 'execution',
+  'Right leg filled': 'execution',
+  'Left leg partially_filled': 'execution',
+  'Right leg partially_filled': 'execution',
+  'Left leg cancelled': 'execution',
+  'Right leg cancelled': 'execution',
+  'Left leg rejected': 'execution',
+  'Right leg rejected': 'execution',
+  'Left leg expired': 'execution',
+  'Right leg expired': 'execution',
+  // Take-profit & risk.
+  'Take-profit triggered': 'risk',
+  'Take-profit Executed': 'risk',
+  'Take-profit updated': 'risk',
+  'Stop-loss triggered': 'risk',
+  'Basis take-profit triggered': 'risk',
+  'Timed close triggered': 'risk',
+  'Timed close slice executed': 'risk',
+  'Timed close slice failed': 'risk',
+  // Maker & hedge.
+  'Maker quote placed': 'maker',
+  'Maker exit quote placed': 'maker',
+  'Maker quote rejected': 'maker',
+  'Hedging filled quantity': 'maker',
+  'Trimming residual imbalance': 'maker',
+  'Hedge order settled': 'maker',
+  'Residual trim settled': 'maker',
+  'Hedge order failed': 'maker',
+  'Padding terminal residual': 'maker',
+  'Residual padding settled': 'maker',
+  'Trimming padded residual': 'maker',
+  'Padded residual trim settled': 'maker',
+  'Residual top-up unavailable': 'maker',
+  'Residual trim deferred': 'maker',
+  // System lifecycle.
+  'Strategy started': 'system',
+  'Strategy resumed': 'system',
+  'Strategy paused': 'system',
+  'Strategy stopped': 'system',
+  'Strategy completed': 'system',
+  'Strategy engine error': 'system',
+  'Shutdown cancellation pending': 'system',
+  'Strategy pause pending': 'system',
+  'Strategy stop pending': 'system',
+  'Waiting for funding threshold': 'system',
+  'Carry entry gate blocked': 'system',
+  'Carry entry gate passed': 'system',
+  'Funding interval unknown': 'system',
+};
+
+const strategyLogEventsIn = (category: StrategyLogEventCategory): string[] =>
+  Object.keys(STRATEGY_LOG_EVENT_CATEGORY).filter((event) => STRATEGY_LOG_EVENT_CATEGORY[event] === category);
+
+/**
+ * Events the backend must select to reproduce a category correctly. Each entry is either an exact
+ * event name or, when it ends in `%`, a SQL `LIKE` prefix pattern. Only the leg-level diagnostics
+ * use a pattern, because their tail is a dynamic order state the enum can never close over — a
+ * fixed `event IN (...)` set would silently drop states such as `fail`, `remote_not_found`, or a
+ * transient `open`/`new` returned by a timed-out `awaitTerminalOrder`.
+ *
+ * The category's own events are the base set; the extras are *dependency* rows the client-side
+ * grouping needs, and every category whose clip can contain legs must include the leg prefix:
+ * - `execution` also reads `Take-profit triggered` so a grouped exit is labelled `Take-profit
+ *   Executed` instead of `Position open Executed`. Its own leg patterns cover the open/close legs.
+ * - `risk` also reads every leg pattern (not just the two `filled` names): a take-profit clip whose
+ *   leg ended in any failure state is fetched by `execution`, groups into a `Take-profit Executed`
+ *   row (risk), and would otherwise vanish from both tabs — no tab could ever show it.
+ * Selecting a superset is safe: the client re-filters the grouped rows down to the category.
+ */
+export const STRATEGY_LOG_CATEGORY_FETCH_EVENTS: Record<StrategyLogEventCategory, string[]> = {
+  execution: [...strategyLogEventsIn('execution'), 'Take-profit triggered',
+    ...STRATEGY_LOG_LEG_EVENT_PREFIXES.map((prefix) => `${prefix}%`)],
+  risk: [...strategyLogEventsIn('risk'),
+    ...STRATEGY_LOG_LEG_EVENT_PREFIXES.map((prefix) => `${prefix}%`)],
+  maker: strategyLogEventsIn('maker'),
+  system: strategyLogEventsIn('system'),
+};
+
+/** Keyset cursor for paging older execution-log rows: `created_at` plus the row id for tie-breaks. */
+export const StrategyLogsCursorSchema = z.object({ createdAt: z.string(), id: z.string() });
+export type StrategyLogsCursor = z.infer<typeof StrategyLogsCursorSchema>;
+
 export const MarketSizeUnitsSchema = z.object({
   units: z.record(z.string(), z.string()),
   fetchedAt: z.string(),
@@ -1197,7 +1310,12 @@ export const TerminalStreamMessageSchema = z.discriminatedUnion('type', [
 export type TerminalStreamMessage = z.infer<typeof TerminalStreamMessageSchema>;
 
 export const StrategiesResponseSchema = z.object({ strategies: z.array(StrategyRecordSchema) });
-export const StrategyLogsResponseSchema = z.object({ logs: z.array(StrategyLogSchema) });
+export const StrategyLogsResponseSchema = z.object({
+  logs: z.array(StrategyLogSchema),
+  /** New optional keys: older clients keep working, and a full first page stays byte-compatible. */
+  hasMore: z.boolean().optional(),
+  nextCursor: StrategyLogsCursorSchema.nullable().optional(),
+});
 export const InstrumentsResponseSchema = z.object({ items: z.array(CrossExInstrumentSchema) });
 export const LeverageResponseSchema = z.object({ symbol: z.string(), leverage: z.string().nullable() });
 export const LeverageUpdateResponseSchema = z.object({ symbol: z.string(), leverage: z.string() });
