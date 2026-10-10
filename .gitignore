@@ -12,6 +12,9 @@ test-results
 release
 .release-cache
 .runtime
+.run.log
 .gate-crossex-source-install
 .gate-crossex-source.json
 .claude/
+# Scratch files written while probing a live venue (never part of the source tree).
+.probe-*
