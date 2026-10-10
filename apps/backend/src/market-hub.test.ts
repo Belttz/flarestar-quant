@@ -445,3 +445,78 @@ describe('CrossEx dynamic market channels', () => {
       .toEqual([600_000, 660_000]);
   });
 });
+
+describe('CrossEx dynamic market budget', () => {
+  const definitions = (prefix: string, count: number): Array<{ symbol: string; venue: 'GATE'; asset: string }> =>
+    Array.from({ length: count }, (_, index) => ({
+      symbol: `GATE_SPOT_${prefix}${index}_USDT`,
+      venue: 'GATE' as const,
+      asset: `${prefix}${index}`,
+    }));
+
+  it('recycles the coldest dynamic market instead of refusing new registrations', () => {
+    const hub = new CrossExMarketHub('ws://127.0.0.1:1', { maxDynamicSymbols: 4 });
+    // Saturate the budget with the first generation of browsed markets.
+    expect(hub.ensureMarkets(definitions('OLD', 4))).toBe(true);
+    expect(hub.registrationStats().used).toBe(4);
+
+    // A cold un-watched market is the one recycled, so the boards' own top rows stay registered.
+    const internals = hub as unknown as { dynamicMarkets: Map<string, number> };
+    internals.dynamicMarkets.set('GATE_SPOT_OLD0_USDT', 0);
+
+    // The regression: this used to return false forever once the budget was full, which left every
+    // newly opened market showing zeros and read to users as "that exchange has no data".
+    expect(hub.ensureMarkets([{ symbol: 'BINANCE_SPOT_NEW_USDT', venue: 'BINANCE', asset: 'NEW' }])).toBe(true);
+    expect(hub.market('BINANCE_SPOT_NEW_USDT')).not.toBeNull();
+    expect(hub.registrationStats().used).toBe(4);
+    // The coldest registration left; the rest were kept.
+    expect(hub.market('GATE_SPOT_OLD0_USDT')).toBeNull();
+    expect(hub.market('GATE_SPOT_OLD1_USDT')).not.toBeNull();
+  });
+
+  it('never evicts a market somebody is streaming to make room for a new one', () => {
+    const hub = new CrossExMarketHub('ws://127.0.0.1:1', { maxDynamicSymbols: 2 });
+    expect(hub.ensureMarkets(definitions('HOT', 2))).toBe(true);
+    const release = hub.watchQuotes(['GATE_SPOT_HOT0_USDT', 'GATE_SPOT_HOT1_USDT']);
+    const internals = hub as unknown as { dynamicMarkets: Map<string, number> };
+    for (const symbol of internals.dynamicMarkets.keys()) internals.dynamicMarkets.set(symbol, 0);
+
+    // Every slot is pinned: the request must fail cleanly (not silently drop half rows).
+    expect(hub.ensureMarkets([{ symbol: 'OKX_SPOT_NEW_USDT', venue: 'OKX', asset: 'NEW' }])).toBe(false);
+    expect(hub.market('GATE_SPOT_HOT0_USDT')).not.toBeNull();
+    expect(hub.market('GATE_SPOT_HOT1_USDT')).not.toBeNull();
+
+    release();
+    expect(hub.ensureMarkets([{ symbol: 'OKX_SPOT_NEW_USDT', venue: 'OKX', asset: 'NEW' }])).toBe(true);
+  });
+
+  it('registers what fits when a batch is larger than the remaining budget', () => {
+    const hub = new CrossExMarketHub('ws://127.0.0.1:1', { maxDynamicSymbols: 3 });
+    // Partial admission: one of three fits now instead of the whole batch being discarded.
+    expect(hub.ensureMarkets(definitions('BIG', 5))).toBe(false);
+    expect(hub.registrationStats().used).toBe(3);
+    expect(hub.market('GATE_SPOT_BIG0_USDT')).not.toBeNull();
+    expect(hub.market('GATE_SPOT_BIG4_USDT')).toBeNull();
+  });
+
+  it('reports budget starvation through the degradation sink instead of failing silently', () => {
+    const warnings: Array<{ reason: string; detail?: Record<string, unknown> }> = [];
+    const hub = new CrossExMarketHub('ws://127.0.0.1:1', {
+      maxDynamicSymbols: 1,
+      warn: (reason, detail) => warnings.push({ reason, detail }),
+    });
+    expect(hub.ensureMarkets(definitions('AUDIT', 3))).toBe(false);
+    expect(warnings.map((entry) => entry.reason)).toContain('market_hub_dynamic_budget_exhausted');
+    const audit = warnings.find((entry) => entry.reason === 'market_hub_dynamic_budget_exhausted');
+    expect(audit?.detail).toMatchObject({ requested: 3, admitted: 1, refused: 2, budget: 1 });
+  });
+
+  it('still serves every symbol when the batch is re-requested once room exists', () => {
+    const hub = new CrossExMarketHub('ws://127.0.0.1:1', { maxDynamicSymbols: 2 });
+    hub.watchQuotes([]);
+    expect(hub.ensureMarkets(definitions('WARM', 2))).toBe(true);
+    // Re-asking for the same set refreshes their recency without spending new slots.
+    expect(hub.ensureMarkets(definitions('WARM', 2))).toBe(true);
+    expect(hub.registrationStats().used).toBe(2);
+  });
+});

@@ -65,7 +65,11 @@ export interface MarketDefinition {
   asset: string;
 }
 
-/** Streamed symbols beyond the seed set are bounded so a long session cannot grow subscriptions without limit. */
+/**
+ * Budget for streamed symbols beyond the seed set. Every registration past it is served by
+ * evicting the coldest unwatched dynamic market (see `evictColdest`), so the budget bounds the
+ * upstream subscription bill rather than capping how many different markets a session may visit.
+ */
 const MAX_DYNAMIC_SYMBOLS = 1_000;
 
 /**
@@ -75,7 +79,7 @@ const MAX_DYNAMIC_SYMBOLS = 1_000;
  * spread across a pool of connections, each carrying at most 100 symbols on every channel.
  */
 const SYMBOLS_PER_SHARD = 100;
-const MAX_SHARDS = Math.ceil((1_000 + 200) / SYMBOLS_PER_SHARD);
+const SEED_SYMBOL_COUNT = MARKET_ASSETS.length * MARKET_VENUES.length;
 
 interface ShardConnection {
   index: number;
@@ -92,6 +96,9 @@ interface ShardConnection {
 }
 
 type MarketListener = (message: MarketHubMessage) => void;
+
+/** Optional sink for degradation the operator can act on (capacity pressure, dropped symbols). */
+export type MarketHubWarn = (reason: string, detail?: Record<string, unknown>) => void;
 
 // Low-liquidity instruments omit or null out optional quote fields. bid/ask must stay optional
 // so one sparse frame cannot invalidate the whole ticker push (Bug: best-bid stuck at '0').
@@ -268,14 +275,28 @@ export class CrossExMarketHub {
   private readonly heartbeatIntervalMs: number;
   private readonly marketIdlePingAfterMs: number;
   private readonly staleAfterMs: number;
+  private readonly maxDynamicSymbols: number;
+  /** Connection-pool ceiling derived from the budget so the two always agree. */
+  private readonly maxShards: number;
+  private readonly warn: MarketHubWarn | undefined;
 
   constructor(
     private readonly url: string,
-    options: { heartbeatIntervalMs?: number; marketIdlePingAfterMs?: number; staleAfterMs?: number } = {},
+    options: {
+      heartbeatIntervalMs?: number;
+      marketIdlePingAfterMs?: number;
+      staleAfterMs?: number;
+      maxDynamicSymbols?: number;
+      /** Degradation sink; the backend wires this to its logger so starvation is never silent. */
+      warn?: MarketHubWarn;
+    } = {},
   ) {
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 25_000;
     this.marketIdlePingAfterMs = options.marketIdlePingAfterMs ?? 2_000;
     this.staleAfterMs = options.staleAfterMs ?? 60_000;
+    this.maxDynamicSymbols = options.maxDynamicSymbols ?? MAX_DYNAMIC_SYMBOLS;
+    this.maxShards = Math.ceil((this.maxDynamicSymbols + SEED_SYMBOL_COUNT) / SYMBOLS_PER_SHARD);
+    this.warn = options.warn;
     MARKET_ASSETS.forEach((asset, assetIndex) => MARKET_VENUES.forEach((venue, venueIndex) => {
       const market = seedMarket(venue, asset, venueIndex, assetIndex);
       this.markets.set(market.symbol, market);
@@ -356,6 +377,17 @@ export class CrossExMarketHub {
     return (MARKET_ASSETS as readonly string[]).includes(asset);
   }
 
+  /** Registered dynamic symbols against their budget; lets callers report pressure to operators. */
+  registrationStats(): { used: number; capacity: number; pending: number; shards: number; maxShards: number } {
+    return {
+      used: this.dynamicSymbolCount,
+      capacity: this.maxDynamicSymbols,
+      pending: this.pendingAssignments.size,
+      shards: this.shards.size,
+      maxShards: this.maxShards,
+    };
+  }
+
   hasAsset(asset: string): boolean {
     for (const market of this.markets.values()) {
       if (market.asset === asset) return true;
@@ -365,26 +397,97 @@ export class CrossExMarketHub {
 
   /**
    * Register markets discovered from the instrument catalog and subscribe their public channels.
-   * Safe to call repeatedly: known symbols are skipped. Returns false when the dynamic-symbol
-   * budget is exhausted, in which case nothing was added.
+   * Safe to call repeatedly: known symbols are skipped. Returns true when every requested symbol
+   * is registered afterwards.
+   *
+   * Registration is **never** an all-or-nothing coin flip on the dynamic-symbol budget. How it
+   * behaves matters: a single-service call asking for one symbol must succeed when the budget is
+   * merely full of colder markets, otherwise every freshly opened market silently shows zeros
+   * forever — which is how per-venue data "disappears" mid-session. Free slots are used first,
+   * then the coldest *unwatched* dynamic markets are recycled until the request fits. Only when
+   * the remaining candidates are all pinned by an active watcher does something get refused, and
+   * that is reported through `warn` instead of failing silently.
    */
   ensureMarkets(definitions: MarketDefinition[]): boolean {
     const missing = definitions.filter((definition) => !this.markets.has(definition.symbol));
-    if (missing.length === 0) return true;
-    if (this.dynamicSymbolCount + missing.length > MAX_DYNAMIC_SYMBOLS) return false;
-    this.dynamicSymbolCount += missing.length;
-    for (const definition of missing) {
+    if (missing.length === 0) {
+      for (const definition of definitions) {
+        if (this.dynamicMarkets.has(definition.symbol)) this.dynamicMarkets.set(definition.symbol, Date.now());
+      }
+      return true;
+    }
+    const overflow = this.dynamicSymbolCount + missing.length - this.maxDynamicSymbols;
+    // Symbols the caller asked for are not eviction candidates even when already registered:
+    // churning them would cancel and re-request three upstream channels for nothing.
+    const keep = new Set(definitions.map((definition) => definition.symbol));
+    if (overflow > 0) this.evictColdest(overflow, keep);
+    // Admit whatever still fits; a large batch degrades to a partial registration rather than
+    // dropping everything on the floor.
+    const capacity = Math.max(0, this.maxDynamicSymbols - this.dynamicSymbolCount);
+    const admitted = missing.slice(0, capacity);
+    const refused = missing.slice(admitted.length);
+    if (refused.length > 0) {
+      this.warn?.('market_hub_dynamic_budget_exhausted', {
+        requested: missing.length, admitted: admitted.length, refused: refused.length,
+        budget: this.maxDynamicSymbols, used: this.dynamicSymbolCount,
+        symbols: refused.slice(0, 10).map((definition) => definition.symbol),
+      });
+    }
+    if (admitted.length === 0) return false;
+    this.dynamicSymbolCount += admitted.length;
+    for (const definition of admitted) {
       this.markets.set(definition.symbol, pendingMarket(definition));
       this.dynamicMarkets.set(definition.symbol, Date.now());
     }
     for (const definition of definitions) {
       if (this.dynamicMarkets.has(definition.symbol)) this.dynamicMarkets.set(definition.symbol, Date.now());
     }
-    const symbols = missing.map((definition) => definition.symbol);
+    const symbols = admitted.map((definition) => definition.symbol);
     for (const channel of ['ticker', 'funding_rate', 'open_interest']) {
       this.subscribeSymbols(channel, symbols);
     }
-    return true;
+    return refused.length === 0;
+  }
+
+  /**
+   * Evict up to `count` registered dynamic markets, coldest first. Actively watched markets and
+   * any symbol in `keep` are skipped — dropping a market somebody is streaming would blank a live
+   * view to make room for one nobody asked about yet.
+   */
+  private evictColdest(count: number, keep: ReadonlySet<string> = new Set()): number {
+    let evicted = 0;
+    // Never scan for more slots than exist — a caller asking for a huge batch must not turn into
+    // quadratic work when every registered market is pinned by a watcher anyway.
+    const rounds = Math.min(count, this.dynamicMarkets.size);
+    // `Map.set` on an existing key keeps its original position, so the least-recently-used order
+    // lives in the timestamps themselves: pick the coldest eligible market on every round.
+    for (let round = 0; round < rounds; round += 1) {
+      let coldestSymbol: string | null = null;
+      let coldestAt = Number.POSITIVE_INFINITY;
+      for (const [symbol, lastUsedAt] of this.dynamicMarkets) {
+        if (keep.has(symbol) || this.isActivelyWatched(symbol)) continue;
+        if (lastUsedAt < coldestAt) {
+          coldestAt = lastUsedAt;
+          coldestSymbol = symbol;
+        }
+      }
+      if (coldestSymbol === null) break;
+      this.retireDynamicMarket(coldestSymbol);
+      evicted += 1;
+    }
+    return evicted;
+  }
+
+  /** Drop one dynamic market: unsubscribe its channels, free its shard slot, forget the symbol. */
+  private retireDynamicMarket(symbol: string): void {
+    for (const channel of ['ticker', 'funding_rate', 'open_interest']) {
+      this.unsubscribeSymbols(channel, [symbol]);
+      this.invalidSymbols.get(channel)?.delete(symbol);
+    }
+    this.releaseSymbolShard(symbol);
+    this.markets.delete(symbol);
+    this.dynamicMarkets.delete(symbol);
+    this.dynamicSymbolCount = Math.max(0, this.dynamicSymbolCount - 1);
   }
 
   orderBook(symbol: string): OrderBookSnapshot | null {
@@ -502,7 +605,16 @@ export class CrossExMarketHub {
       if (invalid?.has(symbol)) continue;
       const shard = this.shardFor(symbol);
       if (!shard) {
-        this.pendingAssignments.add(symbol);
+        // Every symbol that cannot get a connection slot is queued, not dropped: the periodic
+        // eviction sweep retries the queue. In practice the pool ceiling is derived from the symbol
+        // budget (`maxShards` below), so a slot should always be free and this branch stays a
+        // defensive guard — it must NOT be documented anywhere as a known, verified live alarm.
+        if (!this.pendingAssignments.has(symbol)) {
+          this.pendingAssignments.add(symbol);
+          this.warn?.('market_hub_shard_pool_exhausted', {
+            symbol, shards: this.shards.size, maxShards: this.maxShards, queued: this.pendingAssignments.size,
+          });
+        }
         continue;
       }
       this.pendingAssignments.delete(symbol);
@@ -562,7 +674,7 @@ export class CrossExMarketHub {
         return shard;
       }
     }
-    if (this.shards.size >= MAX_SHARDS) return null;
+    if (this.shards.size >= this.maxShards) return null;
     const shard: ShardConnection = {
       index: this.nextShardIndex++,
       socket: null,
@@ -709,16 +821,9 @@ export class CrossExMarketHub {
 
   private evictIdleDynamicMarkets(): void {
     const cutoff = Date.now() - DYNAMIC_MARKET_IDLE_MS;
-    for (const [symbol, lastUsedAt] of this.dynamicMarkets) {
+    for (const [symbol, lastUsedAt] of [...this.dynamicMarkets]) {
       if (lastUsedAt > cutoff || this.isActivelyWatched(symbol)) continue;
-      for (const channel of ['ticker', 'funding_rate', 'open_interest']) {
-        this.unsubscribeSymbols(channel, [symbol]);
-        this.invalidSymbols.get(channel)?.delete(symbol);
-      }
-      this.releaseSymbolShard(symbol);
-      this.markets.delete(symbol);
-      this.dynamicMarkets.delete(symbol);
-      this.dynamicSymbolCount = Math.max(0, this.dynamicSymbolCount - 1);
+      this.retireDynamicMarket(symbol);
     }
     // Symbols that waited for a shard slot get another chance once space may have freed up.
     if (this.pendingAssignments.size > 0 && !this.stopped) {
@@ -958,5 +1063,5 @@ export class CrossExMarketHub {
   }
 }
 
-export { invalidSymbolsFromMessage, CANDLE_INTERVALS };
+export { invalidSymbolsFromMessage, CANDLE_INTERVALS, MAX_DYNAMIC_SYMBOLS, SYMBOLS_PER_SHARD };
 export type { CandleInterval };
