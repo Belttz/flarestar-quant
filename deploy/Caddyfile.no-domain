@@ -1,0 +1,11 @@
+# 纯公网 IP / 局域网访问用的 Caddy 配置：没有域名、拿不到证书，只提供明文 HTTP。
+#
+# 由 docker-compose.cloud.nodomain.yml 挂载并作为 Caddy 的配置使用；
+# deploy/server/install.sh 会在 GCT_DOMAIN 为空时自动叠加该覆盖文件。
+# 注意：如果直接把本文件（或空的 {$GCT_DOMAIN}）交给 deploy/Caddyfile 的域名站点，
+# Caddy 会因为站点地址为空而解析失败退出 —— 这正是本文件存在的意义。
+#
+# 正式对外使用建议配好域名后改用 deploy/Caddyfile（自带 HTTPS 证书申请）。
+http://:80 {
+	reverse_proxy gate-crossex:17840
+}

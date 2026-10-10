@@ -1,3 +1,11 @@
+# Caddy 根据 GCT_DOMAIN 自动签发 HTTPS 证书
 {$GCT_DOMAIN} {
+	reverse_proxy gate-crossex:17840
+}
+
+# 兜底站点：直接用服务器公网 IP 或局域网地址访问时也能落到应用。
+# 这一段只能走明文 HTTP（拿不到证书），会话 Cookie 仍然带 SameSite=Strict + HttpOnly，
+# 但正式使用请删掉本段、只保留上面的域名站点。
+http://:80 {
 	reverse_proxy gate-crossex:17840
 }

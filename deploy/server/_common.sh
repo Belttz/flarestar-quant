@@ -9,6 +9,8 @@
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 COMPOSE_FILE="$REPO_ROOT/docker-compose.cloud.yml"
+# 无域名（纯 IP / 局域网访问）时叠加的覆盖文件；不存在时自动忽略。
+NODOMAIN_COMPOSE_FILE="$REPO_ROOT/docker-compose.cloud.nodomain.yml"
 DOCKERFILE="$REPO_ROOT/Dockerfile"
 ENV_FILE="${GCT_ENV_FILE:-$REPO_ROOT/cloud.env}"
 APP_SERVICE="gate-crossex"
@@ -104,6 +106,30 @@ mark_compose_variant() {
   fi
 }
 
+# 从 cloud.env 读取一个键的值（缺失时返回空串）。多处脚本共用。
+env_value() {
+  [ -f "$ENV_FILE" ] || return 0
+  grep -E "^$1=" "$ENV_FILE" | tail -n 1 | cut -d= -f2- || true
+}
+
+# 依据 cloud.env 里的 GCT_DOMAIN 决定要叠加哪些 compose 文件：
+#   - 填了域名        → 只跑基础文件（deploy/Caddyfile，含自动 HTTPS）
+#   - 域名为空        → 再叠加 no-domain 覆盖文件（deploy/Caddyfile.no-domain，仅明文 HTTP）
+# 由 cloud.env 单一来源判定，install / update / uninstall 三条脚本得到同一套 -f 参数。
+compose_files=()
+
+resolve_compose_files() {
+  compose_files=(-f "$COMPOSE_FILE")
+  if [ ! -f "$NODOMAIN_COMPOSE_FILE" ]; then return 0; fi
+  # 去掉全部空白（含手改文件留下的空格与 CRLF 的 \r）：`GCT_DOMAIN=   ` 这类值应视同未填域名，
+  # 否则会选到域名站配置、而 Caddy 拿到一个不合法的站点地址直接退出。
+  local domain
+  domain="$(env_value GCT_DOMAIN | tr -d '[:space:]')"
+  if [ -z "$domain" ]; then
+    compose_files+=(-f "$NODOMAIN_COMPOSE_FILE")
+  fi
+}
+
 compose() {
   if [ "$COMPOSE_V1" -eq 1 ]; then
     docker-compose "$@"
@@ -113,7 +139,20 @@ compose() {
 }
 
 compose_env() {
-  compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
+  resolve_compose_files
+  compose --env-file "$ENV_FILE" "${compose_files[@]}" "$@"
+}
+
+# 给用户复制用的 compose 命令串（含 cloud.env 与可能的 no-domain 覆盖文件）。
+compose_hint() {
+  resolve_compose_files
+  local parts=("docker compose" "--env-file" "$(basename "$ENV_FILE")") file
+  for file in "${compose_files[@]}"; do
+    if [ "$file" != "-f" ]; then
+      parts+=("-f" "$(basename "$file")")
+    fi
+  done
+  printf '%s' "${parts[*]} $*"
 }
 
 # 容器健康检查通过才返回 0；应用容器自带 HEALTHCHECK（见 Dockerfile）。

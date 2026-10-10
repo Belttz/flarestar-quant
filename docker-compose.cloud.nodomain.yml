@@ -1,0 +1,20 @@
+# 无域名（纯公网 IP / 局域网访问）时的 compose 覆盖文件。
+#
+# 作用：把 Caddy 的配置换成不含域名站点的 deploy/Caddyfile.no-domain。
+# 为什么需要它：deploy/Caddyfile 的第一个站点地址是 {$GCT_DOMAIN}，当 GCT_DOMAIN 为空时
+# 会展开成空地址，Caddy 2 解析 Caddyfile 直接报错退出 —— 于是连 http://:80 兜底站也一起挂，
+# 反而抵消了「公网 IP 也能访问」的目的。本覆盖文件让空域名场景有可用的配置。
+#
+# 用法（与基础文件叠加，顺序在后）：
+#   docker compose --env-file cloud.env \
+#     -f docker-compose.cloud.yml -f docker-compose.cloud.nodomain.yml up -d --build
+#
+# deploy/server/*.sh 会读取 cloud.env 里的 GCT_DOMAIN，为空时自动叠加本文件，一般无需手动指定。
+services:
+  caddy:
+    # 覆盖基础文件继承的镜像默认命令，改用无域名配置。
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile.no-domain", "--adapter", "caddyfile"]
+    volumes:
+      # 挂到与基础文件 **不同的** 容器路径：Compose 合并 volumes 时是同目标替换/追加语义，
+      # 复用同一路径会产生歧义，换路径最稳妥。
+      - ./deploy/Caddyfile.no-domain:/etc/caddy/Caddyfile.no-domain:ro

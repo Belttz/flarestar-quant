@@ -147,6 +147,35 @@ describe('deploy shell scripts', () => {
     assert.match(result.stdout, /--source/);
   });
 
+  test('GCT_DOMAIN 留空时自动叠加 no-domain 覆盖文件，填域名时不叠加', { skip: skipWithoutBash }, (t) => {
+    const envFile = join(mkTemp('env'), 'cloud.env');
+    const bashEnv = bashPath(envFile);
+    const bashCommon = bashPath(join(REPO_ROOT, 'deploy', 'server', '_common.sh'));
+    if (!bashEnv || !bashCommon) return t.skip(CANNOT_CONVERT);
+
+    const probe = (domain) => {
+      writeFileSync(envFile, `GCT_DOMAIN=${domain}\n`);
+      const script = [
+        'set -euo pipefail',
+        'source "$GCT_COMMON"',
+        'resolve_compose_files',
+        'printf "%s\\n" "${compose_files[*]}"',
+      ].join('\n');
+      const result = run(BASH, ['-c', script], {
+        env: { ...process.env, GCT_COMMON: bashCommon, GCT_ENV_FILE: bashEnv },
+      });
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout;
+    };
+
+    // 空域名 = 纯 IP / 局域网访问，必须叠加覆盖文件，否则 Caddy 会因站点地址为空而退出。
+    assert.match(probe(''), /docker-compose\.cloud\.nodomain\.yml/);
+    // 只写了空白也视同未填域名（手改文件常见的空格 / CRLF 手误）。
+    assert.match(probe('   '), /docker-compose\.cloud\.nodomain\.yml/);
+    // 填了域名就只跑基础文件（deploy/Caddyfile，含自动 HTTPS）。
+    assert.doesNotMatch(probe('quant.example.com'), /nodomain/);
+  });
+
   test('未知参数原样转发给 install.sh', { skip: skipWithoutBash }, () => {
     const source = makeFakeSourceDir();
     const result = runBootstrap([

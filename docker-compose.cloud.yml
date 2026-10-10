@@ -11,8 +11,19 @@ services:
       # 进程必须监听容器网卡；对外只经 Caddy 的 80/443 暴露。
       GCT_HOST: 0.0.0.0
       GCT_PORT: 17840
-      GCT_ALLOWED_HOSTS: ${GCT_DOMAIN}
-      GCT_FRONTEND_ORIGIN: https://${GCT_DOMAIN}
+      # 访问控制：不要把「访问地址」写死成单一域名。
+      # any = 接受任意 Host（域名 / 公网 IP / 局域网地址都能进），非显式信任来源一律 403。
+      # 想收紧成固定地址时，改成 loopback 并配下面的 GCT_ALLOWED_HOSTS / GCT_ALLOWED_ORIGINS。
+      GCT_HOST_ACCESS: ${GCT_HOST_ACCESS:-any}
+      # 显式收紧来源（逗号分隔，可选）。注意：Docker Compose 只把 environment 块里 **声明过**
+      # 的变量透传进容器，cloud.env 里的同名变量若未在此声明则不会生效——这正是下面两行必须
+      # 存在的原因（否则设了 GCT_HOST_ACCESS=loopback 却没有 allowlist，所有请求都会 403）。
+      # 留空是安全的：后端会过滤掉空白项。
+      GCT_ALLOWED_HOSTS: ${GCT_ALLOWED_HOSTS:-}
+      GCT_ALLOWED_ORIGINS: ${GCT_ALLOWED_ORIGINS:-}
+      # 浏览器来源（可选，单值）。install.sh 在填写了域名时会写入 https://<域名>；
+      # 留空则交给后端自适应逻辑（同源请求按 Host 头判定，域名 / 公网 IP 都能正常访问）。
+      GCT_FRONTEND_ORIGIN: ${GCT_FRONTEND_ORIGIN:-}
       GCT_DISABLE_OS_KEYCHAIN: "1"
       GCT_CREDENTIAL_ENV_PATH: /app/.local-data/credentials.env
       # 操作员登录（云端已启用）。密码仅首次启动用于种子化，之后请在界面里修改。
@@ -36,7 +47,11 @@ services:
       - "80:80"
       - "443:443"
     environment:
-      GCT_DOMAIN: ${GCT_DOMAIN}
+      # 站点地址：填域名时 Caddy 自动申请 HTTPS。
+      # 留空（纯 IP / 局域网访问）时必须叠加 docker-compose.cloud.nodomain.yml，改用不含域名
+      # 站点的 deploy/Caddyfile.no-domain；否则 {$GCT_DOMAIN} 展开为空会让 Caddy 解析失败退出，
+      # 连 http://:80 兜底站也会一起挂。deploy/server/*.sh 会依据 cloud.env 自动叠加。
+      GCT_DOMAIN: ${GCT_DOMAIN:-}
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
