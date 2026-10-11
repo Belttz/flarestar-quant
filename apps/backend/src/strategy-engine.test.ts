@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type Database from 'better-sqlite3';
+import { Decimal } from 'decimal.js';
 import { loadConfig } from './config.js';
 import { openDatabase } from './database.js';
 import { DEFAULT_CREDENTIAL_PROFILE, MemoryCredentialVault, type GateCredentials } from './credential-vault.js';
@@ -2141,9 +2142,14 @@ describe('auto signed thresholds and funding carry strategies', () => {
     expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
   });
 
+  // Entry at 20 bps must sit strictly between entryBps (10) and stopLossBps (30), or the fixture
+  // would either never open or stop out on the very next tick. Widening to 40 bps is genuinely
+  // adverse for a positive entry (the trade profits on convergence), so the stop must fire there
+  // while convergence toward 0 must never trigger it.
   it('closes both legs and stops the auto strategy when the stop-loss threshold is hit', async () => {
     const { engine, runtime, gateway, markets } = await createHarness();
-    markets.set('BINANCE_FUTURE_BTC_USDT', '100150', '100151');
+    // entrySpread = (100200 − 100000)/100000 = 20 bps → ≥ entryBps 10, < stopLossBps 30.
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100200', '100201');
     markets.set('OKX_FUTURE_BTC_USDT', '99999', '100000');
     const record = await engine.startStrategy({
       kind: 'auto', asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'OKX', leftSide: 'SELL', rightSide: 'BUY',
@@ -2153,7 +2159,7 @@ describe('auto signed thresholds and funding carry strategies', () => {
 
     const entryTick = engine.tick();
     await waitFor(() => gateway.createdOrders.length === 2);
-    ackOrder(runtime, 'remote-1', 'FILLED', '0.1', '100150');
+    ackOrder(runtime, 'remote-1', 'FILLED', '0.1', '100200');
     ackOrder(runtime, 'remote-2', 'FILLED', '0.1', '100000');
     await entryTick;
     await waitFor(() => runtime.getStrategy(record.id).openPosition === '0.1');
@@ -2171,9 +2177,40 @@ describe('auto signed thresholds and funding carry strategies', () => {
     await waitFor(() => runtime.getStrategy(record.id).status === 'STOPPED');
     expect(engine.listActiveStrategyIds()).not.toContain(record.id);
     expect(runtime.strategyLogs(record.id).some((log) => log.event === 'Stop-loss triggered')).toBe(true);
+    // C2: the stop-loss unwind must not masquerade as a take-profit exit.
+    expect(runtime.strategyLogs(record.id).some((log) => log.event === 'Stop-loss exit triggered')).toBe(true);
+    expect(runtime.strategyLogs(record.id).some((log) => log.event === 'Stop-loss Executed')).toBe(true);
+    expect(runtime.strategyLogs(record.id).some((log) => log.event === 'Take-profit triggered')).toBe(false);
     // A stopped strategy must not trade again.
     await engine.tick();
     expect(gateway.createdOrders).toHaveLength(4);
+  });
+
+  it('never turns a convergent move into a stop-loss exit', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    // Same coherent setup: enter at 20 bps (entryBps 10 < 20 < stopLossBps 30).
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100200', '100201');
+    markets.set('OKX_FUTURE_BTC_USDT', '99999', '100000');
+    const record = await engine.startStrategy({
+      kind: 'auto', asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'OKX', leftSide: 'SELL', rightSide: 'BUY',
+      entryBps: '10', takeProfitBps: '2', stopLossBps: 30, maxPosition: '0.1', perOrderQuantity: '0.1',
+      reduceOnly: false, executionMethod: 'TAKER_TAKER',
+    });
+    const entryTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 2);
+    ackOrder(runtime, 'remote-1', 'FILLED', '0.1', '100200');
+    ackOrder(runtime, 'remote-2', 'FILLED', '0.1', '100000');
+    await entryTick;
+    await waitFor(() => runtime.getStrategy(record.id).openPosition === '0.1');
+
+    // Convergence: 20 bps → 5 bps is profit for this direction, still above takeProfitBps 2.
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100050', '100051');
+    await engine.tick();
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 40));
+    expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+    expect(runtime.getStrategy(record.id).openPosition).toBe('0.1');
+    expect(gateway.createdOrders).toHaveLength(2);
+    expect(runtime.strategyLogs(record.id).some((log) => log.event === 'Stop-loss triggered')).toBe(false);
   });
 
   it('rejects same-venue auto strategies that pair two futures markets', async () => {
@@ -2622,5 +2659,415 @@ describe('auto signed thresholds and funding carry strategies', () => {
     ackOrder(runtime, 'remote-2', 'FILLED', '0.1', '100195');
     await entryTick;
     await waitFor(() => runtime.getStrategy(record.id).openPosition === '0.1');
+  });
+
+  describe('auto stop-loss gate and laddered add-ons', () => {
+    // Shared ladder fixture: entry 50 bps, add one clip every 20 bps of further widening, with the
+    // absolute stop at 100 bps. Tiers reachable below the stop line are 50 / 70 / 90 bps.
+    const ladderConfig = {
+      kind: 'auto' as const, asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'OKX',
+      leftSide: 'SELL' as const, rightSide: 'BUY' as const,
+      entryBps: '50', takeProfitBps: '2', stopLossBps: 100,
+      maxPosition: '0.3', perOrderQuantity: '0.1', reduceOnly: false,
+      executionMethod: 'TAKER_TAKER' as const, addOnStepBps: 20,
+    };
+
+    /** entrySpread = (sellBid − buyAsk)/buyAsk; buyAsk is pinned at 100000 so 1 bps = 10 units. */
+    function setSpread(markets: StubMarkets, bps: number): void {
+      markets.set('OKX_FUTURE_BTC_USDT', '99999', '100000');
+      const bid = new Decimal(100000).mul(new Decimal(1).plus(new Decimal(bps).div(10_000))).toString();
+      const ask = new Decimal(bid).plus(1).toString();
+      markets.set('BINANCE_FUTURE_BTC_USDT', bid, ask);
+    }
+
+    /** Runs one tick and acknowledges the two taker legs it submitted, leaving one filled clip. */
+    async function fillClip(
+      engine: StrategyEngine,
+      runtime: TradingRuntime,
+      gateway: ScriptedGateway,
+      expectedOrders: number,
+    ): Promise<void> {
+      const tick = engine.tick();
+      await waitFor(() => gateway.createdOrders.length === expectedOrders + 2);
+      ackOrder(runtime, `remote-${expectedOrders + 1}`, 'FILLED', '0.1', '100000');
+      ackOrder(runtime, `remote-${expectedOrders + 2}`, 'FILLED', '0.1', '100000');
+      await tick;
+    }
+
+    function clipCount(gateway: ScriptedGateway): number {
+      return gateway.createdOrders.filter((order) => order.type === 'MARKET' && order.reduce_only === 'false').length / 2;
+    }
+
+    it('adds exactly one clip per tier and never two clips in the same tick', async () => {
+      const { engine, runtime, gateway, markets } = await createHarness();
+      setSpread(markets, 50);
+      await engine.startStrategy(ladderConfig);
+
+      // Tier 0 (50 bps): one clip.
+      await fillClip(engine, runtime, gateway, 0);
+      expect(clipCount(gateway)).toBe(1);
+
+      // Same tier, same price: repeating the tick must not add anything.
+      await engine.tick();
+      expect(clipCount(gateway)).toBe(1);
+
+      // Tier 1 boundary (70 bps): exactly one more clip.
+      setSpread(markets, 70);
+      await fillClip(engine, runtime, gateway, 2);
+      expect(clipCount(gateway)).toBe(2);
+      await engine.tick();
+      expect(clipCount(gateway)).toBe(2);
+
+      // Tier 2 boundary (90 bps): one more clip, reaching maxPosition.
+      setSpread(markets, 90);
+      await fillClip(engine, runtime, gateway, 4);
+      expect(clipCount(gateway)).toBe(3);
+      await engine.tick();
+      expect(clipCount(gateway)).toBe(3);
+    });
+
+    it('refuses an add-on until the spread advances a full step', async () => {
+      const { engine, runtime, gateway, markets } = await createHarness();
+      setSpread(markets, 50);
+      await engine.startStrategy(ladderConfig);
+      await fillClip(engine, runtime, gateway, 0);
+      expect(clipCount(gateway)).toBe(1);
+
+      // 69 bps is still tier 0 → floor((69−50)/20) = 0 → no second clip.
+      setSpread(markets, 69);
+      await engine.tick();
+      expect(clipCount(gateway)).toBe(1);
+
+      // 70 bps reaches tier 1.
+      setSpread(markets, 70);
+      await engine.tick();
+      await waitFor(() => gateway.createdOrders.length === 4);
+      expect(clipCount(gateway)).toBe(2);
+    });
+
+    it('stops the ladder at the stop line and lets the stop win the same tick', async () => {
+      const { engine, runtime, gateway, markets } = await createHarness();
+      setSpread(markets, 50);
+      const record = await engine.startStrategy(ladderConfig);
+      await fillClip(engine, runtime, gateway, 0);
+      expect(clipCount(gateway)).toBe(1);
+
+      // Jump straight past the stop line: the stop arms and unwinds before the entry branch runs,
+      // so no further add-on can be placed (§8.2 tick ordering).
+      setSpread(markets, 100);
+      const stopTick = engine.tick();
+      await waitFor(() => gateway.createdOrders.length === 4);
+      expect(clipCount(gateway)).toBe(1);
+      expect(gateway.createdOrders.slice(2)).toHaveLength(2);
+      expect(gateway.createdOrders.slice(2).every((order) => order.reduce_only === 'true')).toBe(true);
+      ackOrder(runtime, 'remote-3', 'FILLED', '0.1', '100000');
+      ackOrder(runtime, 'remote-4', 'FILLED', '0.1', '100000');
+      await stopTick;
+      await waitFor(() => runtime.getStrategy(record.id).status === 'STOPPED');
+      expect(clipCount(gateway)).toBe(1);
+    });
+
+    it('keeps tick-driven accumulation when addOnStepBps is absent', async () => {
+      const { engine, runtime, gateway, markets } = await createHarness();
+      setSpread(markets, 50);
+      const { addOnStepBps: _omitted, ...withoutLadder } = ladderConfig;
+      await engine.startStrategy(withoutLadder);
+
+      // Unchanged behaviour: one clip per evaluation whenever the entry holds and capacity remains.
+      await fillClip(engine, runtime, gateway, 0);
+      await fillClip(engine, runtime, gateway, 2);
+      await fillClip(engine, runtime, gateway, 4);
+      expect(clipCount(gateway)).toBe(3);
+      await engine.tick();
+      expect(clipCount(gateway)).toBe(3);
+      expect(runtime.getStrategy(engine.listActiveStrategyIds()[0] ?? '').status).toBe('RUNNING');
+    });
+
+    it('reports the tier in the add-on condition without inventing a new event', async () => {
+      const { engine, runtime, gateway, markets } = await createHarness();
+      setSpread(markets, 50);
+      const record = await engine.startStrategy(ladderConfig);
+      await fillClip(engine, runtime, gateway, 0);
+      setSpread(markets, 70);
+      await fillClip(engine, runtime, gateway, 2);
+
+      const events = new Set(runtime.strategyLogs(record.id).map((log) => log.event));
+      expect(events.has('Entry triggered')).toBe(true);
+      expect(events.has('Position open Executed')).toBe(true);
+      // Tier details ride in the condition; no new event names are registered for add-ons.
+      expect(runtime.strategyLogs(record.id).some((log) => /Add-on tier 2 ·/.test(log.condition))).toBe(true);
+    });
+
+    it('refuses to enter while the spread already breaches the stop-loss line', async () => {
+      const { engine, runtime, gateway, markets } = await createHarness();
+      // 50 bps ≥ stopLossBps 30 with entryBps 10: the adverse side is breached before any position.
+      setSpread(markets, 50);
+      const record = await engine.startStrategy({
+        kind: 'auto', asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'OKX', leftSide: 'SELL', rightSide: 'BUY',
+        entryBps: '10', takeProfitBps: '2', stopLossBps: 30, maxPosition: '0.1', perOrderQuantity: '0.1',
+        reduceOnly: false, executionMethod: 'TAKER_TAKER',
+      });
+
+      await engine.tick();
+      expect(gateway.createdOrders).toHaveLength(0);
+      expect(runtime.getStrategy(record.id).openPosition).toBe('0');
+      expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+
+      // Below the stop line the same strategy opens normally.
+      setSpread(markets, 20);
+      const entryTick = engine.tick();
+      await waitFor(() => gateway.createdOrders.length === 2);
+      ackOrder(runtime, 'remote-1', 'FILLED', '0.1', '100000');
+      ackOrder(runtime, 'remote-2', 'FILLED', '0.1', '100000');
+      await entryTick;
+      await waitFor(() => runtime.getStrategy(record.id).openPosition === '0.1');
+    });
+
+    it('refuses auto configs whose stop-loss leaves no room above the entry level', async () => {
+      const { engine, markets } = await createHarness();
+      setSpread(markets, 20);
+      const base = {
+        kind: 'auto' as const, asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'OKX',
+        leftSide: 'SELL' as const, rightSide: 'BUY' as const, takeProfitBps: '2',
+        maxPosition: '0.1', perOrderQuantity: '0.1', reduceOnly: false,
+        executionMethod: 'TAKER_TAKER' as const,
+      };
+      // stopLossBps 10 <= |entryBps| 10 ⇒ zero headroom.
+      await expect(engine.startStrategy({ ...base, entryBps: '10', stopLossBps: 10 }))
+        .rejects.toMatchObject({ code: 'stop_loss_not_above_entry' });
+      // Mirror branch: stopLossBps 6 <= |−6|.
+      await expect(engine.startStrategy({ ...base, entryBps: '-6', stopLossBps: 6 }))
+        .rejects.toMatchObject({ code: 'stop_loss_not_above_entry' });
+      // Valid configs still start (30 > |10|).
+      await expect(engine.startStrategy({ ...base, entryBps: '10', stopLossBps: 30 }))
+        .resolves.toMatchObject({ status: 'RUNNING' });
+    });
+
+    it('rejects a ladder whose first tier sits at or beyond the stop-loss line', async () => {
+      const { engine, markets } = await createHarness();
+      setSpread(markets, 50);
+      // |50| + 60 = 110 >= stopLossBps 100 ⇒ the first add-on tier is unreachable.
+      await expect(engine.startStrategy({
+        ...ladderConfig, addOnStepBps: 60,
+      })).rejects.toMatchObject({ code: 'add_on_step_beyond_stop_loss' });
+      // The same ladder step is accepted for MAKER_TAKER: no execution-method rejection.
+      await expect(engine.startStrategy({
+        ...ladderConfig, executionMethod: 'MAKER_TAKER', makerLeg: 'left',
+      })).resolves.toMatchObject({ status: 'RUNNING' });
+    });
+
+    it('honours the negative entry branch for the gate and the stop', async () => {
+      const { engine, runtime, gateway, markets } = await createHarness();
+      // Negative entry: left is BUY (BINANCE ask 100000), right is SELL (OKX bid).
+      // spread = (OKX bid − BINANCE ask)/BINANCE ask; 1 bps = 10 price units at 100000.
+      // adverse = spread ≤ −30 bps (the opening cost widens past the stop).
+      markets.set('BINANCE_FUTURE_BTC_USDT', '99999', '100000');
+      markets.set('OKX_FUTURE_BTC_USDT', '99700', '99701');
+      const record = await engine.startStrategy({
+        kind: 'auto', asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'OKX', leftSide: 'BUY', rightSide: 'SELL',
+        entryBps: '-6', takeProfitBps: '2', stopLossBps: 30, maxPosition: '0.1', perOrderQuantity: '0.1',
+        reduceOnly: false, executionMethod: 'TAKER_TAKER',
+      });
+
+      // −30 bps is already at the stop line → entry refused.
+      await engine.tick();
+      expect(gateway.createdOrders).toHaveLength(0);
+
+      // Enter at −10 bps (bounded cost, below the stop line).
+      markets.set('OKX_FUTURE_BTC_USDT', '99900', '99901');
+      const entryTick = engine.tick();
+      await waitFor(() => gateway.createdOrders.length === 2);
+      ackOrder(runtime, 'remote-1', 'FILLED', '0.1', '100000');
+      ackOrder(runtime, 'remote-2', 'FILLED', '0.1', '99900');
+      await entryTick;
+      await waitFor(() => runtime.getStrategy(record.id).openPosition === '0.1');
+
+      // Widen past the stop: −40 bps ≤ −30 bps.
+      markets.set('OKX_FUTURE_BTC_USDT', '99600', '99601');
+      await engine.tick();
+      await waitFor(() => gateway.createdOrders.length === 4);
+      expect(runtime.strategyLogs(record.id).some((log) => log.event === 'Stop-loss triggered')).toBe(true);
+    });
+  });
+
+  describe('auto maker entry gate and sequential maker ladder', () => {
+    const makerLadderConfig = {
+      kind: 'auto' as const, asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'OKX',
+      leftSide: 'SELL' as const, rightSide: 'BUY' as const,
+      entryBps: '50', takeProfitBps: '2', stopLossBps: 100,
+      maxPosition: '0.5', perOrderQuantity: '0.1', reduceOnly: false,
+      executionMethod: 'MAKER_TAKER' as const, makerLeg: 'left' as const, addOnStepBps: 20,
+    };
+
+    /** The maker leg (BINANCE SELL) is priced from the OKX ask; keep it below every tier boundary. */
+    function setMakerBooks(markets: StubMarkets, takerAsk = '100000'): void {
+      markets.set('OKX_FUTURE_BTC_USDT', '99999', takerAsk);
+      markets.set('BINANCE_FUTURE_BTC_USDT', '100300', '100301');
+    }
+
+    function entryQuotes(gateway: ScriptedGateway) {
+      return gateway.createdOrders.filter((order) => order.symbol === 'BINANCE_FUTURE_BTC_USDT'
+        && order.side === 'SELL' && order.type === 'LIMIT' && order.time_in_force === 'POC');
+    }
+
+    function hedgeOrders(gateway: ScriptedGateway) {
+      return gateway.createdOrders.filter((order) => order.symbol === 'OKX_FUTURE_BTC_USDT' && order.type === 'MARKET');
+    }
+
+    /**
+     * Fills the resting maker quote and its taker hedge, completing exactly one clip, then re-evaluates.
+     *
+     * The explicit `tick()` is required, not cosmetic: `afterExecutionChange` only hedges, persists
+     * and checks completion — quoting happens exclusively inside `evaluate()` →
+     * `evaluateMakerQuotes()`. In production `StrategyEngine.start()` (app.ts:1331) installs a
+     * 500ms timer that drives those ticks; this harness never calls `start()`, so a new quote is
+     * only ever produced by an explicit tick. The settle delay clears the shared
+     * `requoteIntervalMs / 2` quote throttle so the replacement is not skipped.
+     *
+     * Each await counts *new* orders (previous clips leave filled hedges behind), so the helper can
+     * never satisfy itself with a stale one. Whether a fresh entry quote follows is left to the
+     * caller: the tier-capped case must assert that one does *not* appear.
+     */
+    async function fillMakerClip(
+      engine: StrategyEngine,
+      runtime: TradingRuntime,
+      gateway: ScriptedGateway,
+      price: string,
+      expectedPosition: string,
+    ): Promise<void> {
+      const quote = entryQuotes(gateway).at(-1);
+      expect(quote).toBeDefined();
+      const hedgesBefore = hedgeOrders(gateway).length;
+      ackOrder(runtime, quote!.remoteId, 'FILLED', '0.1', price);
+      ingestFill(runtime, quote!.remoteId, 'BINANCE_FUTURE_BTC_USDT', 'SELL', '0.1', price);
+      await waitFor(() => hedgeOrders(gateway).length > hedgesBefore);
+      const hedge = hedgeOrders(gateway).at(-1)!;
+      ackOrder(runtime, hedge.remoteId, 'FILLED', '0.1', '100000');
+      // Wait for this clip's own exposure: cumulative, so prior clips cannot satisfy it.
+      await waitFor(() => runtime.getStrategy(engine.listActiveStrategyIds()[0] ?? '').openPosition === expectedPosition);
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 15));
+      await engine.tick();
+    }
+
+    it('walks the maker entry quote one tier per filled clip and keeps a single resting quote', async () => {
+      const { engine, runtime, gateway, markets } = await createHarness();
+      setMakerBooks(markets);
+      await engine.startStrategy(makerLadderConfig);
+      await engine.tick();
+      await waitFor(() => entryQuotes(gateway).length === 1);
+      // Tier 0 rests at 100000 × (1 + 50 bps) = 100500.
+      expect(entryQuotes(gateway)[0]).toMatchObject({ side: 'SELL', type: 'LIMIT', time_in_force: 'POC', price: '100500' });
+
+      await fillMakerClip(engine, runtime, gateway, '100500', '0.1');
+      await waitFor(() => entryQuotes(gateway).length === 2);
+      expect(entryQuotes(gateway)[1]?.price).toBe('100700');
+      // Only ever one entry quote: the previous quote is terminal before the next is priced.
+      expect(entryQuotes(gateway)).toHaveLength(2);
+
+      await fillMakerClip(engine, runtime, gateway, '100700', '0.2');
+      await waitFor(() => entryQuotes(gateway).length === 3);
+      expect(entryQuotes(gateway)[2]?.price).toBe('100900');
+      expect(entryQuotes(gateway)).toHaveLength(3);
+      expect(runtime.getStrategy(engine.listActiveStrategyIds()[0] ?? '').openPosition).toBe('0.2');
+    });
+    it('counts one maker clip once, whether the hedge is filled or still outstanding', async () => {
+      const { engine, runtime, gateway, markets } = await createHarness();
+      setMakerBooks(markets);
+      await engine.startStrategy(makerLadderConfig);
+      await engine.tick();
+      await waitFor(() => entryQuotes(gateway).length === 1);
+      const quote = entryQuotes(gateway)[0]!;
+
+      // Maker leg filled, hedge still open: matched is 0 (min(|left|,|right|)) and the accounting
+      // must count the pending hedge via inFlight — i.e. exactly one clip, not two.
+      ackOrder(runtime, quote.remoteId, 'FILLED', '0.1', '100500');
+      ingestFill(runtime, quote.remoteId, 'BINANCE_FUTURE_BTC_USDT', 'SELL', '0.1', '100500');
+      await waitFor(() => gateway.createdOrders.some((order) => order.symbol === 'OKX_FUTURE_BTC_USDT' && order.type === 'MARKET'));
+      // Same tick requirement as `fillMakerClip`: quoting lives in `evaluate()`, not in the fill path.
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 15));
+      await engine.tick();
+      await waitFor(() => entryQuotes(gateway).length === 2);
+      expect(entryQuotes(gateway)[1]?.price).toBe('100700');
+
+      const hedge = gateway.createdOrders.filter((order) => order.symbol === 'OKX_FUTURE_BTC_USDT' && order.type === 'MARKET').at(-1)!;
+      ackOrder(runtime, hedge.remoteId, 'FILLED', '0.1', '100000');
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 40));
+      await engine.tick();
+      // Once both legs are flat the count is unchanged, so the tier does not skip to 90 bps.
+      expect(entryQuotes(gateway).at(-1)?.price).toBe('100700');
+      expect(entryQuotes(gateway)).toHaveLength(2);
+    });
+
+    it('stops referencing maker entry quotes past the stop line and blocks entry while breached', async () => {
+      const { engine, runtime, gateway, markets } = await createHarness();
+      setMakerBooks(markets);
+      const record = await engine.startStrategy(makerLadderConfig);
+      await engine.tick();
+      await waitFor(() => entryQuotes(gateway).length === 1);
+      await fillMakerClip(engine, runtime, gateway, '100500', '0.1');
+      await fillMakerClip(engine, runtime, gateway, '100700', '0.2');
+      await fillMakerClip(engine, runtime, gateway, '100900', '0.3');
+      await waitFor(() => entryQuotes(gateway).length === 3);
+
+      // The next tier would sit at 110 bps ≥ stopLossBps 100, so no further entry quote may be
+      // rested even though maxPosition (0.5) still leaves capacity for two more clips.
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 40));
+      await engine.tick();
+      await engine.tick();
+      expect(entryQuotes(gateway)).toHaveLength(3);
+      expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+      expect(runtime.getStrategy(record.id).openPosition).toBe('0.3');
+
+      // Breaching the stop line while a quote rests cancels it and forbids a fresh one.
+      markets.set('BINANCE_FUTURE_BTC_USDT', '101100', '101101');
+      await engine.tick();
+      expect(entryQuotes(gateway)).toHaveLength(3);
+    });
+
+    it('leaves the maker requote cadence untouched when no ladder is configured', async () => {
+      const { engine, gateway, markets } = await createHarness();
+      setMakerBooks(markets);
+      const { addOnStepBps: _omitted, ...withoutLadder } = makerLadderConfig;
+      await engine.startStrategy(withoutLadder);
+      await engine.tick();
+      await waitFor(() => entryQuotes(gateway).length === 1);
+      expect(entryQuotes(gateway)[0]?.price).toBe('100500');
+
+      // A static book must not produce any cancel/replace: the tier maths adds no requote rate.
+      await engine.tick();
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 40));
+      await engine.tick();
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 40));
+      await engine.tick();
+      expect(gateway.cancelledOrders).toHaveLength(0);
+      expect(entryQuotes(gateway)).toHaveLength(1);
+      expect(entryQuotes(gateway)[0]?.price).toBe('100500');
+    });
+
+    it('blocks the maker entry quote while the live spread already breaches the stop line', async () => {
+      const { engine, runtime, gateway, markets } = await createHarness();
+      // The shared `setMakerBooks` book prices BINANCE at 100300, giving a 30 bps entry spread that
+      // already equals this case's stopLossBps — nothing would ever be quoted, so the initial spread
+      // is compressed to 10 bps here (still valid per B1: stopLossBps 30 > |entryBps| 10).
+      markets.set('OKX_FUTURE_BTC_USDT', '99999', '100000');
+      markets.set('BINANCE_FUTURE_BTC_USDT', '100100', '100101');
+      const record = await engine.startStrategy({
+        // No ladder here: this case isolates the B2 gate itself (entryBps 10 + step 20 would sit
+        // exactly on stopLossBps 30 and be rejected by `add_on_step_beyond_stop_loss`).
+        ...makerLadderConfig, entryBps: '10', stopLossBps: 30, addOnStepBps: undefined,
+      });
+      await engine.tick();
+      await waitFor(() => entryQuotes(gateway).length === 1);
+      const firstQuote = entryQuotes(gateway)[0]!;
+
+      // 400 bps ≥ stopLossBps 30: the resting entry quote must go and no new one may be placed.
+      markets.set('BINANCE_FUTURE_BTC_USDT', '100400', '100401');
+      await engine.tick();
+      await waitFor(() => gateway.cancelledOrders.includes(firstQuote.remoteId));
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 40));
+      await engine.tick();
+      expect(entryQuotes(gateway)).toHaveLength(1);
+      expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+    });
   });
 });

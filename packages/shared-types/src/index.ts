@@ -1079,6 +1079,13 @@ export const StrategyConfigSchema = z.object({
   takeProfitBps: PositiveDecimalTextSchema.optional(),
   /** Auto strategies: optional adverse-move stop-loss; a trigger closes both legs and stops. */
   stopLossBps: z.number().gt(0).optional(),
+  /**
+   * auto: optional laddered add-on step in bps. When set, the strategy adds one clip
+   * (= perOrderQuantity) each time the spread advances another `addOnStepBps` beyond
+   * `entryBps`, instead of adding a clip on every evaluation while the entry holds.
+   * Absent keeps the original tick-driven accumulation, so existing strategies are unaffected.
+   */
+  addOnStepBps: z.number().gt(0).optional(),
   /** Explicit leg symbols override the venue/asset derivation (required for spot legs). */
   leftSymbol: z.string().regex(/^(?:(?:GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_SPOT_[A-Z0-9]+_(?:USDT|USDC)|(?:GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_[A-Z0-9]+_(?:USDT|USDC|USD))$/).optional(),
   rightSymbol: z.string().regex(/^(?:(?:GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_SPOT_[A-Z0-9]+_(?:USDT|USDC)|(?:GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_[A-Z0-9]+_(?:USDT|USDC|USD))$/).optional(),
@@ -1206,6 +1213,8 @@ export const STRATEGY_LOG_EVENT_CATEGORY: Record<string, StrategyLogEventCategor
   'Take-profit Executed': 'risk',
   'Take-profit updated': 'risk',
   'Stop-loss triggered': 'risk',
+  'Stop-loss exit triggered': 'risk',
+  'Stop-loss Executed': 'risk',
   'Basis take-profit triggered': 'risk',
   'Timed close triggered': 'risk',
   'Timed close slice executed': 'risk',

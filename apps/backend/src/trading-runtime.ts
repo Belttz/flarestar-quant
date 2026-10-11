@@ -92,6 +92,14 @@ export const CreateStrategyInputSchema = z.object({
   takeProfitBps: decimalText.optional(),
   /** auto: optional adverse-move stop-loss; |spread| beyond it closes both legs and stops. */
   stopLossBps: z.number().gt(0).optional(),
+  /**
+   * auto: optional laddered add-on step in bps. When set, the strategy adds one clip
+   * (= perOrderQuantity) each time the spread advances another `addOnStepBps` beyond
+   * `entryBps`, instead of adding a clip on every evaluation while the entry holds.
+   * Absent keeps the original tick-driven accumulation, so existing strategies are unaffected.
+   * Valid for both TAKER_TAKER and MAKER_TAKER.
+   */
+  addOnStepBps: z.number().gt(0).optional(),
   /** Explicit leg symbols override the venue/asset derivation (required for Gate spot legs). */
   leftSymbol: strategyLegSymbol.optional(),
   rightSymbol: strategyLegSymbol.optional(),

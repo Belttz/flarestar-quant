@@ -245,6 +245,72 @@ describe('strategy log event classification', () => {
     expect(isFilledLeg(log({ id: 'r', event: 'Right leg filled' }))).toBe(true);
     expect(isFilledLeg(log({ id: 't', event: 'Entry triggered' }))).toBe(false);
   });
+
+  it('routes the renamed stop-loss exit events to the risk tab', () => {
+    // C2: stop-loss exits used to reuse the take-profit names, which mislabelled them.
+    expect(classifyStrategyLogEvent('Stop-loss exit triggered')).toBe('risk');
+    expect(classifyStrategyLogEvent('Stop-loss Executed')).toBe('risk');
+    expect(strategyLogRowCategory(log({ id: 'sl', event: 'Stop-loss Executed' }))).toBe('risk');
+  });
+});
+
+describe('stop-loss exit grouping (design §5 Step 4)', () => {
+  it('labels a legacy leg pair whose trigger is a stop-loss exit as a stop-loss, not a take-profit', () => {
+    const condition = 'Spread 141.45 bps hit the 100 bps stop-loss';
+    const logs = [
+      log({ id: 'left-exit', event: 'Left leg filled', condition, result: 'BUY BINANCE @ 100200' }),
+      log({ id: 'right-exit', event: 'Right leg filled', condition, result: 'SELL OKX @ 99999' }),
+      log({ id: 'trigger-exit', event: 'Stop-loss exit triggered', condition }),
+    ];
+
+    expect(groupStrategyLogs(logs)[0]).toEqual(expect.objectContaining({
+      id: 'left-exit:right-exit',
+      event: 'Stop-loss Executed',
+    }));
+  });
+
+  it('still labels a leg pair with a take-profit trigger as a take-profit', () => {
+    const condition = 'Spread 2.00 bps ≤ 2.00 bps';
+    const logs = [
+      log({ id: 'left-exit', event: 'Left leg filled', condition }),
+      log({ id: 'right-exit', event: 'Right leg filled', condition }),
+      log({ id: 'trigger-exit', event: 'Take-profit triggered', condition }),
+    ];
+
+    expect(groupStrategyLogs(logs)[0]).toEqual(expect.objectContaining({ event: 'Take-profit Executed' }));
+  });
+
+  it('keeps the trigger row visible in the risk tab next to its grouped execution', () => {
+    const condition = 'Spread 141.45 bps hit the 100 bps stop-loss';
+    const logs = [
+      log({ id: 'left-exit', event: 'Left leg filled', condition }),
+      log({ id: 'right-exit', event: 'Right leg filled', condition }),
+      log({ id: 'trigger-exit', event: 'Stop-loss exit triggered', condition }),
+    ];
+
+    expect(prepareStrategyLogView(logs, 'risk').map((row) => row.event)).toEqual([
+      'Stop-loss Executed',
+      'Stop-loss exit triggered',
+    ]);
+    expect(prepareStrategyLogView(logs, 'execution')).toHaveLength(0);
+  });
+
+  it('gives a completed stop-loss clip the same derived spread metric as other clips', () => {
+    const prepared = prepareStrategyLogs([
+      log({
+        id: 'sl-exit',
+        event: 'Stop-loss Executed',
+        result: 'BUY BINANCE_FUTURE_BTC_USDT 10 @ 100200 · SELL OKX_FUTURE_BTC_USDT 10 @ 100000',
+      }),
+    ], { kind: 'auto', leftSide: 'BUY', rightSide: 'SELL' });
+
+    expect(prepared[0]?.executionSpreadBps).toBe('-19.96');
+  });
+
+  it('keeps the two stop-loss names covered by the backend fetch set', () => {
+    expect(STRATEGY_LOG_CATEGORY_FETCH_EVENTS.risk).toContain('Stop-loss exit triggered');
+    expect(STRATEGY_LOG_CATEGORY_FETCH_EVENTS.risk).toContain('Stop-loss Executed');
+  });
 });
 
 describe('prepareStrategyLogView category filtering', () => {

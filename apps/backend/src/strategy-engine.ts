@@ -518,6 +518,20 @@ export class StrategyEngine {
       && new Decimal(input.takeProfitBps).gte(new Decimal(input.entryBps))) {
       throw new StrategyEngineError('take_profit_must_be_below_entry', 400);
     }
+    // B1: the absolute stop must sit beyond |entry|, otherwise a position opened at the entry
+    // level is already at/through its stop and could never be held — the effective buffer would be
+    // zero or negative. Unified rule: stopLossBps > |entryBps| (signed entry, §2 B1).
+    if (input.kind === 'auto' && input.stopLossBps && input.entryBps
+      && new Decimal(input.stopLossBps).lte(new Decimal(input.entryBps).abs())) {
+      throw new StrategyEngineError('stop_loss_not_above_entry', 400);
+    }
+    // Ladder (§8.6): the first add-on tier must still leave room below the stop line, otherwise
+    // that tier can never be reached without tripping the stop first.
+    if (input.kind === 'auto' && input.addOnStepBps && input.stopLossBps && input.entryBps
+      && new Decimal(input.entryBps).abs().plus(new Decimal(input.addOnStepBps))
+        .gte(new Decimal(input.stopLossBps))) {
+      throw new StrategyEngineError('add_on_step_beyond_stop_loss', 400);
+    }
     if (input.kind === 'premium' && !input.grid && !input.reduceOnly
       && input.entryPremiumPct !== undefined && input.takeProfitPremiumPct !== undefined) {
       const entry = new Decimal(input.entryPremiumPct);
@@ -1660,6 +1674,93 @@ export class StrategyEngine {
   }
 
   /**
+   * True when the live spread already sits at/beyond the absolute stop-loss line, i.e. in the
+   * adverse region for this strategy's signed entry level: `spread >= stopLossBps` when the entry
+   * is positive (the trade profits on convergence, so widening is adverse), and
+   * `spread <= -stopLossBps` when the entry is negative (the opening cost widens).
+   *
+   * Single-purpose and stateless by design: the stop path (`maybeTriggerAutoStopLoss`) and the B2
+   * entry gate (taker + maker) must share *exactly* this predicate so their notions of "breached"
+   * can never drift apart.
+   */
+  private adverseBreached(config: CreateStrategyInput, spread: Decimal): boolean {
+    const stop = new Decimal(config.stopLossBps ?? '0');
+    const level = new Decimal(config.entryBps ?? '0');
+    return level.gte(0) ? spread.gte(stop) : spread.lte(stop.neg());
+  }
+
+  /**
+   * Index of the ladder tier the given spread belongs to: `floor(advance / step)` where `advance`
+   * is how far the spread has widened beyond the entry level. Tier 0 is the initial entry tier, so
+   * tier `k` permits `k + 1` clips. Returns 0 with no ladder configured (or below the entry level).
+   *
+   * Stateless: the tier is always re-derived from the live spread plus already-placed quantity, so
+   * nothing needs restoring after a backend restart (§8.1).
+   */
+  private tierIndexFor(config: CreateStrategyInput, spread: Decimal): number {
+    const step = new Decimal(config.addOnStepBps ?? '0');
+    if (!step.gt(0)) return 0;
+    const level = new Decimal(config.entryBps ?? '0');
+    const advance = level.gte(0) ? spread.minus(level) : level.minus(spread);
+    return advance.lte(0) ? 0 : advance.div(step).floor().toNumber();
+  }
+
+  /** Signed entry level (bps) of tier `tier`: `entryBps + tier·step`, mirrored for negative entries. */
+  private tierLevelBps(config: CreateStrategyInput, tier: number): Decimal {
+    const step = new Decimal(config.addOnStepBps ?? '0');
+    const level = new Decimal(config.entryBps ?? '0');
+    return level.gte(0) ? level.plus(step.mul(tier)) : level.minus(step.mul(tier));
+  }
+
+  /** Magnitude of tier `tier`'s level: `|entryBps| + tier·step` — compare against `stopLossBps`. */
+  private absThreshold(config: CreateStrategyInput, tier: number): Decimal {
+    const step = new Decimal(config.addOnStepBps ?? '0');
+    const level = new Decimal(config.entryBps ?? '0');
+    return level.abs().plus(step.mul(tier));
+  }
+
+  /**
+   * Whether the ladder admits another clip at the live spread. Used by the **taker** path, which
+   * acts on the current tick, so it judges the *live spread* via `tierIndexFor`. The maker path is
+   * passive (its quote waits for the gap) and uses {@link nextLadderTier} instead — deliberately
+   * different helpers; do not merge them.
+   *
+   * `matched + inFlight` counts placed clips: using `matched` alone would let a still-open entry
+   * order be submitted again on the next tick. No ladder configured ⇒ today's tick-driven
+   * accumulation (unchanged behaviour for existing strategies).
+   */
+  private ladderAllowsAdd(actor: StrategyActor, exposure: { left: Decimal; right: Decimal }, spread: Decimal): boolean {
+    const step = new Decimal(actor.config.addOnStepBps ?? '0');
+    if (!step.gt(0)) return true;
+    const perOrder = new Decimal(actor.config.perOrderQuantity);
+    if (!perOrder.gt(0)) return true;
+    const placed = this.placedQuantity(actor, exposure);
+    const allowedClips = perOrder.mul(this.tierIndexFor(actor.config, spread) + 1);
+    return placed.lt(allowedClips.minus(QUANTITY_EPSILON));
+  }
+
+  /**
+   * Index of the tier the **next** clip belongs to, derived from the clip count rather than the
+   * live spread: notebook price action cannot advance a maker tier, only a filled clip can. One
+   * maker clip is one matched pair, so `floor((matched + inFlight) / perOrder)` counts it exactly
+   * once whether the hedge has filled (`matched`) or is still outstanding (`inFlight`) (§8.5.4).
+   */
+  private nextLadderTier(actor: StrategyActor, exposure: { left: Decimal; right: Decimal }): number {
+    const step = new Decimal(actor.config.addOnStepBps ?? '0');
+    if (!step.gt(0)) return 0;
+    const perOrder = new Decimal(actor.config.perOrderQuantity);
+    if (!perOrder.gt(0)) return 0;
+    return this.placedQuantity(actor, exposure).div(perOrder).floor().toNumber();
+  }
+
+  /** Already-committed quantity in left-leg units = filled exposure plus open order quantity. */
+  private placedQuantity(actor: StrategyActor, exposure: { left: Decimal; right: Decimal }): Decimal {
+    const matched = this.matchedQuantity(exposure);
+    const quoteIds = new Set([...actor.quotes.values()].map((quote) => quote.orderId));
+    return matched.plus(this.inFlightQuantity(actor, quoteIds));
+  }
+
+  /**
    * Auto stop-loss: when the live spread has moved past the configured bps in the adverse
    * direction relative to the signed entry threshold, close the entire open position with one
    * reduce-only taker clip. The strategy itself stops once that exit has fully filled.
@@ -1672,9 +1773,7 @@ export class StrategyEngine {
     if (!matched.gt(QUANTITY_EPSILON)) return false;
     const entry = this.entrySpreadBps(actor.config);
     if (!entry) return false;
-    const entryLevel = new Decimal(actor.config.entryBps ?? '0');
-    const stop = new Decimal(stopLoss);
-    const adverse = entryLevel.gte(0) ? entry.spread.gte(stop) : entry.spread.lte(stop.neg());
+    const adverse = this.adverseBreached(actor.config, entry.spread);
     if (!adverse) return false;
     actor.stopLossArmed = true;
     this.runtime.addStrategyLog(actor.id, 'warning', 'Stop-loss triggered',
@@ -2091,16 +2190,33 @@ export class StrategyEngine {
     const matched = this.matchedQuantity(exposure);
     const perOrder = new Decimal(actor.config.perOrderQuantity);
     const entryLevel = new Decimal(actor.config.entryBps ?? '0');
+    // Three independent admission conditions, evaluated cheap→semantic so a breached or
+    // un-triggered book never runs the ladder math. They are deliberately separate helpers:
+    // `adverseBreached` is shared with the stop path and must stay single-purpose.
+    const breached = entry !== null && actor.kind === 'auto' && actor.config.stopLossBps !== undefined
+      && this.adverseBreached(actor.config, entry.spread);
     // Signed entry: a positive threshold enters when the spread is at least that wide, a negative
     // threshold enters when the spread is at most that negative (bounded opening cost).
-    const entryTriggered = entry !== null
+    const atThreshold = entry !== null
       && (entryLevel.gte(0) ? entry.spread.gte(entryLevel) : entry.spread.lte(entryLevel));
+    const ladderTier = entry !== null && actor.config.addOnStepBps
+      ? this.tierIndexFor(actor.config, entry.spread) : 0;
+    const ladderOk = entry !== null && this.ladderAllowsAdd(actor, exposure, entry.spread);
+    const entryTriggered = entry !== null && !breached && atThreshold && ladderOk;
 
     if (entry && entryTriggered) {
       const capacity = this.remainingEntryCapacity(actor, exposure);
       const quantity = Decimal.min(perOrder, capacity);
       if (quantity.gt(QUANTITY_EPSILON)) {
-        await this.executeTakerClip(actor, 'entry', quantity, `Spread ${entry.spread.toFixed(2)} bps ${entryLevel.gte(0) ? '≥' : '≤'} ${actor.config.entryBps} bps`);
+        // An add-on clip *is* an entry clip, so it reuses the existing events and carries its tier
+        // in the condition instead of inventing a new event name (§8.8). Tier 0 is the opening
+        // clip rather than an add-on, so it keeps the original wording — only the clips the ladder
+        // actually adds are labelled, and their number is 1-based to match the UI's tier list
+        // (`Add-on tiers: 50 / 70 / 90`), where tier 1 is the entry level itself.
+        const condition = actor.config.addOnStepBps && ladderTier > 0
+          ? `Add-on tier ${ladderTier + 1} · spread ${entry.spread.toFixed(2)} bps ${entryLevel.gte(0) ? '≥' : '≤'} ${this.tierLevelBps(actor.config, ladderTier).toFixed(2)} bps`
+          : `Spread ${entry.spread.toFixed(2)} bps ${entryLevel.gte(0) ? '≥' : '≤'} ${actor.config.entryBps} bps`;
+        await this.executeTakerClip(actor, 'entry', quantity, condition);
         return;
       }
     }
@@ -2160,7 +2276,12 @@ export class StrategyEngine {
     actor.busy = true;
     try {
       const reduceOnly = intent === 'exit' || actor.config.reduceOnly;
-      const triggeredEvent = intent === 'exit' ? 'Take-profit triggered'
+      // An exit driven by a latched auto stop-loss must not be labelled "Take-profit" — this is the
+      // C2 mislabelling: with a position open, `intent === 'exit'` covered both take-profit and
+      // stop-loss unwinds. Otherwise the event names are unchanged (C2).
+      const stopLossExit = actor.kind === 'auto' && actor.stopLossArmed && intent === 'exit';
+      const triggeredEvent = stopLossExit ? 'Stop-loss exit triggered'
+        : intent === 'exit' ? 'Take-profit triggered'
         : actor.config.reduceOnly ? 'Reduce-only triggered' : 'Entry triggered';
       this.runtime.addStrategyLog(actor.id, 'info', triggeredEvent, condition,
         `${quantity.toString()} ${actor.config.asset}`, 'Submitting both taker legs');
@@ -2199,7 +2320,9 @@ export class StrategyEngine {
       const left = settled.find((order) => order.strategyLeg === 'left');
       const right = settled.find((order) => order.strategyLeg === 'right');
       if (left?.state === 'FILLED' && right?.state === 'FILLED') {
-        const executedEvent = intent === 'exit' ? 'Take-profit Executed'
+        const stopLossExit = actor.kind === 'auto' && actor.stopLossArmed && intent === 'exit';
+        const executedEvent = stopLossExit ? 'Stop-loss Executed'
+          : intent === 'exit' ? 'Take-profit Executed'
           : actor.config.reduceOnly ? 'Reduce-only Executed' : 'Position open Executed';
         this.runtime.addStrategyLog(actor.id, 'info',
           executedEvent,
@@ -2222,7 +2345,7 @@ export class StrategyEngine {
     await this.afterExecutionChange(actor);
   }
 
-  private desiredMakerPrice(actor: StrategyActor, intent: QuoteIntent): { price: Decimal; makerLeg: LegDefinition; takerLeg: LegDefinition } | null {
+  private desiredMakerPrice(actor: StrategyActor, intent: QuoteIntent, tier = 0): { price: Decimal; makerLeg: LegDefinition; takerLeg: LegDefinition } | null {
     const makerLegKey = actor.config.makerLeg ?? 'left';
     const legs = this.legsForIntent(actor, intent);
     const makerLeg = makerLegKey === 'left' ? legs.left : legs.right;
@@ -2231,7 +2354,12 @@ export class StrategyEngine {
     if (!pair) return null;
     const makerMarket = makerLeg.leg === 'left' ? pair.left : pair.right;
     const takerMarket = takerLeg.leg === 'left' ? pair.left : pair.right;
-    const threshold = intent === 'entry' ? new Decimal(actor.config.entryBps ?? '0') : new Decimal(actor.config.takeProfitBps ?? '0');
+    // Entry rests at the *next unfilled tier's* level rather than the raw entry threshold, so the
+    // maker quote walks outward one step per filled clip (sequential ladder, §8.5.2). `tier` is 0
+    // without a ladder, which reproduces today's price exactly. The exit branch is unchanged.
+    const threshold = intent === 'entry'
+      ? this.tierLevelBps(actor.config, tier)
+      : new Decimal(actor.config.takeProfitBps ?? '0');
     const factor = threshold.div(BPS);
     const tick = this.constraintsFor(makerLeg.symbol).tickSize;
     let boundary: Decimal;
@@ -2260,14 +2388,28 @@ export class StrategyEngine {
     const exposure = this.legExposures(actor.id, actor.config);
     const matched = this.matchedQuantity(exposure);
     const perOrder = new Decimal(actor.config.perOrderQuantity);
-    const intents: Array<{ intent: QuoteIntent; quantity: Decimal }> = [];
+    const intents: Array<{ intent: QuoteIntent; quantity: Decimal; tier: number }> = [];
     const entryCapacity = this.remainingEntryCapacity(actor, exposure);
     if (entryCapacity.gt(QUANTITY_EPSILON)) {
-      const entryQuantity = this.carryAdjustedMakerQuantity(actor, exposure, Decimal.min(perOrder, entryCapacity));
-      if (entryQuantity.gt(QUANTITY_EPSILON)) intents.push({ intent: 'entry', quantity: entryQuantity });
+      // B2 gate on the maker path too: a MAKER_TAKER auto strategy must not rest an entry quote at
+      // or beyond the stop-loss line, or it would open a position that stops out immediately.
+      const liveSpread = this.entrySpreadBps(actor.config)?.spread;
+      const gateOk = !(actor.kind === 'auto' && actor.config.stopLossBps !== undefined
+        && liveSpread !== undefined && this.adverseBreached(actor.config, liveSpread));
+      // Ladder cap: stop resting entry quotes once the next tier's level reaches the stop line.
+      // Complementary to `gateOk` and never deadlocks against it — the exit intent below is pushed
+      // independently, and once a position is open the armed stop routes `evaluate()` away from here
+      // entirely (§8.5.5).
+      const nextTier = this.nextLadderTier(actor, exposure);
+      const tierOk = !actor.config.addOnStepBps || !actor.config.stopLossBps
+        || this.absThreshold(actor.config, nextTier).lt(new Decimal(actor.config.stopLossBps));
+      if (gateOk && tierOk) {
+        const entryQuantity = this.carryAdjustedMakerQuantity(actor, exposure, Decimal.min(perOrder, entryCapacity));
+        if (entryQuantity.gt(QUANTITY_EPSILON)) intents.push({ intent: 'entry', quantity: entryQuantity, tier: nextTier });
+      }
     }
     if (actor.kind === 'auto' && actor.config.takeProfitBps && matched.gt(QUANTITY_EPSILON)) {
-      intents.push({ intent: 'exit', quantity: Decimal.min(perOrder, matched) });
+      intents.push({ intent: 'exit', quantity: Decimal.min(perOrder, matched), tier: 0 });
     }
     for (const [intent] of [...actor.quotes]) {
       if (!intents.some((candidate) => candidate.intent === intent)) {
@@ -2280,13 +2422,13 @@ export class StrategyEngine {
       }
     }
     for (const candidate of intents) {
-      await this.maintainQuote(actor, candidate.intent, candidate.quantity);
+      await this.maintainQuote(actor, candidate.intent, candidate.quantity, candidate.tier);
     }
   }
 
-  private async maintainQuote(actor: StrategyActor, intent: QuoteIntent, quantity: Decimal): Promise<void> {
+  private async maintainQuote(actor: StrategyActor, intent: QuoteIntent, quantity: Decimal, tier = 0): Promise<void> {
     if (actor.status !== 'RUNNING') return;
-    const desired = this.desiredMakerPrice(actor, intent);
+    const desired = this.desiredMakerPrice(actor, intent, tier);
     if (!desired) return;
     const existing = actor.quotes.get(intent);
     const now = this.options.now();

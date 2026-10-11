@@ -2,6 +2,27 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [0.3.2] - 2026-10-11
+
+### Added
+
+- Optional laddered add-ons for auto spread strategies: a new **Add-on step** field (bps, auto only) admits one clip (= per-order quantity) each time the spread advances another step past the entry threshold, instead of adding a clip on every evaluation tick. Blank keeps today's tick-driven accumulation, so every already-running strategy is unaffected.
+- The add-on ladder works on both execution methods. On Taker–Taker the tier is derived from the live spread; on Maker–Taker the resting entry quote is priced at the next unfilled tier's level and walks outward one step per filled clip, still keeping a single resting entry quote.
+- The auto form now shows the **effective stop buffer** (`stopLossBps − |entryBps|`) next to the stop-loss field, in the launch summary and in the confirmation rows. The stop compares an absolute spread level while entry only requires `spread >= entryBps`, so a 65 bps entry under a 100 bps stop tolerates 35 bps of further adverse move — previously the UI implied 100.
+- A live **add-on tier preview** under the threshold fields lists every reachable tier and the cap that limits it, e.g. `Add-on tiers: 50 / 70 / 90 bps · 3 clips before the 100 bps stop`, or `· 5 clips · limited by max position`.
+- Add-on clips carry their tier in the log condition (`Add-on tier 2 · spread 88.40 bps ≥ 70 bps`) instead of a new event name, so existing log filters keep working.
+
+### Changed
+
+- Auto strategies now refuse to open while the live spread already sits at or beyond the stop-loss line, on the maker path as well as the taker path. Previously a position could be opened that stopped out on the very next evaluation.
+- Laddered add-ons stop at the stop-loss line: no entry clip or maker entry quote is placed once the next tier's level would reach the stop. The strategy stays `RUNNING` and can still place exit quotes.
+- Auto configs are now validated at launch: `stopLossBps` must exceed `|entryBps|` (a stop at or inside the entry level could never be held), and `|entryBps| + addOnStepBps` must stay below `stopLossBps` (otherwise the first add-on tier is unreachable). The strategy form blocks both with a plain-language reason before anything reaches the engine.
+- The stop-loss judgement is now a single shared predicate used by both the stop path and the entry gate, so the two can no longer drift apart.
+
+### Fixed
+
+- Stop-loss exits were logged as `Take-profit triggered` / `Take-profit Executed`, so an unwind driven by the stop-loss showed up as a take-profit in the log list and in the risk tab. They are now logged as `Stop-loss exit triggered` / `Stop-loss Executed`, classified under **risk**, and historical clips that were mislabelled before this release regroup under the stop-loss label.
+
 ## [0.3.1] - 2026-10-11
 
 ### Added

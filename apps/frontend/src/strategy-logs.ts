@@ -102,12 +102,18 @@ export function groupStrategyLogs(logs: StrategyLog[]): StrategyLog[] {
     const right = log.event === 'Right leg filled' ? log : counterpart;
     const takeProfit = logs.some((candidate) =>
       candidate.event === 'Take-profit triggered' && candidate.condition === log.condition);
+    // Legacy stop-loss exits were logged as `Take-profit triggered` / `Take-profit Executed`.
+    // The backend now emits `Stop-loss exit triggered` / `Stop-loss Executed`, so a stored leg
+    // pair whose trigger is the stop-loss name must regroup under the stop-loss label —
+    // otherwise a historical stop-loss clip keeps showing up as a take-profit in the risk tab.
+    const stopLoss = logs.some((candidate) =>
+      candidate.event === 'Stop-loss exit triggered' && candidate.condition === log.condition);
     consumed.add(index);
     consumed.add(counterpartIndex);
     grouped.push({
       id: `${left.id}:${right.id}`,
       level: 'info',
-      event: takeProfit ? 'Take-profit Executed' : 'Position open Executed',
+      event: stopLoss ? 'Stop-loss Executed' : takeProfit ? 'Take-profit Executed' : 'Position open Executed',
       condition: log.condition,
       quantity: `${left.quantity} · ${right.quantity}`,
       result: `${left.result} · ${right.result}`,
@@ -145,6 +151,9 @@ function decorateStrategyLogExecutions(grouped: StrategyLog[], config?: Strategy
   return grouped.map((log) => {
     const isExecution = log.event === 'Position open Executed'
       || log.event === 'Take-profit Executed'
+      // Stop-loss exits carry a real fill on both legs, so they get the same derived spread
+      // metric as every other completed clip.
+      || log.event === 'Stop-loss Executed'
       || log.event === 'Reduce-only Executed';
     if (!isExecution || !config) {
       return { ...log, executionPremiumPct: null, executionSpreadBps: null };

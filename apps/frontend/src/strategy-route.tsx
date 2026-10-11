@@ -68,6 +68,8 @@ import { numericFutureFeeRate } from './fee-rates.js';
 import { ExecutionPagination } from './execution-pagination-control.js';
 import { executionPageWindow } from './execution-pagination.js';
 import { StrategyLogLoadMore } from './strategy-log-load-more.js';
+import { describeAutoThresholds, formatBps, formatTierLevels } from './strategy-ladder.js';
+import { AutoThresholdHints } from './strategy-threshold-hints.js';
 
 /** Execution-log page size, shared by the client pager and the server-side fetch. */
 const LOG_PAGE_SIZE = 50;
@@ -687,6 +689,9 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const [threshold, setThreshold] = useState(() => queryDecimal(autoQuery?.get('entryBps')) ?? '0');
   const [takeProfitThreshold, setTakeProfitThreshold] = useState('0.4');
   const [stopLossThreshold, setStopLossThreshold] = useState('100');
+  // Auto only: optional laddered add-on step (bps). Blank keeps today's tick-driven accumulation,
+  // so every already-running strategy keeps the behaviour it was launched with.
+  const [addOnStep, setAddOnStep] = useState('');
   // Auto legs may use the Gate spot market on either side; everything else stays perpetual.
   const [leftProduct, setLeftProduct] = useState<'perpetual' | 'spot'>(() => queryProduct(autoQuery?.get('leftProduct')) ?? 'perpetual');
   const [rightProduct, setRightProduct] = useState<'perpetual' | 'spot'>(() => queryProduct(autoQuery?.get('rightProduct')) ?? 'perpetual');
@@ -899,6 +904,17 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
     minimumNotionalIssue({ instrument: rightInstrument, quantity: configuredPerOrderNumber, price: rightPrice, asset, venueName: rightExchange.name, t }),
   ].filter((issue): issue is string => issue !== null);
   const instrumentsReady = leftInstrument !== undefined && rightInstrument !== undefined;
+  // Auto stop-loss tolerance. The engine compares ABSOLUTE spread levels against `stopLossBps`,
+  // while entry only requires `spread >= entryBps`, so the adverse move a freshly opened position
+  // can still absorb is `stopLossBps - |entryBps|`. Derived once here and reused by the field
+  // hint, the launch summary, the confirmation rows and the launcher gate (design §5.10-5.12).
+  const autoThresholds = describeAutoThresholds({
+    entryBps: threshold,
+    stopLossBps: stopLossThreshold,
+    addOnStepBps: addOnStep,
+    maxPosition,
+    perOrderQuantity: configuredPerOrder,
+  });
   const signedEntryThreshold = /^-?\d+(?:\.\d+)?$/.test(threshold);
   // Both modes accept signed thresholds: auto trades either spread direction, and position
   // strategies may accept a bounded negative opening cost.
@@ -966,6 +982,14 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   );
   const marginAvailabilityKnown = marginAssessment.known;
   const marginInsufficient = !reduceOnly && marginEstimateAvailable && marginAssessment.insufficient;
+  // Auto-only threshold rules, surfaced verbatim so the operator knows why launch is blocked.
+  const thresholdIssues = mode === 'auto'
+    ? [
+      autoThresholds.stopLossTooClose ? t('Stop-loss must exceed the entry threshold') : null,
+      autoThresholds.addOnStepInvalid ? t('Add-on step must be positive') : null,
+      autoThresholds.firstTierBeyondStop ? t('The first add-on tier must sit below the stop-loss') : null,
+    ].filter((issue): issue is string => issue !== null)
+    : [];
   const sizeInputsValid = isPositiveDecimal(configuredPerOrder)
     && isPositiveDecimal(mode === 'position' ? amount : maxPosition)
     && entryThresholdValid
@@ -974,6 +998,13 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
       && (Number(threshold) <= 0 || Number(takeProfitThreshold) < Number(threshold))))
     // Optional stop-loss: empty disables it, otherwise it must be a positive bps number.
     && (mode !== 'auto' || stopLossThreshold.trim() === '' || isPositiveDecimal(stopLossThreshold))
+    // The stop must sit outside the entry level, otherwise the strategy stops out on its own
+    // entry: `stopLossBps > |entryBps|` (design B1).
+    && (mode !== 'auto' || !autoThresholds.stopLossTooClose)
+    // Optional ladder step: blank keeps today's tick-driven accumulation; a typed step must be
+    // positive and must leave the first add-on tier strictly below the stop line (design §8.6).
+    // Identical for Taker–Taker and Maker–Taker — no execution-method branch (§8.5.6).
+    && (mode !== 'auto' || (!autoThresholds.addOnStepInvalid && !autoThresholds.firstTierBeyondStop))
     && instrumentsReady
     && sizeIssues.length === 0;
   const strategyInputsValid = sizeInputsValid && !marginInsufficient
@@ -1068,6 +1099,11 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
           takeProfitBps: takeProfitThreshold,
           // Empty stop-loss disables it; the backend treats it as optional too.
           ...(stopLossThreshold.trim() !== '' ? { stopLossBps: Number(stopLossThreshold) } : {}),
+          // Empty add-on step keeps the original tick-driven accumulation; only a typed
+          // value switches the clip admission to the ladder rule (§8.0, §8.6). `Number.isFinite`
+          // keeps unparseable text out of the payload even if a future path bypasses the gate.
+          ...(addOnStep.trim() !== '' && Number.isFinite(Number(addOnStep))
+            ? { addOnStepBps: Number(addOnStep) } : {}),
           // All-futures spreads trade at the configured per-leg leverage; spot legs stay 1×.
           ...(autoAllPerp ? { leftLeverage, rightLeverage } : {}),
           // Gate spot legs must carry their explicit symbol so the engine routes spot orders.
@@ -1124,10 +1160,10 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
           asset={asset} quote={quoteFor(rightExchange.id)} value={rightLeverage} referencePrice={rightPrice}
           fallbackCurrent={rightPortfolioPosition?.leverage} fallbackMax={rightPortfolioPosition?.maxLeverage}
           tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} onValueChange={setRightLeverage} onRiskLimitChange={setRightRiskPositionValue} />
-      </>}<label><span>{t('Entry threshold')}</span><div><input value={threshold} onChange={(event) => setThreshold(event.target.value)} /><b>bps</b></div></label><label><span>{t('Take-profit threshold')}</span><div><input value={takeProfitThreshold} onChange={(event) => setTakeProfitThreshold(event.target.value)} /><b>bps</b></div></label><label><span>{t('Stop-loss threshold')}</span><div><input placeholder={t('Optional')} value={stopLossThreshold} onChange={(event) => setStopLossThreshold(event.target.value)} /><b>bps</b></div></label></>}</div>
+      </>}<label><span>{t('Entry threshold')}</span><div><input value={threshold} onChange={(event) => setThreshold(event.target.value)} /><b>bps</b></div></label><label><span>{t('Take-profit threshold')}</span><div><input value={takeProfitThreshold} onChange={(event) => setTakeProfitThreshold(event.target.value)} /><b>bps</b></div></label><label><span>{t('Stop-loss threshold')}</span><div><input placeholder={t('Optional')} value={stopLossThreshold} onChange={(event) => setStopLossThreshold(event.target.value)} /><b>bps</b></div></label><label><span>{t('Add-on step')}</span><div><input placeholder={t('Optional')} value={addOnStep} onChange={(event) => setAddOnStep(event.target.value)} /><b>bps</b></div></label></>}{mode === 'auto' && <AutoThresholdHints view={autoThresholds} armed={addOnStep.trim() !== ''} />}</div>
       {instrumentsReady && <div className={`strategy-size-check ${sizeInputsValid ? 'valid' : 'invalid'}`}><span>{sizeInputsValid ? '✓' : '!'}</span><p>{sizeInputsValid
         ? t('Per-order quantity meets both exchange minimums')
-        : sizeIssues.join(' · ') || t('Enter valid strategy amounts')}</p></div>}
+        : sizeIssues.join(' · ') || thresholdIssues.join(' · ') || t('Enter valid strategy amounts')}</p></div>}
       {marginEstimateAvailable && marginAvailabilityKnown && <div className={`strategy-size-check strategy-margin-check ${marginInsufficient ? 'invalid' : 'valid'}`}><span>{marginInsufficient ? '!' : '✓'}</span><p>
         {t('Estimated margin')}: <strong>{formatAmount(estimatedStrategyMargin)} USDT</strong> · {t('Available margin')}: <strong>{useAggregateMargin ? `${formatAmount(aggregateAvailableMargin ?? 0)} USDT` : `${formatAmount(leftAvailableMargin ?? 0)} / ${formatAmount(rightAvailableMargin ?? 0)} USDT`}</strong>
         <small>{t('Preflight estimate includes a 10% reserve')}</small>
@@ -1311,7 +1347,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
         <article className={`strategy-launch terminal-panel ${mode === 'auto' ? 'auto-launch' : ''}`}>
           <div className="launch-status"><span><i />{t(mode === 'position' ? 'Review & execute' : 'Review & launch')}</span><small>{t(mode === 'position' ? 'Finite' : 'Continuous')}</small></div>
           <div className="launch-intent"><div><small>{t(mode === 'position' ? 'Total execution' : 'Strategy')}</small><strong>{mode === 'position' ? `${amount || '0'} ${asset}` : `${asset} ${t('spread bot')}`}</strong></div><p><span className={leftSide.toLowerCase()}>{t(leftSide)} {leftExchange.name}</span><i>⇄</i><span className={rightSide.toLowerCase()}>{t(rightSide)} {rightExchange.name}</span></p></div>
-          <dl className="launch-summary review-grid"><div><dt>{t('Entry')}</dt><dd>{Number(threshold) < 0 ? '≤' : '≥'} {threshold || '0'} bps</dd></div>{mode === 'auto' && <div><dt>{t('Take profit')}</dt><dd>≤ {takeProfitThreshold || '0'} bps</dd></div>}{mode === 'auto' && stopLossThreshold.trim() !== '' && <div><dt>{t('Stop loss')}</dt><dd>{stopLossThreshold} bps</dd></div>}{autoAllPerp && <div><dt>{t('Leverage')}</dt><dd>{leftLeverage || '1'}× / {rightLeverage || '1'}×</dd></div>}{mode === 'position' && <><div><dt>{t('Per order')}</dt><dd>{positionOrderQuantity || '0'} {asset}</dd></div><div><dt>{t('Leverage')}</dt><dd>{leftLeverage || '—'}× / {rightLeverage || '—'}×</dd></div><div><dt>{t('Max position at selected leverage')}</dt><dd>{leftRiskPositionValue !== null && leftRiskPositionValue !== undefined ? formatAmount(leftRiskPositionValue) : '—'} {quoteFor(leftExchange.id)} / {rightRiskPositionValue !== null && rightRiskPositionValue !== undefined ? formatAmount(rightRiskPositionValue) : '—'} {quoteFor(rightExchange.id)}</dd></div><div><dt>{t('Projected position')}</dt><dd>{projectedLeftPositionValue !== null ? formatAmount(projectedLeftPositionValue) : '—'} {quoteFor(leftExchange.id)} / {projectedRightPositionValue !== null ? formatAmount(projectedRightPositionValue) : '—'} {quoteFor(rightExchange.id)}</dd></div><div><dt>{t('Reduce only')}</dt><dd>{t(reduceOnly ? 'Yes' : 'No')}</dd></div></>}<div><dt>{t('Method')}{language === 'zh' ? '：' : ': '}</dt><dd>{configuredExecutionMethod.replaceAll('–', '-')}</dd></div>{mode === 'position' && selectedFeeRows.map(({ exchange, symbol, feeKind }) => {
+          <dl className="launch-summary review-grid"><div><dt>{t('Entry')}</dt><dd>{Number(threshold) < 0 ? '≤' : '≥'} {threshold || '0'} bps</dd></div>{mode === 'auto' && <div><dt>{t('Take profit')}</dt><dd>≤ {takeProfitThreshold || '0'} bps</dd></div>}{mode === 'auto' && stopLossThreshold.trim() !== '' && <div><dt>{t('Stop loss')}</dt><dd>{stopLossThreshold} bps{autoThresholds.stopBuffer !== null ? ` · ${t('Effective stop buffer')}: ${formatBps(autoThresholds.stopBuffer.bufferBps)} bps` : ''}</dd></div>}{mode === 'auto' && autoThresholds.ladder !== null && <div><dt>{t('Add-on ladder')}</dt><dd>{formatTierLevels(autoThresholds.ladder)} bps</dd></div>}{autoAllPerp && <div><dt>{t('Leverage')}</dt><dd>{leftLeverage || '1'}× / {rightLeverage || '1'}×</dd></div>}{mode === 'position' && <><div><dt>{t('Per order')}</dt><dd>{positionOrderQuantity || '0'} {asset}</dd></div><div><dt>{t('Leverage')}</dt><dd>{leftLeverage || '—'}× / {rightLeverage || '—'}×</dd></div><div><dt>{t('Max position at selected leverage')}</dt><dd>{leftRiskPositionValue !== null && leftRiskPositionValue !== undefined ? formatAmount(leftRiskPositionValue) : '—'} {quoteFor(leftExchange.id)} / {rightRiskPositionValue !== null && rightRiskPositionValue !== undefined ? formatAmount(rightRiskPositionValue) : '—'} {quoteFor(rightExchange.id)}</dd></div><div><dt>{t('Projected position')}</dt><dd>{projectedLeftPositionValue !== null ? formatAmount(projectedLeftPositionValue) : '—'} {quoteFor(leftExchange.id)} / {projectedRightPositionValue !== null ? formatAmount(projectedRightPositionValue) : '—'} {quoteFor(rightExchange.id)}</dd></div><div><dt>{t('Reduce only')}</dt><dd>{t(reduceOnly ? 'Yes' : 'No')}</dd></div></>}<div><dt>{t('Method')}{language === 'zh' ? '：' : ': '}</dt><dd>{configuredExecutionMethod.replaceAll('–', '-')}</dd></div>{mode === 'position' && selectedFeeRows.map(({ exchange, symbol, feeKind }) => {
             const rate = numericFutureFeeRate(fees, exchange.id, symbol, feeKind) ?? Number.NaN;
             return <div key={exchange.id}><dt>{exchange.name} · {t(feeKind === 'maker' ? 'Maker fee' : 'Taker fee')}</dt><dd>{Number.isFinite(rate) ? `${(rate * 100).toFixed(4)}%` : t('Exchange setting')}</dd></div>;
           })}</dl>
@@ -1333,7 +1369,13 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
         { label: t('Direction'), value: `${t(leftSide)} ${leftExchange.name} ⇄ ${t(rightSide)} ${rightExchange.name}` },
         { label: t('Entry'), value: `${Number(threshold) < 0 ? '≤' : '≥'} ${threshold || '0'} bps` },
         ...(mode === 'auto' ? [{ label: t('Take profit'), value: `≤ ${takeProfitThreshold || '0'} bps` }] : []),
-        ...(mode === 'auto' && stopLossThreshold.trim() !== '' ? [{ label: t('Stop loss'), value: `${stopLossThreshold} bps` }] : []),
+        ...(mode === 'auto' && stopLossThreshold.trim() !== '' ? [{
+          label: t('Stop loss'),
+          value: `${stopLossThreshold} bps${autoThresholds.stopBuffer !== null ? ` · ${t('Effective stop buffer')}: ${formatBps(autoThresholds.stopBuffer.bufferBps)} bps` : ''}`,
+        }] : []),
+        ...(mode === 'auto' && autoThresholds.ladder !== null
+          ? [{ label: t('Add-on ladder'), value: `${formatTierLevels(autoThresholds.ladder)} bps` }]
+          : []),
         ...(autoAllPerp ? [{ label: t('Leverage'), value: `${leftLeverage || '1'}× / ${rightLeverage || '1'}×` }] : []),
         { label: t(mode === 'position' ? 'Total execution' : 'Max position'), value: `${mode === 'position' ? amount : maxPosition} ${asset}` },
         { label: t('Per order'), value: `${mode === 'position' ? positionOrderQuantity : orderQuantity} ${asset}` },
