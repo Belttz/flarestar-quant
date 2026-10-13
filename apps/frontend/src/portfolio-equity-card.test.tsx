@@ -27,15 +27,15 @@ const baseProps = {
 };
 
 describe('portfolio equity card', () => {
-  it('renders the four range tabs with 24h pressed by default, and the loading state while fetching', () => {
+  it('renders the four range tabs with 24h selected by default, and the loading state while fetching', () => {
     const html = renderInContext(<PortfolioEquityCard />);
-    expect(html).toContain('aria-pressed="true"');
-    expect(html.match(/aria-pressed="false"/g)).toHaveLength(3);
+    expect(html).toContain('aria-checked="true"');
+    expect(html.match(/aria-checked="false"/g)).toHaveLength(3);
     expect(html).toContain('>24h</button>');
     expect(html).toContain('>7d</button>');
     expect(html).toContain('>30d</button>');
     expect(html).toContain('>All</button>');
-    expect(html).toContain('role="group"');
+    expect(html).toContain('role="radiogroup"');
     expect(html).toContain('Equity curve range');
     // Effects never run in SSR, so the card shows its loading state.
     expect(html).toContain('Loading equity curve…');

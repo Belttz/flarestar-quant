@@ -269,6 +269,7 @@ DEPLOY_CONFIG_PATHS=(deploy docker-compose.cloud.yml docker-compose.cloud.nodoma
 
 # 检测被本地改动的受版本控制部署文件，并默认从 git 恢复它们（git checkout -- <path>）。
 #   - 逃生舱：GCT_KEEP_DEPLOY_CONFIG=1 时只告警、不恢复。
+#   - 覆盖前把即将被丢弃的每个文件复制为 <file>.bak，并在日志里打印备份路径，便于找回。
 #   - 仓库不是 git 仓库时静默跳过。
 #   - 绝不触碰 cloud.env / .local-data / 数据卷，也绝不 checkout 整个仓库（只限定上面那批路径）。
 # 该函数在 `set -euo pipefail` 下也必须幂等、非交互安全。
@@ -299,6 +300,22 @@ restore_modified_deploy_config() {
   while IFS= read -r file; do
     if [ -n "$file" ]; then restore_paths+=("$file"); fi
   done <<< "$modified"
+
+  # 覆盖前先给每个即将被丢弃的文件留一份副本（<file>.bak）。git checkout -- 会销毁工作树里
+  # 未提交的改动，而这里恰恰是「用户手改过、且我们正要用仓库版本覆盖掉」的场景 —— 没有备份
+  # 就等于静默删掉用户改过的域名 / HTTPS 配置。用固定 .bak 后缀便于找回，路径逐个打进日志。
+  local backup path
+  for file in "${restore_paths[@]}"; do
+    path="$REPO_ROOT/$file"
+    if [ -f "$path" ]; then
+      backup="${path}.bak"
+      if cp -p "$path" "$backup" 2>/dev/null; then
+        warn "已备份 ${file} -> ${backup}（可用它找回被覆盖前的改动）"
+      else
+        warn "备份 ${file} 失败（cp 退出非零）；请自行确认其内容后再继续。"
+      fi
+    fi
+  done
 
   warn "正在从 git 恢复上述文件（git checkout -- <path>）..."
   if git -C "$REPO_ROOT" checkout -- "${restore_paths[@]}" 2>/dev/null; then

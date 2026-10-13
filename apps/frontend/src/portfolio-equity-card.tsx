@@ -64,12 +64,13 @@ export function EquityCardBody({
   return <article className="equity-card terminal-panel">
     <div className="section-title">
       <div><p className="eyebrow">{t('Performance')}</p><h2>{t('Equity curve')}</h2></div>
-      <div className="equity-range-tabs" role="group" aria-label={t('Equity curve range')}>
+      <div className="equity-range-tabs" role="radiogroup" aria-label={t('Equity curve range')}>
         {EQUITY_RANGES.map((item) => <button
           key={item}
           type="button"
+          role="radio"
           className={range === item ? 'active' : ''}
-          aria-pressed={range === item}
+          aria-checked={range === item}
           onClick={() => onRangeChange(item)}
         >{t(equityRangeLabel(item))}</button>)}
       </div>

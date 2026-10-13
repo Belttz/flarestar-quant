@@ -19,7 +19,7 @@ import {
  * The pure helpers are exercised exhaustively (round-trip idempotency over every subset), and
  * `OpportunitiesView` is server-rendered to prove the buttons really reflect a restored URL query.
  * There is no jsdom/@testing-library in this workspace, so click behaviour is covered through the
- * toggle helpers the click handlers call plus the SSR snapshot of `aria-pressed`.
+ * toggle helpers the click handlers call plus the SSR snapshot of `aria-checked`.
  */
 
 const VENUE_COUNT = ALL_SPREAD_VENUES.length;
@@ -42,8 +42,8 @@ function subsets<T>(items: readonly T[]): T[][] {
   return items.reduce<T[][]>((acc, item) => [...acc, ...acc.map((subset) => [...subset, item])], [[]]);
 }
 
-function pressedFlags(html: string): boolean[] {
-  return [...html.matchAll(/aria-pressed="(true|false)"/g)].map((match) => match[1] === 'true');
+function checkedFlags(html: string): boolean[] {
+  return [...html.matchAll(/aria-checked="(true|false)"/g)].map((match) => match[1] === 'true');
 }
 
 /**
@@ -229,7 +229,7 @@ describe('spread board filter buttons', () => {
     expect(html).toContain('exchange-filter');
     expect(html).toContain('market-filter');
     expect(html).toContain('opportunity-filter-groups');
-    const flags = pressedFlags(html);
+    const flags = checkedFlags(html);
     expect(flags).toHaveLength(VENUE_COUNT + MARKET_COUNT);
     // Default: every exchange is on, and only the perpetual market is enabled — spot legs start
     // off because they carry far more cross-exchange symbol mismatches than genuine opportunities.
@@ -241,7 +241,7 @@ describe('spread board filter buttons', () => {
 
   it('restores a partial selection from the URL query', () => {
     const html = renderSpreadBoard('?venues=GATE,OKX&markets=spot');
-    const flags = pressedFlags(html);
+    const flags = checkedFlags(html);
     expect(flags).toHaveLength(VENUE_COUNT + MARKET_COUNT);
     expect(flags.slice(0, VENUE_COUNT)).toEqual([true, false, true, false, false, false, false, false]);
     // Market switches follow the venue buttons: spot on, perpetual off.
@@ -251,18 +251,19 @@ describe('spread board filter buttons', () => {
 
   it('restores a lower-case hand-edited query and falls back to full selection for junk', () => {
     const lower = renderSpreadBoard('?venues=okx,gate&markets=PERP');
-    expect(pressedFlags(lower).slice(0, VENUE_COUNT)).toEqual([true, false, true, false, false, false, false, false]);
-    expect(pressedFlags(lower).slice(VENUE_COUNT)).toEqual([false, true]);
+    expect(checkedFlags(lower).slice(0, VENUE_COUNT)).toEqual([true, false, true, false, false, false, false, false]);
+    expect(checkedFlags(lower).slice(VENUE_COUNT)).toEqual([false, true]);
 
     const junk = renderSpreadBoard('?venues=NOT_A_VENUE&markets=swap');
-    expect(pressedFlags(junk).every((flag) => flag)).toBe(true);
+    expect(checkedFlags(junk).every((flag) => flag)).toBe(true);
   });
 
   it('leaves the funding board without the new spread filter groups', () => {
     const html = renderFundingBoard('?venues=GATE&markets=spot');
     expect(html).not.toContain('opportunity-filter-groups');
     expect(html).not.toContain('market-filter');
-    expect(pressedFlags(html)).toEqual([]);
+    // No spread-filter checkboxes: the funding board's only checked control is the hedge-mode radiogroup.
+    expect([...html.matchAll(/role="checkbox"/g)]).toHaveLength(0);
   });
 });
 

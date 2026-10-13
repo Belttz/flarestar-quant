@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { STRATEGY_LOG_CATEGORIES, type CrossExRiskLimitTier, type StrategyLogCategory } from '@gate-crossex/shared-types';
+import { STRATEGY_LOG_CATEGORIES, type CrossExRiskLimitTier, type StrategyLogCategory, type StrategyPnl } from '@gate-crossex/shared-types';
 import {
   api,
   ApiError,
@@ -70,11 +70,22 @@ import { executionPageWindow } from './execution-pagination.js';
 import { StrategyLogLoadMore } from './strategy-log-load-more.js';
 import { describeAutoThresholds, formatBps, formatTierLevels } from './strategy-ladder.js';
 import { AutoThresholdHints } from './strategy-threshold-hints.js';
+import { bpsFigure, pnlUsdtFigure, PNL_DASH } from './strategy-pnl.js';
+import { StrategyConfigDetailDialog } from './strategy-config-detail.js';
 
 /** Execution-log page size, shared by the client pager and the server-side fetch. */
 const LOG_PAGE_SIZE = 50;
+/**
+ * A category query fetches a grouping **superset** (dependency rows the tab then filters away), and
+ * a MAKER_TAKER strategy writes a maker-quote row on every requote — thousands of rows against a
+ * handful of risk/system events. Scanning only a couple of 50-row pages therefore reported "no
+ * events in this category" for categories that have plenty of older data. Scan with the backend's
+ * maximum page and keep going for a bounded budget before giving up.
+ */
+const LOG_SCAN_PAGE_SIZE = 200;
+const LOG_SCAN_ATTEMPTS = 10;
 /** Cap the automatic continuation when a category superset page yields no visible rows. */
-const LOG_EMPTY_PAGE_ATTEMPTS = 3;
+const LOG_EMPTY_PAGE_ATTEMPTS = LOG_SCAN_ATTEMPTS;
 /** Tab order plus the i18n key each category label resolves through. */
 const LOG_CATEGORY_LABELS: Record<StrategyLogCategory, string> = {
   all: 'All',
@@ -215,15 +226,92 @@ function strategyCloseTarget(position: StrategyPositionRow): ClosePositionTarget
   };
 }
 
-export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tradingSnapshot, instruments, tradingMode, onOpenModeDialog, onStrategiesChanged, onPositionsRefresh }: {
+/**
+ * The two PnL cells every strategy row carries in **both** tabs.
+ *
+ * `netPnl` is the result after fees and funding; `lockedProfitBps` is the already-closed result in
+ * basis points of the closed entry notional. The backend emits `null` when it cannot attribute a
+ * figure, so a missing value renders an em dash rather than a misleading zero.
+ *
+ * Exported as a pure view so its markup can be asserted from static markup in this workspace,
+ * which has no jsdom to switch tabs with.
+ */
+export function StrategyPnlCells({ pnl }: { pnl: StrategyPnl | null | undefined }) {
+  const { t } = useLanguage();
+  const netPnl = pnlUsdtFigure(pnl?.netPnl);
+  const lockedProfit = bpsFigure(pnl?.lockedProfitBps);
+
+  return <>
+    <span className={`strategy-pnl${netPnl ? ` ${netPnl.tone}` : ''}`}><strong>{netPnl ? `${netPnl.text} USDT` : PNL_DASH}</strong><small>{t('Net of fees and funding')}</small></span>
+    <span className={`strategy-locked-bps${lockedProfit ? ` ${lockedProfit.tone}` : ''}`}><strong>{lockedProfit ? `${lockedProfit.text} bps` : PNL_DASH}</strong><small>{t('Already closed')}</small></span>
+  </>;
+}
+
+/**
+ * The strategy table header.
+ *
+ * `Net PnL` and `Locked profit` are emitted in **both** tabs — they are deliberately not gated on
+ * `showingHistory`, so a running strategy's mark-to-market result sits in the same column as a
+ * stopped one's. Only `Start time` (historical only) and the trailing action column (running only)
+ * are tab-dependent; both keep the total at 13 tracks, matching the grid templates in `styles.css`.
+ *
+ * Exported as a pure view because this workspace has no jsdom to switch tabs with: rendering it
+ * with `showingHistory` false and true is how the "both tabs show the PnL columns" contract is
+ * asserted.
+ */
+export function StrategyTableHead({ showingHistory }: { showingHistory: boolean }) {
+  const { t } = useLanguage();
+
+  return <div className="running-head">
+    {showingHistory && <span>{t('Start time')}</span>}
+    <span>{t('Strategy')}</span>
+    <span>{t('Market name')}</span>
+    <span>{t('Exchanges')}</span>
+    <span>{t('Entry / Exit')}</span>
+    <span>{t('Funding collected')}</span>
+    <span>{t('Net PnL')}</span>
+    <span>{t('Locked profit')}</span>
+    <span>{t('Size limits')}</span>
+    <span>{t('Method')}</span>
+    <span>{t('Execution log')}</span>
+    <span>{t(showingHistory ? 'Duration' : 'Runtime')}</span>
+    <span>{t('Status')}</span>
+    {!showingHistory && <span />}
+  </div>;
+}
+
+/** Only the inner controls' own selectors are guarded; anything else belongs to the row itself. */
+const ROW_INTERACTIVE_SELECTOR = 'button, input, select, a, label';
+
+/**
+ * True when a click/keypress on a strategy row should open its configuration detail, i.e. when it
+ * did not land on an inner control. Stop / resume / logs / copy / the take-profit editor must keep
+ * working untouched, so their clicks are filtered out here.
+ *
+ * Duck-typed on `closest` (rather than `instanceof HTMLElement`) so the guard is unit-testable
+ * without a DOM and so a text-node target — which has no `closest` — still counts as a row click.
+ */
+export function rowClickOpensStrategy(target: EventTarget | null | undefined): boolean {
+  const closest = (target as { closest?: (selector: string) => Element | null } | null | undefined)?.closest;
+  if (typeof closest !== 'function') return true;
+  return closest.call(target, ROW_INTERACTIVE_SELECTOR) === null;
+}
+
+export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tradingSnapshot, instruments, tradingMode, requestedStrategyId, onOpenModeDialog, onStrategiesChanged, onPositionsRefresh, onOpenStrategyConfig, onCopyStrategy }: {
   strategies: StrategyRecord[];
   authenticatedPortfolio: AuthenticatedPortfolioSnapshot | null;
   tradingSnapshot: TradingSnapshot | null;
   instruments: CrossExInstrument[] | null;
   tradingMode: TradingMode | null;
+  /** `?strategyId=` from the URL; opens that strategy's detail dialog once the list has loaded. */
+  requestedStrategyId?: string | null;
   onOpenModeDialog: () => void;
   onStrategiesChanged: () => Promise<void>;
   onPositionsRefresh: () => Promise<void>;
+  /** Keeps the address bar in sync so the opened detail dialog is shareable/reload-safe. */
+  onOpenStrategyConfig: (strategy: StrategyRecord) => void;
+  /** Jump to the launch form prefilled with this strategy's configuration. */
+  onCopyStrategy: (strategy: StrategyRecord) => void;
 }) {
   const { language, t } = useLanguage();
   const [activeStrategyTab, setActiveStrategyTab] = useState<'running' | 'positions' | 'historical'>('running');
@@ -240,6 +328,10 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   const [logLoadingOlder, setLogLoadingOlder] = useState(false);
   const [logErrorKind, setLogErrorKind] = useState<'network' | 'timeout' | 'cancelled' | 'backend' | null>(null);
   const [logPage, setLogPage] = useState(1);
+  // Rows stored per category (backend `categoryTotal`), so a tab can show "(22)" and the empty
+  // state can distinguish "never fired" from "buried under newer rows of another category".
+  const [logCategoryTotals, setLogCategoryTotals] = useState<Partial<Record<StrategyLogCategory, number>>>({});
+  const [logScannedRows, setLogScannedRows] = useState(0);
   const [stopNotice, setStopNotice] = useState<string | null>(null);
   const [editingTakeProfitId, setEditingTakeProfitId] = useState<string | null>(null);
   const [takeProfitDraft, setTakeProfitDraft] = useState('');
@@ -264,6 +356,12 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   );
   const selectedLogStrategy = strategies.find((strategy) => strategy.id === selectedLogStrategyId) ?? null;
   const logDialogRef = useDialogFocus(Boolean(selectedLogStrategy), () => setSelectedLogStrategyId(null));
+  // The read-only configuration detail dialog lives here (not in each view) because its "execution
+  // log" button reuses this panel's `openLogs`, and this panel is the one component all four
+  // strategy views share — duplicating it per view would be four copies of the same state machine.
+  const [detailStrategyId, setDetailStrategyId] = useState<string | null>(null);
+  const selectedDetailStrategy = strategies.find((strategy) => strategy.id === detailStrategyId) ?? null;
+  const detailDialogRef = useDialogFocus(Boolean(selectedDetailStrategy), () => setDetailStrategyId(null));
 
   function requestPositionClose(positions: StrategyPositionRow[]) {
     if (tradingMode !== 'live') {
@@ -276,6 +374,16 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   useEffect(() => {
     setHistoryPage((current) => Math.min(current, historyPages));
   }, [historyPages]);
+
+  // Deep link / cross-page jump: `?strategyId=X` must open the detail dialog for X. This has to be
+  // an effect rather than a mount initializer because navigating within the same strategy kind
+  // reuses the mounted view, and the list itself arrives asynchronously — so we keep waiting until
+  // the record exists. An unknown id stays silent: no error, no URL rewrite.
+  useEffect(() => {
+    if (!requestedStrategyId) return;
+    if (!strategies.some((strategy) => strategy.id === requestedStrategyId)) return;
+    setDetailStrategyId(requestedStrategyId);
+  }, [requestedStrategyId, strategies]);
 
   useEffect(() => {
     if (!closeNotice) return;
@@ -347,22 +455,30 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
       let buffer: StrategyLog[] = [];
       let cursor: { createdAt: string; id: string } | null = null;
       let hasMore = false;
+      let categoryTotal: number | null = null;
       // The category query returns the grouping superset, so a single page can hold only dependency
-      // rows (e.g. a lone leg). Keep pulling until the tab shows something or the log ends, bounded
-      // so a pathological category can never spin forever.
+      // rows (e.g. a lone leg) — and a MAKER_TAKER strategy buries sparse categories under
+      // thousands of requote rows. Scan with the backend's maximum page until the tab shows
+      // something or the log ends, bounded so a pathological category can never spin forever.
       for (let attempt = 0; attempt < LOG_EMPTY_PAGE_ATTEMPTS; attempt += 1) {
         const before = cursor;
-        const response = await api.strategyLogs(id, { category, limit: LOG_PAGE_SIZE, ...(before ? { before } : {}) });
+        const response = await api.strategyLogs(id, {
+          category, limit: category === 'all' ? LOG_PAGE_SIZE : LOG_SCAN_PAGE_SIZE,
+          ...(before ? { before } : {}),
+        });
         if (request !== logRequestRef.current) return;
         buffer = mergeStrategyLogs(buffer, response.logs);
         cursor = response.nextCursor ?? null;
         hasMore = (response.hasMore ?? false) && cursor !== null;
+        if (typeof response.categoryTotal === 'number') categoryTotal = response.categoryTotal;
         if (prepareStrategyLogView(buffer, category, strategy?.config).length > 0 || !hasMore) break;
       }
       if (request !== logRequestRef.current) return;
       setLogRawBuffer(buffer);
       setLogHasMore(hasMore);
       setLogCursor(hasMore ? cursor : null);
+      setLogCategoryTotals((current) => ({ ...current, ...(categoryTotal !== null ? { [category]: categoryTotal } : {}) }));
+      setLogScannedRows(buffer.length);
       setSelectedStrategyLogs(prepareStrategyLogView(buffer, category, strategy?.config));
       setLogLoadState({ status: 'loaded' });
     } catch (error) {
@@ -391,17 +507,23 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
         const before = cursor;
         if (!before) { hasMore = false; break; }
         const visibleBefore = prepareStrategyLogView(buffer, category, strategy?.config).length;
-        const response = await api.strategyLogs(id, { category, limit: LOG_PAGE_SIZE, before });
+        const response = await api.strategyLogs(id, {
+          category, limit: category === 'all' ? LOG_PAGE_SIZE : LOG_SCAN_PAGE_SIZE, before,
+        });
         if (request !== logRequestRef.current) return;
         buffer = mergeStrategyLogs(buffer, response.logs);
         cursor = response.nextCursor ?? null;
         hasMore = (response.hasMore ?? false) && cursor !== null;
+        if (typeof response.categoryTotal === 'number') {
+          setLogCategoryTotals((current) => ({ ...current, [category]: response.categoryTotal! }));
+        }
         // Stop as soon as the page contributed a visible row (or the log ended); otherwise keep going.
         if (prepareStrategyLogView(buffer, category, strategy?.config).length > visibleBefore || !hasMore) break;
       }
       setLogRawBuffer(buffer);
       setLogHasMore(hasMore);
       setLogCursor(hasMore ? cursor : null);
+      setLogScannedRows(buffer.length);
       setSelectedStrategyLogs(prepareStrategyLogView(buffer, category, strategy?.config));
       setLogPage(1);
     } catch (error) {
@@ -424,6 +546,22 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   function retryLogs() {
     const id = selectedLogStrategyId;
     if (id) void openLogs(id, activeLogCategory);
+  }
+
+  /**
+   * Row activation. Opens locally *and* asks the app to reflect it in the URL, so the dialog
+   * survives a reload without a round trip through the router having to be the only path in
+   * (clicking the same row twice would otherwise be a no-op, since the URL would be unchanged).
+   */
+  function openStrategyConfig(strategy: StrategyRecord) {
+    setDetailStrategyId(strategy.id);
+    onOpenStrategyConfig(strategy);
+  }
+
+  /** Copy navigates to a form prefilled from the record; the detail dialog must not stay open. */
+  function copyStrategyConfig(strategy: StrategyRecord) {
+    setDetailStrategyId(null);
+    onCopyStrategy(strategy);
   }
 
   function editTakeProfit(strategy: StrategyRecord) {
@@ -473,7 +611,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
         {positionsView.status === 'stale' && <div className="no-strategies stale-strategy-positions"><span>!</span><strong>{t('Position snapshot is stale')}</strong><small>{t('Waiting for a fresh account snapshot.')}</small></div>}
         {positionsView.status === 'unavailable' && <div className="no-strategies"><span>◎</span><strong>{t('Position data unavailable')}</strong><small>{t('Waiting for a fresh account snapshot.')}</small></div>}
       </> : <>
-        <div className={`running-table ${showingHistory ? 'historical' : ''}`}><div className="running-head">{showingHistory && <span>{t('Start time')}</span>}<span>{t('Strategy')}</span><span>{t('Market name')}</span><span>{t('Exchanges')}</span><span>{t('Entry / Exit')}</span><span>{t('Funding collected')}</span>{showingHistory && <span>{t('Realized PnL')}</span>}<span>{t('Size limits')}</span><span>{t('Method')}</span><span>{t('Execution log')}</span><span>{t(showingHistory ? 'Duration' : 'Runtime')}</span><span>{t('Status')}</span>{!showingHistory && <span />}</div>{visibleStrategies.map((strategy) => {
+        <div className={`running-table ${showingHistory ? 'historical' : ''}`}><StrategyTableHead showingHistory={showingHistory} />{visibleStrategies.map((strategy) => {
       const config = strategy.config;
       const premium = config.kind === 'premium';
       const timedClose = Boolean(config.closePlan);
@@ -481,7 +619,18 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
       const leftVenue = exchanges.find((item) => item.id === config.leftVenue.toLowerCase());
       const rightVenue = exchanges.find((item) => item.id === config.rightVenue.toLowerCase());
       const startedAt = strategyStartTime(strategy.createdAt, language);
-      return <div className="running-row" key={strategy.id}>
+      return <div
+        className="running-row clickable"
+        key={strategy.id}
+        tabIndex={0}
+        onClick={(event) => { if (rowClickOpensStrategy(event.target)) openStrategyConfig(strategy); }}
+        onKeyDown={(event) => {
+          if (event.key !== 'Enter' && event.key !== ' ') return;
+          if (!rowClickOpensStrategy(event.target)) return;
+          event.preventDefault();
+          openStrategyConfig(strategy);
+        }}
+      >
         {showingHistory && <span className="strategy-start-time"><strong>{startedAt.date}</strong><small>{startedAt.time}</small></span>}
         <span><strong>{strategy.id}</strong><small>{kindLabel(strategy)}{strategy.accountLabel ? ` · ${strategy.accountLabel}` : ''}</small></span>
         <span><strong>{strategyMarketLabel(config)}</strong><small>{t(config.kind === 'carry' ? 'Spot ⇄ perpetual' : premium ? 'ADR premium' : 'Perpetual')}</small></span>
@@ -505,10 +654,10 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
         <span className="strategy-funding-collected">{config.kind === 'carry' && strategy.carryMetrics
           ? <><strong className={Number(strategy.carryMetrics.fundingCollectedUsdt) >= 0 ? 'positive' : 'negative'}>{Number(strategy.carryMetrics.fundingCollectedUsdt) >= 0 ? '+' : ''}{Number(strategy.carryMetrics.fundingCollectedUsdt).toFixed(4)}</strong><small>USDT</small></>
           : '—'}</span>
-        {showingHistory && <span className={`strategy-realized-pnl ${Number(strategy.realizedPnl) >= 0 ? 'positive' : 'negative'}`}><strong>{Number(strategy.realizedPnl) >= 0 ? '+' : ''}{Number(strategy.realizedPnl).toFixed(2)}</strong><small>USDT</small></span>}
+        <StrategyPnlCells pnl={strategy.pnl} />
         <span>{timedClose ? `${config.closePlan?.targets.length} ${t('Positions')} · ${config.closePlan?.orderCount} ${t('orders')}` : `${config.perOrderQuantity} ${config.asset} · ${t('max')} ${strategyMaxAmount(config)}`}</span>
         <span>{config.executionMethod.replaceAll('_', '–')}</span>
-        <span><button className="logs-button" onClick={() => void openLogs(strategy.id)}>{t('View logs')}</button></span>
+        <span className="strategy-log-actions"><button className="logs-button" onClick={() => void openLogs(strategy.id)}>{t('View logs')}</button>{showingHistory && <button className="copy-button" onClick={() => copyStrategyConfig(strategy)}>{t('Copy')}</button>}</span>
         <span>{strategyRuntime(strategy, showingHistory)}</span>
         <span className={`strategy-status ${strategy.status.toLowerCase()}`}><i />{strategy.status}<small>{strategy.progress.toFixed(0)}%</small></span>
         {!showingHistory && <span className="strategy-actions">{strategy.status === 'PAUSED' && <button className="resume-button" onClick={() => void resumeStrategy(strategy.id)} disabled={resumingIds.includes(strategy.id) || stoppingIds.includes(strategy.id)}>{resumingIds.includes(strategy.id) ? t('Resuming…') : t('Resume')}</button>}<button className="stop-button" onClick={() => void stopStrategy(strategy.id)} disabled={stoppingIds.includes(strategy.id) || resumingIds.includes(strategy.id)}>{stoppingIds.includes(strategy.id) ? t('Stopping…') : t('Stop')}</button></span>}
@@ -541,6 +690,16 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
       onRetry={retryLogs}
       onClose={() => setSelectedLogStrategyId(null)}
       dialogRef={logDialogRef}
+      categoryTotals={logCategoryTotals}
+      scannedRows={logScannedRows}
+    />}
+    {selectedDetailStrategy && <StrategyConfigDetailDialog
+      strategy={selectedDetailStrategy}
+      // Closing first keeps a single modal on screen; the log dialog then owns the focus trap.
+      onViewLogs={() => { setDetailStrategyId(null); void openLogs(selectedDetailStrategy.id); }}
+      onCopy={() => copyStrategyConfig(selectedDetailStrategy)}
+      onClose={() => setDetailStrategyId(null)}
+      dialogRef={detailDialogRef}
     />}
   </>;
 }
@@ -565,6 +724,8 @@ export function StrategyExecutionLogDialog({
   onRetry,
   onClose,
   dialogRef,
+  categoryTotals,
+  scannedRows,
 }: {
   strategy: StrategyRecord;
   rows: DisplayStrategyLog[];
@@ -580,6 +741,8 @@ export function StrategyExecutionLogDialog({
   onRetry: () => void;
   onClose: () => void;
   dialogRef: ReturnType<typeof useDialogFocus>;
+  categoryTotals: Partial<Record<StrategyLogCategory, number>>;
+  scannedRows: number;
 }) {
   const { language, t } = useLanguage();
   const config = strategy.config;
@@ -615,7 +778,7 @@ export function StrategyExecutionLogDialog({
                 : (index - 1 + STRATEGY_LOG_CATEGORIES.length) % STRATEGY_LOG_CATEGORIES.length;
               onCategoryChange(STRATEGY_LOG_CATEGORIES[nextIndex]);
             }}>
-            {t(LOG_CATEGORY_LABELS[category])}
+            {t(LOG_CATEGORY_LABELS[category])}{typeof categoryTotals[category] === 'number' && <span className="strategy-log-tab-count">({categoryTotals[category]})</span>}
           </button>
         ))}
       </div>
@@ -626,7 +789,18 @@ export function StrategyExecutionLogDialog({
           <span>{errorKind === 'network' ? t('Could not reach the backend.') : errorKind === 'timeout' ? t('The request timed out.') : t('The backend returned an error.')}</span>
           <button type="button" className="retry-logs" onClick={onRetry}>{t('Try again')}</button>
         </div>}
-        {loadState.status === 'loaded' && visibleRows.length === 0 && <div className="execution-log-state">{activeCategory === 'all' ? t('No execution events yet.') : t('No events in this category.')}</div>}
+        {loadState.status === 'loaded' && visibleRows.length === 0 && <div className="execution-log-state">
+          {activeCategory === 'all'
+            ? t('No execution events yet.')
+            // The stored total is the grouping superset (an upper bound), but any positive number
+            // proves the category has fired — so "buried" and "never fired" must not look alike.
+            : (categoryTotals[activeCategory] ?? 0) > 0
+              ? <span className="execution-log-state-buried">
+                {t('This category has')} {categoryTotals[activeCategory]} {t('stored events, none of them in the newest')} {scannedRows}{'.'}
+                {hasMore && <button type="button" className="retry-logs" onClick={onLoadOlder} disabled={loadingOlder}>{loadingOlder ? t('Searching…') : t('Keep searching older events')}</button>}
+              </span>
+              : t('No events in this category.')}
+        </div>}
         {visibleRows.map((log) => <div className="execution-log-row" key={log.id}>
           <span>{new Date(log.createdAt).toLocaleTimeString(language === 'zh' ? 'zh-CN' : 'en-US')}</span>
           <span><strong>{t(log.event)}</strong><small>{t(log.level)}</small></span>
@@ -668,37 +842,48 @@ interface StrategyViewProps {
   onStrategiesChanged: () => Promise<void>;
   onPositionsRefresh: () => Promise<void>;
   watchQuotes: (symbols: string[]) => void;
+  /** `?strategyId=` deep link that should open that strategy's configuration detail dialog. */
+  requestedStrategyId?: string | null;
+  onOpenStrategyConfig: (strategy: StrategyRecord) => void;
+  onCopyStrategy: (strategy: StrategyRecord) => void;
 }
 
-export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, strategies, balances, authenticatedPortfolio, tradingSnapshot, tradingMode, onOpenModeDialog, onStrategiesChanged, onPositionsRefresh, watchQuotes }: StrategyViewProps) {
+export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, strategies, balances, authenticatedPortfolio, tradingSnapshot, tradingMode, requestedStrategyId, onOpenModeDialog, onStrategiesChanged, onPositionsRefresh, watchQuotes, onOpenStrategyConfig, onCopyStrategy }: StrategyViewProps) {
   const { language, theme, t } = useLanguage();
   // Prefill query from the Opportunities board is read once on mount; later renders ignore it.
   const [query] = useState(() => new URLSearchParams(window.location.search));
   const autoQuery = mode === 'auto' ? query : null;
   const [directionFlipped, setDirectionFlipped] = useState(false);
-  const [reduceOnly, setReduceOnly] = useState(false);
+  // Only an explicit `reduceOnly=true` opts in, so an absent parameter keeps the safe default.
+  const [reduceOnly, setReduceOnly] = useState(() => query.get('reduceOnly') === 'true');
   const [asset, setAsset] = useState(() => prefill?.asset ?? queryAsset(autoQuery?.get('asset')) ?? 'BTC');
   // The standard direction sells venue A and buys venue B. Funding-page presets therefore put
   // the high-rate (short) venue on A and the low-rate (long) venue on B.
   const [leftExchangeId, setLeftExchangeId] = useState<string>(() => prefill?.shortVenue ?? queryVenueId(autoQuery?.get('left')) ?? 'binance');
   const [rightExchangeId, setRightExchangeId] = useState<string>(() => prefill?.longVenue ?? queryVenueId(autoQuery?.get('right')) ?? 'okx');
-  const [executionMethod, setExecutionMethod] = useState<'Taker–Taker' | 'Maker–Taker'>('Taker–Taker');
-  const [makerLeg, setMakerLeg] = useState<'left' | 'right'>('left');
-  const [amount, setAmount] = useState('');
-  const [positionOrderQuantity, setPositionOrderQuantity] = useState('');
+  // One-click copy prefill: the same one-shot query channel, carrying the fields a stored strategy
+  // exposes (see `strategy-copy.ts`). Every value still goes through the mount-time guards below,
+  // so a malformed parameter keeps its default instead of half-prefilling the form.
+  const [executionMethod, setExecutionMethod] = useState<'Taker–Taker' | 'Maker–Taker'>(() => query.get('executionMethod') === 'maker' ? 'Maker–Taker' : 'Taker–Taker');
+  const [makerLeg, setMakerLeg] = useState<'left' | 'right'>(() => query.get('makerLeg') === 'right' ? 'right' : 'left');
+  const [amount, setAmount] = useState(() => queryDecimal(query.get('totalAmount')) ?? '');
+  const [positionOrderQuantity, setPositionOrderQuantity] = useState(() => queryDecimal(query.get('perOrderQuantity')) ?? '');
   const [threshold, setThreshold] = useState(() => queryDecimal(autoQuery?.get('entryBps')) ?? '0');
-  const [takeProfitThreshold, setTakeProfitThreshold] = useState('0.4');
-  const [stopLossThreshold, setStopLossThreshold] = useState('100');
+  const [takeProfitThreshold, setTakeProfitThreshold] = useState(() => queryDecimal(autoQuery?.get('takeProfitBps')) ?? '0.4');
+  const [stopLossThreshold, setStopLossThreshold] = useState(() => queryDecimal(autoQuery?.get('stopLossBps')) ?? '100');
   // Auto only: optional laddered add-on step (bps). Blank keeps today's tick-driven accumulation,
   // so every already-running strategy keeps the behaviour it was launched with.
-  const [addOnStep, setAddOnStep] = useState('');
+  const [addOnStep, setAddOnStep] = useState(() => queryDecimal(autoQuery?.get('addOnStepBps')) ?? '');
   // Auto legs may use the Gate spot market on either side; everything else stays perpetual.
   const [leftProduct, setLeftProduct] = useState<'perpetual' | 'spot'>(() => queryProduct(autoQuery?.get('leftProduct')) ?? 'perpetual');
   const [rightProduct, setRightProduct] = useState<'perpetual' | 'spot'>(() => queryProduct(autoQuery?.get('rightProduct')) ?? 'perpetual');
-  const [maxPosition, setMaxPosition] = useState('');
-  const [orderQuantity, setOrderQuantity] = useState('');
-  const [leftLeverage, setLeftLeverage] = useState('1');
-  const [rightLeverage, setRightLeverage] = useState('1');
+  const [maxPosition, setMaxPosition] = useState(() => queryDecimal(autoQuery?.get('maxPosition')) ?? '');
+  const [orderQuantity, setOrderQuantity] = useState(() => queryDecimal(autoQuery?.get('perOrderQuantity')) ?? '');
+  const [leftLeverage, setLeftLeverage] = useState(() => queryDecimal(query.get('leftLeverage')) ?? '1');
+  const [rightLeverage, setRightLeverage] = useState(() => queryDecimal(query.get('rightLeverage')) ?? '1');
+  // Copy notice: dismissing hides the reminder only. The prefilled fields stay put, so closing the
+  // banner never destroys the configuration the operator just asked to reuse.
+  const [copyNoticeStrategyId, setCopyNoticeStrategyId] = useState<string | null>(() => query.get('copyStrategyId'));
   const [leftRiskPositionValue, setLeftRiskPositionValue] = useState<number | null | undefined>(undefined);
   const [rightRiskPositionValue, setRightRiskPositionValue] = useState<number | null | undefined>(undefined);
   const [launching, setLaunching] = useState(false);
@@ -1138,6 +1323,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const strategySetup = (
     <article className="strategy-panel strategy-rules compact strategy-rules-sidebar terminal-panel">
       <header className="strategy-panel-head"><div><p className="eyebrow">{t('Strategy setup')}</p><h2>{t(mode === 'position' ? 'Configure cross-exchange hedge' : 'Configure continuous bot')}</h2></div></header>
+      {copyNoticeStrategyId && <div className="strategy-copy-notice" role="status"><span>⧉</span><p>{t('Prefilled from strategy')} <strong>{copyNoticeStrategyId}</strong> {t('Review the details, then launch.')}</p><button onClick={() => setCopyNoticeStrategyId(null)}>{t('Dismiss prefill notice')}</button></div>}
       <div className="compact-fields">{mode === 'position' ? <>
         <label><span>{t('Per-order quantity')}</span><div><input placeholder="e.g. 0.10" value={positionOrderQuantity} onChange={(event) => setPositionOrderQuantity(event.target.value)} /><b>{asset}</b></div></label>
         <label><span>{t('Total amount')}</span><div><input placeholder="e.g. 1.00" value={amount} onChange={(event) => setAmount(event.target.value)} /><b>{asset}</b></div></label>
@@ -1171,7 +1357,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
       {!reduceOnly && configuredTarget > 0 && riskLimitsReady && <div className={`strategy-size-check strategy-risk-limit-check ${positionRiskLimitExceeded ? 'invalid' : 'valid'}`}><span>{positionRiskLimitExceeded ? '!' : '✓'}</span><p>{positionRiskLimitExceeded
         ? t('Configured position exceeds the maximum at selected leverage')
         : t('Configured position fits the leverage-tier limits')}</p></div>}
-      <div className="strategy-setup-actions">{mode === 'position' && <div className="compact-trigger"><span className={priceDiffBps !== null && priceDiffBps >= Number(threshold) ? 'ready' : ''}>{priceDiffBps !== null && priceDiffBps >= Number(threshold) ? '✓' : '○'}</span><p>{t('Enter at')} <strong>≥ {threshold || '0'} bps</strong></p></div>}<div className="compact-method"><span>{t('Execution method')}</span><div className="method-options execution-method-options" role="group" aria-label={t('Execution method')}><button type="button" className={executionMethod === 'Taker–Taker' ? 'active' : ''} aria-pressed={executionMethod === 'Taker–Taker'} onClick={() => setExecutionMethod('Taker–Taker')}>⚡ {t('Taker–Taker')}</button><button type="button" className={executionMethod === 'Maker–Taker' ? 'active' : ''} aria-pressed={executionMethod === 'Maker–Taker'} onClick={() => setExecutionMethod('Maker–Taker')}>◫ {t('Maker–Taker')}</button></div>{executionMethod === 'Maker–Taker' && <div className="maker-leg-picker execution-maker-leg-options" role="group" aria-label={t('Choose maker leg')}><button type="button" className={makerLeg === 'left' ? 'active' : ''} aria-pressed={makerLeg === 'left'} onClick={() => setMakerLeg('left')}><small>{t('Maker')} · A</small><strong>{leftExchange.name}</strong></button><button type="button" className={makerLeg === 'right' ? 'active' : ''} aria-pressed={makerLeg === 'right'} onClick={() => setMakerLeg('right')}><small>{t('Maker')} · B</small><strong>{rightExchange.name}</strong></button></div>}</div></div>
+      <div className="strategy-setup-actions">{mode === 'position' && <div className="compact-trigger"><span className={priceDiffBps !== null && priceDiffBps >= Number(threshold) ? 'ready' : ''}>{priceDiffBps !== null && priceDiffBps >= Number(threshold) ? '✓' : '○'}</span><p>{t('Enter at')} <strong>≥ {threshold || '0'} bps</strong></p></div>}<div className="compact-method"><span>{t('Execution method')}</span><div className="method-options execution-method-options" role="radiogroup" aria-label={t('Execution method')}><button type="button" role="radio" className={executionMethod === 'Taker–Taker' ? 'active' : ''} aria-checked={executionMethod === 'Taker–Taker'} onClick={() => setExecutionMethod('Taker–Taker')}>⚡ {t('Taker–Taker')}</button><button type="button" role="radio" className={executionMethod === 'Maker–Taker' ? 'active' : ''} aria-checked={executionMethod === 'Maker–Taker'} onClick={() => setExecutionMethod('Maker–Taker')}>◫ {t('Maker–Taker')}</button></div>{executionMethod === 'Maker–Taker' && <div className="maker-leg-picker execution-maker-leg-options" role="radiogroup" aria-label={t('Choose maker leg')}><button type="button" role="radio" className={makerLeg === 'left' ? 'active' : ''} aria-checked={makerLeg === 'left'} onClick={() => setMakerLeg('left')}><small>{t('Maker')} · A</small><strong>{leftExchange.name}</strong></button><button type="button" role="radio" className={makerLeg === 'right' ? 'active' : ''} aria-checked={makerLeg === 'right'} onClick={() => setMakerLeg('right')}><small>{t('Maker')} · B</small><strong>{rightExchange.name}</strong></button></div>}</div></div>
       {mode === 'position' && <div className="compact-stop"><span>◎</span><p>{`${t('Stops after')} ${amount || '0'} ${asset} ${t('executes')}`}</p></div>}
     </article>
   );
@@ -1193,9 +1379,9 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
                   value={leftExchangeId}
                   onSelect={setLeftExchangeId}
                 />
-                {mode === 'auto' && leftExchangeId === 'gate' && <div className="leg-product-toggle" role="group" aria-label={t('Market type')}>
-                  <button type="button" className={leftProduct === 'perpetual' ? 'active' : ''} aria-pressed={leftProduct === 'perpetual'} onClick={() => setLeftProduct('perpetual')}>{t('Perpetual')}</button>
-                  <button type="button" className={leftProduct === 'spot' ? 'active' : ''} aria-pressed={leftProduct === 'spot'} onClick={() => setLeftProduct('spot')}>{t('Spot')}</button>
+                {mode === 'auto' && leftExchangeId === 'gate' && <div className="leg-product-toggle" role="radiogroup" aria-label={t('Market type')}>
+                  <button type="button" role="radio" className={leftProduct === 'perpetual' ? 'active' : ''} aria-checked={leftProduct === 'perpetual'} onClick={() => setLeftProduct('perpetual')}>{t('Perpetual')}</button>
+                  <button type="button" role="radio" className={leftProduct === 'spot' ? 'active' : ''} aria-checked={leftProduct === 'spot'} onClick={() => setLeftProduct('spot')}>{t('Spot')}</button>
                 </div>}
                 <em>{t(leftSide)} <span>{leftTicker}</span></em>
               </div>
@@ -1222,9 +1408,9 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
                   value={rightExchangeId}
                   onSelect={setRightExchangeId}
                 />
-                {mode === 'auto' && rightExchangeId === 'gate' && <div className="leg-product-toggle" role="group" aria-label={t('Market type')}>
-                  <button type="button" className={rightProduct === 'perpetual' ? 'active' : ''} aria-pressed={rightProduct === 'perpetual'} onClick={() => setRightProduct('perpetual')}>{t('Perpetual')}</button>
-                  <button type="button" className={rightProduct === 'spot' ? 'active' : ''} aria-pressed={rightProduct === 'spot'} onClick={() => setRightProduct('spot')}>{t('Spot')}</button>
+                {mode === 'auto' && rightExchangeId === 'gate' && <div className="leg-product-toggle" role="radiogroup" aria-label={t('Market type')}>
+                  <button type="button" role="radio" className={rightProduct === 'perpetual' ? 'active' : ''} aria-checked={rightProduct === 'perpetual'} onClick={() => setRightProduct('perpetual')}>{t('Perpetual')}</button>
+                  <button type="button" role="radio" className={rightProduct === 'spot' ? 'active' : ''} aria-checked={rightProduct === 'spot'} onClick={() => setRightProduct('spot')}>{t('Spot')}</button>
                 </div>}
                 <em>{t(rightSide)} <span>{rightTicker}</span></em>
               </div>
@@ -1263,11 +1449,12 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
             </div>
             <div className="premium-history-controls">
               <span className="premium-live-badge"><i /> {t('Actual rates paid at each settlement')}</span>
-              <div role="group" aria-label={t('Duration')}>
+              <div role="radiogroup" aria-label={t('Duration')}>
                 {POSITION_FUNDING_RANGES.map((range) => <button
                   key={range.days}
+                  role="radio"
                   className={positionFundingDuration === range.days ? 'active' : ''}
-                  aria-pressed={positionFundingDuration === range.days}
+                  aria-checked={positionFundingDuration === range.days}
                   onClick={() => setPositionFundingDuration(range.days)}
                 >{range.label}</button>)}
               </div>
@@ -1389,7 +1576,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
       onCancel={() => setConfirmingLaunch(false)}
       onConfirm={() => { void launchStrategy(); }}
     />}
-    <RunningStrategiesPanel strategies={strategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} instruments={instruments} tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} onStrategiesChanged={onStrategiesChanged} onPositionsRefresh={onPositionsRefresh} />
+    <RunningStrategiesPanel strategies={strategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} instruments={instruments} tradingMode={tradingMode} requestedStrategyId={requestedStrategyId} onOpenModeDialog={onOpenModeDialog} onStrategiesChanged={onStrategiesChanged} onPositionsRefresh={onPositionsRefresh} onOpenStrategyConfig={onOpenStrategyConfig} onCopyStrategy={onCopyStrategy} />
   </div>;
 }
 
@@ -1405,6 +1592,10 @@ interface CarryStrategyViewProps {
   onStrategiesChanged: () => Promise<void>;
   onPositionsRefresh: () => Promise<void>;
   watchQuotes: (symbols: string[]) => void;
+  /** `?strategyId=` deep link that should open that strategy's configuration detail dialog. */
+  requestedStrategyId?: string | null;
+  onOpenStrategyConfig: (strategy: StrategyRecord) => void;
+  onCopyStrategy: (strategy: StrategyRecord) => void;
 }
 
 /** Annualize an 8h-equivalent funding percentage (percent per 8h × 3 × 365). */
@@ -1418,7 +1609,7 @@ function fundingAprPercent(rate8hPercent: number | null): number | null {
  * collect each funding settlement, and close both legs once the basis converges to the
  * take-profit level. Each leg's venue is chosen freely within its connected catalog entries.
  */
-export function CarryStrategyView({ marketSnapshot, catalog, strategies, balances, authenticatedPortfolio, tradingSnapshot, tradingMode, onOpenModeDialog, onStrategiesChanged, onPositionsRefresh, watchQuotes }: CarryStrategyViewProps) {
+export function CarryStrategyView({ marketSnapshot, catalog, strategies, balances, authenticatedPortfolio, tradingSnapshot, tradingMode, requestedStrategyId, onOpenModeDialog, onStrategiesChanged, onPositionsRefresh, watchQuotes, onOpenStrategyConfig, onCopyStrategy }: CarryStrategyViewProps) {
   const { language, theme, t } = useLanguage();
   // Prefill query from the Opportunities board is read once on mount; later renders ignore it.
   const [query] = useState(() => new URLSearchParams(window.location.search));
@@ -1428,7 +1619,10 @@ export function CarryStrategyView({ marketSnapshot, catalog, strategies, balance
   const [perpVenueId, setPerpVenueId] = useState(() => queryVenueId(query.get('rightVenue')) ?? 'gate');
   const [fundingDirection, setFundingDirection] = useState<'POSITIVE' | 'NEGATIVE'>(() => query.get('direction') === 'NEGATIVE' ? 'NEGATIVE' : 'POSITIVE');
   const [fundingAprMin, setFundingAprMin] = useState(() => queryDecimal(query.get('aprMin')) ?? '15');
-  const [totalAmount, setTotalAmount] = useState('');
+  // One-click copy prefill: the carry record also restores its open amount, and the notice below
+  // tells the operator which strategy the form was filled from.
+  const [totalAmount, setTotalAmount] = useState(() => queryDecimal(query.get('totalAmount')) ?? '');
+  const [copyNoticeStrategyId, setCopyNoticeStrategyId] = useState<string | null>(() => query.get('copyStrategyId'));
   const [basisTakeProfit, setBasisTakeProfit] = useState('20');
   const [inventoryCheck, setInventoryCheck] = useState(false);
   const [launching, setLaunching] = useState(false);
@@ -1730,11 +1924,12 @@ export function CarryStrategyView({ marketSnapshot, catalog, strategies, balance
             </div>
             <div className="premium-history-controls">
               <span className={`premium-live-badge${fundingDirection === 'POSITIVE' ? '' : ' negative'}`}><i /> {fundingDirection === 'POSITIVE' ? t('Buy spot · short perp') : t('Sell spot · long perp')}</span>
-              <div role="group" aria-label={t('Duration')}>
+              <div role="radiogroup" aria-label={t('Duration')}>
                 {POSITION_FUNDING_RANGES.map((range) => <button
                   key={range.days}
+                  role="radio"
                   className={carryFundingDuration === range.days ? 'active' : ''}
-                  aria-pressed={carryFundingDuration === range.days}
+                  aria-checked={carryFundingDuration === range.days}
                   onClick={() => setCarryFundingDuration(range.days)}
                 >{range.label}</button>)}
               </div>
@@ -1764,10 +1959,11 @@ export function CarryStrategyView({ marketSnapshot, catalog, strategies, balance
       <aside className="strategy-sidebar">
         <article className="strategy-panel strategy-rules compact strategy-rules-sidebar terminal-panel">
           <header className="strategy-panel-head"><div><p className="eyebrow">{t('Strategy setup')}</p><h2>{t('Configure carry bot')}</h2></div></header>
+          {copyNoticeStrategyId && <div className="strategy-copy-notice" role="status"><span>⧉</span><p>{t('Prefilled from strategy')} <strong>{copyNoticeStrategyId}</strong> {t('Review the details, then launch.')}</p><button onClick={() => setCopyNoticeStrategyId(null)}>{t('Dismiss prefill notice')}</button></div>}
           <div className="compact-fields">
-            <label className="reduce-only-control"><span onClick={(event) => event.preventDefault()}>{t('Funding direction')}</span><div className="method-options" role="group" aria-label={t('Funding direction')}>
-              <button type="button" className={fundingDirection === 'POSITIVE' ? 'active' : ''} aria-pressed={fundingDirection === 'POSITIVE'} onClick={() => setFundingDirection('POSITIVE')}><small>+</small><strong>{t('Positive')}</strong></button>
-              <button type="button" className={fundingDirection === 'NEGATIVE' ? 'active' : ''} aria-pressed={fundingDirection === 'NEGATIVE'} onClick={() => setFundingDirection('NEGATIVE')}><small>−</small><strong>{t('Negative')}</strong></button>
+            <label className="reduce-only-control"><span onClick={(event) => event.preventDefault()}>{t('Funding direction')}</span><div className="method-options" role="radiogroup" aria-label={t('Funding direction')}>
+              <button type="button" role="radio" className={fundingDirection === 'POSITIVE' ? 'active' : ''} aria-checked={fundingDirection === 'POSITIVE'} onClick={() => setFundingDirection('POSITIVE')}><small>+</small><strong>{t('Positive')}</strong></button>
+              <button type="button" role="radio" className={fundingDirection === 'NEGATIVE' ? 'active' : ''} aria-checked={fundingDirection === 'NEGATIVE'} onClick={() => setFundingDirection('NEGATIVE')}><small>−</small><strong>{t('Negative')}</strong></button>
             </div></label>
             <label><span>{t('Funding APR threshold')}</span><div><input value={fundingAprMin} onChange={(event) => setFundingAprMin(event.target.value)} /><b>%</b></div></label>
             <label><span>{t('Open amount')}</span><div><input placeholder="e.g. 0.10" value={totalAmount} onChange={(event) => setTotalAmount(event.target.value)} /><b>{asset}</b></div></label>
@@ -1811,7 +2007,7 @@ export function CarryStrategyView({ marketSnapshot, catalog, strategies, balance
       onCancel={() => setConfirmingLaunch(false)}
       onConfirm={() => { void launchStrategy(); }}
     />}
-    <RunningStrategiesPanel strategies={strategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} instruments={null} tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} onStrategiesChanged={onStrategiesChanged} onPositionsRefresh={onPositionsRefresh} />
+    <RunningStrategiesPanel strategies={strategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} instruments={null} tradingMode={tradingMode} requestedStrategyId={requestedStrategyId} onOpenModeDialog={onOpenModeDialog} onStrategiesChanged={onStrategiesChanged} onPositionsRefresh={onPositionsRefresh} onOpenStrategyConfig={onOpenStrategyConfig} onCopyStrategy={onCopyStrategy} />
   </div>;
 }
 
@@ -1829,6 +2025,10 @@ interface PremiumStrategyViewProps {
   candleSeries: Record<string, Candle[]>;
   watchQuotes: (symbols: string[]) => void;
   watchKlines: (watches: KlineWatch[]) => void;
+  /** `?strategyId=` deep link that should open that strategy's configuration detail dialog. */
+  requestedStrategyId?: string | null;
+  onOpenStrategyConfig: (strategy: StrategyRecord) => void;
+  onCopyStrategy: (strategy: StrategyRecord) => void;
 }
 
 function loadFreshPairCandles(adrSymbol: string, hedgeSymbol: string, interval: CandleInterval) {
@@ -2007,20 +2207,32 @@ function StrategyLeverageControl({
   </div>;
 }
 
-export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balances, authenticatedPortfolio, tradingSnapshot, tradingMode, onOpenModeDialog, onStrategiesChanged, onPositionsRefresh, candleSeries, watchQuotes, watchKlines }: PremiumStrategyViewProps) {
+export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balances, authenticatedPortfolio, tradingSnapshot, tradingMode, requestedStrategyId, onOpenModeDialog, onStrategiesChanged, onPositionsRefresh, candleSeries, watchQuotes, watchKlines, onOpenStrategyConfig, onCopyStrategy }: PremiumStrategyViewProps) {
   const { language, theme, t } = useLanguage();
-  const [adrVenueId, setAdrVenueId] = useState('gate');
-  const [hedgeVenueId, setHedgeVenueId] = useState('gate');
-  const [directionFlipped, setDirectionFlipped] = useState(false);
-  const [perOrderQuantity, setPerOrderQuantity] = useState('');
-  const adrRatio = DEFAULT_ADR_RATIO;
-  const [entryPremium, setEntryPremium] = useState('35');
-  const [takeProfitPremium, setTakeProfitPremium] = useState('24');
-  const [maxPosition, setMaxPosition] = useState('');
-  const [reduceOnly, setReduceOnly] = useState(false);
-  const [hedgeMode, setHedgeMode] = useState<'SHARE_RATIO' | 'EQUAL_NOTIONAL'>('EQUAL_NOTIONAL');
-  const [adrLeverage, setAdrLeverage] = useState('3');
-  const [hedgeLeverage, setHedgeLeverage] = useState('3');
+  // One-click copy prefill (see `strategy-copy.ts`): read once on mount, exactly like the auto and
+  // carry forms. `App.tsx` keys this view on `copyStrategyId` / `strategyId`, so the initializers
+  // below re-run whenever the prefill changes — without that key a same-kind navigation would reuse
+  // the mounted component instance and the prefill would silently do nothing.
+  const [query] = useState(() => new URLSearchParams(window.location.search));
+  const [adrVenueId, setAdrVenueId] = useState(() => queryVenueId(query.get('leftVenue')) ?? 'gate');
+  const [hedgeVenueId, setHedgeVenueId] = useState(() => queryVenueId(query.get('rightVenue')) ?? 'gate');
+  // `leftSide` carries the direction: the payload writes `SELL` for the short-premium default, so a
+  // copied long strategy must arrive with the direction already flipped.
+  const [directionFlipped, setDirectionFlipped] = useState(() => query.get('leftSide') === 'BUY');
+  const [perOrderQuantity, setPerOrderQuantity] = useState(() => queryDecimal(query.get('perOrderQuantity')) ?? '');
+  // There is no editor for the share ratio, so this state has no setter: it exists purely so a
+  // copied strategy restores the ratio it was launched with instead of silently using the default.
+  const [adrRatio] = useState(() => queryDecimal(query.get('adrRatio')) ?? DEFAULT_ADR_RATIO);
+  const [entryPremium, setEntryPremium] = useState(() => queryDecimal(query.get('entryPremiumPct')) ?? '35');
+  const [takeProfitPremium, setTakeProfitPremium] = useState(() => queryDecimal(query.get('takeProfitPremiumPct')) ?? '24');
+  const [maxPosition, setMaxPosition] = useState(() => queryDecimal(query.get('maxPosition')) ?? '');
+  const [reduceOnly, setReduceOnly] = useState(() => query.get('reduceOnly') === 'true');
+  const [hedgeMode, setHedgeMode] = useState<'SHARE_RATIO' | 'EQUAL_NOTIONAL'>(() => query.get('hedgeMode') === 'SHARE_RATIO' ? 'SHARE_RATIO' : 'EQUAL_NOTIONAL');
+  const [adrLeverage, setAdrLeverage] = useState(() => queryDecimal(query.get('leftLeverage')) ?? '3');
+  const [hedgeLeverage, setHedgeLeverage] = useState(() => queryDecimal(query.get('rightLeverage')) ?? '3');
+  // Copy notice: dismissing hides the reminder only. The prefilled fields stay put, so closing the
+  // banner never destroys the configuration the operator just asked to reuse.
+  const [copyNoticeStrategyId, setCopyNoticeStrategyId] = useState<string | null>(() => query.get('copyStrategyId'));
   const [adrRiskPositionValue, setAdrRiskPositionValue] = useState<number | null | undefined>(undefined);
   const [hedgeRiskPositionValue, setHedgeRiskPositionValue] = useState<number | null | undefined>(undefined);
   const [launching, setLaunching] = useState(false);
@@ -2470,6 +2682,7 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
       <aside className="strategy-sidebar">
         <article className="strategy-panel strategy-rules compact strategy-rules-sidebar terminal-panel">
           <header className="strategy-panel-head"><div><p className="eyebrow">{t('Strategy setup')}</p><h2>{t('Configure premium bot')}</h2></div></header>
+          {copyNoticeStrategyId && <div className="strategy-copy-notice" role="status"><span>⧉</span><p>{t('Prefilled from strategy')} <strong>{copyNoticeStrategyId}</strong> {t('Review the details, then launch.')}</p><button onClick={() => setCopyNoticeStrategyId(null)}>{t('Dismiss prefill notice')}</button></div>}
           <div className="compact-fields">
             <label><span>{t('Per-order quantity')}</span><div><input placeholder="e.g. 0.10" value={perOrderQuantity} onChange={(event) => setPerOrderQuantity(event.target.value)} /><b>{ADR_ASSET}</b></div></label>
             <label><span>{t(reduceOnly ? 'Max close amount' : 'Max position')}</span><div><input placeholder="e.g. 0.50" value={maxPosition} onChange={(event) => setMaxPosition(event.target.value)} /><b>{ADR_ASSET}</b></div></label>
@@ -2496,9 +2709,9 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
               : <>{t('Enter at')} <strong>{entryComparator} {entryPremium || '0'}%</strong> · {t('Take profit at')} <strong>{exitComparator} {takeProfitPremium || '0'}%</strong></>}</p></div>
             <label className="reduce-only-control premium-reduce-only-control"><span onClick={(event) => event.preventDefault()}>{t('Position handling')}</span><div><input type="checkbox" checked={reduceOnly} onChange={(event) => setReduceOnly(event.target.checked)} /><b>{t('Reduce only')}</b></div></label>
             <div className="compact-method premium-hedge-sizing"><span>{t('Hedge sizing')}</span>
-              <div className="method-options maker-leg-picker hedge-sizing-options" role="group" aria-label={t('Hedge sizing')}>
-                <button type="button" aria-pressed={hedgeMode === 'EQUAL_NOTIONAL'} className={hedgeMode === 'EQUAL_NOTIONAL' ? 'active' : ''} onClick={() => setHedgeMode('EQUAL_NOTIONAL')}><small>{t('Equal notional')}</small><strong>{t('Match value at entry')}</strong></button>
-                <button type="button" aria-pressed={hedgeMode === 'SHARE_RATIO'} className={hedgeMode === 'SHARE_RATIO' ? 'active' : ''} onClick={() => setHedgeMode('SHARE_RATIO')}><small>{t('Share ratio')}</small><strong>1 {ADR_HEDGE_ASSET} = {adrRatio || '—'} {ADR_ASSET}</strong></button>
+              <div className="method-options maker-leg-picker hedge-sizing-options" role="radiogroup" aria-label={t('Hedge sizing')}>
+                <button type="button" role="radio" aria-checked={hedgeMode === 'EQUAL_NOTIONAL'} className={hedgeMode === 'EQUAL_NOTIONAL' ? 'active' : ''} onClick={() => setHedgeMode('EQUAL_NOTIONAL')}><small>{t('Equal notional')}</small><strong>{t('Match value at entry')}</strong></button>
+                <button type="button" role="radio" aria-checked={hedgeMode === 'SHARE_RATIO'} className={hedgeMode === 'SHARE_RATIO' ? 'active' : ''} onClick={() => setHedgeMode('SHARE_RATIO')}><small>{t('Share ratio')}</small><strong>1 {ADR_HEDGE_ASSET} = {adrRatio || '—'} {ADR_ASSET}</strong></button>
               </div>
             </div>
           </div>
@@ -2544,6 +2757,6 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
       onCancel={() => setConfirmingLaunch(false)}
       onConfirm={() => { void launchStrategy(); }}
     />}
-    <RunningStrategiesPanel strategies={strategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} instruments={instruments} tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} onStrategiesChanged={onStrategiesChanged} onPositionsRefresh={onPositionsRefresh} />
+    <RunningStrategiesPanel strategies={strategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} instruments={instruments} tradingMode={tradingMode} requestedStrategyId={requestedStrategyId} onOpenModeDialog={onOpenModeDialog} onStrategiesChanged={onStrategiesChanged} onPositionsRefresh={onPositionsRefresh} onOpenStrategyConfig={onOpenStrategyConfig} onCopyStrategy={onCopyStrategy} />
   </div>;
 }

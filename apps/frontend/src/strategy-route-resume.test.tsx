@@ -37,6 +37,8 @@ function render(status: string): string {
     onOpenModeDialog={vi.fn()}
     onStrategiesChanged={vi.fn(async () => undefined)}
     onPositionsRefresh={vi.fn(async () => undefined)}
+    onOpenStrategyConfig={vi.fn()}
+    onCopyStrategy={vi.fn()}
   />);
 }
 

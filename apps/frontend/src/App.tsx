@@ -27,6 +27,7 @@ import {
 } from './api.js';
 import { parseStoredFavorites } from './local-preferences.js';
 import { scopeStrategiesToAccount, strategyBelongsToAccount } from './strategy-accounts.js';
+import { strategyCopyQuery, strategyPrefillKey, strategyRouteKind } from './strategy-copy.js';
 import { DEFAULT_FRONTEND_ROUTE, frontendPath, frontendRoute, type FrontendRoute, type StrategyRouteKind } from './frontend-routes.js';
 import { LanguageContext, translate, useLanguage, type Language, type Theme } from './i18n.js';
 import { LoginPage } from './login-page.js';
@@ -451,9 +452,9 @@ function TradingModeGate({ mode, onApplied, credentialEntryPath, onCredentialSta
       <header>
         <div><p className="eyebrow">{t('Trading mode')}</p><h2 id="risk-disclaimer-title">{t('Risk disclaimer')}</h2></div>
         <div className="disclaimer-header-actions">
-          <div className="disclaimer-lang" role="group" aria-label={t('Language')}>
-            <button className={language === 'en' ? 'active' : ''} onClick={() => setLanguage('en')} aria-pressed={language === 'en'}>EN</button>
-            <button className={language === 'zh' ? 'active' : ''} onClick={() => setLanguage('zh')} aria-pressed={language === 'zh'}>中文</button>
+          <div className="disclaimer-lang" role="radiogroup" aria-label={t('Language')}>
+            <button role="radio" className={language === 'en' ? 'active' : ''} onClick={() => setLanguage('en')} aria-checked={language === 'en'}>EN</button>
+            <button role="radio" className={language === 'zh' ? 'active' : ''} onClick={() => setLanguage('zh')} aria-checked={language === 'zh'}>中文</button>
           </div>
           {!forced && <button className="disclaimer-close" aria-label={t('Close')} onClick={() => onClose?.()}>×</button>}
         </div>
@@ -1148,14 +1149,32 @@ function App() {
     [strategies, connection],
   );
   const opportunityBoard = route.workspace === 'Opportunities' ? route.board : 'funding';
+  // `?strategyId=` deep link. Derived from `route` (not read off `window` inside the view) and
+  // listed in the `content` memo deps below: navigating to the *same* strategy kind would otherwise
+  // reuse a referentially identical element and React would bail out of re-rendering the view, so
+  // the detail dialog's effect would never see the new id.
+  const requestedStrategyId = route.workspace === 'Strategy' ? route.query?.strategyId ?? null : null;
+  // Remount key for the strategy views. The forms read their prefill from `window.location.search`
+  // inside `useState` mount initializers, which do not re-run when React reuses a component
+  // instance — and clicking 复制 on the history row of the page you are already on navigates to the
+  // same kind, so only the query changes. Keying the element on the prefill parameters forces the
+  // remount that makes the prefill actually happen. Must stay in the `content` memo deps, or the
+  // memo would bail out and hand React the old element with the old key.
+  const strategyPrefillKeyValue = route.workspace === 'Strategy' ? strategyPrefillKey(route.query) : 'default';
+  const openStrategyConfig = useCallback((strategy: StrategyRecord) => {
+    navigate({ workspace: 'Strategy', strategyKind: strategyRouteKind(strategy.kind), query: { strategyId: strategy.id } });
+  }, [navigate]);
+  const copyStrategy = useCallback((strategy: StrategyRecord) => {
+    navigate({ workspace: 'Strategy', strategyKind: strategyRouteKind(strategy.kind), query: strategyCopyQuery(strategy) });
+  }, [navigate]);
 
   const content = useMemo(() => {
     if (workspace === 'Trade') return <TradingView asset={selectedAsset} catalog={availableCatalog} onSelectAsset={selectAsset} marketSnapshot={marketSnapshot} tradingSnapshot={tradingSnapshot} authenticatedPortfolio={authenticatedPortfolio} balances={balances} fees={fees} orderBook={orderBook} publicTrades={publicTrades} candleSeries={candleSeries} candleBackfilling={candleBackfilling} watchMarket={watchMarket} watchSelectorQuotes={watchSelectorQuotes} seedCandles={seedCandles} onTradingChanged={refreshTrading} onPositionsRefresh={refreshPositions} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} favorites={favorites} onToggleFavorite={toggleFavorite} confirmOrders={confirmOrders} onSetConfirmOrders={setConfirmOrders} />;
     if (workspace === 'Strategy') {
-      if (strategyKind === 'premium') return <PremiumStrategyView marketSnapshot={marketSnapshot} catalog={availableCatalog} strategies={activeAccountStrategies} balances={balances} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} candleSeries={candleSeries} watchQuotes={watchQuotes} watchKlines={watchKlines} />;
-      if (strategyKind === 'carry') return <CarryStrategyView marketSnapshot={marketSnapshot} catalog={availableCatalog} strategies={activeAccountStrategies} balances={balances} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} watchQuotes={watchQuotes} />;
-      if (strategyKind === 'boros') return <BorosStrategyView marketSnapshot={marketSnapshot} catalog={availableCatalog} balances={balances} fees={fees} feesReady={feesReady} strategies={activeAccountStrategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} watchQuotes={watchQuotes} />;
-      return <StrategyView mode={strategyKind} prefill={positionPrefill} marketSnapshot={marketSnapshot} catalog={availableCatalog} fees={fees} strategies={activeAccountStrategies} balances={balances} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} watchQuotes={watchQuotes} />;
+      if (strategyKind === 'premium') return <PremiumStrategyView key={strategyPrefillKeyValue} marketSnapshot={marketSnapshot} catalog={availableCatalog} strategies={activeAccountStrategies} balances={balances} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} requestedStrategyId={requestedStrategyId} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} candleSeries={candleSeries} watchQuotes={watchQuotes} watchKlines={watchKlines} onOpenStrategyConfig={openStrategyConfig} onCopyStrategy={copyStrategy} />;
+      if (strategyKind === 'carry') return <CarryStrategyView key={strategyPrefillKeyValue} marketSnapshot={marketSnapshot} catalog={availableCatalog} strategies={activeAccountStrategies} balances={balances} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} requestedStrategyId={requestedStrategyId} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} watchQuotes={watchQuotes} onOpenStrategyConfig={openStrategyConfig} onCopyStrategy={copyStrategy} />;
+      if (strategyKind === 'boros') return <BorosStrategyView key={strategyPrefillKeyValue} marketSnapshot={marketSnapshot} catalog={availableCatalog} balances={balances} fees={fees} feesReady={feesReady} strategies={activeAccountStrategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} requestedStrategyId={requestedStrategyId} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} watchQuotes={watchQuotes} onOpenStrategyConfig={openStrategyConfig} onCopyStrategy={copyStrategy} />;
+      return <StrategyView key={strategyPrefillKeyValue} mode={strategyKind} prefill={positionPrefill} marketSnapshot={marketSnapshot} catalog={availableCatalog} fees={fees} strategies={activeAccountStrategies} balances={balances} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} requestedStrategyId={requestedStrategyId} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} watchQuotes={watchQuotes} onOpenStrategyConfig={openStrategyConfig} onCopyStrategy={copyStrategy} />;
     }
     if (workspace === 'Funding Rates') return fundingDetailAsset
       ? <FundingDetailView asset={fundingDetailAsset} fundingOverview={fundingOverview} onFundingOverview={setFundingOverview} onBack={() => navigate({ workspace: 'Funding Rates', asset: null })} />
@@ -1165,7 +1184,7 @@ function App() {
     if (workspace === 'Trading Fees') return <FeeComparisonView catalog={availableCatalog} marketSnapshot={marketSnapshot} favorites={favorites} fees={fees} feesReady={feesReady} error={feesError} onRefresh={refreshFees} watchSelectorQuotes={watchSelectorQuotes} />;
     return null;
 
-  }, [workspace, strategyKind, positionPrefill, selectedAsset, fundingMetric, fundingOverview, fundingHistoryCache, availableCatalog, selectAsset, marketSnapshot, tradingSnapshot, authenticatedPortfolio, accountStream, activeAccountStrategies, balances, fees, feesReady, feesError, orderBook, publicTrades, candleSeries, candleBackfilling, tradingMode, openModeDialog, watchMarket, watchQuotes, watchSelectorQuotes, watchKlines, seedCandles, refreshTrading, refreshStrategies, refreshPositions, refreshMarketSnapshot, refreshFees, favorites, toggleFavorite, confirmOrders, fundingDetailAsset, openFundingDetail, openFundingStrategy, mergeFundingHistory, navigate, connection?.activeProfileId, opportunityBoard]);
+  }, [workspace, strategyKind, positionPrefill, requestedStrategyId, strategyPrefillKeyValue, openStrategyConfig, copyStrategy, selectedAsset, fundingMetric, fundingOverview, fundingHistoryCache, availableCatalog, selectAsset, marketSnapshot, tradingSnapshot, authenticatedPortfolio, accountStream, activeAccountStrategies, balances, fees, feesReady, feesError, orderBook, publicTrades, candleSeries, candleBackfilling, tradingMode, openModeDialog, watchMarket, watchQuotes, watchSelectorQuotes, watchKlines, seedCandles, refreshTrading, refreshStrategies, refreshPositions, refreshMarketSnapshot, refreshFees, favorites, toggleFavorite, confirmOrders, fundingDetailAsset, openFundingDetail, openFundingStrategy, mergeFundingHistory, navigate, connection?.activeProfileId, opportunityBoard]);
 
   const storageLabel = connection?.storage === 'os_keychain' ? t('OS keychain') : connection?.storage === 'env_file' ? t('Local .env file') : connection?.storage ?? '—';
   const accountStatusLabel = accountStream?.state === 'live' ? t('Account live')
@@ -1477,16 +1496,16 @@ function App() {
             <p className="settings-section">{t('Display')}</p>
             <div className="settings-row">
               <strong>{t('Language')}</strong>
-              <div className="settings-options" role="group" aria-label={t('Language')}>
-                <button className={language === 'en' ? 'active' : ''} onClick={() => setLanguage('en')} aria-pressed={language === 'en'}>EN</button>
-                <button className={language === 'zh' ? 'active' : ''} onClick={() => setLanguage('zh')} aria-pressed={language === 'zh'}>中文</button>
+              <div className="settings-options" role="radiogroup" aria-label={t('Language')}>
+                <button role="radio" className={language === 'en' ? 'active' : ''} onClick={() => setLanguage('en')} aria-checked={language === 'en'}>EN</button>
+                <button role="radio" className={language === 'zh' ? 'active' : ''} onClick={() => setLanguage('zh')} aria-checked={language === 'zh'}>中文</button>
               </div>
             </div>
             <div className="settings-row">
               <strong>{t('Theme')}</strong>
-              <div className="settings-options" role="group" aria-label={t('Theme')}>
-                <button className={theme === 'dark' ? 'active' : ''} onClick={() => setTheme('dark')} aria-pressed={theme === 'dark'}>{t('Dark mode')}</button>
-                <button className={theme === 'light' ? 'active' : ''} onClick={() => setTheme('light')} aria-pressed={theme === 'light'}>{t('Light mode')}</button>
+              <div className="settings-options" role="radiogroup" aria-label={t('Theme')}>
+                <button role="radio" className={theme === 'dark' ? 'active' : ''} onClick={() => setTheme('dark')} aria-checked={theme === 'dark'}>{t('Dark mode')}</button>
+                <button role="radio" className={theme === 'light' ? 'active' : ''} onClick={() => setTheme('light')} aria-checked={theme === 'light'}>{t('Light mode')}</button>
               </div>
             </div>
             <button className="settings-link" onClick={() => window.open('/api/system/discovery', '_blank', 'noopener')}>API<span>›</span></button>

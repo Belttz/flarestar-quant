@@ -749,6 +749,67 @@ export const OpportunityResponseSchema = z.object({
 });
 export type OpportunityResponse = z.infer<typeof OpportunityResponseSchema>;
 
+/**
+ * One row of the spread-quality board: the 24h statistics of one (asset, sell venue, buy venue)
+ * price spread, ranked by how *capturable* the spread is rather than how wide it is right now.
+ *
+ * The series behind the statistics is either reconstructed from 24h of 5-minute candles
+ * (`source: 'candles'`) or sampled from live executable spreads (`source: 'samples'`, once the
+ * sampler has accumulated a day). Every statistic is `null` — never zero — when the series is too
+ * short or degenerate to support it; rows below the minimum sample count never reach the board.
+ */
+export const SpreadQualityRowSchema = z.object({
+  pairType: z.enum(['SPOT_PERP', 'PERP_PERP']),
+  asset: z.string(),
+  /** Sell leg (aligned with the engine's spread = sellBid − buyAsk). */
+  leftSymbol: z.string(),
+  /** Buy leg. */
+  rightSymbol: z.string(),
+  leftVenue: z.string(),
+  rightVenue: z.string(),
+  /** The executable spread right now, mirroring the spread board's reading. */
+  currentSpreadBps: z.number().finite(),
+  /** Mean of the 24h spread series (bps). */
+  meanSpreadBps: z.number().finite().nullable(),
+  /** Standard deviation of the series (bps). */
+  spreadVolatilityBps: z.number().finite().nullable(),
+  /** Third moment: positive means the big spreads lean favourable. */
+  skewness: z.number().finite().nullable(),
+  /** Fourth moment (excess): fat tails mean occasional extreme spreads. */
+  excessKurtosis: z.number().finite().nullable(),
+  /** |skewness| small and mean ≈ median — the distribution behaves as modelled. */
+  symmetric: z.boolean(),
+  /** AR(1) coefficient of the series; null when degenerate. ≥ 1 means trending, not reverting. */
+  ar1Coefficient: z.number().finite().nullable(),
+  /** ln(0.5) / ln(φ): hours for a dislocation to halve. Null when the series does not revert. */
+  halfLifeHours: z.number().finite().nonnegative().nullable(),
+  /**
+   * Funding differential over the expected holding window plus round-trip fees (bps). Null when
+   * the funding input is unavailable — scoring then treats the pair as maximally expensive.
+   */
+  holdingCostBps: z.number().finite().nullable(),
+  /** Weaker leg's top-of-book notional (USDT); what a single fill can absorb. */
+  bookDepthUsdt: z.number().finite().nonnegative(),
+  /** Composite 0–100: weighted percentiles of the factors above across the candidate set. */
+  score: z.number().finite(),
+  /** Candles or samples behind the statistics. */
+  sampleCount: z.number().int().nonnegative(),
+  source: z.enum(['candles', 'samples']),
+  updatedAt: z.string(),
+  ...OpportunityRowClassificationSchema.shape,
+});
+export type SpreadQualityRow = z.infer<typeof SpreadQualityRowSchema>;
+
+export const SpreadQualityResponseSchema = z.object({
+  rows: z.array(SpreadQualityRowSchema),
+  /** Candidate-set size before the top-N cut, so the UI can say what it is looking at. */
+  totalCandidates: z.number().int().nonnegative(),
+  windowHours: z.number().int().positive().default(24),
+  fetchedAt: z.string(),
+  cacheStatus: z.enum(['fresh', 'stale']),
+});
+export type SpreadQualityResponse = z.infer<typeof SpreadQualityResponseSchema>;
+
 export const FundingHistoryEntrySchema = z.object({
   symbol: z.string(),
   status: z.enum(['ok', 'pending', 'unavailable']),
@@ -1136,6 +1197,38 @@ export const StrategyCarryMetricsSchema = z.object({
 });
 export type StrategyCarryMetrics = z.infer<typeof StrategyCarryMetricsSchema>;
 
+/**
+ * Strategy profit and loss, rebuilt from the strategy's own fills so the figure is venue-agnostic
+ * and identical for perpetual and spot legs. Average-cost matching over the fills in time order
+ * splits them into position-increasing and position-reducing fills, which is what separates the
+ * "locked" (already closed) result from the mark-to-market one:
+ *
+ * - `realizedPnl` — result of the position-reducing fills, before costs.
+ * - `unrealizedPnl` — still-open legs marked against the latest stored mark/last price.
+ * - `feesPaid` — every fill's fee as a positive cost (Gate's trade feed reports fees unsigned).
+ * - `fundingFeeUsdt` — funding charged (positive) or collected (negative).
+ * - `netPnl` — `realizedPnl + unrealizedPnl − feesPaid − fundingFeeUsdt`.
+ * - `lockedProfitBps` — the already-closed result net of the closing fills' fees and the funding
+ *   charge, expressed in basis points of `closedEntryNotionalUsdt`. This is the "how many bps did
+ *   this strategy actually keep" figure: it uses the close's own cost basis, not the whole
+ *   strategy's, so a strategy that is still adding size cannot inflate it.
+ *
+ * A `null` always means "the inputs are not available", never zero — the UI shows a dash instead
+ * of inventing a number. `unrealizedPnl` is null when an open leg has no stored mark price, and
+ * `fundingFeeUsdt` is null when the funding charge cannot be attributed to this strategy alone.
+ */
+export const StrategyPnlSchema = z.object({
+  realizedPnl: z.string(),
+  unrealizedPnl: z.string().nullable(),
+  feesPaid: z.string(),
+  fundingFeeUsdt: z.string().nullable(),
+  netPnl: z.string().nullable(),
+  closedEntryNotionalUsdt: z.string(),
+  entryNotionalUsdt: z.string(),
+  lockedProfitBps: z.string().nullable(),
+});
+export type StrategyPnl = z.infer<typeof StrategyPnlSchema>;
+
 export const StrategyRecordSchema = z.object({
   id: z.string(),
   kind: z.enum(['position', 'auto', 'premium', 'carry']),
@@ -1149,6 +1242,8 @@ export const StrategyRecordSchema = z.object({
   filledRight: z.string(),
   openPosition: z.string(),
   realizedPnl: z.string(),
+  /** Net PnL, cost, and the locked-profit bps shown on the strategy rows. Null when unavailable. */
+  pnl: StrategyPnlSchema.nullish(),
   carryMetrics: StrategyCarryMetricsSchema.nullish(),
   createdAt: z.string(),
   updatedAt: z.string(),
@@ -1223,6 +1318,8 @@ export const STRATEGY_LOG_EVENT_CATEGORY: Record<string, StrategyLogEventCategor
   'Maker quote placed': 'maker',
   'Maker exit quote placed': 'maker',
   'Maker quote rejected': 'maker',
+  'Maker quoting parked': 'maker',
+  'Maker quoting resumed': 'maker',
   'Hedging filled quantity': 'maker',
   'Trimming residual imbalance': 'maker',
   'Hedge order settled': 'maker',
@@ -1234,6 +1331,16 @@ export const STRATEGY_LOG_EVENT_CATEGORY: Record<string, StrategyLogEventCategor
   'Padded residual trim settled': 'maker',
   'Residual top-up unavailable': 'maker',
   'Residual trim deferred': 'maker',
+  // Reduce-only exit size reconciliation. All three are emitted from `reconcileExitQuantity`, which
+  // only the maker quote path reaches (`evaluateMakerQuotes`), so they belong with the rest of the
+  // maker quote lifecycle: the exit quote is re-reported at the venue's reducible size, or
+  // withdrawn entirely when the venue holds nothing reducible.
+  'Exit size drift': 'maker',
+  'Exit size corrected': 'maker',
+  'Exit quote withdrawn': 'maker',
+  // A maker exit that overruns its budget relaxes the hedge-leg slippage cap; it belongs with the
+  // other exit-risk signals so the widened cap stays visible in the risk tab used to audit exits.
+  'Maker exit fallback': 'risk',
   // System lifecycle.
   'Strategy started': 'system',
   'Strategy resumed': 'system',
@@ -1244,10 +1351,19 @@ export const STRATEGY_LOG_EVENT_CATEGORY: Record<string, StrategyLogEventCategor
   'Shutdown cancellation pending': 'system',
   'Strategy pause pending': 'system',
   'Strategy stop pending': 'system',
+  // Recovery degradation: a persisted RUNNING strategy whose symbol could not be re-registered
+  // with the market hub after restart gets no ticker frames. It is a lifecycle/system signal (not
+  // a maker-stage event), so it belongs with `Strategy resumed` in the system tab used to audit
+  // recovery.
+  'Strategy market unavailable': 'system',
   'Waiting for funding threshold': 'system',
   'Carry entry gate blocked': 'system',
   'Carry entry gate passed': 'system',
   'Funding interval unknown': 'system',
+  // A failed venue position read is a degradation signal, not a maker-stage event: the same helper
+  // is called from the maker exit path *and* the taker two-leg submission path, so filing it under
+  // `maker` would hide a taker strategy's reconciliation failure from the tab that shows taker work.
+  'Position reconciliation failed': 'system',
 };
 
 const strategyLogEventsIn = (category: StrategyLogEventCategory): string[] =>
@@ -1270,7 +1386,7 @@ const strategyLogEventsIn = (category: StrategyLogEventCategory): string[] =>
  * Selecting a superset is safe: the client re-filters the grouped rows down to the category.
  */
 export const STRATEGY_LOG_CATEGORY_FETCH_EVENTS: Record<StrategyLogEventCategory, string[]> = {
-  execution: [...strategyLogEventsIn('execution'), 'Take-profit triggered',
+  execution: [...strategyLogEventsIn('execution'), 'Take-profit triggered', 'Stop-loss exit triggered',
     ...STRATEGY_LOG_LEG_EVENT_PREFIXES.map((prefix) => `${prefix}%`)],
   risk: [...strategyLogEventsIn('risk'),
     ...STRATEGY_LOG_LEG_EVENT_PREFIXES.map((prefix) => `${prefix}%`)],
@@ -1324,6 +1440,12 @@ export const StrategyLogsResponseSchema = z.object({
   /** New optional keys: older clients keep working, and a full first page stays byte-compatible. */
   hasMore: z.boolean().optional(),
   nextCursor: StrategyLogsCursorSchema.nullable().optional(),
+  /**
+   * Total rows stored for the requested category (for `all`, every row), independent of the cursor.
+   * The tab labels use it so an operator can tell "this category has 22 rows but none in the newest
+   * page" apart from "this category has never fired" — the two look identical without it.
+   */
+  categoryTotal: z.number().int().nonnegative().optional(),
 });
 export const InstrumentsResponseSchema = z.object({ items: z.array(CrossExInstrumentSchema) });
 export const LeverageResponseSchema = z.object({ symbol: z.string(), leverage: z.string().nullable() });

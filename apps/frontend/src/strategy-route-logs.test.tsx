@@ -55,6 +55,7 @@ function render(props: {
   hasMore?: boolean;
   loadState?: { status: 'idle' | 'loading' | 'loaded' | 'error'; message?: string };
   errorKind?: 'network' | 'timeout' | 'cancelled' | 'backend' | null;
+  categoryTotals?: Partial<Record<StrategyLogCategory, number>>;
 }): string {
   return renderToStaticMarkup(
     <LanguageContext.Provider value={{ language: 'en', theme: 'dark', t: (key) => key, setLanguage: vi.fn() }}>
@@ -73,6 +74,8 @@ function render(props: {
         onRetry={vi.fn()}
         onClose={vi.fn()}
         dialogRef={{ current: null }}
+        categoryTotals={props.categoryTotals ?? {}}
+        scannedRows={150}
       />
     </LanguageContext.Provider>,
   );
@@ -124,5 +127,38 @@ describe('execution-log dialog paging and states', () => {
 
     const cancelled = render({ rows: [], loadState: { status: 'error', message: 'aborted' }, errorKind: 'cancelled' });
     expect(cancelled).not.toContain('role="alert"');
+  });
+});
+
+describe('execution-log category totals and the buried-empty state', () => {
+  it('shows the stored row count on every tab that has one', () => {
+    const html = render({ rows: rows(2), activeCategory: 'execution', categoryTotals: { execution: 12, risk: 22 } });
+    expect(html).toContain('strategy-log-tab-count');
+    expect(html).toContain('(12)');
+    expect(html).toContain('(22)');
+    // A category with no reported total (never queried) shows no count at all.
+    expect(html).not.toContain('(0)');
+  });
+
+  it('says a category has stored events instead of claiming it is empty', () => {
+    // The regression: a MAKER_TAKER strategy buries 22 risk rows under thousands of maker quotes,
+    // so the newest scanned page holds none. "No events in this category" was a lie.
+    const html = render({ rows: [], activeCategory: 'risk', hasMore: true, categoryTotals: { risk: 22 } });
+    expect(html).not.toContain('No events in this category.');
+    expect(html).toContain('This category has');
+    expect(html).toContain('stored events, none of them in the newest');
+    expect(html).toContain('Keep searching older events');
+  });
+
+  it('keeps the plain empty message when the category really has no rows', () => {
+    const html = render({ rows: [], activeCategory: 'maker', hasMore: false, categoryTotals: { maker: 0 } });
+    expect(html).toContain('No events in this category.');
+    expect(html).not.toContain('Keep searching older events');
+  });
+
+  it('hides the keep-searching button once the log is exhausted', () => {
+    const html = render({ rows: [], activeCategory: 'risk', hasMore: false, categoryTotals: { risk: 5 } });
+    expect(html).toContain('This category has');
+    expect(html).not.toContain('Keep searching older events');
   });
 });

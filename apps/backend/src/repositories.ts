@@ -646,6 +646,145 @@ export function prunePortfolioEquitySamples(database: Database.Database, nowMs: 
   })();
 }
 
+/** One 30-second spread sample (see `migrations/0024_spread_samples.sql`). */
+export interface SpreadSampleRow {
+  pairType: 'SPOT_PERP' | 'PERP_PERP';
+  asset: string;
+  leftSymbol: string;
+  rightSymbol: string;
+  /** Epoch ms aligned to the sampler's 30s boundary; part of the upsert key. */
+  sampledAt: number;
+  spreadBps: number;
+  depthUsdt: number;
+  leftPrice: number | null;
+  rightPrice: number | null;
+}
+
+/** Coverage of one pair's samples inside a window, driving the samples-source switch. */
+export interface SpreadSampleCoverage {
+  count: number;
+  oldestMs: number;
+  newestMs: number;
+}
+
+/**
+ * Composite key of one (left, right) pair. CrossEx symbols are uppercase alphanumerics plus
+ * underscores, so `|` can never collide with a symbol boundary.
+ */
+export function spreadSamplePairKey(leftSymbol: string, rightSymbol: string): string {
+  return `${leftSymbol}|${rightSymbol}`;
+}
+
+/**
+ * Batch-upsert spread samples in one transaction. `sampled_at` is part of the primary key,
+ * so a retried tick rewrites its 30s bucket instead of duplicating a point. Rows carrying an
+ * unusable timestamp or non-finite numbers are dropped rather than written as zeros — the
+ * same "missing data is never fabricated" rule the quality board follows. Returns the number
+ * of rows written.
+ */
+export function recordSpreadSamples(database: Database.Database, rows: readonly SpreadSampleRow[]): number {
+  const usable = rows.filter((row) =>
+    Number.isFinite(row.sampledAt) && row.sampledAt > 0
+    && Number.isFinite(row.spreadBps)
+    && Number.isFinite(row.depthUsdt) && row.depthUsdt >= 0
+    && (row.leftPrice === null || Number.isFinite(row.leftPrice))
+    && (row.rightPrice === null || Number.isFinite(row.rightPrice)));
+  if (usable.length === 0) return 0;
+  const upsert = database.prepare(`
+    INSERT INTO spread_samples (pair_type, asset, left_symbol, right_symbol, sampled_at, spread_bps, depth_usdt, left_price, right_price)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(left_symbol, right_symbol, sampled_at) DO UPDATE SET
+      pair_type = excluded.pair_type,
+      asset = excluded.asset,
+      spread_bps = excluded.spread_bps,
+      depth_usdt = excluded.depth_usdt,
+      left_price = excluded.left_price,
+      right_price = excluded.right_price
+  `);
+  database.transaction(() => {
+    for (const row of usable) {
+      upsert.run(
+        row.pairType, row.asset, row.leftSymbol, row.rightSymbol,
+        Math.trunc(row.sampledAt), row.spreadBps, row.depthUsdt, row.leftPrice, row.rightPrice,
+      );
+    }
+  })();
+  return usable.length;
+}
+
+/**
+ * Read one pair's sample series from `fromMs` (inclusive), oldest first. Returns an empty
+ * array when the pair was never sampled — the empty state, never an error.
+ */
+export function readSpreadSeries(
+  database: Database.Database,
+  leftSymbol: string,
+  rightSymbol: string,
+  fromMs: number,
+): SpreadSampleRow[] {
+  const safeFrom = Number.isFinite(fromMs) ? Math.max(0, Math.trunc(fromMs)) : 0;
+  const rows = database.prepare(`
+    SELECT pair_type, asset, left_symbol, right_symbol, sampled_at, spread_bps, depth_usdt, left_price, right_price
+    FROM spread_samples
+    WHERE left_symbol = ? AND right_symbol = ? AND sampled_at >= ?
+    ORDER BY sampled_at
+  `).all(leftSymbol, rightSymbol, safeFrom) as Array<{
+    pair_type: string; asset: string; left_symbol: string; right_symbol: string;
+    sampled_at: number; spread_bps: number; depth_usdt: number;
+    left_price: number | null; right_price: number | null;
+  }>;
+  return rows.map((row) => ({
+    pairType: row.pair_type as SpreadSampleRow['pairType'],
+    asset: row.asset,
+    leftSymbol: row.left_symbol,
+    rightSymbol: row.right_symbol,
+    sampledAt: row.sampled_at,
+    spreadBps: row.spread_bps,
+    depthUsdt: row.depth_usdt,
+    leftPrice: row.left_price,
+    rightPrice: row.right_price,
+  }));
+}
+
+/**
+ * Coverage (count, oldest, newest) of each requested pair's samples inside `[fromMs, ∞)`,
+ * keyed by `spreadSamplePairKey`. Pairs without samples in the window are absent from the
+ * map, so callers read "no samples yet" as a missing key rather than a zero row. One indexed
+ * statement per pair keeps this cheap at the candidate cap (≤ 50).
+ */
+export function spreadSampleCoverage(
+  database: Database.Database,
+  pairs: ReadonlyArray<{ leftSymbol: string; rightSymbol: string }>,
+  fromMs: number,
+): Map<string, SpreadSampleCoverage> {
+  const coverage = new Map<string, SpreadSampleCoverage>();
+  if (pairs.length === 0) return coverage;
+  const safeFrom = Number.isFinite(fromMs) ? Math.max(0, Math.trunc(fromMs)) : 0;
+  const statement = database.prepare(`
+    SELECT COUNT(*) AS count, MIN(sampled_at) AS oldest_ms, MAX(sampled_at) AS newest_ms
+    FROM spread_samples
+    WHERE left_symbol = ? AND right_symbol = ? AND sampled_at >= ?
+  `);
+  for (const pair of pairs) {
+    const row = statement.get(pair.leftSymbol, pair.rightSymbol, safeFrom) as {
+      count: number; oldest_ms: number | null; newest_ms: number | null;
+    } | undefined;
+    if (row === undefined || row.count === 0 || row.oldest_ms === null || row.newest_ms === null) continue;
+    coverage.set(spreadSamplePairKey(pair.leftSymbol, pair.rightSymbol), {
+      count: row.count,
+      oldestMs: row.oldest_ms,
+      newestMs: row.newest_ms,
+    });
+  }
+  return coverage;
+}
+
+/** Delete samples older than `olderThanMs` (exclusive). Returns the number of deleted rows. */
+export function pruneSpreadSamples(database: Database.Database, olderThanMs: number): number {
+  const safeCutoff = Number.isFinite(olderThanMs) ? Math.max(0, Math.trunc(olderThanMs)) : 0;
+  return database.prepare('DELETE FROM spread_samples WHERE sampled_at < ?').run(safeCutoff).changes;
+}
+
 export function saveReconciliationReport(database: Database.Database, report: ReconciliationReport): void {
   const validated = ReconciliationReportSchema.parse(report);
   database.transaction(() => {

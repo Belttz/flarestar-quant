@@ -2,12 +2,13 @@ import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { Decimal } from 'decimal.js';
 import { z } from 'zod';
-import type { LiveBalance, PortfolioFill, PortfolioFuturesPosition, UnresolvedOrder } from '@gate-crossex/shared-types';
+import type { LiveBalance, PortfolioFill, PortfolioFuturesPosition, StrategyPnl, UnresolvedOrder } from '@gate-crossex/shared-types';
 import { DEFAULT_CREDENTIAL_PROFILE, type CredentialVault } from './credential-vault.js';
 import {
   CrossExOrderRequestSchema,
   GateApiError,
   type GateCrossExAccount,
+  type GateCrossExPosition,
   type GateCrossExRiskLimit,
   type GateSpotAccount,
   type PortfolioOperationsCrossExGateway,
@@ -16,6 +17,7 @@ import {
 } from './crossex-client.js';
 import type { PrivateCrossExEvent } from './private-stream.js';
 import { readInstrumentCatalog } from './repositories.js';
+import { computeStrategyPnl, type StrategyFillInput } from './strategy-pnl.js';
 import type { TradingSession } from './trading-session.js';
 import { STRATEGY_LOG_CATEGORY_FETCH_EVENTS, type StrategyLogCategory } from '@gate-crossex/shared-types';
 
@@ -35,6 +37,8 @@ export interface StrategyLogPage {
   logs: StrategyLogRow[];
   hasMore: boolean;
   nextCursor: { createdAt: string; id: string } | null;
+  /** Rows stored for this category (an upper bound: the fetch set is a grouping superset). */
+  categoryTotal: number;
 }
 
 const decimalText = z.string().regex(/^\d+(?:\.\d+)?$/).refine((value) => new Decimal(value).gt(0));
@@ -279,6 +283,8 @@ export interface StrategyRecord {
   realizedPnl: string;
   /** Carry accounting snapshot; null for every non-carry strategy. */
   carryMetrics: StrategyCarryMetrics | null;
+  /** Rebuilt net PnL, cost and locked-profit bps; null when the inputs are not available. */
+  pnl: StrategyPnl | null;
   createdAt: string; updatedAt: string; stoppedAt: string | null;
 }
 
@@ -307,6 +313,28 @@ interface StrategyRow {
   created_at: string; updated_at: string; stopped_at: string | null;
 }
 
+/** One strategy-linked fill in chronological order, as read back for the PnL rebuild. */
+interface StrategyFillRow {
+  strategy_id: string; symbol: string; venue: string; side: 'BUY' | 'SELL';
+  quantity: string; price: string; fee: string; created_at: string;
+}
+
+/** Separator that cannot occur inside a venue or symbol, for the (venue, symbol) composite key. */
+function positionPairKey(venue: string, symbol: string): string { return `${venue}\u0000${symbol}`; }
+
+/** A price string only counts as a usable mark when it parses to a strictly positive number. */
+function positiveMarkOrNull(value: string | null | undefined): string | null {
+  if (value === null || value === undefined) return null;
+  try {
+    const parsed = new Decimal(value);
+    // decimal.js answers `new Decimal('Infinity').gt(0)` with true, so finiteness is explicit:
+    // an infinite "price" must never pass as a usable mark.
+    return parsed.isFinite() && parsed.gt(0) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 function orderFromRow(row: OrderRow): ExecutionOrder {
   return { id: row.id, remoteOrderId: row.remote_order_id, clientOrderId: row.client_order_id,
     symbol: row.symbol, venue: row.venue, side: row.side, type: row.order_type, timeInForce: row.time_in_force,
@@ -324,6 +352,8 @@ function strategyFromRow(row: StrategyRow): StrategyRecord {
     filledQuantity: row.filled_quantity, filledLeft: row.filled_left, filledRight: row.filled_right,
     openPosition: row.open_position, realizedPnl: '0',
     carryMetrics: carryMetricsFromRow(row.metrics_json ?? null),
+    // Filled in by the caller once the per-strategy PnL rebuild has run; null when unavailable.
+    pnl: null,
     createdAt: row.created_at, updatedAt: row.updated_at, stoppedAt: row.stopped_at };
 }
 
@@ -342,6 +372,40 @@ export function isTerminalOrderState(state: string): boolean {
  */
 function isDefinitiveSubmitRejection(error: unknown): boolean {
   return error instanceof GateApiError && error.statusCode >= 400 && error.statusCode < 500;
+}
+
+/**
+ * True when a rejection means "reduce-only quantity exceeds the venue position". The engine's
+ * ledger drifts from the venue whenever a position is closed outside the engine, and this code
+ * is the venue saying so explicitly — a state mismatch to reconcile, not a submission failure
+ * to retry or count against the five-strike budget.
+ */
+export function isReduceOnlyQuantityRejection(error: unknown): boolean {
+  return error instanceof GateApiError && error.label === 'TRADE_REDUCE_ONLY_POSITION_QTY_ERROR';
+}
+
+function isoFromEpochMillis(value: string): string {
+  const milliseconds = Number(value);
+  return Number.isFinite(milliseconds) && milliseconds > 0 ? new Date(milliseconds).toISOString() : value;
+}
+
+/**
+ * Map a raw venue position row onto the portfolio shape `reconcileLivePositions` persists.
+ * ADL enrichment is deliberately omitted: this read exists to re-anchor quantities after a
+ * reduce-only rejection, and the periodic portfolio reconciliation re-adds the ranks.
+ */
+function normalizeRemotePosition(position: GateCrossExPosition): PortfolioFuturesPosition {
+  return {
+    positionId: position.position_id, symbol: position.symbol, positionSide: position.position_side,
+    initialMargin: position.initial_margin, maintenanceMargin: position.maintenance_margin,
+    quantity: position.position_qty, value: position.position_value, unrealizedPnl: position.upnl,
+    unrealizedPnlRate: position.upnl_rate, entryPrice: position.entry_price, markPrice: position.mark_price,
+    leverage: position.leverage, maxLeverage: position.max_leverage, riskLimit: position.risk_limit,
+    fee: position.fee, fundingFee: position.funding_fee, fundingTime: position.funding_time,
+    createdAt: isoFromEpochMillis(position.create_time), updatedAt: isoFromEpochMillis(position.update_time),
+    realizedPnl: position.closed_pnl,
+    crossExAdlRank: null, exchangeAdlRank: null,
+  };
 }
 
 function maxRiskPositionValueAtLeverage(
@@ -405,6 +469,8 @@ export class TradingRuntime {
   private readonly submitResolveMaxAttempts: number;
   private readonly remoteRefreshes = new Map<string, Promise<ExecutionOrder | null>>();
   private readonly cancelRequests = new Map<string, Promise<ExecutionOrder>>();
+  /** In-flight on-demand position reconciliation; concurrent callers share one remote read. */
+  private positionsReconcileRun: Promise<PortfolioFuturesPosition[]> | null = null;
   private readonly preparedStatements = new Map<string, Database.Statement>();
   private readonly runAuthenticatedWrite: <T>(work: () => Promise<T>) => Promise<T>;
 
@@ -653,9 +719,29 @@ export class TradingRuntime {
   listStrategies(): StrategyRecord[] {
     const rows = this.statement("SELECT * FROM execution_strategies WHERE environment = 'live' ORDER BY created_at DESC").all() as StrategyRow[];
     const realizedPnl = this.strategyRealizedPnl();
+    // One bulk pass over every strategy-linked fill serves both the per-strategy replay and the
+    // (venue, symbol) ownership test the funding attribution needs — no per-strategy query.
+    const fillRows = this.strategyFillRows();
+    const marks = this.pnlMarks();
+    const owners = this.positionPairOwners(fillRows);
+    const livePositions = this.livePositionFundingRows();
+    const fillsByStrategy = new Map<string, StrategyFillRow[]>();
+    for (const row of fillRows) {
+      const bucket = fillsByStrategy.get(row.strategy_id);
+      if (bucket) bucket.push(row);
+      else fillsByStrategy.set(row.strategy_id, [row]);
+    }
     return rows.map((row) => {
       const strategy = strategyFromRow(row);
-      return { ...strategy, realizedPnl: realizedPnl.get(strategy.id)?.toString() ?? '0' };
+      // A single strategy's PnL must never take the whole list down: any failure degrades that one
+      // row to `pnl: null` while every other strategy is still served.
+      let pnl: StrategyPnl | null = null;
+      try {
+        pnl = this.computePnlFor(strategy, fillsByStrategy.get(strategy.id) ?? [], marks, owners, livePositions);
+      } catch {
+        pnl = null;
+      }
+      return { ...strategy, realizedPnl: realizedPnl.get(strategy.id)?.toString() ?? '0', pnl };
     });
   }
 
@@ -698,6 +784,11 @@ export class TradingRuntime {
       clauses.push(`(${eventTerms.join(' OR ')})`);
       params.push(...exact, ...patterns);
     }
+    // Cursor-independent total for the same filter, so a tab can say "22 rows exist, just not in
+    // the newest page" instead of the misleading "no events in this category". The superset means
+    // this counts dependency rows too (leg diagnostics, trigger rows); the client re-filters, so
+    // the number is an upper bound — still enough to disambiguate "empty" from "buried".
+    const totalRow = this.statement(`SELECT COUNT(*) AS total FROM execution_strategy_logs WHERE ${clauses.join(' AND ')}`).get(...params) as { total: number };
     const rows = this.statement(`SELECT id, level, event, condition_text, quantity, result_text, created_at
       FROM execution_strategy_logs
       WHERE ${clauses.join(' AND ')}
@@ -713,6 +804,7 @@ export class TradingRuntime {
         quantity: row.quantity, result: row.result_text, createdAt: row.created_at })),
       hasMore,
       nextCursor,
+      categoryTotal: totalRow.total,
     };
   }
 
@@ -746,6 +838,51 @@ export class TradingRuntime {
       }
     })();
     this.emit({ type: 'execution.snapshot', payload: this.snapshot() });
+  }
+
+  /**
+   * Fetch the venue's futures positions right now and refresh `live_positions` from them.
+   *
+   * The strategy engine calls this when a reduce-only order is rejected with
+   * TRADE_REDUCE_ONLY_POSITION_QTY_ERROR: the engine's ledger believes a position the venue
+   * no longer holds (or holds smaller than believed). That drift happens whenever a position
+   * is closed outside the engine — manually on the exchange, by liquidation, or by the
+   * opposite leg — and only a fresh remote read can re-anchor the quantity, so waiting for
+   * the next periodic reconciliation would keep rejecting correctly-sized orders. The
+   * refreshed rows are returned so the caller can clamp its order immediately. Concurrent
+   * callers share one in-flight read.
+   */
+  async reconcilePositionsFromRemote(): Promise<PortfolioFuturesPosition[]> {
+    if (this.positionsReconcileRun) return this.positionsReconcileRun;
+    const run = this.fetchAndReconcilePositions();
+    this.positionsReconcileRun = run;
+    try {
+      return await run;
+    } finally {
+      if (this.positionsReconcileRun === run) this.positionsReconcileRun = null;
+    }
+  }
+
+  private async fetchAndReconcilePositions(): Promise<PortfolioFuturesPosition[]> {
+    if (!this.session.liveTradingEnabled) throw new TradingRuntimeError('live_trading_locked', 403);
+    const credentials = await this.vault.get(DEFAULT_CREDENTIAL_PROFILE);
+    if (!credentials) throw new TradingRuntimeError('credential_not_configured', 409);
+    const tradingGateway = this.gateway as Partial<TradingCrossExGateway>;
+    if (!tradingGateway.queryPositions) {
+      throw new TradingRuntimeError('position_reconciliation_unavailable', 503);
+    }
+    let positions: GateCrossExPosition[];
+    try {
+      positions = await tradingGateway.queryPositions(credentials);
+    } catch (error) {
+      if (error instanceof GateApiError && error.statusCode === 429) {
+        throw new TradingRuntimeError('position_reconciliation_rate_limited', 429);
+      }
+      throw new TradingRuntimeError('position_reconciliation_unavailable', 503);
+    }
+    const normalized = positions.map(normalizeRemotePosition);
+    this.reconcileLivePositions(normalized);
+    return normalized;
   }
 
   reconcileLiveBalances(balances: Array<{ venue: string; coin: string; balance: string; availableBalance: string; equity: string; unrealizedPnl: string }>, updatedAt: string): void {
@@ -1422,7 +1559,132 @@ export class TradingRuntime {
 
   private withStrategyMetrics(strategy: StrategyRecord): StrategyRecord {
     const realizedPnl = this.strategyRealizedPnl(strategy.id).get(strategy.id) ?? new Decimal(0);
-    return { ...strategy, realizedPnl: realizedPnl.toString() };
+    let pnl: StrategyPnl | null = null;
+    try {
+      const ownFillRows = this.strategyFillRows(strategy.id);
+      const marks = this.pnlMarks();
+      // Ownership is a global property of the (venue, symbol) pair, so the bulky fill rows are
+      // still needed here even though only one strategy's own fills are being priced.
+      const owners = this.positionPairOwners(this.strategyFillRows());
+      const livePositions = this.livePositionFundingRows();
+      pnl = this.computePnlFor(strategy, ownFillRows, marks, owners, livePositions);
+    } catch {
+      pnl = null;
+    }
+    return { ...strategy, realizedPnl: realizedPnl.toString(), pnl };
+  }
+
+  /**
+   * Every strategy-linked fill, chronologically, for the PnL rebuild. Passing a strategy id narrows
+   * it to that strategy; omitting it returns the bulk set used by the list view (and by the
+   * funding-exclusivity test, which is inherently cross-strategy).
+   */
+  private strategyFillRows(strategyId?: string): StrategyFillRow[] {
+    const columns = `SELECT strategy_order.strategy_id, fill.symbol, fill.venue, fill.side,
+        fill.quantity, fill.price, fill.fee, fill.created_at
+      FROM execution_fills AS fill
+      JOIN execution_orders AS strategy_order ON strategy_order.id = fill.order_id`;
+    return (strategyId
+      ? this.statement(`${columns} WHERE strategy_order.strategy_id = ?
+          ORDER BY fill.created_at ASC, fill.rowid ASC`).all(strategyId)
+      : this.statement(`${columns} WHERE strategy_order.strategy_id IS NOT NULL
+          ORDER BY fill.created_at ASC, fill.rowid ASC`).all()) as StrategyFillRow[];
+  }
+
+  /**
+   * Latest mark price per symbol, built ONCE and shared by every strategy in a list call. The
+   * public snapshot table is the primary source (it has a row for both spot and perpetual
+   * symbols); a still-missing symbol falls back to the live position's own mark.
+   */
+  private pnlMarks(): Map<string, string> {
+    const marks = new Map<string, string>();
+    const snapshots = this.statement(
+      'SELECT symbol, mark_price, last_price FROM public_market_snapshots',
+    ).all() as Array<{ symbol: string; mark_price: string | null; last_price: string | null }>;
+    for (const row of snapshots) {
+      const mark = positiveMarkOrNull(row.mark_price) ?? positiveMarkOrNull(row.last_price);
+      if (mark !== null) marks.set(row.symbol, mark);
+    }
+    const positions = this.statement(
+      'SELECT symbol, mark_price FROM live_positions',
+    ).all() as Array<{ symbol: string; mark_price: string | null }>;
+    for (const row of positions) {
+      if (marks.has(row.symbol)) continue;
+      const mark = positiveMarkOrNull(row.mark_price);
+      if (mark !== null) marks.set(row.symbol, mark);
+    }
+    return marks;
+  }
+
+  /** Strategies touching each `(venue, symbol)` pair, derived from the bulk fill rows. */
+  private positionPairOwners(fillRows: StrategyFillRow[]): Map<string, Set<string>> {
+    const owners = new Map<string, Set<string>>();
+    for (const row of fillRows) {
+      const key = positionPairKey(row.venue, row.symbol);
+      const ids = owners.get(key) ?? new Set<string>();
+      ids.add(row.strategy_id);
+      owners.set(key, ids);
+    }
+    return owners;
+  }
+
+  private livePositionFundingRows(): Array<{ symbol: string; venue: string; funding_fee: string | null }> {
+    return this.statement(
+      'SELECT symbol, venue, funding_fee FROM live_positions',
+    ).all() as Array<{ symbol: string; venue: string; funding_fee: string | null }>;
+  }
+
+  /**
+   * Funding charge attributable to one strategy.
+   *
+   * - A carry strategy keeps an authoritative collected figure in its metrics snapshot, so that is
+   *   used directly (collected funding is a negative cost).
+   * - Every other kind falls back to `live_positions.funding_fee`. A position row is a *venue
+   *   account* position, not a per-strategy one, so its funding charge is only attributed when this
+   *   strategy is the SOLE strategy trading that `(venue, symbol)` pair. When two strategies share
+   *   a pair the charge cannot be split, and when no usable row exists at all, the field is reported
+   *   as `null` ("unavailable") rather than a misleading partial sum.
+   */
+  private strategyFundingFee(
+    strategy: Pick<StrategyRecord, 'id' | 'kind' | 'carryMetrics'>,
+    ownFillRows: StrategyFillRow[],
+    owners: Map<string, Set<string>>,
+    livePositions: Array<{ symbol: string; venue: string; funding_fee: string | null }>,
+  ): string | null {
+    if (strategy.kind === 'carry' && strategy.carryMetrics) {
+      return new Decimal(strategy.carryMetrics.fundingCollectedUsdt).neg().toString();
+    }
+    const pairs = new Set(ownFillRows.map((row) => positionPairKey(row.venue, row.symbol)));
+    let total = new Decimal(0);
+    let attributed = false;
+    for (const position of livePositions) {
+      const key = positionPairKey(position.venue, position.symbol);
+      if (!pairs.has(key) || position.funding_fee === null) continue;
+      const ids = owners.get(key);
+      if (!ids || ids.size !== 1 || !ids.has(strategy.id)) continue;
+      total = total.plus(new Decimal(position.funding_fee));
+      attributed = true;
+    }
+    return attributed ? total.toString() : null;
+  }
+
+  /** Assemble the pure-function input for one strategy from the shared context. */
+  private computePnlFor(
+    strategy: Pick<StrategyRecord, 'id' | 'kind' | 'carryMetrics'>,
+    ownFillRows: StrategyFillRow[],
+    marks: Map<string, string>,
+    owners: Map<string, Set<string>>,
+    livePositions: Array<{ symbol: string; venue: string; funding_fee: string | null }>,
+  ): StrategyPnl {
+    const fills: StrategyFillInput[] = ownFillRows.map((row) => ({
+      symbol: row.symbol, venue: row.venue, side: row.side,
+      quantity: row.quantity, price: row.price, fee: row.fee, createdAt: row.created_at,
+    }));
+    return computeStrategyPnl({
+      fills,
+      marks,
+      fundingFeeUsdt: this.strategyFundingFee(strategy, ownFillRows, owners, livePositions),
+    });
   }
 
   /**

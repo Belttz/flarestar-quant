@@ -29,6 +29,16 @@ class ScriptedGateway implements TradingCrossExGateway {
   isolatedAvailableMargins: Record<string, string> = {};
   spotAccounts: GateSpotAccount[] = [];
   holdCancellations = false;
+  /**
+   * Label carried by scripted create-order failures. Existing suites depend on the insufficient
+   * margin label (five strikes → pause on margin), so scenarios that need a different rejection
+   * — notably TRADE_REDUCE_ONLY_POSITION_QTY_ERROR — override it explicitly.
+   */
+  createFailLabel = 'TRADE_INSUFFICIENT_AVAILABLE_MARGIN_ERROR';
+  /** When set, `queryPositions` rejects with this Gate API label. */
+  failPositionsLabel: string | null = null;
+  /** Number of `queryPositions` calls, so a test can prove a rejection triggered a reconciliation. */
+  positionQueries = 0;
   private readonly failCreateBudget = new Map<string, number>();
   private readonly remoteStates = new Map<string, string>();
   private sequence = 0;
@@ -53,7 +63,11 @@ class ScriptedGateway implements TradingCrossExGateway {
       update_time: String(Date.now()), assets: this.accountAssets,
     };
   }
-  async queryPositions(): Promise<GateCrossExPortfolio['positions']> { return this.positions; }
+  async queryPositions(): Promise<GateCrossExPortfolio['positions']> {
+    this.positionQueries += 1;
+    if (this.failPositionsLabel) throw new GateApiError(500, this.failPositionsLabel);
+    return this.positions;
+  }
   async querySpotAccounts(): Promise<GateSpotAccount[]> {
     return this.spotAccounts;
   }
@@ -120,7 +134,7 @@ class ScriptedGateway implements TradingCrossExGateway {
     const budget = order.symbol ? this.failCreateBudget.get(order.symbol) ?? 0 : 0;
     if (order.symbol && budget > 0) {
       this.failCreateBudget.set(order.symbol, budget - 1);
-      throw new GateApiError(400, 'TRADE_INSUFFICIENT_AVAILABLE_MARGIN_ERROR');
+      throw new GateApiError(400, this.createFailLabel);
     }
     this.sequence += 1;
     const remoteId = `remote-${this.sequence}`;
@@ -1157,7 +1171,10 @@ describe('strategy engine', () => {
     await waitFor(() => gateway.createdOrders.length === 1);
     expect(gateway.createdOrders[0]?.price).toBe('100100');
 
-    markets.set('OKX_FUTURE_BTC_USDT', '100499', '100500');
+    // Move the taker (OKX) leg only ~10 bps: spread (100000 − 100100) / 100100 ≈ −9.99 bps ⇒
+    // distance 10 − (−9.99) ≈ 19.99 bps ≤ 25, still inside the maker-entry proximity band, so the
+    // requote path is reached instead of being parked.
+    markets.set('OKX_FUTURE_BTC_USDT', '100099', '100100');
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 15));
     const requoteTick = engine.tick();
     await waitFor(() => gateway.cancelledOrders.length === 1);
@@ -1166,7 +1183,9 @@ describe('strategy engine', () => {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 15));
     await engine.tick();
     await waitFor(() => gateway.createdOrders.length === 2);
-    expect(gateway.createdOrders[1]?.price).toBe('100600.5');
+    // 100100 × (1 + 10 bps) = 100200.1, already on the 0.01 tick; the BINANCE best ask (100001) sits
+    // below it, so the makerTop clamp does not move the price.
+    expect(gateway.createdOrders[1]?.price).toBe('100200.1');
   });
 
   it('runs an auto spread bot through an entry and take-profit cycle with reduce-only exits', async () => {
@@ -1223,6 +1242,165 @@ describe('strategy engine', () => {
     expect(stopped.status).toBe('STOPPED');
     expect(gateway.cancelledOrders).toEqual(['remote-1']);
     expect(engine.listActiveStrategyIds()).toEqual([]);
+  });
+
+  describe('reduce-only rejections reconcile against the venue position', () => {
+    const left = 'BINANCE_FUTURE_BTC_USDT';
+    const right = 'OKX_FUTURE_BTC_USDT';
+
+    /** The drift correction arms a 250 ms cooldown before re-quoting; wait it out explicitly. */
+    const pastCooldown = (): Promise<void> => new Promise((resolvePromise) => setTimeout(resolvePromise, 300));
+
+    /**
+     * An auto spread bot already at its position cap: both legs are seeded filled, so once the
+     * take-profit level is reached the only order the engine can rest is the reduce-only exit.
+     */
+    async function openCappedPosition(
+      harness: Harness,
+      executionMethod: 'TAKER_TAKER' | 'MAKER_TAKER' = 'MAKER_TAKER',
+    ) {
+      const { engine, database, markets } = harness;
+      markets.set(left, '100150', '100151');
+      markets.set(right, '99999', '100000');
+      const record = await engine.startStrategy({
+        kind: 'auto', asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'OKX',
+        leftSide: 'SELL', rightSide: 'BUY', entryBps: '10', takeProfitBps: '2',
+        maxPosition: '0.1', perOrderQuantity: '0.1', reduceOnly: false, executionMethod,
+        ...(executionMethod === 'MAKER_TAKER' ? { makerLeg: 'left' as const } : {}),
+      });
+      seedFilledStrategyOrder(database, record.id, 'seed-left', left, 'SELL', '0.1', 'left');
+      seedFilledStrategyOrder(database, record.id, 'seed-right', right, 'BUY', '0.1', 'right');
+      return record;
+    }
+
+    /** Collapse the spread to ≈1 bp, below takeProfitBps 2, so the exit intent fires. */
+    function collapseToTakeProfit(markets: StubMarkets): void {
+      markets.set(left, '100009', '100010');
+      markets.set(right, '100000', '100001');
+    }
+
+    function eventsOf(runtime: TradingRuntime, strategyId: string): Set<string> {
+      return new Set(runtime.strategyLogs(strategyId).map((log) => log.event));
+    }
+
+    it('clamps a maker exit to the venue size and re-quotes instead of burning the strike budget', async () => {
+      const harness = await createHarness();
+      const { engine, runtime, gateway, markets } = harness;
+      const record = await openCappedPosition(harness);
+      // The venue closed most of the position outside the engine: only 0.04 of 0.1 remains short.
+      gateway.positions = [futuresPosition(left, 'SHORT', '0.04')];
+      gateway.createFailLabel = 'TRADE_REDUCE_ONLY_POSITION_QTY_ERROR';
+      gateway.failCreate(left, 1);
+
+      collapseToTakeProfit(markets);
+      // Margin preflight already read positions once; the rejection must add exactly one more read.
+      const readsBeforeRejection = gateway.positionQueries;
+      await engine.tick();
+      await waitFor(() => gateway.createAttempts.length === 1);
+      expect(gateway.createAttempts[0]).toMatchObject({
+        symbol: left, side: 'BUY', type: 'LIMIT', qty: '0.1', reduce_only: 'true',
+      });
+
+      // The rejection reconciled from the venue rather than counting a strike.
+      await waitFor(() => eventsOf(runtime, record.id).has('Exit size corrected'));
+      const events = eventsOf(runtime, record.id);
+      expect(events.has('Exit size drift')).toBe(true);
+      expect(events.has('Maker quote rejected')).toBe(false);
+      expect(gateway.positionQueries).toBe(readsBeforeRejection + 1);
+      expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+      expect(runtime.snapshot().positions).toEqual([
+        expect.objectContaining({ symbol: left, quantity: '-0.04' }),
+      ]);
+
+      // The next tick re-reports at the venue size instead of resubmitting a doomed exit.
+      await pastCooldown();
+      const requoteTick = engine.tick();
+      await waitFor(() => gateway.createAttempts.length === 2);
+      expect(gateway.createAttempts[1]).toMatchObject({ symbol: left, side: 'BUY', qty: '0.04', reduce_only: 'true' });
+      await requoteTick;
+      expect(engine.listActiveStrategyIds()).toEqual([record.id]);
+    });
+
+    it('withdraws the maker exit quote when the venue holds no reducible position', async () => {
+      const harness = await createHarness();
+      const { engine, runtime, gateway, markets } = harness;
+      const record = await openCappedPosition(harness);
+      gateway.createFailLabel = 'TRADE_REDUCE_ONLY_POSITION_QTY_ERROR';
+      gateway.failCreate(left, 1);
+
+      collapseToTakeProfit(markets);
+      await engine.tick();
+      await waitFor(() => eventsOf(runtime, record.id).has('Exit quote withdrawn'));
+
+      expect(eventsOf(runtime, record.id).has('Maker quote rejected')).toBe(false);
+      expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+      expect(runtime.snapshot().positions).toEqual([]);
+
+      // No death loop: once the clamp reads zero the exit intent is dropped entirely, so repeated
+      // ticks submit nothing further.
+      await pastCooldown();
+      await engine.tick();
+      await pastCooldown();
+      await engine.tick();
+      expect(gateway.createAttempts).toHaveLength(1);
+      expect(engine.listActiveStrategyIds()).toEqual([record.id]);
+    });
+
+    it('falls back to ordinary rejection accounting when the venue agrees with the ledger', async () => {
+      const harness = await createHarness();
+      const { engine, runtime, gateway, markets } = harness;
+      const record = await openCappedPosition(harness);
+      gateway.positions = [futuresPosition(left, 'SHORT', '0.1')];
+      gateway.createFailLabel = 'TRADE_REDUCE_ONLY_POSITION_QTY_ERROR';
+      gateway.failCreate(left, 1);
+
+      collapseToTakeProfit(markets);
+      await engine.tick();
+      await waitFor(() => eventsOf(runtime, record.id).has('Maker quote rejected'));
+
+      const events = eventsOf(runtime, record.id);
+      expect(events.has('Exit size drift')).toBe(true);
+      expect(events.has('Exit size corrected')).toBe(false);
+      expect(events.has('Exit quote withdrawn')).toBe(false);
+      expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+    });
+
+    it('falls back to the ordinary path when the reconciliation read itself fails', async () => {
+      const harness = await createHarness();
+      const { engine, runtime, gateway, markets } = harness;
+      const record = await openCappedPosition(harness);
+      gateway.createFailLabel = 'TRADE_REDUCE_ONLY_POSITION_QTY_ERROR';
+      gateway.failPositionsLabel = 'TRADE_SYSTEM_BUSY';
+      gateway.failCreate(left, 1);
+
+      collapseToTakeProfit(markets);
+      await engine.tick();
+      await waitFor(() => eventsOf(runtime, record.id).has('Position reconciliation failed'));
+
+      expect(eventsOf(runtime, record.id).has('Maker quote rejected')).toBe(true);
+      expect(eventsOf(runtime, record.id).has('Exit size corrected')).toBe(false);
+      expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+    });
+
+    it('pauses immediately when a taker exit finds the venue position already gone', async () => {
+      const harness = await createHarness();
+      const { engine, runtime, gateway, markets } = harness;
+      const record = await openCappedPosition(harness, 'TAKER_TAKER');
+      gateway.createFailLabel = 'TRADE_REDUCE_ONLY_POSITION_QTY_ERROR';
+      // Only the left leg is rejected; the venue holds nothing at all on either leg.
+      gateway.failCreate(left, 1);
+
+      collapseToTakeProfit(markets);
+      const readsBeforeRejection = gateway.positionQueries;
+      await engine.tick();
+      await waitFor(() => runtime.getStrategy(record.id).status === 'PAUSED');
+
+      expect(gateway.positionQueries).toBe(readsBeforeRejection + 1);
+      expect(gateway.createAttempts).toHaveLength(2);
+      expect(runtime.strategyLogs(record.id).some((log) => log.event === 'Strategy paused'
+        && /holds no reducible position/i.test(log.result))).toBe(true);
+      expect(engine.listActiveStrategyIds()).toEqual([]);
+    });
   });
 
   it('keeps a stop pending until the exchange confirms every cancellation', async () => {
@@ -2033,6 +2211,140 @@ describe('strategy engine', () => {
     expect(runtime.strategyLogs(record.id)).toEqual(expect.arrayContaining([
       expect.objectContaining({ event: 'Strategy paused', condition: 'Account credentials changed' }),
     ]));
+  });
+});
+
+describe('recovered RUNNING strategies re-subscribe their leg markets', () => {
+  it('registers and watches both leg symbols when activating a persisted strategy after restart', async () => {
+    const { engine, runtime, database, markets } = await createHarness();
+    const leftSymbol = 'BINANCE_FUTURE_BTC_USDT';
+    const rightSymbol = 'OKX_FUTURE_BTC_USDT';
+    markets.set(leftSymbol, '100150', '100151');
+    markets.set(rightSymbol, '99999', '100000');
+    const record = await engine.startStrategy(takerTakerConfig);
+    expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+    await engine.stop();
+
+    // Simulate the restart: the market hub comes back with an empty in-memory table and nothing
+    // watching the strategy's symbols any more.
+    markets.remove(leftSymbol);
+    markets.remove(rightSymbol);
+    markets.watchQuotesCalls.length = 0;
+    const ensured: string[] = [];
+    markets.ensureHandler = (symbol) => {
+      ensured.push(symbol);
+      return true;
+    };
+
+    const rearmedSession = new TradingSession();
+    rearmedSession.set('live');
+    const recovered = new StrategyEngine(database, rearmedSession, runtime, markets, {
+      tickIntervalMs: 20,
+      orderTimeoutMs: 400,
+    });
+    recovered.activatePersistedStrategies();
+
+    expect(recovered.listActiveStrategyIds()).toEqual([record.id]);
+    // Both legs are registered with the hub...
+    expect(ensured).toEqual(expect.arrayContaining([leftSymbol, rightSymbol]));
+    // ...and subscribed for ticker frames as a single idempotent release.
+    expect(markets.watchQuotesCalls).toEqual([[leftSymbol, rightSymbol]]);
+    expect(runtime.strategyLogs(record.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        event: 'Strategy resumed',
+        result: expect.stringContaining('leg quotes re-subscribed'),
+      }),
+    ]));
+
+    await recovered.stop();
+  });
+
+  // G1: the close-plan recovery path used to register the targets with the hub but never subscribe
+  // them, unlike the leg path above. A recovered close strategy then received no ticker frames, and
+  // the first settlement slice threw `strategy_market_data_unavailable` because it had no price.
+  it('G1 watches the close-plan targets and stays observable when recovering a persisted close strategy', async () => {
+    const { engine, runtime, database, markets, gateway } = await createHarness();
+    const symbol = 'BINANCE_FUTURE_BTC_USDT';
+    markets.set(symbol, '100000', '100001');
+    gateway.positions = [futuresPosition(symbol, 'LONG', '0.1')];
+    const record = await engine.startStrategy({
+      kind: 'position', asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'BINANCE',
+      leftSide: 'SELL', rightSide: 'BUY', totalAmount: '0.1', perOrderQuantity: '0.03',
+      reduceOnly: true, executionMethod: 'TAKER_TAKER',
+      closePlan: {
+        orderCount: 3,
+        intervalSeconds: 5,
+        targets: [{ symbol, side: 'SELL', quantity: '0.1', positionSide: 'NONE' }],
+      },
+    });
+    expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+    await engine.stop();
+
+    // Restart: the hub comes back empty, so a close slice would have no price to size against.
+    markets.remove(symbol);
+    markets.watchQuotesCalls.length = 0;
+    const ensured: string[] = [];
+    markets.ensureHandler = (requested) => { ensured.push(requested); return true; };
+
+    const rearmedSession = new TradingSession();
+    rearmedSession.set('live');
+    const recovered = new StrategyEngine(database, rearmedSession, runtime, markets, {
+      tickIntervalMs: 20,
+      orderTimeoutMs: 400,
+    });
+    recovered.activatePersistedStrategies();
+
+    expect(recovered.listActiveStrategyIds()).toEqual([record.id]);
+    // The target is re-registered with the hub…
+    expect(ensured).toContain(symbol);
+    // …and, mirroring start/resume, its ticker subscription is held for the strategy lifetime.
+    expect(markets.watchQuotesCalls).toEqual([[symbol]]);
+    // The recovery is observable in the log, not a silent attach.
+    expect(runtime.strategyLogs(record.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        event: 'Strategy resumed',
+        result: expect.stringContaining('leg quotes re-subscribed'),
+      }),
+    ]));
+
+    await recovered.stop();
+  });
+
+  // G2: `ensureActorMarkets` used to ignore `ensureMarket`'s return value. A symbol the hub could no
+  // longer register left the recovered strategy attached but feed-less — a silent spin. It must now
+  // surface that degradation instead of looking healthy while writing no rows.
+  it('G2 reports an unavailable market instead of silently spinning when a symbol cannot be re-registered', async () => {
+    const { engine, runtime, database, markets } = await createHarness();
+    const leftSymbol = 'BINANCE_FUTURE_BTC_USDT';
+    const rightSymbol = 'OKX_FUTURE_BTC_USDT';
+    markets.set(leftSymbol, '100150', '100151');
+    markets.set(rightSymbol, '99999', '100000');
+    const record = await engine.startStrategy(takerTakerConfig);
+    expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+    await engine.stop();
+
+    // Simulate the restart with a hub that can no longer register either symbol.
+    markets.remove(leftSymbol);
+    markets.remove(rightSymbol);
+    markets.ensureHandler = () => false;
+
+    const rearmedSession = new TradingSession();
+    rearmedSession.set('live');
+    const recovered = new StrategyEngine(database, rearmedSession, runtime, markets, {
+      tickIntervalMs: 20,
+      orderTimeoutMs: 400,
+    });
+    recovered.activatePersistedStrategies();
+
+    const unavailable = runtime.strategyLogs(record.id).filter((log) => log.event === 'Strategy market unavailable');
+    // One warning per unregisterable symbol, carrying the offending symbol in its condition.
+    expect(unavailable.map((log) => log.condition)).toEqual(expect.arrayContaining([leftSymbol, rightSymbol]));
+    expect(unavailable).toHaveLength(2);
+    expect(unavailable.every((log) => log.level === 'warning')).toBe(true);
+    // Recovery still completes — a missing feed is reported, never fatal.
+    expect(recovered.listActiveStrategyIds()).toEqual([record.id]);
+
+    await recovered.stop();
   });
 });
 
@@ -2958,12 +3270,20 @@ describe('auto signed thresholds and funding carry strategies', () => {
       // Tier 0 rests at 100000 × (1 + 50 bps) = 100500.
       expect(entryQuotes(gateway)[0]).toMatchObject({ side: 'SELL', type: 'LIMIT', time_in_force: 'POC', price: '100500' });
 
+      // A maker entry quote only fills once the maker leg's own book has reached it: by the time
+      // clip 0 trades at 100500, BINANCE has walked up to 100500, i.e. the live entry spread is
+      // 50 bps = tier 0's level. That keeps the fixture self-consistent — in production the ladder
+      // tier and the live spread advance together, so tier 1 (70 bps) is only 20 bps away and the
+      // 25 bps proximity band stays open.
+      markets.set('BINANCE_FUTURE_BTC_USDT', '100500', '100501');
       await fillMakerClip(engine, runtime, gateway, '100500', '0.1');
       await waitFor(() => entryQuotes(gateway).length === 2);
       expect(entryQuotes(gateway)[1]?.price).toBe('100700');
       // Only ever one entry quote: the previous quote is terminal before the next is priced.
       expect(entryQuotes(gateway)).toHaveLength(2);
 
+      // Clip 1 filled at 100700 ⇒ BINANCE now quotes 100700, spread 70 bps = tier 1's level.
+      markets.set('BINANCE_FUTURE_BTC_USDT', '100700', '100701');
       await fillMakerClip(engine, runtime, gateway, '100700', '0.2');
       await waitFor(() => entryQuotes(gateway).length === 3);
       expect(entryQuotes(gateway)[2]?.price).toBe('100900');
@@ -2983,6 +3303,10 @@ describe('auto signed thresholds and funding carry strategies', () => {
       ackOrder(runtime, quote.remoteId, 'FILLED', '0.1', '100500');
       ingestFill(runtime, quote.remoteId, 'BINANCE_FUTURE_BTC_USDT', 'SELL', '0.1', '100500');
       await waitFor(() => gateway.createdOrders.some((order) => order.symbol === 'OKX_FUTURE_BTC_USDT' && order.type === 'MARKET'));
+      // The maker clip traded at 100500 ⇒ BINANCE is now at 100500, spread 50 bps: tier 1 (70 bps)
+      // sits 20 bps away, inside the band. Without this the book would stay at spread 30 bps (40 bps
+      // from tier 1) and the quote would park instead of advancing.
+      markets.set('BINANCE_FUTURE_BTC_USDT', '100500', '100501');
       // Same tick requirement as `fillMakerClip`: quoting lives in `evaluate()`, not in the fill path.
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 15));
       await engine.tick();
@@ -2998,14 +3322,53 @@ describe('auto signed thresholds and funding carry strategies', () => {
       expect(entryQuotes(gateway)).toHaveLength(2);
     });
 
+    it('parks the next tier when a clip fills against a still book, then resumes once the spread arrives', async () => {
+      const { engine, runtime, gateway, markets } = await createHarness();
+      setMakerBooks(markets);
+      const record = await engine.startStrategy(makerLadderConfig);
+      const parked = (): number => runtime.strategyLogs(record.id)
+        .filter((log) => log.event === 'Maker quoting parked').length;
+      const resumed = (): number => runtime.strategyLogs(record.id)
+        .filter((log) => log.event === 'Maker quoting resumed').length;
+      await engine.tick();
+      await waitFor(() => entryQuotes(gateway).length === 1);
+      // Tier 0 rests at 100500 with the live spread at 30 bps ⇒ distance 20 bps, inside the band.
+      expect(entryQuotes(gateway)[0]?.price).toBe('100500');
+
+      // Clip 0 fills at 100500 but the book does NOT move: the spread is still 30 bps while tier 1
+      // needs 70 bps ⇒ distance 40 bps, outside the band. No tier-1 quote may appear, and the park
+      // transition is logged exactly once.
+      await fillMakerClip(engine, runtime, gateway, '100500', '0.1');
+      expect(entryQuotes(gateway)).toHaveLength(1);
+      expect(parked()).toBe(1);
+      expect(resumed()).toBe(0);
+
+      // Now the spread walks up to tier 1's level: BINANCE quotes 100700 ⇒ spread 70 bps ⇒ distance
+      // 0 bps, back inside the band, so quoting resumes. 100000 × (1 + 70 bps) = 100700, but the
+      // BINANCE best ask (100701) sits above that boundary, so the makerTop clamp rests the SELL one
+      // tick higher at 100701. A single resume row is logged.
+      markets.set('BINANCE_FUTURE_BTC_USDT', '100700', '100701');
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 15));
+      await engine.tick();
+      await waitFor(() => entryQuotes(gateway).length === 2);
+      expect(entryQuotes(gateway)[1]?.price).toBe('100701');
+      expect(parked()).toBe(1);
+      expect(resumed()).toBe(1);
+    });
+
     it('stops referencing maker entry quotes past the stop line and blocks entry while breached', async () => {
       const { engine, runtime, gateway, markets } = await createHarness();
       setMakerBooks(markets);
       const record = await engine.startStrategy(makerLadderConfig);
       await engine.tick();
       await waitFor(() => entryQuotes(gateway).length === 1);
+      // Each clip only trades after BINANCE has walked up to its resting price, so the live spread
+      // advances with the ladder (50 ⇒ 70 ⇒ 90 bps) and the next tier stays inside the 25 bps band.
+      markets.set('BINANCE_FUTURE_BTC_USDT', '100500', '100501');
       await fillMakerClip(engine, runtime, gateway, '100500', '0.1');
+      markets.set('BINANCE_FUTURE_BTC_USDT', '100700', '100701');
       await fillMakerClip(engine, runtime, gateway, '100700', '0.2');
+      markets.set('BINANCE_FUTURE_BTC_USDT', '100900', '100901');
       await fillMakerClip(engine, runtime, gateway, '100900', '0.3');
       await waitFor(() => entryQuotes(gateway).length === 3);
 
@@ -3018,7 +3381,8 @@ describe('auto signed thresholds and funding carry strategies', () => {
       expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
       expect(runtime.getStrategy(record.id).openPosition).toBe('0.3');
 
-      // Breaching the stop line while a quote rests cancels it and forbids a fresh one.
+      // Breaching the stop line (spread 110 bps) keeps entry quoting off: the next tier already sits
+      // past the line, so no fresh quote may be rested here either.
       markets.set('BINANCE_FUTURE_BTC_USDT', '101100', '101101');
       await engine.tick();
       expect(entryQuotes(gateway)).toHaveLength(3);
@@ -3069,5 +3433,691 @@ describe('auto signed thresholds and funding carry strategies', () => {
       expect(entryQuotes(gateway)).toHaveLength(1);
       expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
     });
+  });
+
+  describe('maker entry proximity band', () => {
+    // A plain auto MAKER_TAKER strategy with a positive entry threshold. The proximity band only
+    // gates the entry intent; the take-profit exit is intentionally out of scope (§gate-crossex).
+    const proximityConfig = {
+      kind: 'auto' as const, asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'OKX',
+      leftSide: 'SELL' as const, rightSide: 'BUY' as const,
+      entryBps: '10', takeProfitBps: '2', maxPosition: '0.5', perOrderQuantity: '0.1',
+      reduceOnly: false, executionMethod: 'MAKER_TAKER' as const, makerLeg: 'left' as const,
+    };
+
+    // The actor is private; reach it through a structural view purely for these read-only assertions.
+    type ProximityActor = { id: string; makerEntryParked: boolean; quotes: Map<string, unknown> };
+    function actorOf(engine: StrategyEngine, id: string): ProximityActor {
+      return (engine as unknown as { actors: Map<string, ProximityActor> }).actors.get(id)!;
+    }
+
+    // The live entry spread is (BINANCE bid − OKX ask) / OKX ask. Only those two prices matter for
+    // the proximity gate; the other legs are padded just to keep every book positive.
+    function setEntrySpread(markets: StubMarkets, binanceBid: number, okxAsk: number): void {
+      markets.set('BINANCE_FUTURE_BTC_USDT', String(binanceBid), String(binanceBid + 1));
+      markets.set('OKX_FUTURE_BTC_USDT', String(okxAsk - 1), String(okxAsk));
+    }
+
+    function parkCount(runtime: TradingRuntime, id: string): number {
+      return runtime.strategyLogs(id).filter((log) => log.event === 'Maker quoting parked').length;
+    }
+    function resumeCount(runtime: TradingRuntime, id: string): number {
+      return runtime.strategyLogs(id).filter((log) => log.event === 'Maker quoting resumed').length;
+    }
+
+    const left = 'BINANCE_FUTURE_BTC_USDT';
+    const right = 'OKX_FUTURE_BTC_USDT';
+    function seedOpenPosition(database: Database.Database, id: string): void {
+      seedFilledStrategyOrder(database, id, 'seed-left', left, 'SELL', '0.1', 'left');
+      seedFilledStrategyOrder(database, id, 'seed-right', right, 'BUY', '0.1', 'right');
+    }
+
+    it('1. parks the maker entry quote when the live spread is far outside the proximity band', async () => {
+      const { engine, runtime, markets } = await createHarness();
+      // entryBps 10, spread (99800−100000)/100000 = −20 bps ⇒ distance 10−(−20) = 30 bps > 25.
+      setEntrySpread(markets, 99800, 100000);
+      const record = await engine.startStrategy(proximityConfig);
+      await engine.tick();
+
+      const actor = actorOf(engine, record.id);
+      expect(actor.makerEntryParked).toBe(true);
+      expect(actor.quotes.has('entry')).toBe(false);
+      expect(parkCount(runtime, record.id)).toBe(1);
+      expect(resumeCount(runtime, record.id)).toBe(0);
+      expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+    });
+
+    it('2. rests the maker entry quote and logs a single resume when the spread moves inside the band', async () => {
+      const { engine, runtime, markets } = await createHarness();
+      // First park it: spread −20 bps ⇒ distance 30 bps.
+      setEntrySpread(markets, 99800, 100000);
+      const record = await engine.startStrategy(proximityConfig);
+      await engine.tick();
+      expect(actorOf(engine, record.id).makerEntryParked).toBe(true);
+      expect(parkCount(runtime, record.id)).toBe(1);
+
+      // Now bring the spread inside the band: spread 0 bps ⇒ distance 10 bps ≤ 25.
+      setEntrySpread(markets, 100000, 100000);
+      await engine.tick();
+
+      const actor = actorOf(engine, record.id);
+      expect(actor.makerEntryParked).toBe(false);
+      expect(actor.quotes.has('entry')).toBe(true);
+      expect(resumeCount(runtime, record.id)).toBe(1);
+      // Exactly one park event — the resume does not re-trigger a park.
+      expect(parkCount(runtime, record.id)).toBe(1);
+    });
+
+    it('3. rests the entry quote at the inclusive 25 bps edge without parking', async () => {
+      const { engine, runtime, markets } = await createHarness();
+      // spread −15 bps ⇒ distance 10−(−15) = 25 bps, the inclusive boundary of the band.
+      setEntrySpread(markets, 99850, 100000);
+      const record = await engine.startStrategy(proximityConfig);
+      await engine.tick();
+
+      const actor = actorOf(engine, record.id);
+      expect(actor.makerEntryParked).toBe(false);
+      expect(actor.quotes.has('entry')).toBe(true);
+      expect(parkCount(runtime, record.id)).toBe(0);
+      expect(resumeCount(runtime, record.id)).toBe(0);
+    });
+
+    it('4. keeps an already-parked strategy parked across repeated evaluations with no duplicate park log', async () => {
+      const { engine, runtime, markets } = await createHarness();
+      setEntrySpread(markets, 99800, 100000);
+      const record = await engine.startStrategy(proximityConfig);
+      await engine.tick();
+      expect(actorOf(engine, record.id).makerEntryParked).toBe(true);
+      expect(parkCount(runtime, record.id)).toBe(1);
+
+      // Repeated ticks with the spread still far away must not re-log the transition (only the
+      // makerEntryParked transition is logged, not every 500ms pass).
+      await engine.tick();
+      expect(actorOf(engine, record.id).makerEntryParked).toBe(true);
+      expect(actorOf(engine, record.id).quotes.has('entry')).toBe(false);
+      expect(parkCount(runtime, record.id)).toBe(1);
+
+      await engine.tick();
+      expect(actorOf(engine, record.id).makerEntryParked).toBe(true);
+      expect(actorOf(engine, record.id).quotes.has('entry')).toBe(false);
+      expect(parkCount(runtime, record.id)).toBe(1);
+    });
+
+    it('5. applies the mirrored proximity branch for a negative entryBps (park then resume)', async () => {
+      const { engine, runtime, markets } = await createHarness();
+      // Negative entryBps −10 mirrors the distance to spread − level. Park when spread > 15 bps.
+      // spread 20 bps ⇒ distance 20−(−10) = 30 bps > 25 ⇒ park.
+      setEntrySpread(markets, 100200, 100000);
+      const record = await engine.startStrategy({ ...proximityConfig, entryBps: '-10' });
+      await engine.tick();
+      expect(actorOf(engine, record.id).makerEntryParked).toBe(true);
+      expect(actorOf(engine, record.id).quotes.has('entry')).toBe(false);
+      expect(parkCount(runtime, record.id)).toBe(1);
+
+      // spread 10 bps ⇒ distance 10−(−10) = 20 bps ≤ 25 ⇒ resume.
+      setEntrySpread(markets, 100100, 100000);
+      await engine.tick();
+      const actor = actorOf(engine, record.id);
+      expect(actor.makerEntryParked).toBe(false);
+      expect(actor.quotes.has('entry')).toBe(true);
+      expect(resumeCount(runtime, record.id)).toBe(1);
+    });
+
+    it('6. abstains from the proximity gate for a premium strategy (no park/resume logs)', async () => {
+      const { engine, runtime, markets, gateway } = await createHarness();
+      // Premium strategies route to evaluatePremiumClip, never evaluateMakerQuotes, so the band is
+      // out of reach; even with quoting proceeding normally there must be no park/resume rows.
+      markets.set('GATE_FUTURE_SKHY_USDT', '229.9', '230.0');
+      markets.set('GATE_FUTURE_SKHYNIX_USDT', '1700', '1700');
+      const record = await engine.startStrategy({
+        kind: 'premium', asset: 'SKHY', hedgeAsset: 'SKHYNIX', adrRatio: '10',
+        leftVenue: 'GATE', rightVenue: 'GATE', leftSide: 'SELL', rightSide: 'BUY',
+        entryPremiumPct: '35', takeProfitPremiumPct: '24', maxPosition: '0.1',
+        perOrderQuantity: '0.1', reduceOnly: false, executionMethod: 'TAKER_TAKER',
+      });
+      await engine.tick();
+
+      expect(parkCount(runtime, record.id)).toBe(0);
+      expect(resumeCount(runtime, record.id)).toBe(0);
+      expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+      // Quoting proceeded per the normal premium path (entry taker legs were placed).
+      expect(gateway.createdOrders.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('7. produces no park/resume logs for a carry strategy (entryBps undefined)', async () => {
+      const { engine, runtime, markets } = await createHarness();
+      // Carry strategies carry no entryBps and route to evaluateCarryTriggers, so the proximity
+      // gate is never consulted — there must be no park/resume rows regardless of the book.
+      markets.set('GATE_SPOT_BTC_USDT', '99995', '100005');
+      markets.set('GATE_FUTURE_BTC_USDT', '100195', '100205');
+      const record = await engine.startStrategy({
+        kind: 'carry', asset: 'BTC', leftVenue: 'GATE', rightVenue: 'GATE',
+        leftSide: 'BUY', rightSide: 'SELL',
+        leftSymbol: 'GATE_SPOT_BTC_USDT', rightSymbol: 'GATE_FUTURE_BTC_USDT',
+        fundingDirection: 'POSITIVE', fundingAprMin: 15, basisTakeProfitBps: 5,
+        totalAmount: '0.1', perOrderQuantity: '0.1', reduceOnly: false,
+        executionMethod: 'TAKER_TAKER',
+      });
+      await engine.tick();
+
+      expect(parkCount(runtime, record.id)).toBe(0);
+      expect(resumeCount(runtime, record.id)).toBe(0);
+      expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+    });
+
+    it('8. keeps the take-profit exit quote resting regardless of how far the spread is from the entry trigger', async () => {
+      const { engine, runtime, database, markets } = await createHarness();
+      // Entry spread is far (−20 bps ⇒ distance 30 bps ⇒ entry parked), but the exit spread is
+      // collapsed (≈0.1 bps ≤ takeProfitBps 2) so the take-profit quote must still rest.
+      markets.set('BINANCE_FUTURE_BTC_USDT', '99800', '100000');
+      markets.set('OKX_FUTURE_BTC_USDT', '99999', '100000');
+      const record = await engine.startStrategy(proximityConfig);
+      seedOpenPosition(database, record.id);
+      await engine.tick();
+
+      const actor = actorOf(engine, record.id);
+      // Entry side: gated by the band, so no entry quote — but the band did fire (park logged).
+      expect(actor.quotes.has('entry')).toBe(false);
+      expect(parkCount(runtime, record.id)).toBeGreaterThanOrEqual(1);
+      // Exit side: untouched by the proximity band, so the take-profit quote rests anyway.
+      expect(actor.quotes.has('exit')).toBe(true);
+      expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+    });
+
+    // The pre-fix `requotes the maker order when the taker leg moves beyond tolerance` scenario,
+    // preserved on its own: a MAKER_TAKER *position* quote whose taker leg jumps far outside the
+    // band in one step must be parked — withdrawn once and never re-rested — while the strategy
+    // keeps running.
+    it('9. parks a MAKER_TAKER position quote when the taker leg jumps beyond the band and never re-quotes it', async () => {
+      const { engine, runtime, gateway, markets } = await createHarness();
+      markets.set('BINANCE_FUTURE_BTC_USDT', '100000', '100001');
+      markets.set('OKX_FUTURE_BTC_USDT', '99999', '100000');
+      const record = await engine.startStrategy({
+        ...takerTakerConfig, executionMethod: 'MAKER_TAKER', makerLeg: 'left', perOrderQuantity: '0.2',
+      });
+      await engine.tick();
+      await waitFor(() => gateway.createdOrders.length === 1);
+      const firstQuote = gateway.createdOrders[0]!;
+      // Initial spread is 0 bps ⇒ distance 10 bps ≤ 25, so the entry quote rests at
+      // 100000 × (1 + 10 bps) = 100100.
+      expect(firstQuote.price).toBe('100100');
+
+      // The taker (OKX) leg jumps to 100499/100500 in one step: spread −49.75 bps ⇒ distance
+      // 10 − (−49.75) = 59.75 bps, far outside the 25 bps band, with no maker clip in between.
+      markets.set('OKX_FUTURE_BTC_USDT', '100499', '100500');
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 15));
+      const parkTick = engine.tick();
+      await waitFor(() => gateway.cancelledOrders.includes(firstQuote.remoteId));
+      ackOrder(runtime, firstQuote.remoteId, 'CANCELLED', '0', '0');
+      await parkTick;
+
+      // Still far away on the following evaluation: the resting quote was withdrawn and nothing is
+      // re-rested, but the strategy itself keeps running. Exactly one park transition is logged.
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 15));
+      await engine.tick();
+      expect(gateway.createdOrders).toHaveLength(1);
+      expect(parkCount(runtime, record.id)).toBe(1);
+      expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+    });
+  });
+});
+
+/**
+ * Regression cover for the AUTO-AF80979A livelock: a MAKER_TAKER auto take-profit whose maker exit
+ * leg fills but can never finish, because `evaluateMakerQuotes` rested the exit quote on *any*
+ * matched quantity (the take-profit price never participated) and `ensureHedged` only ever *topped
+ * up* the lagging leg — re-buying the maker leg the exit had just reduced, pinning the pair back to
+ * its full size. The fix latches the exit on a price trigger, unwinds the hedge leg with a
+ * reduce-only limit at a bounded slippage, and never reopens a leg while the latch is set.
+ */
+describe('MAKER_TAKER take-profit exit latch', () => {
+  const left = 'BINANCE_FUTURE_BTC_USDT';
+  const right = 'OKX_FUTURE_BTC_USDT';
+  const exitConfig = {
+    kind: 'auto' as const, asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'OKX',
+    leftSide: 'SELL' as const, rightSide: 'BUY' as const,
+    entryBps: '10', takeProfitBps: '2', maxPosition: '0.1', perOrderQuantity: '0.1',
+    reduceOnly: false, executionMethod: 'MAKER_TAKER' as const, makerLeg: 'left' as const,
+  };
+
+  type ExitActor = {
+    id: string;
+    makerExitArmed: boolean;
+    makerExitStartedAt: number | null;
+    makerExitFallbackLogged: boolean;
+    makerExitHedgeRequotes: number;
+    makerExitHedgeFailures: number;
+    makerExitHedgeRetryAt: number;
+    makerExitHedge: { orderId: string; leg: 'left' | 'right'; quantity: Decimal } | null;
+    quotes: Map<string, unknown>;
+  };
+  function actorOf(engine: StrategyEngine, id: string): ExitActor {
+    return (engine as unknown as { actors: Map<string, ExitActor> }).actors.get(id)!;
+  }
+
+  /** Set both legs' books with a stamp aligned to the injected clock so quotes stay fresh. */
+  function setBook(
+    markets: StubMarkets, at: number, leftBid: string, leftAsk: string, rightBid: string, rightAsk: string,
+  ): void {
+    const stamp = new Date(at).toISOString();
+    markets.set(left, leftBid, leftAsk, stamp);
+    markets.set(right, rightBid, rightAsk, stamp);
+  }
+
+  /** Take-profit-level book: exit spread (left.ask − right.bid) ≈ 1 bp ≤ takeProfitBps 2. */
+  function armBook(markets: StubMarkets, at: number): void {
+    setBook(markets, at, '100000', '100010', '100000', '100001');
+  }
+
+  function seedOpen(database: Database.Database, id: string): void {
+    seedFilledStrategyOrder(database, id, 'seed-left', left, 'SELL', '0.1', 'left');
+    seedFilledStrategyOrder(database, id, 'seed-right', right, 'BUY', '0.1', 'right');
+  }
+
+  const exitQuotes = (gateway: ScriptedGateway) =>
+    gateway.createdOrders.filter((order) => order.symbol === left && order.type === 'LIMIT');
+  const hedgeOrders = (gateway: ScriptedGateway) =>
+    gateway.createdOrders.filter((order) => order.symbol === right && order.type === 'LIMIT');
+  /** Every hedge-submit attempt including rejected ones (`createdOrders` only holds successes). */
+  const hedgeAttempts = (gateway: ScriptedGateway) =>
+    gateway.createAttempts.filter((order) => order.symbol === right);
+  const fallbackCount = (runtime: TradingRuntime, id: string) =>
+    runtime.strategyLogs(id).filter((log) => log.event === 'Maker exit fallback').length;
+
+  it('R1 latches on the price trigger and rests a reduce-only maker exit quote', async () => {
+    const now = Date.now();
+    const { engine, gateway, database, markets } = await createHarness({ now: () => now });
+    armBook(markets, now);
+    const record = await engine.startStrategy(exitConfig);
+    seedOpen(database, record.id);
+
+    await engine.tick();
+
+    const actor = actorOf(engine, record.id);
+    expect(actor.makerExitArmed).toBe(true);
+    expect(actor.makerExitStartedAt).toBe(now);
+    expect(actor.makerExitFallbackLogged).toBe(false);
+    expect(exitQuotes(gateway)[0]).toMatchObject({
+      symbol: left, side: 'BUY', type: 'LIMIT', time_in_force: 'POC', reduce_only: 'true', qty: '0.1',
+    });
+  });
+
+  it('R2 does not latch outside take-profit, and never withdraws a resting exit quote once latched', async () => {
+    const now = Date.now();
+    const { engine, gateway, database, markets } = await createHarness({ now: () => now });
+    // Exit spread (left.ask 100300 − right.bid 100000) = 30 bps > takeProfitBps 2 ⇒ no latch.
+    setBook(markets, now, '100200', '100300', '100000', '100001');
+    const record = await engine.startStrategy(exitConfig);
+    seedOpen(database, record.id);
+    await engine.tick();
+
+    expect(actorOf(engine, record.id).makerExitArmed).toBe(false);
+    expect(actorOf(engine, record.id).quotes.has('exit')).toBe(false);
+    expect(gateway.createdOrders).toHaveLength(0);
+
+    // Collapse onto take-profit ⇒ latch + a resting exit quote.
+    armBook(markets, now);
+    await engine.tick();
+    expect(actorOf(engine, record.id).makerExitArmed).toBe(true);
+    const quote = exitQuotes(gateway).find((order) => order.time_in_force === 'POC')!;
+    expect(quote).toBeDefined();
+
+    // Widen the *exit* spread through the maker leg's ask only: the exit quote's own price is
+    // derived from the maker/taker bids, so it neither drifts nor is withdrawn. The latch persists.
+    setBook(markets, now, '100000', '100300', '100000', '100001');
+    await engine.tick();
+    expect(actorOf(engine, record.id).makerExitArmed).toBe(true);
+    expect(actorOf(engine, record.id).quotes.has('exit')).toBe(true);
+    expect(gateway.cancelledOrders).not.toContain(quote.remoteId);
+  });
+
+  it('R3 reduces the hedge leg by |hedge|−|maker| with a reduce-only limit, never a market order', async () => {
+    const now = Date.now();
+    const { engine, runtime, gateway, database, markets } = await createHarness({ now: () => now });
+    armBook(markets, now);
+    const record = await engine.startStrategy(exitConfig);
+    seedOpen(database, record.id);
+    await engine.tick();
+    const quote = exitQuotes(gateway)[0]!;
+
+    // The maker exit leg fills 0.06 of 0.1: maker left −0.04, hedge right +0.1 ⇒ unwind 0.06.
+    ackOrder(runtime, quote.remoteId, 'FILLED', '0.06', '100010');
+    ingestFill(runtime, quote.remoteId, left, 'BUY', '0.06', '100010');
+    await waitFor(() => runtime.getStrategy(record.id).openPosition === '0.04');
+    await waitFor(() => hedgeOrders(gateway).length === 1);
+
+    await engine.tick();
+
+    expect(hedgeOrders(gateway)).toHaveLength(1);
+    expect(hedgeOrders(gateway)[0]).toMatchObject({
+      symbol: right, side: 'SELL', type: 'LIMIT', time_in_force: 'GTC', reduce_only: 'true', qty: '0.06',
+    });
+    // Bounded slippage below the mid (100000.5 × (1 − 3 bps)) — a limit, never a market order.
+    expect(hedgeOrders(gateway)[0]!.price).toBe('99970.49');
+    expect(gateway.createdOrders.some((order) => order.type === 'MARKET')).toBe(false);
+  });
+
+  it('R4 cancels and re-prices the hedge exit limit once its TTL elapses without a fill', async () => {
+    let now = Date.now();
+    const { engine, runtime, gateway, database, markets } = await createHarness({ now: () => now });
+    armBook(markets, now);
+    const record = await engine.startStrategy(exitConfig);
+    seedOpen(database, record.id);
+    await engine.tick();
+    const quote = exitQuotes(gateway)[0]!;
+    ackOrder(runtime, quote.remoteId, 'FILLED', '0.06', '100010');
+    ingestFill(runtime, quote.remoteId, left, 'BUY', '0.06', '100010');
+    await waitFor(() => hedgeOrders(gateway).length === 1);
+    const firstHedge = hedgeOrders(gateway)[0]!;
+    expect(firstHedge.price).toBe('99970.49');
+
+    // The 1500 ms TTL elapses without a fill and the hedge mid moves ⇒ cancel + re-price.
+    now += 1_600;
+    setBook(markets, now, '100000', '100010', '100100', '100101');
+    await engine.tick();
+
+    expect(gateway.cancelledOrders).toContain(firstHedge.remoteId);
+    expect(hedgeOrders(gateway)).toHaveLength(2);
+    const rehedge = hedgeOrders(gateway)[1]!;
+    expect(rehedge.price).not.toBe(firstHedge.price);
+    expect(rehedge.qty).toBe('0.06');
+    expect(actorOf(engine, record.id).makerExitHedgeRequotes).toBe(1);
+    expect(actorOf(engine, record.id).makerExitHedge?.orderId).not.toBe(firstHedge.remoteId);
+  });
+
+  it('R5 widens the hedge slippage cap once and logs a single fallback after the 30 s budget', async () => {
+    let now = Date.now();
+    const { engine, runtime, gateway, database, markets } = await createHarness({ now: () => now });
+    armBook(markets, now);
+    const record = await engine.startStrategy(exitConfig);
+    seedOpen(database, record.id);
+    await engine.tick();
+    const quote = exitQuotes(gateway)[0]!;
+    ackOrder(runtime, quote.remoteId, 'FILLED', '0.06', '100010');
+    ingestFill(runtime, quote.remoteId, left, 'BUY', '0.06', '100010');
+    await waitFor(() => hedgeOrders(gateway).length === 1);
+    const firstHedge = hedgeOrders(gateway)[0]!;
+    expect(firstHedge.price).toBe('99970.49');
+    expect(fallbackCount(runtime, record.id)).toBe(0);
+
+    // 30 s elapse with the exit still open: the fallback widens the cap to 10 bps and logs exactly
+    // one row. The TTL has also elapsed, so the resting hedge limit is re-priced at the wider cap.
+    now += 30_000;
+    armBook(markets, now);
+    await engine.tick();
+
+    expect(fallbackCount(runtime, record.id)).toBe(1);
+    expect(actorOf(engine, record.id).makerExitFallbackLogged).toBe(true);
+    expect(gateway.cancelledOrders).toContain(firstHedge.remoteId);
+    // 100000.5 × (1 − 10 bps) rounded down to the tick.
+    expect(hedgeOrders(gateway).at(-1)!.price).toBe('99900.49');
+
+    // A further tick keeps the single fallback row.
+    now += 10;
+    armBook(markets, now);
+    await engine.tick();
+    expect(fallbackCount(runtime, record.id)).toBe(1);
+  });
+
+  it('R6 never re-buys the maker leg after the exit has reduced it (the livelock regression pin)', async () => {
+    const now = Date.now();
+    const { engine, runtime, gateway, database, markets } = await createHarness({ now: () => now });
+    armBook(markets, now);
+    const record = await engine.startStrategy(exitConfig);
+    seedOpen(database, record.id);
+    await engine.tick();
+    const quote = exitQuotes(gateway)[0]!;
+    ackOrder(runtime, quote.remoteId, 'FILLED', '0.06', '100010');
+    ingestFill(runtime, quote.remoteId, left, 'BUY', '0.06', '100010');
+    await waitFor(() => hedgeOrders(gateway).length === 1);
+
+    // Several ticks while the exit unwinds: no market order may touch the maker leg. The pre-fix
+    // `ensureHedged` re-bought it (GATE +1000 → +2000) and pinned the pair back to full size.
+    await engine.tick();
+    await engine.tick();
+    expect(gateway.createdOrders.filter((order) => order.symbol === left && order.type === 'MARKET')).toHaveLength(0);
+    for (const order of gateway.createdOrders.filter((order) => order.symbol === left)) {
+      expect(order.reduce_only).toBe('true');
+    }
+  });
+
+  it('R7 retires the latch once both legs are flat and allows a fresh entry', async () => {
+    let now = Date.now();
+    const { engine, runtime, gateway, database, markets } = await createHarness({ now: () => now });
+    armBook(markets, now);
+    const record = await engine.startStrategy(exitConfig);
+    seedOpen(database, record.id);
+    await engine.tick();
+    const quote = exitQuotes(gateway)[0]!;
+
+    // Maker exit leg fills fully (left → 0); the hedge leg is then unwound (right → 0).
+    ackOrder(runtime, quote.remoteId, 'FILLED', '0.1', '100010');
+    ingestFill(runtime, quote.remoteId, left, 'BUY', '0.1', '100010');
+    await waitFor(() => hedgeOrders(gateway).length === 1);
+    const hedge = hedgeOrders(gateway)[0]!;
+    ackOrder(runtime, hedge.remoteId, 'FILLED', '0.1', '99970.49');
+    ingestFill(runtime, hedge.remoteId, right, 'SELL', '0.1', '99970.49');
+    await waitFor(() => runtime.getStrategy(record.id).filledRight === '0');
+
+    // One tick retires the latch (both legs flat)…
+    await engine.tick();
+    expect(actorOf(engine, record.id).makerExitArmed).toBe(false);
+    expect(actorOf(engine, record.id).makerExitStartedAt).toBeNull();
+
+    // …and, the spread back at the entry level (past the quote throttle), the next tick may rest a
+    // fresh entry quote.
+    now += 100;
+    setBook(markets, now, '100100', '100101', '99999', '100000');
+    await engine.tick();
+    const entryQuote = gateway.createdOrders.find((order) =>
+      order.symbol === left && order.type === 'LIMIT' && order.side === 'SELL');
+    expect(entryQuote).toBeDefined();
+    expect(entryQuote).toMatchObject({ time_in_force: 'POC', reduce_only: 'false', qty: '0.1' });
+  });
+
+  it('R8 abstains without a live book, and never withdraws a resting exit quote while latched', async () => {
+    const now = Date.now();
+    const { engine, runtime, gateway, database, markets } = await createHarness({ now: () => now });
+    armBook(markets, now);
+    const record = await engine.startStrategy(exitConfig);
+    seedOpen(database, record.id);
+
+    // No live book and unlatched: nothing rests and not a single log row is written.
+    markets.remove(right);
+    const logsBefore = runtime.strategyLogs(record.id).length;
+    await engine.tick();
+    expect(actorOf(engine, record.id).makerExitArmed).toBe(false);
+    expect(gateway.createdOrders).toHaveLength(0);
+    expect(gateway.cancelledOrders).toHaveLength(0);
+    expect(runtime.strategyLogs(record.id).length).toBe(logsBefore);
+
+    // Latch it, then pull the book again: the resting exit quote is kept and nothing is submitted.
+    armBook(markets, now);
+    await engine.tick();
+    expect(actorOf(engine, record.id).makerExitArmed).toBe(true);
+    const quote = exitQuotes(gateway)[0]!;
+    expect(quote).toBeDefined();
+
+    markets.remove(right);
+    await engine.tick();
+    expect(actorOf(engine, record.id).makerExitArmed).toBe(true);
+    expect(actorOf(engine, record.id).quotes.has('exit')).toBe(true);
+    expect(gateway.cancelledOrders).not.toContain(quote.remoteId);
+    expect(gateway.createdOrders.some((order) => order.type === 'MARKET')).toBe(false);
+  });
+
+  it('R9 sizes the maker exit quote from the maker leg remaining, not the matched quantity', async () => {
+    const now = Date.now();
+    const { engine, gateway, database, markets } = await createHarness({ now: () => now });
+    armBook(markets, now);
+    // Maker (left) is the larger leg: matched = min(0.3, 0.1) = 0.1, |maker| = 0.3, perOrder = 0.5.
+    // The pre-latch `ensureHedged` still runs on this arming tick (the latch is set later in the
+    // pass); the assertion targets the exit quote, whose size proves the formula change.
+    const record = await engine.startStrategy({ ...exitConfig, perOrderQuantity: '0.5' });
+    seedFilledStrategyOrder(database, record.id, 'seed-left', left, 'SELL', '0.3', 'left');
+    seedFilledStrategyOrder(database, record.id, 'seed-right', right, 'BUY', '0.1', 'right');
+
+    await engine.tick();
+
+    expect(actorOf(engine, record.id).makerExitArmed).toBe(true);
+    const quote = exitQuotes(gateway).find((order) => order.side === 'BUY' && order.time_in_force === 'POC')!;
+    expect(quote).toBeDefined();
+    // min(perOrder 0.5, |maker| 0.3) = 0.3 — the old `min(perOrder, matched)` would have rested 0.1.
+    expect(quote.qty).toBe('0.3');
+  });
+
+  it('R10 keeps unwinding the hedge leg and time-fallback while latched with no exit spread', async () => {
+    let now = Date.now();
+    const { engine, runtime, gateway, database, markets } = await createHarness({ now: () => now });
+    armBook(markets, now);
+    const record = await engine.startStrategy(exitConfig);
+    seedOpen(database, record.id);
+    await engine.tick();
+    const first = exitQuotes(gateway)[0]!;
+    expect(first).toBeDefined();
+
+    // The maker exit leg fills 0.06 ⇒ maker −0.04, hedge +0.1 (imbalanced): the hedge leg is unwound
+    // and, past the requote throttle, the latch rests a replacement exit quote for the remaining 0.04.
+    ackOrder(runtime, first.remoteId, 'FILLED', '0.06', '100010');
+    ingestFill(runtime, first.remoteId, left, 'BUY', '0.06', '100010');
+    await waitFor(() => runtime.getStrategy(record.id).openPosition === '0.04');
+    await waitFor(() => hedgeOrders(gateway).length === 1);
+    const firstHedge = hedgeOrders(gateway)[0]!;
+    now += 100;
+    armBook(markets, now);
+    await engine.tick();
+    expect(actorOf(engine, record.id).quotes.has('exit')).toBe(true);
+    const resting = exitQuotes(gateway).filter((order) => order.time_in_force === 'POC').at(-1)!;
+
+    // The maker leg's own feed dies ⇒ exitSpreadBps() is null, but the hedge leg (right) stays live.
+    // The armed exit must NOT go quiet: the hedge leg is still unwound and the time fallback fires.
+    markets.remove(left);
+    now += 30_000;
+    markets.set(right, '100000', '100001', new Date(now).toISOString());
+    await engine.tick();
+
+    // Time fallback fires exactly once…
+    expect(fallbackCount(runtime, record.id)).toBe(1);
+    // …the hedge leg is still trimmed by a reduce-only LIMIT at the widened cap (never a market)…
+    const rehedge = hedgeOrders(gateway).at(-1)!;
+    expect(rehedge).not.toBe(firstHedge);
+    expect(rehedge).toMatchObject({ symbol: right, side: 'SELL', type: 'LIMIT', reduce_only: 'true' });
+    expect(rehedge.price).toBe('99900.49');
+    expect(gateway.createdOrders.some((order) => order.type === 'MARKET')).toBe(false);
+    // …and the resting maker exit quote was neither withdrawn nor cancelled.
+    expect(gateway.cancelledOrders).not.toContain(resting.remoteId);
+    expect(actorOf(engine, record.id).quotes.has('exit')).toBe(true);
+  });
+
+  // A4b: a persistently rejected hedge submit used to retry twice per tick (the reconcile path and
+  // the armed quote branch each call `ensureMakerExitFlat`, and a failed submit leaves the hedge
+  // slot null so the TTL guard could not collapse them), with no strike budget and no pause.
+  it('R11 caps the hedge submit at one attempt per tick and backs off exponentially while it keeps failing', async () => {
+    let now = Date.now();
+    const { engine, runtime, gateway, database, markets } = await createHarness({ now: () => now, requoteIntervalMs: 100_000 });
+    gateway.failCreate(right, 100);
+    armBook(markets, now);
+    const record = await engine.startStrategy(exitConfig);
+    seedOpen(database, record.id);
+    await engine.tick();
+    const quote = exitQuotes(gateway)[0]!;
+    ackOrder(runtime, quote.remoteId, 'FILLED', '0.06', '100010');
+    ingestFill(runtime, quote.remoteId, left, 'BUY', '0.06', '100010');
+    await waitFor(() => hedgeAttempts(gateway).length >= 1);
+
+    // Strike 1 (the fill-triggered reconcile path): the dedicated budget starts and the first
+    // backoff rung is 4 s — the existing `2_000 * 2 ** failures` convention computes the exponent
+    // from the already-incremented strike, exactly like `executeTakerClip`.
+    const actor = actorOf(engine, record.id);
+    expect(actor.makerExitHedgeFailures).toBe(1);
+    expect(actor.makerExitHedgeRetryAt).toBe(now + 4_000);
+
+    // Same-tick dedup: the armed quote branch's second `ensureMakerExitFlat` call in this
+    // evaluation reads the same injected clock, is still inside the backoff window, and must not
+    // re-submit.
+    const afterFirstStrike = hedgeAttempts(gateway).length;
+    await engine.tick();
+    expect(hedgeAttempts(gateway).length).toBe(afterFirstStrike);
+
+    // Still inside the 4 s window one ms before it elapses: no attempt…
+    now += 3_999;
+    armBook(markets, now);
+    await engine.tick();
+    expect(hedgeAttempts(gateway).length).toBe(afterFirstStrike);
+    // …then exactly one more attempt on the second rung (8 s).
+    now += 1;
+    armBook(markets, now);
+    await engine.tick();
+    expect(hedgeAttempts(gateway).length).toBe(afterFirstStrike + 1);
+    expect(actorOf(engine, record.id).makerExitHedgeFailures).toBe(2);
+    expect(actorOf(engine, record.id).makerExitHedgeRetryAt).toBe(now + 8_000);
+    // Two strikes trip nothing meant for the two-leg paths.
+    expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+  });
+
+  it('R12 pauses after five consecutive hedge submit failures with a hedge-specific reason', async () => {
+    let now = Date.now();
+    const { engine, runtime, gateway, database, markets } = await createHarness({ now: () => now, requoteIntervalMs: 100_000 });
+    gateway.failCreate(right, 100);
+    armBook(markets, now);
+    const record = await engine.startStrategy(exitConfig);
+    seedOpen(database, record.id);
+    await engine.tick();
+    const quote = exitQuotes(gateway)[0]!;
+    ackOrder(runtime, quote.remoteId, 'FILLED', '0.06', '100010');
+    ingestFill(runtime, quote.remoteId, left, 'BUY', '0.06', '100010');
+    await waitFor(() => hedgeAttempts(gateway).length >= 1);
+    expect(hedgeAttempts(gateway).length).toBe(1);
+
+    // Strikes 2..5 walk the rungs 4 s → 8 s → 16 s → 32 s; the fifth trips the breaker.
+    for (const step of [4_000, 8_000, 16_000, 32_000]) {
+      now += step;
+      armBook(markets, now);
+      await engine.tick();
+    }
+
+    // The actor is gone from the map once quiesced: read the persisted state and the pause log.
+    expect(runtime.getStrategy(record.id).status).toBe('PAUSED');
+    const pausedLog = runtime.strategyLogs(record.id).find((log) => log.event === 'Strategy paused');
+    expect(pausedLog?.result).toBe('Maker exit hedge order was rejected 5 consecutive times; the position cannot unwind automatically — review the hedge leg manually');
+    expect(hedgeAttempts(gateway).length).toBe(5);
+  });
+
+  it('R13 resets the hedge strike budget after a successful submission', async () => {
+    let now = Date.now();
+    const { engine, runtime, gateway, database, markets } = await createHarness({ now: () => now, requoteIntervalMs: 100_000 });
+    gateway.failCreate(right, 2); // exactly two rejections, then the venue recovers
+    armBook(markets, now);
+    const record = await engine.startStrategy(exitConfig);
+    seedOpen(database, record.id);
+    await engine.tick();
+    const quote = exitQuotes(gateway)[0]!;
+    ackOrder(runtime, quote.remoteId, 'FILLED', '0.06', '100010');
+    ingestFill(runtime, quote.remoteId, left, 'BUY', '0.06', '100010');
+    await waitFor(() => hedgeAttempts(gateway).length >= 1); // strike 1 @ now
+    now += 4_000;
+    armBook(markets, now);
+    await engine.tick(); // strike 2 @ now, next window 8 s
+    expect(actorOf(engine, record.id).makerExitHedgeFailures).toBe(2);
+
+    // The rejection budget is exhausted: the next attempt succeeds and clears the strike budget.
+    now += 8_000;
+    armBook(markets, now);
+    await engine.tick();
+    expect(hedgeOrders(gateway)).toHaveLength(1);
+    expect(actorOf(engine, record.id).makerExitHedgeFailures).toBe(0);
+    const rested = hedgeOrders(gateway)[0]!;
+
+    // The venue degrades again: the next failure is strike 1, not strike 3 — the retry window is
+    // the first 4 s rung, not the accumulated 16 s one.
+    gateway.failCreate(right, 100);
+    now += 1_600; // past the resting hedge's TTL ⇒ cancel + re-price into the rejection
+    armBook(markets, now);
+    await engine.tick();
+    expect(gateway.cancelledOrders).toContain(rested.remoteId);
+    expect(actorOf(engine, record.id).makerExitHedgeFailures).toBe(1);
+    expect(actorOf(engine, record.id).makerExitHedgeRetryAt).toBe(now + 4_000);
+    // Two strikes + one success + one re-strike.
+    expect(hedgeAttempts(gateway).length).toBe(4);
   });
 });

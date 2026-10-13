@@ -343,6 +343,20 @@ export function parseNumber(value: string | undefined | null): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+/** Compact amount formatter shared by the opportunity boards' volume / open-interest cells. */
+const opportunityAmountFormatter = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 });
+
+/**
+ * Format a Decimal-string amount for the volume / open-interest / book-depth columns. Missing data
+ * (`null`, unparsable text, zero) renders as `—` — the venue simply does not publish the figure.
+ */
+export function formatOpportunityAmount(value: string | null | undefined): string {
+  if (value === null || value === undefined) return '—';
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return '—';
+  return opportunityAmountFormatter.format(parsed);
+}
+
 /** Order states counted as resting. Must match trading-runtime and strategy-engine open-state lists. */
 export const OPEN_ORDER_STATES = ['PENDING_SUBMIT', 'OPEN', 'NEW', 'PARTIALLY_FILLED'];
 

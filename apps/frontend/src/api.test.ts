@@ -364,4 +364,31 @@ describe('opportunities and portfolio-equity request assembly', () => {
     expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/crossex/portfolio-equity?range=7d');
     expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).get('x-gct-read-intent')).toBe('portfolio-equity');
   });
+
+  it('builds the spread-quality query from non-default selections only', async () => {
+    const urls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      urls.push(String(url));
+      return new Response(JSON.stringify({
+        rows: [], totalCandidates: 0, windowHours: 24,
+        fetchedAt: '2026-08-01T00:00:00.000Z', cacheStatus: 'fresh',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }));
+    try {
+      await api.spreadQuality({ pairType: 'SPOT_PERP', limit: 25, refresh: true });
+      await api.spreadQuality({ pairType: 'PERP_PERP' });
+      await api.spreadQuality();
+      await api.spreadQuality({ limit: 50 });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(urls).toHaveLength(4);
+    const [fullUrl, pairUrl, defaultUrl, explicitDefaultUrl] = urls;
+    expect(fullUrl).toBe('/api/opportunities/spread-quality?refresh=1&pairType=SPOT_PERP&limit=25');
+    expect(pairUrl).toBe('/api/opportunities/spread-quality?pairType=PERP_PERP');
+    // No pair type and the default limit never travel: the board's own ranking depth applies.
+    expect(defaultUrl).toBe('/api/opportunities/spread-quality?');
+    expect(explicitDefaultUrl).toBe('/api/opportunities/spread-quality?');
+  });
 });

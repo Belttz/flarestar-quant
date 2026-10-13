@@ -2,9 +2,10 @@ export type StrategyRouteKind = 'position' | 'auto' | 'premium' | 'carry' | 'bor
 
 /**
  * Which Opportunities board a route opens: the cross-exchange spread ranking, the funding hedge
- * board, and the single-venue funding-rate extremes ranking.
+ * board, the single-venue funding-rate extremes ranking, and the spread-quality ranking (24h
+ * distribution statistics per asset/venue pair).
  */
-export type OpportunityBoard = 'funding' | 'funding-top' | 'spread';
+export type OpportunityBoard = 'funding' | 'funding-top' | 'spread' | 'spread-quality';
 
 /** Query parameters appended to a page path (one-click prefill, architecture §4.2). */
 export type FrontendQuery = Record<string, string>;
@@ -31,6 +32,7 @@ const OPPORTUNITY_BOARD_PATHS: Record<OpportunityBoard, string> = {
   funding: '/opportunities/funding',
   'funding-top': '/opportunities/funding-top',
   spread: '/opportunities/spread',
+  'spread-quality': '/opportunities/spread-quality',
 };
 
 /** Append prefill query parameters to a path; empty or absent queries leave the path untouched. */
@@ -66,6 +68,7 @@ export function frontendRoute(pathname: string): FrontendRoute | null {
     return { workspace: 'Opportunities', board: 'funding' };
   }
   if (path === '/opportunities/spread') return { workspace: 'Opportunities', board: 'spread' };
+  if (path === '/opportunities/spread-quality') return { workspace: 'Opportunities', board: 'spread-quality' };
   if (path === '/opportunities/funding-top') return { workspace: 'Opportunities', board: 'funding-top' };
   if (path === '/funding-rates') return { workspace: 'Funding Rates', asset: null };
 

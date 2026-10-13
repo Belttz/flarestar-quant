@@ -9,6 +9,7 @@ import type Database from 'better-sqlite3';
 import { PublicMarketDataError, type FundingStatVenue, type PublicMarketDataGateway, type VenueBookTicker, type VenueContractSize, type VenueFundingStat } from '@gate-crossex/public-data';
 import type { CrossExTransferRequest, FundingOverviewResponse, MarketSnapshot, OpportunityResponse, PublicMarketSnapshot } from '@gate-crossex/shared-types';
 import type { Candle, CandleInterval } from '@gate-crossex/shared-types';
+import { SpreadQualityResponseSchema } from '@gate-crossex/shared-types';
 import { buildApp } from './app.js';
 import { loadConfig } from './config.js';
 import { DEFAULT_CREDENTIAL_PROFILE, EnvFileCredentialVault, MemoryCredentialVault, type CredentialVault, type GateCredentials } from './credential-vault.js';
@@ -551,7 +552,7 @@ describe('local backend', () => {
       authenticatedTradingEnabled: false,
       tradingMode: 'unset',
       mode: 'live',
-      database: { migrationCount: 23, currentMigration: '0023_portfolio_equity_samples.sql' },
+      database: { migrationCount: 24, currentMigration: '0024_spread_samples.sql' },
       security: {
         credentialStorage: 'memory_test_only',
         credentialEntryPath: '/secure/credentials',
@@ -2177,6 +2178,83 @@ describe('local backend', () => {
     expect(await get('asset=SIREN&venues=GATE,BYBIT&minBps=300&limit=5')).toHaveLength(1);
     // The same floor without the venue filter still admits the OKX row.
     expect((await get('asset=SIREN&minBps=400&limit=5')).length).toBeGreaterThan(0);
+  });
+
+  it('serves the spread-quality board from candle-reconstructed statistics', async () => {
+    const { app, gateway, publicMarketGateway } = await createTestApp();
+    // GATE joins BINANCE in the catalog so the funding sweep knows both BTC legs and the
+    // GATE/BINANCE combination can carry a real holding cost.
+    gateway.extraSymbols = [catalogSymbol('GATE_FUTURE_BTC_USDT', 'GATE')];
+    // A deterministic PERP_PERP fixture alongside the hub's seeded demo markets.
+    publicMarketGateway.bookTickers = [
+      { venue: 'GATE', business: 'FUTURE', base: 'SIREN', quote: 'USDT', bidPrice: '0.120', askPrice: '0.121', lastPrice: '0.1205' },
+      { venue: 'BYBIT', business: 'FUTURE', base: 'SIREN', quote: 'USDT', bidPrice: '0.125', askPrice: '0.126', lastPrice: null },
+    ];
+    // 24h+ of 5m candles per leg; each symbol gets its own offset and phase so the two legs
+    // of a pair never collapse into a degenerate (zero-variance) spread series.
+    const legClose = (symbol: string, index: number): number => {
+      const offset = [...symbol].reduce((sum, ch) => sum + ch.charCodeAt(0), 0) % 7;
+      return 100 + offset + Math.sin((index + offset) / 20) * 2;
+    };
+    publicMarketGateway.queryCandles = async (symbol: string): Promise<Candle[]> => {
+      publicMarketGateway.candleQueryCount += 1;
+      return Array.from({ length: 300 }, (_, index) => ({
+        startTime: 1_783_688_880_000 + index * 300_000,
+        open: '100', high: '102', low: '98', close: String(legClose(symbol, index)),
+        volume: '1', closed: true,
+      }));
+    };
+    const headers = { host: '127.0.0.1:17840' };
+
+    const response = await app.inject({ method: 'GET', url: '/api/opportunities/spread-quality', headers });
+    expect(response.statusCode).toBe(200);
+    const body = SpreadQualityResponseSchema.parse(response.json());
+    expect(body.windowHours).toBe(24);
+    // The seeded hub markets produce far more than 50 executable combinations, so the
+    // candidate cap applies and every capped candidate reconstructs a full 24h series.
+    expect(body.totalCandidates).toBe(50);
+    expect(body.rows).toHaveLength(50);
+    // Ranked by composite score, descending.
+    for (let index = 1; index < body.rows.length; index += 1) {
+      expect(body.rows[index - 1]!.score).toBeGreaterThanOrEqual(body.rows[index]!.score);
+    }
+    for (const row of body.rows) {
+      expect(row.source).toBe('candles');
+      expect(row.sampleCount).toBe(288);
+      // No hub book exists for any fixture symbol, so depth reads as zero rather than null.
+      expect(row.bookDepthUsdt).toBe(0);
+      expect(row.score).toBeGreaterThanOrEqual(0);
+      expect(row.score).toBeLessThanOrEqual(100);
+    }
+    // Distribution statistics are real for most rows; funding costs exist for the BTC legs
+    // the fake funding sweep knows (GATE 1h and BINANCE 8h).
+    expect(body.rows.some((row) => (row.spreadVolatilityBps ?? 0) > 0)).toBe(true);
+    expect(body.rows.some((row) => row.holdingCostBps !== null)).toBe(true);
+
+    // The 5-minute board cache is reused: a second request re-reads nothing upstream.
+    const candleCallsAfterFirst = publicMarketGateway.candleQueryCount;
+    expect(candleCallsAfterFirst).toBeGreaterThan(0);
+    expect((await app.inject({ method: 'GET', url: '/api/opportunities/spread-quality', headers })).statusCode).toBe(200);
+    expect(publicMarketGateway.candleQueryCount).toBe(candleCallsAfterFirst);
+
+    // refresh=1 drops the cache: the UI's manual Refresh button must never silently replay a
+    // stale board, so a forced request recomputes (candle calls climb again).
+    expect((await app.inject({ method: 'GET', url: '/api/opportunities/spread-quality?refresh=1', headers })).statusCode).toBe(200);
+    expect(publicMarketGateway.candleQueryCount).toBeGreaterThan(candleCallsAfterFirst);
+
+    // Query validation: an unknown pair type and an out-of-range limit are 400s.
+    expect((await app.inject({ method: 'GET', url: '/api/opportunities/spread-quality?pairType=SWAP', headers })).statusCode).toBe(400);
+    expect((await app.inject({ method: 'GET', url: '/api/opportunities/spread-quality?limit=0', headers })).statusCode).toBe(400);
+    expect((await app.inject({ method: 'GET', url: '/api/opportunities/spread-quality?limit=101', headers })).statusCode).toBe(400);
+    // limit slices the ranked rows; pairType selects one shape (this fixture is perp-only).
+    const limited = await app.inject({ method: 'GET', url: '/api/opportunities/spread-quality?pairType=PERP_PERP&limit=1', headers });
+    expect(limited.statusCode).toBe(200);
+    const limitedBody = SpreadQualityResponseSchema.parse(limited.json());
+    expect(limitedBody.rows).toHaveLength(1);
+    expect(limitedBody.rows[0]!.pairType).toBe('PERP_PERP');
+    const spotOnly = await app.inject({ method: 'GET', url: '/api/opportunities/spread-quality?pairType=SPOT_PERP', headers });
+    expect(spotOnly.statusCode).toBe(200);
+    expect(SpreadQualityResponseSchema.parse(spotOnly.json())).toMatchObject({ rows: [], totalCandidates: 0 });
   });
 
   it('never lets the spread venues and markets filters reach the funding board', async () => {

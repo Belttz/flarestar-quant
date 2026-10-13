@@ -220,12 +220,64 @@ const chinese: Record<string, string> = {
   'Strategy execution log': '策略执行日志', 'Close execution log': '关闭执行日志', 'Auto price difference': '自动价差', Event: '事件', 'Spread / trigger': '价差 / 触发值', Quantity: '数量', Result: '结果', 'Actual spread': '实际执行价差',
   'Position open Executed': '开仓已执行', 'Take-profit Executed': '止盈已执行', 'Reduce-only Executed': '只减仓已执行', 'Entry triggered': '已触发开仓', 'Take-profit triggered': '已触发止盈', 'Reduce-only triggered': '已触发只减仓', 'Take-profit updated': '止盈已更新',
   'Padding terminal residual': '补足最终残差', 'Residual padding settled': '残差补单已结算', 'Trimming padded residual': '修剪补足后的残差', 'Padded residual trim settled': '补足残差修剪已结算', 'Residual top-up unavailable': '暂无法补足残差', 'Residual trim deferred': '残差修剪已延后',
+  // Maker entry proximity gate (25 bps). Written once per state transition — one row when quoting
+  // parks and one row when it comes back in range — never once per tick.
+  'Maker quoting parked': '行情离入场价还太远，先不挂单，等走近再说',
+  'Maker quoting resumed': '行情已走近入场价，恢复挂单',
+  // Maker quote lifecycle and its taker hedge. Prices, quantities and bps thresholds all arrive
+  // through `condition` / `quantity`, so none of these labels may hard-code a number.
+  'Maker quote placed': '挂单已报出，等成交',
+  'Maker exit quote placed': '平仓挂单已报出，等成交',
+  'Maker quote rejected': '挂单被交易所拒绝，稍后重新报价',
+  'Hedging filled quantity': '挂单成交了，正在补上另一条腿',
+  'Trimming residual imbalance': '正在把多出来的敞口剪平',
+  'Hedge order settled': '对冲腿已成交完成',
+  'Residual trim settled': '多出来的敞口已剪平',
+  'Hedge order failed': '对冲腿下单失败',
+  // Reduce-only exit reconciliation: the venue is the source of truth for what can still be
+  // closed, so a rejected exit re-reports at the real position size, and a venue that holds
+  // nothing reducible withdraws the quote instead of retrying forever.
+  'Exit size drift': '平仓被交易所拒绝，正在核对真实持仓',
+  'Exit size corrected': '已按交易所真实持仓修正平仓数量',
+  'Exit quote withdrawn': '交易所已无可平仓位，撤销平仓挂单',
+  'Position reconciliation failed': '与交易所核对持仓失败',
+  // The timeout escape hatch for a maker exit that never filled. Registered under `risk`, not
+  // `maker`: the fallback runs when the maker stage has already failed, so it belongs with the
+  // risk-triggered exits rather than with the maker quoting rows.
+  'Maker exit fallback': '挂单平仓超时，改用兜底价格平仓',
+  // Residual close-out and the carry-strategy lifecycle. Thresholds and quantities ride along in
+  // `condition` / `quantity`, so these labels stay numeric-free on purpose.
+  'Leg submission failed': '有一条腿下单失败，稍后重试',
+  'Closing remaining exposure': '正在平掉剩下的敞口',
+  'Residual close submission failed': '收尾平仓下单失败',
+  'Residual close settled': '收尾平仓已结算',
+  'Carry position opened': '套息仓位已建立',
+  // `Stop-loss triggered` arms the exit; `Stop-loss exit triggered` is the clip-level exit itself,
+  // so the two must not read alike. `Basis take-profit triggered` is the carry-strategy variant.
+  'Stop-loss triggered': '已触发止损，准备平仓',
+  'Basis take-profit triggered': '基差止盈已触发',
+  // Pending states mean "asked the venue, still waiting": they are not terminal, so they must never
+  // read like `Strategy paused` / `Strategy stopped`.
+  'Strategy engine error': '策略引擎报错',
+  'Shutdown cancellation pending': '退出时撤单未确认',
+  'Strategy pause pending': '等交易所确认暂停',
+  'Strategy stop pending': '等交易所确认停止',
+  'Waiting for funding threshold': '资金费还没到门槛，先不开仓',
+  // Symmetric pair: the entry gate either has the balances it needs or it does not.
+  'Carry entry gate blocked': '余额不够，先不入场',
+  'Carry entry gate passed': '余额够了，开始入场',
+  'Funding interval unknown': '资金费结算周期未知，先用默认值估算',
+  // A recovered strategy whose symbol is not in the market catalog never gets a live feed, so it
+  // would sit there looking healthy while writing no rows at all. The symbol rides in `condition`.
+  'Strategy market unavailable': '行情源没有这个标的，策略拿不到实时行情',
   'Strategy started': '策略已启动', 'Strategy resumed': '策略已恢复', 'Strategy stopped': '策略已停止', 'Strategy completed': '策略已完成', 'Strategy paused': '策略已暂停', info: '信息', warning: '警告', error: '错误',
   'Timed close triggered': '定时平仓已触发', 'Timed close slice executed': '定时平仓分单已执行', 'Timed close slice failed': '定时平仓分单失败',
   'Persistent backend log': '持久化后端日志', 'Showing executions for': '仅显示', only: '的执行记录',
   'Loading execution log…': '正在加载执行日志…', 'Execution log unavailable': '执行日志暂不可用', 'No execution events yet.': '暂无执行事件。',
   'Execution log category': '执行日志分类', 'Open / Close': '开仓平仓', 'Take-profit & risk': '止盈风控', 'Maker & hedge': '挂单对冲', System: '系统状态',
   'Load older entries': '加载更早记录', 'Loading older entries…': '正在加载更早记录…', 'No events in this category.': '该分类暂无事件。',
+  'This category has': '该分类共有', 'stored events, none of them in the newest': '条记录，但最近扫描的记录里没有',
+  'Keep searching older events': '继续往前查找', 'Searching…': '查找中…',
   'Could not reach the backend.': '无法连接后端。', 'The request timed out.': '请求超时。', 'The backend returned an error.': '后端返回错误。',
   'Edit take profit': '编辑止盈', Save: '保存', 'Saving…': '保存中…', 'Cancel edit': '取消编辑',
   'Take-profit update failed': '止盈更新失败', 'Enter a valid take-profit premium': '请输入有效的止盈溢价',
@@ -451,13 +503,137 @@ const chinese: Record<string, string> = {
   'Stop-loss exit in progress': '止损平仓进行中',
   'Stop-loss Executed': '止损平仓已成交',
   'at least two exchanges required': '至少选择两个交易所',
+  // Strategy rows: net PnL and the already-closed basis-point result (0.3.3).
+  'Net PnL': '净盈亏',
+  'Locked profit': '已锁定利润',
+  'Net of fees and funding': '已扣除手续费与资金费',
+  'Already closed': '已平仓部分',
+  // Per-row one-click copy.
+  Copy: '复制',
+  'Copy as new strategy': '复制为新策略',
+  'Prefills the launch form for review; nothing is submitted.': '仅预填启动表单供确认，不会直接下单。',
+  'Prefilled from strategy': '已按策略',
+  'Review the details, then launch.': '的配置预填，请核对后启动。',
+  'Dismiss prefill notice': '清除预填提示',
+  // Read-only strategy configuration & PnL detail dialog.
+  'Strategy configuration': '策略配置',
+  Configuration: '配置',
+  'Profit and loss': '盈亏',
+  'Strategy ID': '策略 ID',
+  Kind: '类型',
+  Account: '账户',
+  Started: '开始时间',
+  Stopped: '停止时间',
+  Realized: '已实现',
+  Floating: '浮动',
+  'Fees paid': '已付手续费',
+  'Entry notional': '入场名义价值',
+  'Closed entry notional': '已平仓入场名义价值',
+  'Hedge asset': '对冲资产',
+  'Left venue': '左侧交易所',
+  'Right venue': '右侧交易所',
+  'Left side': '左侧方向',
+  'Right side': '右侧方向',
+  'Left symbol': '左侧合约',
+  'Right symbol': '右侧合约',
+  'Left product': '左侧市场类型',
+  'Right product': '右侧市场类型',
+  'Left leverage': '左侧杠杆',
+  'Right leverage': '右侧杠杆',
+  'Maker leg': '挂单腿',
+  Grid: '网格',
+  'Close plan orders': '平仓计划笔数',
+  'Close plan interval': '平仓计划间隔',
+  'Close plan targets': '平仓计划目标',
+  'Floating PnL needs a stored mark price, and the funding fee is only attributable when this strategy alone holds the contract; either shows as — when unavailable.': '浮动盈亏需要已存储的标记价格；资金费仅在本策略独占该合约时可归属。两者无法获取时显示 —。',
   'Every perpetual on the selected exchange, ranked by absolute funding rate.': '所选交易所的全部永续合约，按资金费率绝对值从高到低排序。',
   'Perpetual pairs always short the higher-funding venue and long the other, so the net funding is collected.': '永续组合始终做空费率更高的一侧、做多另一侧，因此净费率为正收入。',
   'Same asset, two perpetual venues: short the higher funding leg and long the other.': '同一资产、两个永续合约交易所：做空高费率腿，做多另一条腿。',
+  // Spread-quality board: 24h spread-distribution statistics ranked by capturability. Every
+  // statistic is nullable server side; the table renders a dash, never a fake zero.
+  'Spread quality board': '价差质量榜',
+  'Spread quality': '价差质量',
+  'Opportunity score': '机会分',
+  'Current spread': '当前价差',
+  'Mean spread': '平均价差',
+  'Spread volatility': '价差波动',
+  'Skewness': '偏度',
+  'Kurtosis': '峰度',
+  'Symmetric': '对称',
+  'Symmetric distribution': '分布对称',
+  'Skewed distribution': '分布偏斜',
+  'Half-life': '半衰期',
+  'Holding cost': '持有成本',
+  'Book depth': '盘口深度',
+  'Candle rebuild': 'K 线重建',
+  'Live sampling': '实时采样',
+  Candidates: '个候选',
+  'Ranked by 24h spread-distribution quality: mean, volatility, skewness, reversion speed, holding cost and book depth.': '按 24h 价差分布质量排名：均值、波动、偏度、回归速度、持有成本与盘口深度。',
 };
 
+/**
+ * Leg diagnostics are persisted as `${Left|Right} leg ${order.state.toLowerCase()}`, so the state
+ * tail is an open set: `filled` / `cancelled` / … but also gateway states such as
+ * `remote_not_found`, `fail`, `new` or `open`, and anything a future venue adds. Enumerating them
+ * in `chinese` is impossible, so these rows go through a template instead. A state the table does
+ * not know keeps its raw English tail (`左腿 remote_not_found`) — a half-translated row is useful
+ * and greppable, while an empty cell or `undefined` would be a silent data loss.
+ */
+const chineseLegSide: Record<string, string> = { Left: '左腿', Right: '右腿' };
+/**
+ * Everything in `OPEN_ORDER_STATES` (`PENDING_SUBMIT`, `PENDING_CANCEL`, `NEW`, `OPEN`,
+ * `PARTIALLY_FILLED`) must be worded: `awaitTerminalOrder` resolves with whatever state the row
+ * holds when its deadline fires, so a cancel the venue never confirms reaches the log as
+ * `pending_cancel`. The rest are the terminal and gateway states seen in production.
+ */
+const chineseLegState: Record<string, string> = {
+  filled: '已成交',
+  partially_filled: '部分成交',
+  cancelled: '已取消',
+  pending_submit: '待提交',
+  pending_cancel: '待撤单',
+  new: '已提交',
+  open: '挂单中',
+  rejected: '已拒绝',
+  expired: '已过期',
+  fail: '失败',
+  failed: '失败',
+  remote_not_found: '交易所查不到该单',
+};
+/** Requires a non-empty state tail; `Left leg ` alone is not a diagnostic and stays untouched. */
+const legDiagnosticPattern = /^(Left|Right) leg (\S.*)$/;
+
+/**
+ * Read an own property only. Both tables are plain object literals, so a bare `table[key]` walks
+ * the prototype chain: `chineseLegState['constructor']` would resolve to the `Object` constructor
+ * and `Left leg constructor` would render as `左腿function Object() { [native code] }`. A state is
+ * attacker-controlled in the sense that it is whatever the venue reports, so the lookup must not
+ * be able to reach past the table's own keys.
+ */
+function ownTranslation(table: Record<string, string>, key: string): string | undefined {
+  return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
+}
+
+/**
+ * Localize a `Left leg <state>` / `Right leg <state>` diagnostic. Returns `undefined` when the key
+ * is not a leg diagnostic, so the caller falls back to the ordinary dictionary and then to the key.
+ */
+export function localizeLegDiagnostic(key: string): string | undefined {
+  const match = legDiagnosticPattern.exec(key);
+  if (!match) return undefined;
+  const side = ownTranslation(chineseLegSide, match[1] ?? '');
+  const state = match[2];
+  if (!side || !state) return undefined;
+  const localizedState = ownTranslation(chineseLegState, state);
+  return localizedState ? `${side}${localizedState}` : `${side} ${state}`;
+}
+
 export function translate(language: Language, key: string) {
-  return language === 'zh' ? chinese[key] ?? key : key;
+  if (language !== 'zh') return key;
+  // Same own-property guard as the leg tables: `chinese` is a plain object literal, so a bare
+  // `chinese[key]` would resolve `constructor` / `toString` / … up the prototype chain and hand a
+  // function back to the renderer instead of a string.
+  return ownTranslation(chinese, key) ?? localizeLegDiagnostic(key) ?? key;
 }
 
 export const LanguageContext = createContext<{ language: Language; theme: Theme; t: (key: string) => string; setLanguage: (language: Language) => void }>({ language: 'en', theme: 'dark', t: (key) => key, setLanguage: () => undefined });

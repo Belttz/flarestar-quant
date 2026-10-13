@@ -712,22 +712,22 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
     <section className="funding-card terminal-panel">
       <div className="exchange-filter" role="group" aria-label="Filter exchanges">
         <span>{t('Exchanges')}</span>
-        {exchanges.map((venue) => <button key={venue.id} className={selectedExchanges.includes(venue.id) ? 'selected' : ''} aria-pressed={selectedExchanges.includes(venue.id)} onClick={() => toggleExchange(venue.id)}><VenueIcon id={venue.id} short={venue.short} />{venue.name}<em>{selectedExchanges.includes(venue.id) ? '✓' : '+'}</em></button>)}
+        {exchanges.map((venue) => <button key={venue.id} role="checkbox" className={selectedExchanges.includes(venue.id) ? 'selected' : ''} aria-checked={selectedExchanges.includes(venue.id)} onClick={() => toggleExchange(venue.id)}><VenueIcon id={venue.id} short={venue.short} />{venue.name}<em>{selectedExchanges.includes(venue.id) ? '✓' : '+'}</em></button>)}
         <small>{selectedExchanges.length} {t('selected')} · {t('at least one required')}</small>
       </div>
-      <div className="oi-filter" role="group" aria-label="Minimum average open interest">
+      <div className="oi-filter" role="radiogroup" aria-label="Minimum average open interest">
         <span>{t('Min average OI')}</span>
         {OI_FILTER_PRESETS.map((preset) => {
           const active = minAvgOiUsd === preset.millions * 1_000_000;
-          return <button key={preset.label} className={active ? 'selected' : ''} aria-pressed={active} onClick={() => { cancelSortPreparation(); setPage(1); setMinOiMillionsText(preset.millions === 0 ? '' : String(preset.millions)); }}>{preset.label === 'Any' ? t('Any') : preset.label}</button>;
+          return <button key={preset.label} role="radio" className={active ? 'selected' : ''} aria-checked={active} onClick={() => { cancelSortPreparation(); setPage(1); setMinOiMillionsText(preset.millions === 0 ? '' : String(preset.millions)); }}>{preset.label === 'Any' ? t('Any') : preset.label}</button>;
         })}
         <label className="oi-custom"><span>$</span><input inputMode="decimal" value={minOiMillionsText} onChange={(event) => { cancelSortPreparation(); setPage(1); setMinOiMillionsText(event.target.value.replace(/[^0-9.]/g, '')); }} placeholder="0" aria-label={t('Min average OI')} /><span>M</span></label>
         <small>{overviewState === 'loading' && !overview ? t('Loading all trading pairs…') : `${filteredMarkets.length} / ${allPairs.length} ${t('pairs')}`}</small>
       </div>
       <div className="funding-toolbar">
         <label className="funding-search"><span aria-hidden="true">⌕</span><input value={query} onChange={(event) => { cancelSortPreparation(); setPage(1); setQuery(event.target.value); }} placeholder={t('Search asset')} aria-label={t('Search asset')} /></label>
-        <div className="metric-switch" role="group" aria-label="Funding rate period">
-          {(['Per interval', 'APR', '24h', '7d', '30d'] as FundingMetric[]).map((item) => <button key={item} className={metric === item ? 'active' : ''} aria-pressed={metric === item} onClick={() => changeMetric(item)}>{item === '24h' || item === '7d' || item === '30d' ? t(`Cumulative ${item}`) : t(item)}</button>)}
+        <div className="metric-switch" role="radiogroup" aria-label="Funding rate period">
+          {(['Per interval', 'APR', '24h', '7d', '30d'] as FundingMetric[]).map((item) => <button key={item} role="radio" className={metric === item ? 'active' : ''} aria-checked={metric === item} onClick={() => changeMetric(item)}>{item === '24h' || item === '7d' || item === '30d' ? t(`Cumulative ${item}`) : t(item)}</button>)}
         </div>
         {preparingSort && <small className="funding-sort-status" role="status">{t('Preparing sort…')}</small>}
         <small className="funding-last-updated">{t('Last updated at')} <time dateTime={lastUpdatedIso}>{lastUpdatedText}</time></small>

@@ -58,6 +58,10 @@ interface BorosStrategyViewProps {
   onStrategiesChanged: () => Promise<void>;
   onPositionsRefresh: () => Promise<void>;
   watchQuotes: (symbols: string[]) => void;
+  /** `?strategyId=` deep link that should open that strategy's configuration detail dialog. */
+  requestedStrategyId?: string | null;
+  onOpenStrategyConfig: (strategy: StrategyRecord) => void;
+  onCopyStrategy: (strategy: StrategyRecord) => void;
 }
 
 function pct(value: number, digits = 2): string {
@@ -215,6 +219,9 @@ export function BorosStrategyView({
   onStrategiesChanged,
   onPositionsRefresh,
   watchQuotes,
+  requestedStrategyId,
+  onOpenStrategyConfig,
+  onCopyStrategy,
 }: BorosStrategyViewProps) {
   const { language, t } = useLanguage();
   const [response, setResponse] = useState<BorosStrategiesResponse | null>(null);
@@ -965,13 +972,13 @@ export function BorosStrategyView({
                   </div>
                   <div className="compact-method boros-execution-method">
                     <span>{t('Execution method')}</span>
-                    <div className="method-options execution-method-options" role="group" aria-label={t('Execution method')}>
-                      <button type="button" className={executionMethod === 'Taker–Taker' ? 'active' : ''} aria-pressed={executionMethod === 'Taker–Taker'} onClick={() => setExecutionMethod('Taker–Taker')}>⚡ {t('Taker–Taker')}</button>
-                      <button type="button" className={executionMethod === 'Maker–Taker' ? 'active' : ''} aria-pressed={executionMethod === 'Maker–Taker'} onClick={() => setExecutionMethod('Maker–Taker')}>◫ {t('Maker–Taker')}</button>
+                    <div className="method-options execution-method-options" role="radiogroup" aria-label={t('Execution method')}>
+                      <button type="button" role="radio" className={executionMethod === 'Taker–Taker' ? 'active' : ''} aria-checked={executionMethod === 'Taker–Taker'} onClick={() => setExecutionMethod('Taker–Taker')}>⚡ {t('Taker–Taker')}</button>
+                      <button type="button" role="radio" className={executionMethod === 'Maker–Taker' ? 'active' : ''} aria-checked={executionMethod === 'Maker–Taker'} onClick={() => setExecutionMethod('Maker–Taker')}>◫ {t('Maker–Taker')}</button>
                     </div>
-                    {executionMethod === 'Maker–Taker' && <div className="maker-leg-picker execution-maker-leg-options" role="group" aria-label={t('Choose maker leg')}>
-                      <button type="button" className={makerLeg === 'left' ? 'active' : ''} aria-pressed={makerLeg === 'left'} onClick={() => setMakerLeg('left')}><small>{t('Maker')} · A</small><strong>{selected.longMarket.platformName}</strong></button>
-                      <button type="button" className={makerLeg === 'right' ? 'active' : ''} aria-pressed={makerLeg === 'right'} onClick={() => setMakerLeg('right')}><small>{t('Maker')} · B</small><strong>{selected.shortMarket.platformName}</strong></button>
+                    {executionMethod === 'Maker–Taker' && <div className="maker-leg-picker execution-maker-leg-options" role="radiogroup" aria-label={t('Choose maker leg')}>
+                      <button type="button" role="radio" className={makerLeg === 'left' ? 'active' : ''} aria-checked={makerLeg === 'left'} onClick={() => setMakerLeg('left')}><small>{t('Maker')} · A</small><strong>{selected.longMarket.platformName}</strong></button>
+                      <button type="button" role="radio" className={makerLeg === 'right' ? 'active' : ''} aria-checked={makerLeg === 'right'} onClick={() => setMakerLeg('right')}><small>{t('Maker')} · B</small><strong>{selected.shortMarket.platformName}</strong></button>
                     </div>}
                   </div>
                 </div>
@@ -1016,7 +1023,7 @@ export function BorosStrategyView({
         </aside>
       </section>
     </>}
-    <RunningStrategiesPanel strategies={strategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} instruments={instruments} tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} onStrategiesChanged={onStrategiesChanged} onPositionsRefresh={onPositionsRefresh} />
+    <RunningStrategiesPanel strategies={strategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} instruments={instruments} tradingMode={tradingMode} requestedStrategyId={requestedStrategyId} onOpenModeDialog={onOpenModeDialog} onStrategiesChanged={onStrategiesChanged} onPositionsRefresh={onPositionsRefresh} onOpenStrategyConfig={onOpenStrategyConfig} onCopyStrategy={onCopyStrategy} />
     {confirmingExecution && selected && symbols && <div className="modal-backdrop confirm-order-backdrop" role="presentation" onMouseDown={() => { if (!launching) setConfirmingExecution(false); }}>
       <section ref={confirmDialogRef} tabIndex={-1} className="confirm-order-modal boros-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="boros-confirm-execution-title" onMouseDown={(event) => event.stopPropagation()}>
         <header>

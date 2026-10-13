@@ -27,6 +27,8 @@ const SHARED_PROPS = {
   onStrategiesChanged: vi.fn(async () => undefined),
   onPositionsRefresh: vi.fn(async () => undefined),
   watchQuotes: vi.fn(),
+  onOpenStrategyConfig: vi.fn(),
+  onCopyStrategy: vi.fn(),
 };
 
 /**

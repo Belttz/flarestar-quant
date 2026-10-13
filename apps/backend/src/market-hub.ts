@@ -19,6 +19,22 @@ const MAX_SYMBOLS_PER_SUBSCRIPTION = 100;
 const DYNAMIC_MARKET_IDLE_MS = 30 * 60_000;
 const DYNAMIC_MARKET_SWEEP_MS = 5 * 60_000;
 
+/**
+ * Backoff applied to a symbol the upstream declared invalid. The verdict is deliberately **not**
+ * permanent any more: a running strategy calls `market()` on every tick, so its market never goes
+ * idle, is never retired, and a single transient rejection used to blackhole the symbol for the
+ * rest of the process lifetime (production: KRAKEN/LIGHTER NATGAS and HYPE never recovered).
+ *
+ * The first window is short (30s) so a hiccup heals inside a minute, and every repeat doubles it
+ * up to 30 minutes, so a genuinely unsupported symbol costs at most one subscribe frame per half
+ * hour instead of a retry storm against an upstream that is already struggling.
+ */
+const INVALID_SYMBOL_BACKOFF_BASE_MS = 30_000;
+const INVALID_SYMBOL_BACKOFF_FACTOR = 2;
+const INVALID_SYMBOL_BACKOFF_MAX_MS = 30 * 60_000;
+/** Exponent guard: a long-lived hub must never grow the window past a finite number. */
+const INVALID_SYMBOL_BACKOFF_MAX_STEPS = 20;
+
 type MarketVenue = typeof MARKET_VENUES[number];
 
 export interface LiveMarket {
@@ -96,6 +112,17 @@ interface ShardConnection {
 }
 
 type MarketListener = (message: MarketHubMessage) => void;
+
+/**
+ * One upstream "invalid symbol" verdict. `at` anchors the backoff window and `attempts` counts
+ * consecutive verdicts so repeats back off exponentially instead of retrying at a fixed rate.
+ */
+interface InvalidSymbolRecord {
+  /** Epoch ms (hub clock) of the most recent verdict. */
+  at: number;
+  /** Consecutive verdicts for this channel+symbol; 1 for the first one. */
+  attempts: number;
+}
 
 /** Optional sink for degradation the operator can act on (capacity pressure, dropped symbols). */
 export type MarketHubWarn = (reason: string, detail?: Record<string, unknown>) => void;
@@ -257,7 +284,11 @@ export class CrossExMarketHub {
   private readonly pendingAssignments = new Set<string>();
   private stopped = true;
   private lastNotifiedState: MarketSnapshot['connectionState'] = 'disconnected';
-  private readonly invalidSymbols = new Map<string, Set<string>>();
+  /**
+   * Symbols the upstream rejected, per channel. Entries expire: they only suppress a re-subscribe
+   * inside their backoff window, and are dropped as soon as the channel delivers data again.
+   */
+  private readonly invalidSymbols = new Map<string, Map<string, InvalidSymbolRecord>>();
   private readonly markets = new Map<string, LiveMarket>();
   private readonly listeners = new Set<MarketListener>();
   private readonly quoteWatchers = new Map<string, number>();
@@ -279,6 +310,8 @@ export class CrossExMarketHub {
   /** Connection-pool ceiling derived from the budget so the two always agree. */
   private readonly maxShards: number;
   private readonly warn: MarketHubWarn | undefined;
+  /** Injected clock; defaults to `Date.now` and exists so tests can advance the invalid backoff. */
+  private readonly clock: () => number;
 
   constructor(
     private readonly url: string,
@@ -289,6 +322,8 @@ export class CrossExMarketHub {
       maxDynamicSymbols?: number;
       /** Degradation sink; the backend wires this to its logger so starvation is never silent. */
       warn?: MarketHubWarn;
+      /** Clock returning epoch ms. Optional: production keeps `Date.now`. */
+      now?: () => number;
     } = {},
   ) {
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 25_000;
@@ -297,6 +332,7 @@ export class CrossExMarketHub {
     this.maxDynamicSymbols = options.maxDynamicSymbols ?? MAX_DYNAMIC_SYMBOLS;
     this.maxShards = Math.ceil((this.maxDynamicSymbols + SEED_SYMBOL_COUNT) / SYMBOLS_PER_SHARD);
     this.warn = options.warn;
+    this.clock = options.now ?? (() => Date.now());
     MARKET_ASSETS.forEach((asset, assetIndex) => MARKET_VENUES.forEach((venue, venueIndex) => {
       const market = seedMarket(venue, asset, venueIndex, assetIndex);
       this.markets.set(market.symbol, market);
@@ -482,8 +518,10 @@ export class CrossExMarketHub {
   private retireDynamicMarket(symbol: string): void {
     for (const channel of ['ticker', 'funding_rate', 'open_interest']) {
       this.unsubscribeSymbols(channel, [symbol]);
-      this.invalidSymbols.get(channel)?.delete(symbol);
     }
+    // Drop verdicts on every channel, not just the three public ones: a stale record would mute
+    // this symbol again the moment it is re-registered.
+    this.clearInvalidSymbol(symbol);
     this.releaseSymbolShard(symbol);
     this.markets.delete(symbol);
     this.dynamicMarkets.delete(symbol);
@@ -597,12 +635,86 @@ export class CrossExMarketHub {
     };
   }
 
+  /** Hub clock. Every invalid-symbol timing decision goes through it so tests can advance time. */
+  private now(): number {
+    return this.clock();
+  }
+
+  /** Backoff window (ms) that `attempts` consecutive invalid verdicts must keep a symbol muted. */
+  private invalidSymbolBackoffMs(attempts: number): number {
+    const steps = Math.min(Math.max(attempts - 1, 0), INVALID_SYMBOL_BACKOFF_MAX_STEPS);
+    const window = INVALID_SYMBOL_BACKOFF_BASE_MS * INVALID_SYMBOL_BACKOFF_FACTOR ** steps;
+    return Math.min(window, INVALID_SYMBOL_BACKOFF_MAX_MS);
+  }
+
+  /** True while a recent verdict must still suppress a re-subscribe for this channel+symbol. */
+  private isInvalidNow(channel: string, symbol: string, now: number = this.now()): boolean {
+    const record = this.invalidSymbols.get(channel)?.get(symbol);
+    if (!record) return false;
+    return now - record.at < this.invalidSymbolBackoffMs(record.attempts);
+  }
+
+  /**
+   * Record an upstream verdict. Repeats widen the window; what the upstream calls invalid is never
+   * second-guessed here — only how long the verdict is honoured.
+   */
+  private markInvalid(channel: string, symbols: string[], now: number = this.now()): void {
+    if (symbols.length === 0) return;
+    let records = this.invalidSymbols.get(channel);
+    if (!records) {
+      records = new Map<string, InvalidSymbolRecord>();
+      this.invalidSymbols.set(channel, records);
+    }
+    for (const symbol of symbols) {
+      const attempts = (records.get(symbol)?.attempts ?? 0) + 1;
+      records.set(symbol, { at: now, attempts });
+    }
+  }
+
+  /** Forget a verdict once the channel delivers data again, so a healthy symbol is never skipped. */
+  private clearInvalid(channel: string, symbol: string): void {
+    const records = this.invalidSymbols.get(channel);
+    if (!records) return;
+    if (!records.delete(symbol)) return;
+    if (records.size === 0) this.invalidSymbols.delete(channel);
+  }
+
+  /** Forget every verdict held for a symbol; used when its registration is torn down. */
+  private clearInvalidSymbol(symbol: string): void {
+    for (const [channel, records] of [...this.invalidSymbols]) {
+      if (!records.delete(symbol)) continue;
+      if (records.size === 0) this.invalidSymbols.delete(channel);
+    }
+  }
+
+  /**
+   * Give symbols whose backoff elapsed another upstream attempt. This is the only automatic way
+   * back for a market a live strategy keeps warm: `retireDynamicMarket` — the old sole clearing
+   * path — never fires for it, because the strategy's per-tick `market()` call keeps `lastUsedAt`
+   * fresh and a quote watch pins it against eviction.
+   */
+  private retryExpiredInvalidSymbols(now: number = this.now()): void {
+    if (this.stopped) return;
+    for (const [channel, records] of [...this.invalidSymbols]) {
+      const due: string[] = [];
+      for (const symbol of [...records.keys()]) {
+        if (this.isInvalidNow(channel, symbol, now)) continue;
+        // Only symbols still carried by the hub are worth a frame; anything already retired is
+        // re-subscribed through `ensureMarkets` if it is ever asked for again.
+        if (!this.markets.has(symbol) && !this.symbolShards.has(symbol)) continue;
+        due.push(symbol);
+      }
+      if (due.length > 0) this.subscribeSymbols(channel, due);
+    }
+  }
+
   /** Route each symbol to its shard, subscribe the channel there, and dial new shards on demand. */
   private subscribeSymbols(channel: string, symbols: string[]): void {
-    const invalid = this.invalidSymbols.get(channel);
+    const now = this.now();
     const byShard = new Map<ShardConnection, string[]>();
     for (const symbol of symbols) {
-      if (invalid?.has(symbol)) continue;
+      // A verdict mutes the symbol only for its backoff window — never permanently.
+      if (this.isInvalidNow(channel, symbol, now)) continue;
       const shard = this.shardFor(symbol);
       if (!shard) {
         // Every symbol that cannot get a connection slot is queued, not dropped: the periodic
@@ -831,6 +943,8 @@ export class CrossExMarketHub {
       this.pendingAssignments.clear();
       for (const channel of ['ticker', 'funding_rate', 'open_interest']) this.subscribeSymbols(channel, pending);
     }
+    // And symbols muted by an upstream verdict get another attempt once their backoff elapsed.
+    this.retryExpiredInvalidSymbols();
   }
 
   private isActivelyWatched(symbol: string): boolean {
@@ -871,12 +985,9 @@ export class CrossExMarketHub {
         return false;
       }
       if (!subscribed) return false;
-      const invalid = this.invalidSymbols.get(channel) ?? new Set<string>();
-      for (const symbol of invalidFound) {
-        subscribed.delete(symbol);
-        invalid.add(symbol);
-      }
-      this.invalidSymbols.set(channel, invalid);
+      const now = this.now();
+      for (const symbol of invalidFound) subscribed.delete(symbol);
+      this.markInvalid(channel, invalidFound, now);
       const socket = shard.socket;
       if (socket?.readyState === WebSocket.OPEN && subscribed.size > 0 && ['ticker', 'funding_rate', 'open_interest'].includes(channel)) {
         this.sendSubscribe(socket, channel, [...subscribed]);
@@ -888,6 +999,8 @@ export class CrossExMarketHub {
       const ticker = TickerPushSchema.safeParse(payload);
       if (!ticker.success) return false;
       const symbol = this.resolveStreamSymbol(ticker.data.result.s);
+      // Data arrived: whatever verdict muted this symbol is over.
+      this.clearInvalid('ticker', symbol);
       const current = this.markets.get(symbol);
       if (!current) return true;
       const value = ticker.data.result;
@@ -929,6 +1042,7 @@ export class CrossExMarketHub {
     if (frame.channel === 'funding_rate') {
       const funding = FundingPushSchema.safeParse(payload);
       if (!funding.success) return false;
+      this.clearInvalid('funding_rate', funding.data.result.s);
       const current = this.markets.get(funding.data.result.s);
       if (current) this.publish({ ...current, fundingRate: funding.data.result.r, nextFundingAt: new Date(funding.data.result.T).toISOString() });
       return true;
@@ -936,6 +1050,7 @@ export class CrossExMarketHub {
     if (frame.channel === 'open_interest') {
       const interest = OpenInterestPushSchema.safeParse(payload);
       if (!interest.success) return false;
+      this.clearInvalid('open_interest', interest.data.result.s);
       const current = this.markets.get(interest.data.result.s);
       if (current) this.publish({ ...current, openInterest: interest.data.result.oi, openInterestValue: interest.data.result.oiV ?? current.openInterestValue });
       return true;
@@ -964,6 +1079,9 @@ export class CrossExMarketHub {
 
   private applyBookUpdate(result: z.infer<typeof OrderBookUpdatePushSchema>['result']): void {
     const symbol = this.resolveStreamSymbol(result.s);
+    // Clear before the watcher check: a delivered frame proves the channel is live whether or not
+    // a client is still listening, and the verdict is this channel's alone.
+    this.clearInvalid('order_book_update', symbol);
     if (!this.bookWatchers.has(`order_book_update:${symbol}`)) return;
     let book = this.books.get(symbol);
     if (!book || result.snapshot) {
@@ -1013,6 +1131,9 @@ export class CrossExMarketHub {
     const symbol = this.tradeWatchers.has(`trade:${result.s}`)
       ? result.s
       : this.tradeSymbolAliases.get(normalizeTradeSymbol(result.s));
+    // Trade-symbol resolution above is watcher-dependent, so clear as soon as a symbol resolves:
+    // the frame proves this channel is live, and only this channel's verdict is forgiven.
+    if (symbol) this.clearInvalid('trade', symbol);
     if (!symbol || !this.tradeWatchers.has(`trade:${symbol}`)) return;
     const trade: PublicTrade = {
       id: result.i, symbol, price: result.p, quantity: result.q, side: result.S,
@@ -1028,6 +1149,7 @@ export class CrossExMarketHub {
 
   private applyKline(interval: CandleInterval, result: { s: string; o: string; h: string; l: string; c: string; v: string; t: number; x: boolean }): void {
     const symbol = this.resolveStreamSymbol(result.s);
+    this.clearInvalid(`kline_${interval}`, symbol);
     if (!this.klineWatchers.has(`kline_${interval}:${symbol}`)) return;
     const key = `${symbol}:${interval}`;
     const series = this.candleSeries.get(key) ?? [];

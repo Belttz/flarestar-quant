@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { Decimal } from 'decimal.js';
+import type { PortfolioFuturesPosition } from '@gate-crossex/shared-types';
 import type { LiveMarket } from './market-hub.js';
 import type { TradingSession } from './trading-session.js';
 import { GateApiError } from './crossex-client.js';
@@ -10,6 +11,7 @@ import {
   UpdatePremiumTakeProfitInputSchema,
   TradingRuntime,
   TradingRuntimeError,
+  isReduceOnlyQuantityRejection,
   isTerminalOrderState,
   type CreateStrategyInput,
   type ExecutionOrder,
@@ -97,6 +99,50 @@ interface StrategyActor {
   lastCloseAt: number;
   /** auto: latched once a stop-loss exit clip was submitted; the strategy stops when flat. */
   stopLossArmed: boolean;
+  /**
+   * Exit quantity the venue can actually reduce, learned when a reduce-only order was rejected
+   * with TRADE_REDUCE_ONLY_POSITION_QTY_ERROR (the ledger believed a position the venue no
+   * longer holds). Every later tick re-reports exits at this size instead of resubmitting a
+   * doomed order; retired as soon as the ledger-derived quantity drops to it, and cleared on
+   * any new fill so a real event always re-derives from the ledger. Null in the normal case.
+   */
+  venueExitQuantity: Decimal | null;
+  /**
+   * True while an entry quote is withheld because the live spread sits outside the maker entry
+   * proximity band; drives the one-shot `Maker quoting parked` / `Maker quoting resumed` logs so
+   * a parked strategy does not write a row on every 500ms tick.
+   */
+  makerEntryParked: boolean;
+  /**
+   * auto MAKER_TAKER only: latched once the live exit spread reached the take-profit level. While
+   * set, the maker exit quote is never withdrawn, the hedge leg is unwound (never topped up), and
+   * no new entry quote is rested. Retired once both legs are flat — restarting recomputes from the
+   * spread, so nothing is persisted.
+   */
+  makerExitArmed: boolean;
+  /** Wall-clock ms when {@link makerExitArmed} latched; null while unarmed. Gates the time fallback. */
+  makerExitStartedAt: number | null;
+  /** True once the one-shot `Maker exit fallback` row has been written for the current latch. */
+  makerExitFallbackLogged: boolean;
+  /** The single resting reduce-only hedge-leg limit backing an armed exit; null when none is out. */
+  makerExitHedge: {
+    orderId: string;
+    price: Decimal;
+    placedAt: number;
+    leg: 'left' | 'right';
+    quantity: Decimal;
+  } | null;
+  /** How many times the hedge-leg exit limit has been cancelled and re-priced; diagnostics only. */
+  makerExitHedgeRequotes: number;
+  /**
+   * Consecutive maker-exit hedge submit failures. Deliberately separate from {@link failureCount}:
+   * that counter is read by the entry / two-leg insufficient-margin paths, and folding hedge
+   * failures into it would change their semantics. Reset to zero on every successful submission
+   * and when the latch retires.
+   */
+  makerExitHedgeFailures: number;
+  /** Earliest wall-clock ms the hedge submit may be attempted again after a failure (backoff gate). */
+  makerExitHedgeRetryAt: number;
   /** carry: in-memory accounting state; reset when the backend restarts (re-estimated from fills). */
   carry: CarryRuntimeState | null;
   /** Serialized metrics of the last write, so unchanged snapshots do not touch the database. */
@@ -155,9 +201,61 @@ const FUNDING_PERIOD_MS = 8 * 3_600_000;
 const MAX_FUNDING_ACCRUAL_CATCHUP = 40;
 /** Legacy carry fallback prefix (rows created before cross-venue carry was unlocked). */
 const GATE_SPOT_SYMBOL_PREFIX = 'GATE_SPOT_';
+/**
+ * Proximity band (bps) around the entry trigger for **maker entry quotes only**: an entry quote is
+ * rested only while the live spread is at most this far from the tier's trigger level. Without it
+ * the quote's target price is re-derived from the opposite leg every tick, so a strategy cancels
+ * and replaces indefinitely even while the market is nowhere near the level it wants.
+ *
+ * A global engine default — deliberately **not** a strategy field: it applies to every MAKER_TAKER
+ * strategy, including ones already running, as soon as the backend restarts. No configuration
+ * change and no migration are involved. Exit / take-profit quotes are never gated by it.
+ */
+const MAKER_ENTRY_PROXIMITY_BPS = 25;
+/**
+ * Budget for a latched maker exit before the engine relaxes the hedge-leg slippage cap. A
+ * MAKER_TAKER take-profit rests a post-only reduce-only limit on the maker leg and unwinds the
+ * hedge leg with a reduce-only *limit* at a bounded slippage from the mid; if the pair is still
+ * not flat after this long, the exit is clearly being starved by an unfavourable book and the
+ * engine widens that cap (see {@link MAKER_EXIT_HEDGE_FALLBACK_SLIPPAGE_BPS}) once.
+ */
+const MAKER_EXIT_FALLBACK_MS = 30_000;
+/** How long the resting hedge-leg exit limit may sit before it is cancelled and re-priced. */
+const MAKER_EXIT_HEDGE_TTL_MS = 1_500;
+/** Slippage (bps) the hedge-leg exit limit may concede from the mid while within its budget. */
+const MAKER_EXIT_HEDGE_SLIPPAGE_BPS = 3;
+/** Widened hedge-leg slippage cap applied once the exit overruns {@link MAKER_EXIT_FALLBACK_MS}. */
+const MAKER_EXIT_HEDGE_FALLBACK_SLIPPAGE_BPS = 10;
 
 function isSpotSymbol(symbol: string): boolean {
   return /^[A-Z0-9]+_SPOT_/.test(symbol);
+}
+
+/**
+ * How much of `symbol` the venue can actually reduce for an order on `side`, read from a fresh
+ * position snapshot: a SELL exit reduces LONG positions, a BUY exit reduces SHORT positions.
+ * Zero when the venue holds nothing reducible — including when it holds no rows for the symbol
+ * at all, i.e. the position was closed outside the engine. Null only when a row cannot be
+ * interpreted, so the caller can tell "venue says zero" from "venue said something unusable".
+ */
+function venueReducibleQuantity(
+  positions: readonly PortfolioFuturesPosition[],
+  symbol: string,
+  side: 'BUY' | 'SELL',
+): Decimal | null {
+  let total = ZERO;
+  for (const position of positions) {
+    if (position.symbol !== symbol) continue;
+    const raw = new Decimal(position.quantity || '0');
+    if (!raw.isFinite()) return null;
+    const positionSide = position.positionSide.toUpperCase();
+    const signed = positionSide === 'SHORT' ? raw.abs().negated()
+      : positionSide === 'LONG' ? raw.abs()
+        : raw;
+    if (side === 'SELL' && signed.gt(0)) total = total.plus(signed);
+    else if (side === 'BUY' && signed.lt(0)) total = total.plus(signed.abs());
+  }
+  return total;
 }
 
 /** Annualize a funding rate into a percentage: |rate| × (24/interval) periods/day × 365 × 100. */
@@ -361,6 +459,9 @@ export class StrategyEngine {
       if (!fill.strategyId) return;
       this.invalidateLedger(fill.strategyId);
       const actor = this.actors.get(fill.strategyId);
+      // A real fill moves the ledger: drop any venue-truth exit clamp so the next exit is
+      // re-derived from the ledger, and re-clamped only if the venue rejects it again.
+      if (actor) actor.venueExitQuantity = null;
       if (actor) this.enqueue(actor, () => this.afterExecutionChange(actor));
     }));
     this.unsubscribers.push(this.runtime.onOrderUpdate((order) => {
@@ -425,8 +526,12 @@ export class StrategyEngine {
         // Legacy rows without an owner are considered part of the active account until reviewed.
         && record.accountProfileId !== null) continue;
       if (this.actors.has(record.id)) continue;
-      this.attach(record);
-      this.runtime.addStrategyLog(record.id, 'info', 'Strategy resumed', 'Live mode enabled after order reconciliation', '—', 'Monitoring live spreads');
+      const actor = this.attach(record);
+      // A restart loses the hub's in-memory market table (only seeds remain), so re-register and
+      // re-watch this strategy's symbols before the next tick. Without it the recovered actor
+      // never receives ticker frames for its symbols and silently stops quoting.
+      this.ensureActorMarkets(actor);
+      this.runtime.addStrategyLog(record.id, 'info', 'Strategy resumed', 'Live mode enabled after order reconciliation', '—', 'Monitoring live spreads · leg quotes re-subscribed');
     }
   }
 
@@ -814,6 +919,44 @@ export class StrategyEngine {
     await Promise.all([...this.actors.values()].map((actor) => actor.queue.catch(() => undefined)));
   }
 
+  /**
+   * Re-subscribes a recovered strategy's symbols to the market hub during restart recovery. The
+   * hub's in-memory market table starts nearly empty (seeds only) after a restart, so a recovered
+   * RUNNING strategy receives no ticker frames for its symbols until they are registered and
+   * watched — which is why, without this, only the strategy currently on screen appeared to trade.
+   * Mirrors the proven start/resume subscription path: `ensureMarket` registers a catalog-known
+   * dynamic symbol and `watchQuotes` opens its ticker subscription, whose release is tracked on the
+   * actor so the existing `releaseQuoteWatch` tears it down on stop/pause/credential change.
+   * Best-effort and throw-free: a symbol that can no longer be registered must not abort recovery.
+   */
+  private ensureActorMarkets(actor: StrategyActor): void {
+    try {
+      // Register a symbol with the hub, reporting a miss instead of idling silently: a recovered
+      // strategy that never receives a ticker frame otherwise looks healthy while writing no rows.
+      const register = (symbol: string): void => {
+        let ok = false;
+        try { ok = Boolean(this.markets.market(symbol)) || Boolean(this.markets.ensureMarket?.(symbol)); }
+        catch { ok = false; }
+        if (ok) return;
+        this.runtime.addStrategyLog(actor.id, 'warning', 'Strategy market unavailable', symbol, '—',
+          'Symbol is absent from the market catalog and could not be registered; the recovered strategy has no live feed for it');
+      };
+      if (actor.config.closePlan) {
+        const symbols = [...new Set(actor.config.closePlan.targets.map((target) => target.symbol))];
+        for (const symbol of symbols) register(symbol);
+        // Mirror the start/resume paths: hold the symbols' ticker subscription for the whole
+        // strategy lifetime. Without it a long close interval (or a hub sweep) leaves a settlement
+        // slice with no prices and it fails with `strategy_market_data_unavailable`.
+        actor.quoteWatchRelease = this.markets.watchQuotes?.(symbols) ?? null;
+        return;
+      }
+      const legs = legsOf(actor.config);
+      for (const leg of [legs.left, legs.right]) register(leg.symbol);
+      // Keep the legs' ticker subscription alive for the whole recovered strategy lifetime.
+      actor.quoteWatchRelease = this.markets.watchQuotes?.([legs.left.symbol, legs.right.symbol]) ?? null;
+    } catch { /* Recovery must never fail because a symbol could not be re-registered. */ }
+  }
+
   /** Releases a strategy's leg-symbol quote subscription exactly once; safe to call repeatedly. */
   private releaseQuoteWatch(actor: StrategyActor): void {
     const release = actor.quoteWatchRelease;
@@ -836,6 +979,15 @@ export class StrategyEngine {
       suspended, quiesceTarget: null, quiesceReason: null, unresolvedOrders: [], createdAt: Date.parse(record.createdAt),
       lastCloseAt: Date.parse(record.updatedAt),
       stopLossArmed: false,
+      venueExitQuantity: null,
+      makerEntryParked: false,
+      makerExitArmed: false,
+      makerExitStartedAt: null,
+      makerExitFallbackLogged: false,
+      makerExitHedge: null,
+      makerExitHedgeRequotes: 0,
+      makerExitHedgeFailures: 0,
+      makerExitHedgeRetryAt: 0,
       carry: record.kind === 'carry' ? emptyCarryState() : null,
       lastCarryMetricsJson: null,
       quoteWatchRelease: null,
@@ -1101,6 +1253,84 @@ export class StrategyEngine {
     if (exposure.left.isZero() || exposure.right.isZero()) return ZERO;
     if (exposure.left.isNegative() === exposure.right.isNegative()) return ZERO;
     return Decimal.min(exposure.left.abs(), exposure.right.abs());
+  }
+
+  /**
+   * Exit quantity after the venue-truth clamp. `venueExitQuantity` remembers what the venue
+   * could actually reduce the last time it rejected a reduce-only exit for exceeding the
+   * position, so every later tick re-reports at that size instead of resubmitting a doomed
+   * order. The clamp retires itself once the ledger-derived quantity falls to it (the engine's
+   * own fills closed the gap) and is cleared outright on any new fill. Null — the normal case —
+   * returns the ledger quantity unchanged.
+   */
+  private exitQuantityFor(actor: StrategyActor, ledgerQuantity: Decimal): Decimal {
+    const override = actor.venueExitQuantity;
+    if (override === null || !override.isFinite() || override.isNegative()) return ledgerQuantity;
+    if (ledgerQuantity.lte(override)) {
+      actor.venueExitQuantity = null;
+      return ledgerQuantity;
+    }
+    return override;
+  }
+
+  /**
+   * Reconcile positions from the venue right now, logging the outcome. Returns the refreshed
+   * rows, or null when the read failed (the caller then keeps its ordinary accounting).
+   */
+  private async refreshVenuePositions(actor: StrategyActor): Promise<PortfolioFuturesPosition[] | null> {
+    try {
+      return await this.runtime.reconcilePositionsFromRemote();
+    } catch (error) {
+      this.runtime.addStrategyLog(actor.id, 'warning', 'Position reconciliation failed',
+        '—', '—', error instanceof Error ? error.message.slice(0, 120) : 'reconciliation error');
+      return null;
+    }
+  }
+
+  /**
+   * Reduce-only exit rejected because the venue holds less than the ledger believes
+   * (TRADE_REDUCE_ONLY_POSITION_QTY_ERROR). Reconcile positions from the venue right now and
+   * re-report at the venue's real size instead of burning the five-strike budget on a state
+   * mismatch: the position was closed outside the engine (manually, by liquidation, or by the
+   * opposite leg), and no amount of retrying changes the venue's answer. Falls back to the
+   * ordinary rejection accounting when the venue confirms the ledger (or cannot be read), so a
+   * genuine submission failure still surfaces through the usual path.
+   *
+   * The requested quantity and the venue quantity are in the same units — the maker leg is the
+   * perpetual leg whenever the venue enforces reduce-only — so the clamp needs no conversion.
+   */
+  private async reconcileExitQuantity(
+    actor: StrategyActor,
+    makerLegSymbol: string,
+    makerLegSide: 'BUY' | 'SELL',
+    requested: Decimal,
+  ): Promise<'clamped' | 'ordinary'> {
+    this.runtime.addStrategyLog(actor.id, 'warning', 'Exit size drift',
+      `Post-only reduce-only exit for ${requested.toString()} ${actor.config.asset}`,
+      requested.toString(), 'Venue rejected the reduce-only exit; reconciling positions');
+    const positions = await this.refreshVenuePositions(actor);
+    const venueQuantity = positions === null || isSpotSymbol(makerLegSymbol)
+      ? null
+      : venueReducibleQuantity(positions, makerLegSymbol, makerLegSide);
+    if (venueQuantity === null || !venueQuantity.isFinite() || venueQuantity.gte(requested)) {
+      // No new information: the venue agrees with the ledger (or the read failed), so this is
+      // an ordinary rejection after all.
+      return 'ordinary';
+    }
+    // The venue is the truth. Remember the clamp so later ticks re-report at this size, and
+    // let the next tick place the corrected quote (a zero means the position is gone and the
+    // exit quote is withdrawn until the venue holds something reducible again).
+    actor.venueExitQuantity = venueQuantity;
+    actor.failureCount = 0;
+    actor.cooldownUntil = this.options.now() + 250;
+    this.runtime.addStrategyLog(actor.id, venueQuantity.gt(QUANTITY_EPSILON) ? 'info' : 'warning',
+      venueQuantity.gt(QUANTITY_EPSILON) ? 'Exit size corrected' : 'Exit quote withdrawn',
+      `Reduce-only exit for ${requested.toString()} ${actor.config.asset}`,
+      requested.toString(),
+      venueQuantity.gt(QUANTITY_EPSILON)
+        ? `Venue holds ${venueQuantity.toString()}; re-reporting at the venue size`
+        : 'Venue holds no reducible position on this leg');
+    return 'clamped';
   }
 
   private openStrategyOrders(strategyId: string, excludeIds: Set<string>): ExecutionOrder[] {
@@ -1720,6 +1950,23 @@ export class StrategyEngine {
   }
 
   /**
+   * How many bps the live spread still has to travel before tier `tier`'s entry level is reached:
+   * positive means "not there yet", zero or negative that the level is already met or exceeded.
+   *
+   * The exact negation of the `advance` term inside {@link tierIndexFor} — that helper measures how
+   * far the spread already got *past* the level, this one measures what is *left* — lifted from
+   * `entryBps` to a ladder tier through {@link tierLevelBps}, and keeping the same mirrored branch
+   * for a negative `entryBps` (which triggers as the spread falls, so the remaining distance is
+   * `spread − level`). The two helpers answer different questions and stay separate by design; do
+   * not refactor them into one.
+   */
+  private entryDistanceBps(config: CreateStrategyInput, spread: Decimal, tier = 0): Decimal {
+    const level = this.tierLevelBps(config, tier);
+    const sign = new Decimal(config.entryBps ?? '0');
+    return sign.gte(0) ? level.minus(spread) : spread.minus(level);
+  }
+
+  /**
    * Whether the ladder admits another clip at the live spread. Used by the **taker** path, which
    * acts on the current tick, so it judges the *live spread* via `tierIndexFor`. The maker path is
    * passive (its quote waits for the gap) and uses {@link nextLadderTier} instead — deliberately
@@ -2296,8 +2543,25 @@ export class StrategyEngine {
       const accepted = submissions.filter((entry): entry is PromiseFulfilledResult<ExecutionOrder> => entry.status === 'fulfilled');
       const rejected = submissions.filter((entry): entry is PromiseRejectedResult => entry.status === 'rejected');
       if (rejected.length > 0) {
-        actor.failureCount += 1;
         const gateErrors = rejected.map((entry) => entry.reason).filter((reason): reason is GateApiError => reason instanceof GateApiError);
+        // A reduce-only rejection on an exit means the venue holds less than the ledger: the
+        // position was closed outside the engine. Re-anchor the position state now, and when
+        // the venue holds nothing reducible stop immediately with the real reason instead of
+        // spending the five-strike budget on orders the venue cannot accept. A partial
+        // position keeps the ordinary accounting as the backstop — the maker path clamps and
+        // re-reports directly, while this two-leg submission re-reports on the next tick.
+        if (intent === 'exit' && rejected.some((entry) => isReduceOnlyQuantityRejection(entry.reason))) {
+          const positions = await this.refreshVenuePositions(actor);
+          const perpetualLeg = !isSpotSymbol(legs.left.symbol) ? legs.left
+            : !isSpotSymbol(legs.right.symbol) ? legs.right : null;
+          const venueQuantity = positions !== null && perpetualLeg !== null
+            ? venueReducibleQuantity(positions, perpetualLeg.symbol, perpetualLeg.side)
+            : null;
+          if (venueQuantity !== null && venueQuantity.lte(QUANTITY_EPSILON)) {
+            await this.pause(actor, 'Venue holds no reducible position on the exit leg; the position was closed outside this strategy');
+          }
+        }
+        actor.failureCount += 1;
         const rateLimitWait = gateErrors
           .filter((error) => error.statusCode === 429)
           .reduce((longest, error) => Math.max(longest, error.retryAfterMs ?? 30_000), 0);
@@ -2388,9 +2652,12 @@ export class StrategyEngine {
     const exposure = this.legExposures(actor.id, actor.config);
     const matched = this.matchedQuantity(exposure);
     const perOrder = new Decimal(actor.config.perOrderQuantity);
+    const legs = legsOf(actor.config);
     const intents: Array<{ intent: QuoteIntent; quantity: Decimal; tier: number }> = [];
     const entryCapacity = this.remainingEntryCapacity(actor, exposure);
-    if (entryCapacity.gt(QUANTITY_EPSILON)) {
+    // No new entry while a take-profit exit is being unwound: the latch retires only once both legs
+    // are flat, so re-entering here would reopen the position the exit is closing.
+    if (entryCapacity.gt(QUANTITY_EPSILON) && !actor.makerExitArmed) {
       // B2 gate on the maker path too: a MAKER_TAKER auto strategy must not rest an entry quote at
       // or beyond the stop-loss line, or it would open a position that stops out immediately.
       const liveSpread = this.entrySpreadBps(actor.config)?.spread;
@@ -2403,13 +2670,64 @@ export class StrategyEngine {
       const nextTier = this.nextLadderTier(actor, exposure);
       const tierOk = !actor.config.addOnStepBps || !actor.config.stopLossBps
         || this.absThreshold(actor.config, nextTier).lt(new Decimal(actor.config.stopLossBps));
-      if (gateOk && tierOk) {
+      // Proximity band on the entry side only: rest an entry quote just once the market is within
+      // `MAKER_ENTRY_PROXIMITY_BPS` of the tier's trigger level, instead of chasing a target price
+      // that drifts with every tick while the market is still far away. Exit / take-profit quotes
+      // below are untouched. Premium strategies are excluded on purpose: their entry condition is
+      // `entryPremiumPct`, not a spread level in bps, so this band has no reading for them. Without
+      // a live spread the gate abstains entirely (no park, no resume) — the quote could not be
+      // priced from a stale book anyway, and parking would flood the log on a data outage.
+      const distance = gateOk && tierOk && liveSpread !== undefined
+        && actor.config.entryBps !== undefined && actor.kind !== 'premium'
+        ? this.entryDistanceBps(actor.config, liveSpread, nextTier) : null;
+      const withinProximity = distance === null || liveSpread === undefined
+        || this.applyMakerEntryProximity(actor, liveSpread, distance, nextTier);
+      if (gateOk && tierOk && withinProximity) {
         const entryQuantity = this.carryAdjustedMakerQuantity(actor, exposure, Decimal.min(perOrder, entryCapacity));
         if (entryQuantity.gt(QUANTITY_EPSILON)) intents.push({ intent: 'entry', quantity: entryQuantity, tier: nextTier });
       }
     }
-    if (actor.kind === 'auto' && actor.config.takeProfitBps && matched.gt(QUANTITY_EPSILON)) {
-      intents.push({ intent: 'exit', quantity: Decimal.min(perOrder, matched), tier: 0 });
+    if (actor.kind === 'auto' && actor.config.takeProfitBps) {
+      if (exposure.left.abs().lte(QUANTITY_EPSILON) && exposure.right.abs().lte(QUANTITY_EPSILON)) {
+        // Fully flat (exit complete, or the venue closed the position elsewhere): retire the latch
+        // so a fresh entry cycle may begin. Mirrors the two-leg flat test in `checkCompletion`.
+        if (actor.makerExitArmed) await this.retireMakerExit(actor);
+      } else {
+        // Price trigger: arm the exit latch when the live exit spread reaches the take-profit level.
+        // A missing book can never *arm* the latch — but it must never *disarm* it, nor go quiet,
+        // either. Once armed, a null `exitSpread` only suppresses new arming: the maker exit quote
+        // stays resting, the hedge leg keeps unwinding, and the time fallback still runs. Silencing
+        // those on a data outage would strand an imbalanced pair exactly when the fallback matters.
+        const exitSpread = this.exitSpreadBps(actor.config);
+        if (exitSpread !== null
+          && exitSpread.lte(new Decimal(actor.config.takeProfitBps))
+          && matched.gt(QUANTITY_EPSILON)) {
+          actor.makerExitArmed = true;
+          if (actor.makerExitStartedAt === null) actor.makerExitStartedAt = this.options.now();
+        }
+        if (actor.makerExitArmed) {
+          // Time fallback is gated on the clock alone — never on the live spread.
+          this.maybeLogMakerExitFallback(actor);
+          // Keep unwinding the hedge leg even with no exit spread. `evaluate` already ran
+          // `reconcileExposure` → `ensureHedged` → `ensureMakerExitFlat` this tick; this call keeps
+          // the guarantee local to the latch and is idempotent within a tick (the TTL/terminal
+          // guards collapse it to a no-op), and it skips itself cleanly when the hedge leg's own book
+          // is missing. It is a reduce-only limit, never a market order, and never cancels the maker
+          // exit quote.
+          await this.ensureMakerExitFlat(actor, exposure);
+          // Size the exit from the maker leg's own remaining position, never the matched quantity:
+          // after a partial hedge the two differ, and the maker exit only ever reduces the maker leg.
+          const makerLeg = (actor.config.makerLeg ?? 'left') === 'left' ? legs.left : legs.right;
+          const makerRemaining = makerLeg.leg === 'left' ? exposure.left.abs() : exposure.right.abs();
+          // The venue-truth clamp keeps a drifted ledger from resubmitting an exit the venue already
+          // rejected for exceeding the position; a zero clamp drops the intent and the cleanup loop
+          // below withdraws any resting exit quote.
+          const exitQuantity = this.exitQuantityFor(actor, Decimal.min(perOrder, makerRemaining));
+          if (exitQuantity.gt(QUANTITY_EPSILON)) {
+            intents.push({ intent: 'exit', quantity: exitQuantity, tier: 0 });
+          }
+        }
+      }
     }
     for (const [intent] of [...actor.quotes]) {
       if (!intents.some((candidate) => candidate.intent === intent)) {
@@ -2424,6 +2742,41 @@ export class StrategyEngine {
     for (const candidate of intents) {
       await this.maintainQuote(actor, candidate.intent, candidate.quantity, candidate.tier);
     }
+  }
+
+  /**
+   * Applies the maker entry proximity band to one evaluation and reports whether the entry quote
+   * may be rested. The band is inclusive: a distance of exactly `MAKER_ENTRY_PROXIMITY_BPS` passes.
+   *
+   * Only the transitions of `makerEntryParked` are logged — one row when the spread leaves the band
+   * and one when it comes back — so a strategy parked for hours does not write a strategy-log row
+   * on every 500ms tick (a parked strategy is quiescent by definition, not an error).
+   */
+  private applyMakerEntryProximity(
+    actor: StrategyActor,
+    spread: Decimal,
+    distance: Decimal,
+    tier: number,
+  ): boolean {
+    if (distance.gt(MAKER_ENTRY_PROXIMITY_BPS)) {
+      if (actor.makerEntryParked) return false;
+      actor.makerEntryParked = true;
+      const level = this.tierLevelBps(actor.config, tier);
+      this.runtime.addStrategyLog(actor.id, 'info', 'Maker quoting parked',
+        `Live spread ${spread.toFixed(2)} bps · ${distance.toFixed(2)} bps away from the ${level.toFixed(2)} bps entry trigger`,
+        '—',
+        `No entry quote is rested while the live spread is more than ${MAKER_ENTRY_PROXIMITY_BPS} bps from the trigger`);
+      return false;
+    }
+    if (actor.makerEntryParked) {
+      actor.makerEntryParked = false;
+      const level = this.tierLevelBps(actor.config, tier);
+      this.runtime.addStrategyLog(actor.id, 'info', 'Maker quoting resumed',
+        `Live spread ${spread.toFixed(2)} bps · inside the ${MAKER_ENTRY_PROXIMITY_BPS} bps band around the ${level.toFixed(2)} bps entry trigger`,
+        '—',
+        `Entry quoting resumes now that the live spread is within ${MAKER_ENTRY_PROXIMITY_BPS} bps of the trigger`);
+    }
+    return true;
   }
 
   private async maintainQuote(actor: StrategyActor, intent: QuoteIntent, quantity: Decimal, tier = 0): Promise<void> {
@@ -2470,6 +2823,12 @@ export class StrategyEngine {
         `Post-only at ${desired.price.toString()}`, `${roundedQuantity.toString()} ${actor.config.asset}`,
         `${desired.makerLeg.side} ${desired.makerLeg.symbol}`);
     } catch (error) {
+      if (intent === 'exit' && isReduceOnlyQuantityRejection(error)) {
+        // The venue holds less than the ledger: reconcile now and re-report at the venue's
+        // real size instead of spending the five-strike budget on a state mismatch.
+        const outcome = await this.reconcileExitQuantity(actor, desired.makerLeg.symbol, desired.makerLeg.side, roundedQuantity);
+        if (outcome === 'clamped') return;
+      }
       actor.failureCount += 1;
       actor.cooldownUntil = this.options.now() + Math.min(60_000, 2_000 * 2 ** Math.min(4, actor.failureCount));
       this.runtime.addStrategyLog(actor.id, 'warning', 'Maker quote rejected', `Post-only at ${desired.price.toString()}`,
@@ -2718,8 +3077,159 @@ export class StrategyEngine {
     return complete;
   }
 
+  /**
+   * Write the one-shot `Maker exit fallback` row once a latched maker exit has overrun its budget.
+   * A single row per latch: the slippage widening it announces is sticky until the latch retires,
+   * so restating it on every 500ms tick would only bury the signal it exists to raise.
+   */
+  private maybeLogMakerExitFallback(actor: StrategyActor): void {
+    if (!actor.makerExitArmed || actor.makerExitFallbackLogged || actor.makerExitStartedAt === null) return;
+    if (this.options.now() - actor.makerExitStartedAt < MAKER_EXIT_FALLBACK_MS) return;
+    actor.makerExitFallbackLogged = true;
+    this.runtime.addStrategyLog(actor.id, 'warning', 'Maker exit fallback',
+      `Maker exit has not completed within ${Math.round(MAKER_EXIT_FALLBACK_MS / 1_000)} s`,
+      `0 ${actor.config.asset} closed`,
+      `Widening the hedge-leg exit slippage cap to ${MAKER_EXIT_HEDGE_FALLBACK_SLIPPAGE_BPS} bps`);
+  }
+
+  /** Cancel the tracked hedge-leg exit limit (if any), forget it, and best-effort drop it remotely. */
+  private async cancelMakerExitHedge(actor: StrategyActor): Promise<void> {
+    const hedge = actor.makerExitHedge;
+    actor.makerExitHedge = null;
+    if (!hedge) return;
+    try { await this.runtime.cancelOrder(hedge.orderId); }
+    catch { /* Already terminal or gone: nothing left to cancel. */ }
+  }
+
+  /**
+   * Retire the maker-exit latch once both legs are flat: clear the bookkeeping and drop any hedge
+   * order still resting, so the strategy is free to enter again.
+   */
+  private async retireMakerExit(actor: StrategyActor): Promise<void> {
+    await this.cancelMakerExitHedge(actor);
+    actor.makerExitArmed = false;
+    actor.makerExitStartedAt = null;
+    actor.makerExitFallbackLogged = false;
+    actor.makerExitHedgeRequotes = 0;
+    // A retired latch starts a fresh entry cycle: the hedge strike budget and its backoff gate
+    // must not carry over into it.
+    actor.makerExitHedgeFailures = 0;
+    actor.makerExitHedgeRetryAt = 0;
+  }
+
+  /**
+   * Unwind the hedge leg toward the maker leg's remaining exposure during a latched maker exit.
+   *
+   * The generic "top up the lagging leg" repair would reopen the leg the exit already reduced and
+   * pin the pair back to its full size (the livelock this path exists to break), so while the exit
+   * latch is set that repair is bypassed entirely (see {@link ensureHedged}). Only the hedge leg is
+   * trimmed, and only by a **reduce-only limit** resting within a bounded slippage of the mid — a
+   * market order is never used. A single hedge order is allowed at a time: it is left to fill for
+   * {@link MAKER_EXIT_HEDGE_TTL_MS}, then cancelled and re-priced at the new mid.
+   */
+  private async ensureMakerExitFlat(
+    actor: StrategyActor,
+    exposure: { left: Decimal; right: Decimal },
+  ): Promise<void> {
+    const legs = legsOf(actor.config);
+    const makerLegKey = actor.config.makerLeg ?? 'left';
+    const makerLeg = makerLegKey === 'left' ? legs.left : legs.right;
+    const hedgeLeg = makerLegKey === 'left' ? legs.right : legs.left;
+    const makerQuantity = makerLeg.leg === 'left' ? exposure.left.abs() : exposure.right.abs();
+    const hedgeQuantity = hedgeLeg.leg === 'left' ? exposure.left.abs() : exposure.right.abs();
+    const target = hedgeQuantity.minus(makerQuantity);
+    const now = this.options.now();
+    // Backoff gate FIRST, before any venue interaction: a persistently rejected hedge submit must
+    // neither re-storm the exchange nor cancel the still-resting hedge order while waiting. Both
+    // same-tick callers (the `reconcileExposure` path and the armed quote branch) share this one
+    // timestamp — they read the same injected clock, so whichever runs second inside one
+    // evaluation is always a no-op, which is what caps the storm at one submit per tick.
+    if (now < actor.makerExitHedgeRetryAt) return;
+    // Settle the resting hedge order's state first: a terminal one frees the single-order slot; a
+    // still-open one older than its TTL is cancelled so it can be re-priced below.
+    const existing = actor.makerExitHedge;
+    if (existing) {
+      const order = this.runtime.getOrder(existing.orderId);
+      if (isTerminalOrderState(order.state)) {
+        actor.makerExitHedge = null;
+      } else if (now - existing.placedAt < MAKER_EXIT_HEDGE_TTL_MS) {
+        return;
+      } else {
+        try { await this.runtime.cancelOrder(existing.orderId); }
+        catch { /* Already terminal or gone. */ }
+        actor.makerExitHedge = null;
+        actor.makerExitHedgeRequotes += 1;
+      }
+    }
+    if (target.lte(QUANTITY_EPSILON)) return;
+    if (actor.busy || (actor.status !== 'RUNNING' && !actor.suspended) || now < actor.cooldownUntil) return;
+    const market = this.freshMarket(hedgeLeg.symbol);
+    if (!market) return;
+    const mid = new Decimal(market.bidPrice).plus(market.askPrice).div(2);
+    if (!mid.gt(0)) return;
+    // A starved exit concedes more of the mid to get filled, but never without a hard cap.
+    const widened = actor.makerExitStartedAt !== null
+      && now - actor.makerExitStartedAt >= MAKER_EXIT_FALLBACK_MS;
+    const slippage = new Decimal(widened
+      ? MAKER_EXIT_HEDGE_FALLBACK_SLIPPAGE_BPS
+      : MAKER_EXIT_HEDGE_SLIPPAGE_BPS);
+    const side: 'BUY' | 'SELL' = hedgeQuantity.gt(0) ? 'SELL' : 'BUY';
+    const rawPrice = side === 'SELL'
+      ? mid.mul(ONE.minus(slippage.div(BPS)))
+      : mid.mul(ONE.plus(slippage.div(BPS)));
+    const constraints = this.constraintsFor(hedgeLeg.symbol);
+    const price = roundToStep(rawPrice, constraints.tickSize, side === 'SELL' ? 'down' : 'up');
+    const quantity = roundToStep(target, constraints.lotSize, 'down');
+    if (!price.gt(0) || !quantity.gt(QUANTITY_EPSILON)) return;
+    actor.busy = true;
+    try {
+      const clip = `exit-hedge-${randomUUID().replaceAll('-', '').slice(0, 12)}`;
+      const order = await this.runtime.createOrder({
+        symbol: hedgeLeg.symbol, side, type: 'LIMIT', timeInForce: 'GTC',
+        quantity: quantity.toString(), price: price.toString(), reduceOnly: true,
+      }, { strategyId: actor.id, strategyLeg: hedgeLeg.leg, strategyClip: clip, riskReducing: true });
+      actor.makerExitHedge = { orderId: order.id, price, placedAt: now, leg: hedgeLeg.leg, quantity };
+      // A real submission clears the hedge's own strike budget, so a later failure streak counts
+      // from scratch instead of inheriting the previous rung.
+      actor.makerExitHedgeFailures = 0;
+    } catch (error) {
+      // The hedge carries its own strike budget and backoff instead of borrowing the generic
+      // `failureCount`/`cooldownUntil`: those are read by the entry and two-leg insufficient-margin
+      // paths, and before this guard the hedge path returned without ever touching them — so a
+      // persistently rejected hedge retried twice per tick, forever, with no strike budget.
+      // Mirrors `executeTakerClip`: a 429's `retryAfterMs` wins, otherwise exponential from 2 s
+      // capped at 60 s. The backoff gate above is what thins the failure log to at most one row
+      // per cooldown window — no extra dedup machinery.
+      actor.makerExitHedgeFailures += 1;
+      const rateLimitWait = error instanceof GateApiError && error.statusCode === 429
+        ? error.retryAfterMs ?? 30_000
+        : 0;
+      actor.makerExitHedgeRetryAt = this.options.now() + Math.max(
+        rateLimitWait,
+        Math.min(60_000, 2_000 * 2 ** Math.min(4, actor.makerExitHedgeFailures)),
+      );
+      this.runtime.addStrategyLog(actor.id, 'warning', 'Leg submission failed',
+        `Maker exit hedge for ${target.toString()} ${actor.config.asset}`, quantity.toString(),
+        error instanceof Error ? error.message.slice(0, 120) : 'submit error');
+      if (actor.makerExitHedgeFailures >= 5) {
+        await this.pause(actor, 'Maker exit hedge order was rejected 5 consecutive times; the position cannot unwind automatically — review the hedge leg manually');
+      }
+    } finally {
+      actor.busy = false;
+    }
+  }
+
   private async ensureHedged(actor: StrategyActor, exposure: { left: Decimal; right: Decimal }): Promise<void> {
     if (actor.busy || (actor.status !== 'RUNNING' && !actor.suspended)) return;
+    // A latched maker exit must NEVER fall through to the generic "top up the lagging leg" repair:
+    // that repair reopens the very leg the exit reduced and pins the pair back to its full size —
+    // exactly the livelock this path breaks. While armed, only the hedge leg may be trimmed (never
+    // grown), and only by {@link ensureMakerExitFlat}.
+    if (actor.makerExitArmed && actor.kind === 'auto' && actor.config.takeProfitBps
+      && actor.config.executionMethod === 'MAKER_TAKER') {
+      await this.ensureMakerExitFlat(actor, exposure);
+      return;
+    }
     // One repair target per pass: for equal-notional the oldest broken clip (each clip has its
     // own intended ratio), otherwise the global fixed-ratio imbalance. `k` is always the
     // right-shares-per-ADR-unit conversion used to size a right-leg repair order.

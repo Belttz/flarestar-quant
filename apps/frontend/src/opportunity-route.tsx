@@ -8,6 +8,8 @@ import type {
   OpportunityResponse,
   PreIpoFilterMode,
   SpreadOpportunity,
+  SpreadQualityResponse,
+  SpreadQualityRow,
 } from '@gate-crossex/shared-types';
 import { api } from './api.js';
 import type { FrontendQuery, FrontendRoute, OpportunityBoard } from './frontend-routes.js';
@@ -25,7 +27,12 @@ import {
 } from './funding-hedge.js';
 import { FundingHedgeTable, FundingRankingTable } from './funding-hedge-tables.js';
 import { useLanguage } from './i18n.js';
-import { assetIcon, assetName, exchanges, fundingVenueName, VenueIcon, type PairedPositionPrefill } from './route-shared.js';
+import { assetIcon, assetName, exchanges, formatOpportunityAmount, fundingVenueName, VenueIcon, type PairedPositionPrefill } from './route-shared.js';
+import { SpreadQualitySourceBadge, SpreadQualityTable } from './spread-quality-table.js';
+
+// The amount formatter moved to route-shared so the spread-quality table can share it without a
+// circular import back into this module; the re-export keeps this module's public surface stable.
+export { formatOpportunityAmount };
 
 /** Query shape accepted by `api.opportunities`, derived so the two can never drift apart. */
 export type OpportunityRequest = NonNullable<Parameters<typeof api.opportunities>[0]>;
@@ -203,6 +210,9 @@ const BOARD_SORT_KEYS: Readonly<Record<OpportunityBoard, readonly OpportunitySor
   funding: ['default', 'apr', 'volume', 'oi', 'asset'],
   'funding-top': ['default', 'apr', 'volume', 'oi', 'asset'],
   spread: ['default', 'spread', 'volume', 'oi', 'asset'],
+  // The spread-quality board is pre-ranked server side by its composite score; v1 ships no
+  // column-header sorting, so only the board's own (default) ranking exists.
+  'spread-quality': ['default'],
 };
 
 /**
@@ -221,7 +231,7 @@ const DEFAULT_HEDGE_SORT: FundingHedgeSortKey = 'apr';
 const FUNDING_RANKING_LIMITS: readonly number[] = [25, 50, 100];
 const DEFAULT_RANKING_LIMIT = 50;
 
-const DEFAULT_OPPORTUNITY_FILTERS: OpportunityViewFilters = {
+export const DEFAULT_OPPORTUNITY_FILTERS: OpportunityViewFilters = {
   minApr: '', minBps: '', asset: '', executableOnly: true,
   // Spot filtering starts off: the board opens on perpetual pairs, and spot legs are opt-in.
   venues: '', markets: 'perp', superClasses: '', classes: '',
@@ -360,6 +370,20 @@ export function toggleSortState(
   return { key, dir: 'desc' };
 }
 
+/**
+ * Apply a column-header click to one board's filter model. `toggleSortState` speaks the URL's
+ * `{ key, dir }` vocabulary while the filter model stores the column as `sort`, so the toggle
+ * result must be mapped field by field: spreading it directly writes a dead `key` field and
+ * silently leaves `sort` on `default`, and the board would never re-sort.
+ */
+export function applySortToggle(
+  filters: OpportunityViewFilters,
+  key: Exclude<OpportunitySortKey, 'default'>,
+): OpportunityViewFilters {
+  const next = toggleSortState({ key: filters.sort, dir: filters.dir }, key);
+  return { ...filters, sort: next.key, dir: next.dir, page: '1' };
+}
+
 /** Parse a 1-based page number; blank, zero and junk fall back to page 1. */
 export function parsePageValue(value: string): number {
   const parsed = Number(value.trim());
@@ -388,20 +412,6 @@ export function opportunityRowMatchesAssetFilters(
   if (preIpo === 'only' && !row.isPreIpo) return false;
   if (preIpo === 'exclude' && row.isPreIpo) return false;
   return true;
-}
-
-/** Compact amount formatter shared by the volume / open-interest cells. */
-const amountFormatter = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 });
-
-/**
- * Format a Decimal-string amount for the volume / open-interest columns. Missing data (`null`,
- * unparsable text, zero) renders as `—` — the venue simply does not publish the figure.
- */
-export function formatOpportunityAmount(value: string | null | undefined): string {
-  if (value === null || value === undefined) return '—';
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed <= 0) return '—';
-  return amountFormatter.format(parsed);
 }
 
 /**
@@ -526,7 +536,7 @@ function opportunityFiltersFromQuery(board: OpportunityBoard): OpportunityViewFi
 }
 
 /** Flatten one board's filters into the URL record consumed by `useFilterQuerySync`. */
-function serializeOpportunityFilters(filters: OpportunityViewFilters): Record<string, string | boolean> {
+export function serializeOpportunityFilters(filters: OpportunityViewFilters): Record<string, string | boolean> {
   const sortState = serializeSortState({ key: filters.sort, dir: filters.dir });
   const page = parsePageValue(filters.page);
   const pageSize = parsePageSizeValue(filters.pageSize);
@@ -634,6 +644,7 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
   const isFundingBoard = board === 'funding';
   const isFundingTopBoard = board === 'funding-top';
   const isSpreadBoard = board === 'spread';
+  const isSpreadQualityBoard = board === 'spread-quality';
   // Funding hedge legs: perpetual pairs come from the venue funding overview, spot pairs from the
   // carry board. Kept in view state rather than the URL because both modes page client-side.
   const [hedgeMode, setHedgeMode] = useState<'spot' | 'perp'>('spot');
@@ -651,14 +662,25 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [fundingFilters, setFundingFilters] = useState<OpportunityViewFilters>(() => opportunityFiltersFromQuery('funding'));
   const [spreadFilters, setSpreadFilters] = useState<OpportunityViewFilters>(() => opportunityFiltersFromQuery('spread'));
+  // Spread-quality board: its own endpoint, its own snapshot. The board keeps no filters in the
+  // URL (the server pre-ranks the whole candidate set), so view state is fetch state only.
+  const [spreadQualityData, setSpreadQualityData] = useState<SpreadQualityResponse | null>(null);
+  const [spreadQualityLoading, setSpreadQualityLoading] = useState(true);
+  const [spreadQualityFailed, setSpreadQualityFailed] = useState(false);
+  // Per-asset combination expansion, mirroring the spread board's controlled pattern: the payload
+  // is pair-level, so the table groups rows by asset and this state picks the expanded one.
+  const [expandedSpreadQuality, setExpandedSpreadQuality] = useState<string | null>(null);
 
   const boardPath = board === 'spread' ? '/opportunities/spread'
-    : board === 'funding-top' ? '/opportunities/funding-top' : '/opportunities/funding';
-  // The ranking board owns its own toolbar state (venue + row count), so it keeps no opportunity
-  // filters in the URL at all.
+    : board === 'funding-top' ? '/opportunities/funding-top'
+    : board === 'spread-quality' ? '/opportunities/spread-quality' : '/opportunities/funding';
+  // The ranking boards own their own toolbar state (venue + row count, or none at all), so they
+  // keep no opportunity filters in the URL.
   useFilterQuerySync(
-    useMemo(() => (isFundingTopBoard ? {} : asFilterRecord(serializeOpportunityFilters(isFundingBoard ? fundingFilters : spreadFilters))),
-      [fundingFilters, isFundingBoard, isFundingTopBoard, spreadFilters]),
+    useMemo(() => (isFundingTopBoard || isSpreadQualityBoard
+      ? {}
+      : asFilterRecord(serializeOpportunityFilters(isFundingBoard ? fundingFilters : spreadFilters))),
+      [fundingFilters, isFundingBoard, isFundingTopBoard, isSpreadQualityBoard, spreadFilters]),
     boardPath,
   );
 
@@ -673,7 +695,9 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
    * stable while the user types, and so the cache key can be derived once for both paths.
    */
   const boardRequest = useMemo<OpportunityRequest | null>(() => {
-    if (isFundingTopBoard) return null;
+    // The ranking boards read the venue funding overview, and the spread-quality board its own
+    // endpoint — neither goes through the opportunity endpoint.
+    if (isFundingTopBoard || isSpreadQualityBoard) return null;
     const activeFilters = isFundingBoard ? fundingFilters : spreadFilters;
     const asset = activeFilters.asset.trim().toUpperCase();
     const minApr = isFundingBoard ? parseFilterNumber(fundingFilters.minApr) : null;
@@ -707,7 +731,7 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
       offset: (page - 1) * pageSize,
       pageSize,
     };
-  }, [board, expandedAsset, fundingFilters, isFundingBoard, isFundingTopBoard, spreadFilters]);
+  }, [board, expandedAsset, fundingFilters, isFundingBoard, isFundingTopBoard, isSpreadQualityBoard, spreadFilters]);
 
   // Monotonic generation stamp: a response landing after a newer request must not overwrite it.
   const loadGeneration = useRef(0);
@@ -731,6 +755,27 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
       if (loadGeneration.current === generation) setLoading(false);
     });
   }, [boardRequest]);
+
+  /**
+   * Spread-quality board fetch. Same out-of-order guard as `load`: a soft refresh landing after a
+   * manual one (or after a tab switch re-mounted the effect) must not overwrite the newer snapshot.
+   */
+  const spreadQualityGeneration = useRef(0);
+  const loadSpreadQuality = useCallback((force = false) => {
+    const generation = spreadQualityGeneration.current + 1;
+    spreadQualityGeneration.current = generation;
+    setSpreadQualityLoading(true);
+    api.spreadQuality(force ? { refresh: true } : {}).then((response) => {
+      if (spreadQualityGeneration.current !== generation) return;
+      setSpreadQualityData(response);
+      setSpreadQualityFailed(false);
+    }).catch(() => {
+      if (spreadQualityGeneration.current !== generation) return;
+      setSpreadQualityFailed(true);
+    }).finally(() => {
+      if (spreadQualityGeneration.current === generation) setSpreadQualityLoading(false);
+    });
+  }, []);
 
   // The funding hedge board in perpetual mode and the ranking board read the venue funding
   // overview instead; the opportunity endpoint is not fetched for them at all.
@@ -761,6 +806,16 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
     return () => window.clearInterval(timer);
   }, [load, boardRequest]);
 
+  // The spread-quality board soft-refreshes on the same 30s foreground cadence as the others.
+  useEffect(() => {
+    if (!isSpreadQualityBoard) return undefined;
+    loadSpreadQuality();
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') loadSpreadQuality();
+    }, SOFT_REFRESH_MS);
+    return () => window.clearInterval(timer);
+  }, [isSpreadQualityBoard, loadSpreadQuality]);
+
   useEffect(() => {
     const timer = window.setInterval(() => setNowMs(Date.now()), 30_000);
     return () => window.clearInterval(timer);
@@ -769,8 +824,11 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
   const activeFilters = isFundingBoard ? fundingFilters : spreadFilters;
   const page = parsePageValue(activeFilters.page);
   const pageSize = parsePageSizeValue(activeFilters.pageSize);
-  // `funding-top` has no server-paged row set of its own; its panel reports its own count.
-  const totalRows = isFundingTopBoard ? 0 : isFundingBoard ? data?.totals.funding ?? 0 : data?.totals.spread ?? 0;
+  // `funding-top` and `spread-quality` have no server-paged row set of their own; each panel
+  // reports its own count.
+  const totalRows = isFundingTopBoard || isSpreadQualityBoard
+    ? 0
+    : isFundingBoard ? data?.totals.funding ?? 0 : data?.totals.spread ?? 0;
   const pageCount = Math.max(1, Math.ceil(totalRows / pageSize));
   // When a filter shrink drops the backend below the requested offset, walk the page back into range.
   useEffect(() => {
@@ -889,24 +947,38 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
     () => isFundingTopBoard ? buildVenueFundingRanking(fundingOverview?.assets ?? [], rankingVenue, Number.MAX_SAFE_INTEGER).length : 0,
     [fundingOverview, isFundingTopBoard, rankingVenue],
   );
+  // --- Spread-quality board --------------------------------------------------------------
+  // The payload is pair-level and pre-ranked server side by composite score; the table groups the
+  // rows per asset for the expand view, so no client-side sorting or slicing happens here.
+  const spreadQualityRows = useMemo<SpreadQualityRow[]>(
+    () => (isSpreadQualityBoard ? spreadQualityData?.rows ?? [] : []),
+    [isSpreadQualityBoard, spreadQualityData],
+  );
 
   const sortState: OpportunitySortState = { key: activeFilters.sort, dir: activeFilters.dir };
   const onSortToggle = (key: Exclude<OpportunitySortKey, 'default'>) => {
-    patchFilters((current) => ({ ...current, ...toggleSortState({ key: current.sort, dir: current.dir }, key), page: '1' }));
+    patchFilters((current) => applySortToggle(current, key));
   };
   const locale = language === 'zh' ? 'zh-CN' : 'en-GB';
   const toggleExpandedAsset = (asset: string) => {
     setExpandedAsset((current) => (current === asset ? null : asset));
   };
-  // The ranking board reports the overview's own freshness; the other boards report the payload's.
+  const toggleExpandedSpreadQuality = (asset: string) => {
+    setExpandedSpreadQuality((current) => (current === asset ? null : asset));
+  };
+  // The ranking board reports the overview's own freshness and the spread-quality board its
+  // payload's; the other boards report the opportunity payload's.
   const freshness = isFundingTopBoard
     ? (fundingOverview ? { at: fundingOverview.fetchedAt, stale: fundingOverview.cacheStatus === 'stale' } : null)
-    : (data ? { at: data.fetchedAt, stale: data.cacheStatus === 'stale' } : null);
-  const refreshing = loading || overviewLoading;
+    : isSpreadQualityBoard
+      ? (spreadQualityData ? { at: spreadQualityData.fetchedAt, stale: spreadQualityData.cacheStatus === 'stale' } : null)
+      : (data ? { at: data.fetchedAt, stale: data.cacheStatus === 'stale' } : null);
+  const refreshing = loading || overviewLoading || spreadQualityLoading;
   // A manual click must always produce new data: drop the client-side freshness window and ask the
   // backend to recompute too (`refresh=1`), so "Refresh" never silently replays the cached board.
   const refreshActive = () => {
     if (isFundingTopBoard || (isFundingBoard && hedgeMode === 'perp')) loadOverview();
+    else if (isSpreadQualityBoard) loadSpreadQuality(true);
     else load(true);
   };
   return <div className="alternate-view opportunity-view">
@@ -940,9 +1012,13 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
         onClick={() => navigate({ workspace: 'Opportunities', board: 'funding-top' })}>
         {t('Funding-rate ranking')}
       </button>
+      <button role="tab" aria-selected={isSpreadQualityBoard} className={isSpreadQualityBoard ? 'active' : ''}
+        onClick={() => navigate({ workspace: 'Opportunities', board: 'spread-quality' })}>
+        {t('Spread quality board')}
+      </button>
     </div>
 
-    {!isFundingTopBoard && <OpportunityClassFilters
+    {!isFundingTopBoard && !isSpreadQualityBoard && <OpportunityClassFilters
       filters={activeFilters}
       onToggleSuperClass={(value) => patchFilters((current) => ({
         ...current,
@@ -986,7 +1062,7 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
         <span>{t('Exchanges')}</span>
         {fundingVenueOptions().map((venue) => {
           const selected = hedgeVenues.includes(venue.code);
-          return <button key={venue.id} type="button" className={selected ? 'selected' : ''} aria-pressed={selected}
+          return <button key={venue.id} type="button" role="checkbox" className={selected ? 'selected' : ''} aria-checked={selected}
             onClick={() => setHedgeVenues((current) => toggleSpreadFilterValue(current, venue.code))}>
             <VenueIcon id={venue.id} short={venue.short} />{venue.name}<em>{selected ? '✓' : '+'}</em>
           </button>;
@@ -1103,7 +1179,7 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
             <span>{t('Exchanges')}</span>
             {exchanges.map((venue) => {
               const selected = selectedVenues.includes(venue.id.toUpperCase());
-              return <button key={venue.id} className={selected ? 'selected' : ''} aria-pressed={selected}
+              return <button key={venue.id} role="checkbox" className={selected ? 'selected' : ''} aria-checked={selected}
                 onClick={() => patchFilters((current) => ({
                   ...current,
                   venues: serializeVenueFilter(toggleSpreadFilterValue(parseVenueFilter(current.venues), venue.id.toUpperCase())),
@@ -1118,7 +1194,7 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
             <span>{t('Market type')}</span>
             {ALL_SPREAD_MARKETS.map((market) => {
               const selected = selectedMarkets.includes(market);
-              return <button key={market} className={selected ? 'selected' : ''} aria-pressed={selected}
+              return <button key={market} role="checkbox" className={selected ? 'selected' : ''} aria-checked={selected}
                 onClick={() => patchFilters((current) => ({
                   ...current,
                   markets: serializeMarketFilter(toggleSpreadFilterValue(parseMarketFilter(current.markets), market)),
@@ -1204,6 +1280,27 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
           onPageChange={(nextPage) => patchFilters((current) => ({ ...current, page: String(nextPage) }))}
           onPageSizeChange={(size) => patchFilters((current) => ({ ...current, pageSize: String(size), page: '1' }))}
         />
+      </section>
+    </>}
+
+    {isSpreadQualityBoard && <>
+      <section className="opportunity-board terminal-panel" aria-labelledby="opportunity-spread-quality-title">
+        <header className="opportunity-board-head">
+          <h2 id="opportunity-spread-quality-title">{t('Spread quality')}</h2>
+          <small>{t('Ranked by 24h spread-distribution quality: mean, volatility, skewness, reversion speed, holding cost and book depth.')}</small>
+          {spreadQualityRows.length > 0 && <SpreadQualitySourceBadge source={spreadQualityRows[0].source} />}
+        </header>
+        {spreadQualityFailed && <p className="opportunity-error" role="alert">{t('Unable to load opportunities')}. {t('Check the backend connection and try again.')}</p>}
+        {spreadQualityRows.length === 0 && !spreadQualityFailed && <div className="empty-state"><span>◎</span>
+          <strong>{spreadQualityLoading ? t('Loading…') : t('No opportunities match the current filters.')}</strong></div>}
+        {spreadQualityRows.length > 0 && <SpreadQualityTable
+          rows={spreadQualityRows}
+          expandedAsset={expandedSpreadQuality}
+          onToggleExpand={toggleExpandedSpreadQuality}
+        />}
+        {spreadQualityData && <p className="opportunity-hint">
+          {t('Showing')} {spreadQualityRows.length} / {spreadQualityData.totalCandidates} {t('Candidates')}
+        </p>}
       </section>
     </>}
   </div>;

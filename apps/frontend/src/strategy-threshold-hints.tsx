@@ -23,8 +23,8 @@ export interface AutoThresholdHintsProps {
  * there is no branch here (§8.5.6).
  *
  * Presentational and exported so the copy can be asserted from static markup — there is no
- * jsdom in this workspace. It never uses `aria-pressed`; the dialog-level SSR assertion reserves
- * that attribute for the spread board's exchange/market buttons.
+ * jsdom in this workspace. It never uses `aria-pressed`; the dialog-level SSR assertion bans
+ * that attribute across the app.
  */
 export function AutoThresholdHints({ view, armed }: AutoThresholdHintsProps) {
   const { t } = useLanguage();

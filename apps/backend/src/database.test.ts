@@ -30,8 +30,8 @@ describe('database migrations', () => {
 
     expect(readDatabaseStatus(first)).toEqual({
       state: 'ok',
-      migrationCount: 23,
-      currentMigration: '0023_portfolio_equity_samples.sql',
+      migrationCount: 24,
+      currentMigration: '0024_spread_samples.sql',
     });
     const strategyMetricsColumns = first.prepare('PRAGMA table_info(execution_strategies)').all() as Array<{ name: string }>;
     expect(strategyMetricsColumns.map((column) => column.name)).toContain('metrics_json');
@@ -54,7 +54,7 @@ describe('database migrations', () => {
     first.close();
 
     const reopened = openDatabase(location.path, migrationsDir);
-    expect(readDatabaseStatus(reopened).migrationCount).toBe(23);
+    expect(readDatabaseStatus(reopened).migrationCount).toBe(24);
     reopened.close();
   });
 
@@ -149,7 +149,7 @@ describe('database migrations', () => {
     const database = openDatabase(location.path, resolve(process.cwd(), '../../migrations'));
     const columns = database.prepare('PRAGMA table_info(audit_events)').all() as Array<{ name: string }>;
     expect(columns.map((column) => column.name)).toContain('correlation_id');
-    expect(readDatabaseStatus(database).currentMigration).toBe('0023_portfolio_equity_samples.sql');
+    expect(readDatabaseStatus(database).currentMigration).toBe('0024_spread_samples.sql');
     database.close();
   });
 

@@ -160,8 +160,8 @@ function OrderBookPanel({ book, trades, liveMarket, quote, base, sizeMultiplier,
     </div>
     {tab === 'book' && <>
       <div className="book-controls">
-        <div className="book-modes" role="group" aria-label={t('Order book layout')}>
-          {BOOK_MODES.map((mode) => <button key={mode.id} className={`depth-button${bookMode === mode.id ? ' active' : ''}`} onClick={() => setBookMode(mode.id)} aria-label={t(mode.label)} aria-pressed={bookMode === mode.id} title={t(mode.label)}><BookModeGlyph mode={mode.id} /></button>)}
+        <div className="book-modes" role="radiogroup" aria-label={t('Order book layout')}>
+          {BOOK_MODES.map((mode) => <button key={mode.id} role="radio" className={`depth-button${bookMode === mode.id ? ' active' : ''}`} onClick={() => setBookMode(mode.id)} aria-label={t(mode.label)} aria-checked={bookMode === mode.id} title={t(mode.label)}><BookModeGlyph mode={mode.id} /></button>)}
         </div>
         <div className="group-select" ref={groupRef}>
           <button ref={groupTriggerRef} className={`group-trigger${groupOpen ? ' open' : ''}`}
@@ -852,7 +852,7 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
       <dl className="market-stats">
         <div><dt>{t('Best bid')}</dt><dd>{priceText(Number(liveMarket?.bidPrice ?? displayedPrice))}</dd></div><div><dt>{t('24h high')}</dt><dd>{priceText(Number(liveMarket?.high24h ?? displayedPrice))}</dd></div><div><dt>{t('24h low')}</dt><dd>{priceText(Number(liveMarket?.low24h ?? displayedPrice))}</dd></div><div><dt>{t('24h volume')}</dt><dd>{liveMarket?.quoteVolume24h ? `$${(Number(liveMarket.quoteVolume24h) / 1_000_000).toFixed(1)}M` : '—'}</dd></div><div><dt>{t('Funding / Interval')}</dt><dd>{isSpot ? '—' : <><span className={Number(liveMarket?.fundingRate ?? 0) >= 0 ? 'positive' : 'negative'}>{((Number(liveMarket?.fundingRate ?? 0)) * 100).toFixed(4)}%</span> · <FundingCountdown target={nextFundingAt} /></>}</dd></div>
       </dl>
-      <button className="star-button" onClick={() => onToggleFavorite(symbol)} aria-label={`${isFavorite ? 'Remove' : 'Add'} ${asset} favorite`} aria-pressed={isFavorite}>{isFavorite ? '★' : '☆'}</button>
+      <button className="star-button" onClick={() => onToggleFavorite(symbol)} aria-label={`${isFavorite ? 'Remove' : 'Add'} ${asset} favorite`}>{isFavorite ? '★' : '☆'}</button>
     </section>
 
     <section className="terminal-grid">

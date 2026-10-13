@@ -60,6 +60,7 @@ import type {
   ReconciliationReportList,
   PublicMarketSnapshotResponse,
   ReadOnlyAccountSummary,
+  SpreadQualityResponse,
   SystemDiscovery,
   VenueFeeRatesResponse,
 } from '@gate-crossex/shared-types';
@@ -82,6 +83,8 @@ import { FundingOverviewService } from './funding-overview.js';
 import { canonicalMarketAsset } from './market-asset-aliases.js';
 import { CrossExMarketHub, CANDLE_INTERVALS, type LiveMarket, type MarketDefinition, type MarketHubMessage } from './market-hub.js';
 import { OpportunityService, type SpreadPairType, type SpotSymbolEntry } from './opportunity-service.js';
+import { SpreadSampler } from './spread-sampler.js';
+import { SpreadQualityService, SPREAD_BOARD_FETCH_LIMIT, SPREAD_QUALITY_CANDLE_PAGE_LIMIT, SPREAD_QUALITY_INTERVAL } from './spread-quality.js';
 import { StrategyEngine, StrategyEngineError, type StrategyEngineOptions } from './strategy-engine.js';
 import { TradingSession } from './trading-session.js';
 import { TradingRuntime, TradingRuntimeError, unresolvedOrderDetails } from './trading-runtime.js';
@@ -107,10 +110,12 @@ import {
   listReconciliationReports,
   readPortfolioEquityFirstSampleAt,
   readPortfolioEquitySeries,
+  readSpreadSeries,
   recordPortfolioEquitySample,
   savePortfolioSnapshot,
   saveReconciliationReport,
   saveActiveCredentialProfile,
+  spreadSampleCoverage,
   upsertPublicMarketSnapshot,
   upsertCredentialMetadata,
 } from './repositories.js';
@@ -1213,6 +1218,57 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     spotSymbolsByAsset,
   });
 
+  // The spread-quality board ranks capturable spreads rather than wide ones: it reads the
+  // spread board's combinations (cached by the service above) and rebuilds each candidate
+  // from 24h of 5m venue candles — one REST page per leg, routed through each venue's own
+  // spot/futures candlestick endpoint. Pairs that accumulated a full 24h of local samples
+  // (see the sampler below) are rebuilt from those instead.
+  const spreadQualityService = new SpreadQualityService({
+    fundingOverview: fundingOverviewService,
+    hub: marketHub,
+    spreadBoard: async (catalog) => (await opportunityService.list(catalog, {
+      funding: false,
+      spread: true,
+      offset: 0,
+      // The board computes its full row set per filter set and only slices on `limit`, so
+      // one large page retrieves every asset row (each carrying all of its combinations)
+      // in a single computation shared with the UI's own board request.
+      limit: SPREAD_BOARD_FETCH_LIMIT,
+    })).spread,
+    loadCandles: async (symbol) => publicMarketGateway.queryCandles
+      ? await publicMarketGateway.queryCandles(symbol, SPREAD_QUALITY_INTERVAL, SPREAD_QUALITY_CANDLE_PAGE_LIMIT)
+      : [],
+    samples: {
+      coverage: (pairs, fromMs) => spreadSampleCoverage(database, pairs, fromMs),
+      series: (leftSymbol, rightSymbol, fromMs) => readSpreadSeries(database, leftSymbol, rightSymbol, fromMs),
+    },
+  });
+
+  // Second track of the dual-source quality board: persist the executable spread of every
+  // quality candidate once per 30s boundary. Once a pair has a full 24h of samples the board
+  // rebuilds it from them (`source: 'samples'`); pairs below the coverage threshold keep
+  // using venue candles, so a freshly started terminal simply samples for later.
+  const spreadSampler = new SpreadSampler({
+    database,
+    hub: marketHub,
+    spreadBoard: async () => {
+      // Cached catalog only: a tick must never block on upstream discovery. Without one
+      // there is no candidate set to sample, and the next tick tries again.
+      const catalog = derivedMarketCatalog();
+      if (!catalog) {
+        app.log.warn('spread sampler skipped a tick: instrument catalog unavailable');
+        return [];
+      }
+      return (await opportunityService.list({ assets: catalog.assets }, {
+        funding: false,
+        spread: true,
+        offset: 0,
+        limit: SPREAD_BOARD_FETCH_LIMIT,
+      })).spread;
+    },
+    warn: (reason) => app.log.warn({ reason }, 'spread sampler tick failed'),
+  });
+
   let portfolioRefreshInFlight: { generation: number; promise: Promise<LivePortfolioSnapshot> } | null = null;
   const refreshPortfolio = (): Promise<LivePortfolioSnapshot> => {
     if (portfolioRefreshInFlight?.generation === credentialGeneration) return portfolioRefreshInFlight.promise;
@@ -1330,6 +1386,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     privateStream.start();
     strategyEngine.start();
     fundingHistoryService.startBackground();
+    spreadSampler.startBackground();
     databaseMaintenanceTimer = setInterval(() => {
       try {
         const result = runDatabaseMaintenance(database);
@@ -1348,6 +1405,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   }
   app.addHook('onClose', async () => {
     await fundingHistoryService.stopBackground();
+    await spreadSampler.stopBackground();
     await strategyEngine.stop();
     if (portfolioReconcileTimer) clearTimeout(portfolioReconcileTimer);
     if (databaseMaintenanceTimer) clearInterval(databaseMaintenanceTimer);
@@ -2494,6 +2552,41 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       expand: query.data.expand === '1',
       limit: query.data.pageSize ?? query.data.limit,
     }) satisfies OpportunityResponse;
+  });
+
+  const SpreadQualityQuerySchema = z.object({
+    // Pair-type whitelist; absent means both shapes are ranked together.
+    pairType: z.enum(['SPOT_PERP', 'PERP_PERP']).optional(),
+    limit: z.coerce.number().int().min(1).max(100).default(100),
+    // refresh=1 drops the 5-minute board cache — what the UI's manual Refresh button sends so a
+    // click always follows through even when the user is inside the freshness window.
+    refresh: z.literal('1').optional(),
+  });
+
+  app.get('/api/opportunities/spread-quality', async (request, reply) => {
+    const query = SpreadQualityQuerySchema.safeParse(request.query);
+    if (!query.success) return reply.code(400).send({ error: 'invalid_spread_quality_query' });
+    let catalog = derivedMarketCatalog();
+    if (!catalog) {
+      try {
+        await fetchInstrumentCatalog();
+        catalog = derivedMarketCatalog();
+      } catch (error) {
+        const errorCode = error instanceof GateApiError ? error.label : 'PUBLIC_DATA_ERROR';
+        recordMarketDataFailure(database, 'gate_crossex_instruments', new Date().toISOString(), errorCode);
+        request.log.warn({ reason: errorCode }, 'spread quality catalog discovery failed');
+      }
+      if (!catalog) return reply.code(502).send({ error: 'market_catalog_unavailable' });
+    } else if (Date.now() - Date.parse(catalog.fetchedAt) > MARKET_CATALOG_FRESH_MS) {
+      void fetchInstrumentCatalog().catch((error: unknown) => {
+        request.log.warn({ reason: error instanceof GateApiError ? error.label : 'PUBLIC_DATA_ERROR' }, 'spread quality catalog refresh failed');
+      });
+    }
+    if (query.data.refresh === '1') spreadQualityService.invalidateCache();
+    return await spreadQualityService.list({ assets: catalog.assets }, {
+      ...(query.data.pairType !== undefined ? { pairType: query.data.pairType } : {}),
+      limit: query.data.limit,
+    }) satisfies SpreadQualityResponse;
   });
 
   app.post('/api/markets/funding-history', {

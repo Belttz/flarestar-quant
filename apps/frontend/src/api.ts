@@ -24,6 +24,7 @@ import {
   OpportunityResponseSchema,
   PortfolioEquitySeriesResponseSchema,
   PublicMarketSnapshotResponseSchema,
+  SpreadQualityResponseSchema,
   StrategiesResponseSchema,
   StrategyLogsResponseSchema,
   StrategyRecordSchema,
@@ -291,6 +292,9 @@ function cachedRead<T>(ttlMs: number, load: () => Promise<T>): () => Promise<T> 
   };
 }
 
+/** Row depth the spread-quality board asks for when the caller names no explicit limit. */
+const DEFAULT_SPREAD_QUALITY_LIMIT = 50;
+
 export const api = {
   auth: {
     session: () => request(AuthSessionResponseSchema, '/api/auth/session'),
@@ -362,6 +366,27 @@ export const api = {
     if (options.pageSize !== undefined) params.set('pageSize', String(options.pageSize));
     else params.set('limit', String(options.limit ?? 50));
     return request(OpportunityResponseSchema, `/api/opportunities?${params}`);
+  },
+  /**
+   * Spread-quality board rows: the 24h distribution statistics of every (asset, sell venue, buy
+   * venue) spread, composite-scored and pre-ranked server side. The board keeps no other filters,
+   * so only a non-default pair type, row limit, or a forced refresh travels in the query.
+   */
+  spreadQuality: (options: {
+    /** Market-type whitelist; omitted means both `SPOT_PERP` and `PERP_PERP` pairs. */
+    pairType?: 'SPOT_PERP' | 'PERP_PERP';
+    /** Row cap; omitted keeps the board's own default ranking depth. */
+    limit?: number;
+    /** Sends `refresh=1` so the backend recomputes instead of serving its cached board. */
+    refresh?: boolean;
+  } = {}) => {
+    const params = new URLSearchParams();
+    if (options.refresh === true) params.set('refresh', '1');
+    if (options.pairType) params.set('pairType', options.pairType);
+    if (options.limit !== undefined && options.limit !== DEFAULT_SPREAD_QUALITY_LIMIT) {
+      params.set('limit', String(options.limit));
+    }
+    return request(SpreadQualityResponseSchema, `/api/opportunities/spread-quality?${params}`);
   },
   fundingHistory: (symbols: string[], durationDays: 1 | 7 | 30) => request(FundingHistoryResponseSchema, '/api/markets/funding-history', {
     method: 'POST',

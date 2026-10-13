@@ -8,8 +8,10 @@ import {
   ALL_ASSET_SUPER_CLASSES,
   ALL_PRE_IPO_MODES,
   ALL_SPREAD_VENUES,
+  DEFAULT_OPPORTUNITY_FILTERS,
   DEFAULT_OPPORTUNITY_PAGE_SIZE,
   OPPORTUNITY_PAGE_SIZES,
+  applySortToggle,
   formatOpportunityAmount,
   parseAssetClassFilter,
   parseAssetSuperClassFilter,
@@ -20,6 +22,7 @@ import {
   parseVenueFilter,
   serializeAssetClassFilter,
   serializeAssetSuperClassFilter,
+  serializeOpportunityFilters,
   serializePreIpoFilter,
   serializeSortState,
   spreadCombinationVenues,
@@ -173,6 +176,59 @@ describe('sort state', () => {
   });
 });
 
+describe('sort toggle wiring (filter model)', () => {
+  // The regression this block pins: a header click must write the clicked column into the
+  // filter model's `sort` field. An earlier version spread `toggleSortState`'s `{ key, dir }`
+  // result straight into the filters, so `sort` stayed `default` forever and every sort
+  // button (Funding APR / 24h volume / Open interest) was a silent no-op.
+  const base = { ...DEFAULT_OPPORTUNITY_FILTERS, page: '3' };
+
+  it('writes the clicked column into sort and resets the page', () => {
+    const next = applySortToggle(base, 'volume');
+    expect(next.sort).toBe('volume');
+    expect(next.dir).toBe('desc');
+    expect(next.page).toBe('1');
+    expect(Object.keys(next)).not.toContain('key');
+  });
+
+  it('flips the direction when the active column is clicked again', () => {
+    const first = applySortToggle(base, 'apr');
+    expect(first).toMatchObject({ sort: 'apr', dir: 'desc' });
+    const second = applySortToggle(first, 'apr');
+    expect(second).toMatchObject({ sort: 'apr', dir: 'asc' });
+    expect(applySortToggle(second, 'apr')).toMatchObject({ sort: 'apr', dir: 'desc' });
+  });
+
+  it('returns to descending when a different column takes over', () => {
+    const aprAsc = applySortToggle(applySortToggle(base, 'apr'), 'apr');
+    expect(applySortToggle(aprAsc, 'oi')).toMatchObject({ sort: 'oi', dir: 'desc' });
+  });
+
+  it('leaves every unrelated filter untouched', () => {
+    const next = applySortToggle({ ...base, minApr: '12', asset: 'btc' }, 'oi');
+    expect(next.minApr).toBe('12');
+    expect(next.asset).toBe('btc');
+  });
+
+  it('carries the toggled column into the URL record the board request reads', () => {
+    // End of the wiring: `useFilterQuerySync` writes this record to the URL and `boardRequest`
+    // sends `sort`/`dir` to /api/opportunities from the same filter model, so the click only
+    // re-orders the board if the column survives serialization.
+    const next = applySortToggle(base, 'apr');
+    expect(serializeOpportunityFilters(next)).toMatchObject({ sort: 'apr', dir: '' });
+    const asc = applySortToggle(next, 'apr');
+    expect(serializeOpportunityFilters(asc)).toMatchObject({ sort: 'apr', dir: 'asc' });
+  });
+
+  it('toggles through every column the boards expose', () => {
+    for (const key of ['apr', 'volume', 'oi', 'asset'] as const) {
+      const next = applySortToggle(base, key);
+      expect(next.sort).toBe(key);
+      expect(parseSortState(key, next.dir).key).toBe(key);
+    }
+  });
+});
+
 describe('page and page-size parsing', () => {
   it('falls back to page 1 for blank, zero and junk input', () => {
     expect(parsePageValue('')).toBe(1);
@@ -311,7 +367,7 @@ describe('funding board SSR', () => {
     expect(html).not.toContain('Exclude pre-IPO');
     expect(html).not.toContain('opportunity-filter-groups');
     expect(html).not.toContain('market-filter');
-    // Hedged funding still never uses aria-pressed: that flag belongs to the spread board buttons.
+    // The project bans aria-pressed everywhere: no render may reintroduce it.
     expect([...html.matchAll(/aria-pressed=/g)]).toHaveLength(0);
   });
 
@@ -367,8 +423,8 @@ describe('spread board default market filter', () => {
     const html = renderBoard('spread', '');
     const segment = html.slice(html.indexOf('market-filter'));
     const group = segment.slice(0, segment.indexOf('</div>'));
-    expect([...group.matchAll(/aria-pressed="true"/g)]).toHaveLength(1);
-    expect(group).toContain('aria-pressed="false"');
+    expect([...group.matchAll(/aria-checked="true"/g)]).toHaveLength(1);
+    expect(group).toContain('aria-checked="false"');
   });
 });
 
@@ -404,5 +460,33 @@ describe('parseVenueFilter', () => {
   it('ignores unknown and blank entries instead of emptying the board', () => {
     expect(parseVenueFilter('GATE,,NOT_A_VENUE')).toEqual(['GATE']);
     expect(parseVenueFilter('NOT_A_VENUE')).toEqual([...ALL_SPREAD_VENUES]);
+  });
+});
+
+describe('spread-quality board SSR', () => {
+  it('opens the fourth tab with no aria-pressed anywhere and no leaked filters', () => {
+    const html = renderBoard('spread-quality', '');
+    expect(html).toContain('Spread quality board');
+    expect(html).toContain('Spread quality');
+    expect(html).toContain('Ranked by 24h spread-distribution quality');
+    // The board keeps no URL-synced filters: no asset chips, no exchange / market button groups.
+    expect(html).not.toContain('asset-class-filters');
+    expect(html).not.toContain('opportunity-filter-groups');
+    // The filter buttons use role=checkbox (+aria-checked); aria-pressed is banned project-wide.
+    expect([...html.matchAll(/aria-pressed=/g)]).toHaveLength(0);
+    // Four boards in the tablist, exactly one selected.
+    expect([...html.matchAll(/role="tab"/g)]).toHaveLength(4);
+    expect([...html.matchAll(/aria-selected="true"/g)]).toHaveLength(1);
+    // The table renders only once rows arrive; the SSR snapshot holds the loading empty state.
+    expect(html).toContain('opportunity-spread-quality-title');
+    expect(html).not.toContain('opportunity-spread-quality-table');
+    expect(html).toContain('Loading…');
+  });
+
+  it('never leaks the spread table into the spread-quality board', () => {
+    const html = renderBoard('spread-quality', '');
+    expect(html).not.toContain('Best path');
+    expect(html).not.toContain('opportunity-spread-title');
+    expect(html).not.toContain('hedge-mode-switch');
   });
 });

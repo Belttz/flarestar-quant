@@ -715,3 +715,169 @@ describe('spot order cancellation', () => {
     expect(gateway.cancelledOrderIds).toHaveLength(1);
   });
 });
+
+describe('strategy PnL surface', () => {
+  interface FillSeed {
+    orderId: string;
+    strategyId: string;
+    leg: 'left' | 'right';
+    symbol: string;
+    venue: string;
+    side: 'BUY' | 'SELL';
+    quantity: string;
+    price: string;
+    fee: string;
+    createdAt: string;
+  }
+
+  function seedStrategy(database: Database.Database, id: string, kind = 'position', metricsJson: string | null = null, config: object = pairedStrategyInput): void {
+    database.prepare(`INSERT INTO execution_strategies (id, kind, environment, status, config_json, progress,
+      filled_quantity, filled_left, filled_right, open_position, metrics_json, created_at, updated_at, stopped_at)
+      VALUES (?, ?, 'live', 'STOPPED', ?, 0, '0', '0', '0', '0', ?, ?, ?, NULL)`)
+      .run(id, kind, JSON.stringify(config), metricsJson, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+  }
+
+  function seedFill(database: Database.Database, seed: FillSeed): void {
+    database.prepare(`INSERT INTO execution_orders (id, client_order_id, environment, symbol, venue, side,
+      order_type, time_in_force, quantity, price, reduce_only, state, executed_quantity, executed_average_price,
+      created_at, updated_at, strategy_id, strategy_leg)
+      VALUES (?, ?, 'live', ?, ?, ?, 'MARKET', 'IOC', ?, NULL, 0, 'FILLED', ?, ?, ?, ?, ?, ?)`)
+      .run(seed.orderId, `${seed.orderId}-client`, seed.symbol, seed.venue, seed.side, seed.quantity,
+        seed.quantity, seed.price, seed.createdAt, seed.createdAt, seed.strategyId, seed.leg);
+    database.prepare(`INSERT INTO execution_fills (id, order_id, symbol, venue, side, quantity, price, fee, realized_pnl, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, '0', ?)`)
+      .run(`fill-${seed.orderId}`, seed.orderId, seed.symbol, seed.venue, seed.side, seed.quantity, seed.price, seed.fee, seed.createdAt);
+  }
+
+  function seedMark(database: Database.Database, symbol: string, venue: string, markPrice: string): void {
+    database.prepare(`INSERT INTO public_market_snapshots (symbol, venue, product, bid_price, ask_price, last_price,
+      mark_price, index_price, funding_rate, predicted_funding_rate, next_funding_at, source_timestamp, fetched_at, source)
+      VALUES (?, ?, 'FUTURE', NULL, NULL, ?, ?, ?, '0', NULL, '0', '0', '0', 'test')`)
+      .run(symbol, venue, markPrice, markPrice, markPrice);
+  }
+
+  function seedLivePosition(database: Database.Database, positionId: string, symbol: string, venue: string, fundingFee: string | null): void {
+    database.prepare(`INSERT INTO live_positions (position_id, symbol, venue, quantity, entry_price, mark_price,
+      realized_pnl, funding_fee, updated_at) VALUES (?, ?, ?, '0', '0', '0', '0', ?, '0')`)
+      .run(positionId, symbol, venue, fundingFee);
+  }
+
+  // A closed perpetual round trip: realized 10, fees 0.105, locked bps = 9.895/100×10000.
+  // No live_positions row exists for the pair, so funding is reported as unavailable (null).
+  it('exposes the rebuilt net PnL and locked bps on both the list and the single-strategy path', async () => {
+    const { database, runtime } = await createHarness();
+    seedStrategy(database, 'S-PNL');
+    seedFill(database, {
+      orderId: 'O1', strategyId: 'S-PNL', leg: 'left', symbol: 'GATE_FUTURE_CXMT_USDT', venue: 'GATE',
+      side: 'BUY', quantity: '1', price: '100', fee: '0.05', createdAt: '2026-01-01T00:00:00.000Z',
+    });
+    seedFill(database, {
+      orderId: 'O2', strategyId: 'S-PNL', leg: 'left', symbol: 'GATE_FUTURE_CXMT_USDT', venue: 'GATE',
+      side: 'SELL', quantity: '1', price: '110', fee: '0.055', createdAt: '2026-01-01T00:01:00.000Z',
+    });
+    seedMark(database, 'GATE_FUTURE_CXMT_USDT', 'GATE', '110');
+
+    const listed = runtime.listStrategies().find((strategy) => strategy.id === 'S-PNL');
+    expect(listed?.pnl).toMatchObject({
+      realizedPnl: '10', unrealizedPnl: '0', feesPaid: '0.105', fundingFeeUsdt: null,
+      netPnl: '9.895', closedEntryNotionalUsdt: '100', entryNotionalUsdt: '100', lockedProfitBps: '989.5',
+    });
+    expect(runtime.getStrategy('S-PNL').pnl).toMatchObject({ netPnl: '9.895', lockedProfitBps: '989.5' });
+    // The legacy trade-feed figure is untouched.
+    expect(listed?.realizedPnl).toBe('0');
+  });
+
+  it('degrades an open position with no stored mark to null rather than zero', async () => {
+    const { database, runtime } = await createHarness();
+    seedStrategy(database, 'S-OPEN');
+    seedFill(database, {
+      orderId: 'O1', strategyId: 'S-OPEN', leg: 'left', symbol: 'GATE_FUTURE_CXMT_USDT', venue: 'GATE',
+      side: 'BUY', quantity: '1', price: '100', fee: '0.05', createdAt: '2026-01-01T00:00:00.000Z',
+    });
+
+    expect(runtime.getStrategy('S-OPEN').pnl).toMatchObject({
+      realizedPnl: '0', unrealizedPnl: null, netPnl: null, closedEntryNotionalUsdt: '0', lockedProfitBps: null,
+    });
+  });
+
+  it('falls back to the snapshot last price when the mark price is unusable', async () => {
+    const { database, runtime } = await createHarness();
+    seedStrategy(database, 'S-LAST');
+    seedFill(database, {
+      orderId: 'O1', strategyId: 'S-LAST', leg: 'left', symbol: 'GATE_FUTURE_CXMT_USDT', venue: 'GATE',
+      side: 'BUY', quantity: '1', price: '100', fee: '0', createdAt: '2026-01-01T00:00:00.000Z',
+    });
+    database.prepare(`INSERT INTO public_market_snapshots (symbol, venue, product, mark_price, last_price,
+      index_price, funding_rate, next_funding_at, source_timestamp, fetched_at, source)
+      VALUES ('GATE_FUTURE_CXMT_USDT', 'GATE', 'FUTURE', '0', '108', '0', '0', '0', '0', '0', 'test')`).run();
+
+    // marked at last 108 against a 100 basis → +8 unrealized, no fees.
+    expect(runtime.getStrategy('S-LAST').pnl).toMatchObject({ unrealizedPnl: '8', netPnl: '8' });
+  });
+
+  it('attributes funding only when the strategy solely owns the position pair', async () => {
+    const sole = await createHarness();
+    seedStrategy(sole.database, 'S-SOLE');
+    seedFill(sole.database, {
+      orderId: 'O1', strategyId: 'S-SOLE', leg: 'left', symbol: 'GATE_FUTURE_CXMT_USDT', venue: 'GATE',
+      side: 'BUY', quantity: '1', price: '100', fee: '0', createdAt: '2026-01-01T00:00:00.000Z',
+    });
+    seedMark(sole.database, 'GATE_FUTURE_CXMT_USDT', 'GATE', '100');
+    seedLivePosition(sole.database, 'P1', 'GATE_FUTURE_CXMT_USDT', 'GATE', '2.5');
+    expect(sole.runtime.getStrategy('S-SOLE').pnl).toMatchObject({ fundingFeeUsdt: '2.5', netPnl: '-2.5' });
+
+    // A second strategy trading the same pair makes the venue-account funding un-splittable → null.
+    const shared = await createHarness();
+    for (const id of ['S-A', 'S-B']) {
+      seedStrategy(shared.database, id);
+      seedFill(shared.database, {
+        orderId: `O-${id}`, strategyId: id, leg: 'left', symbol: 'GATE_FUTURE_CXMT_USDT', venue: 'GATE',
+        side: 'BUY', quantity: '1', price: '100', fee: '0', createdAt: '2026-01-01T00:00:00.000Z',
+      });
+    }
+    seedMark(shared.database, 'GATE_FUTURE_CXMT_USDT', 'GATE', '100');
+    seedLivePosition(shared.database, 'P1', 'GATE_FUTURE_CXMT_USDT', 'GATE', '2.5');
+    for (const strategy of shared.runtime.listStrategies()) {
+      expect(strategy.pnl?.fundingFeeUsdt).toBeNull();
+    }
+  });
+
+  it('takes the carried funding figure for a carry strategy', async () => {
+    const { database, runtime } = await createHarness();
+    const metrics = JSON.stringify({
+      fundingCollectedUsdt: '3.5', basisEntryBps: '0', basisCurrentBps: '0', basisPnlUsdt: '0',
+      feesPaidUsdt: '0', netPnlUsdt: '0', entryFundingApr: '0', nextFundingAccrualAt: null,
+    });
+    seedStrategy(database, 'S-CARRY', 'carry', metrics, carryStrategyInput);
+    seedFill(database, {
+      orderId: 'O1', strategyId: 'S-CARRY', leg: 'left', symbol: 'GATE_SPOT_BTC_USDT', venue: 'GATE',
+      side: 'BUY', quantity: '1', price: '100', fee: '0', createdAt: '2026-01-01T00:00:00.000Z',
+    });
+    seedMark(database, 'GATE_SPOT_BTC_USDT', 'GATE', '100');
+
+    // Collected funding is a credit: 3.5 collected ⇒ fundingFeeUsdt −3.5.
+    expect(runtime.getStrategy('S-CARRY').pnl?.fundingFeeUsdt).toBe('-3.5');
+  });
+
+  // Hard requirement: one strategy's broken data must never take the whole strategy list down.
+  it('isolates an unpriceable strategy without failing the list', async () => {
+    const { database, runtime } = await createHarness();
+    seedStrategy(database, 'S-BAD');
+    seedFill(database, {
+      orderId: 'O-BAD', strategyId: 'S-BAD', leg: 'left', symbol: 'GATE_FUTURE_CXMT_USDT', venue: 'GATE',
+      side: 'BUY', quantity: '1', price: 'not-a-number', fee: '0', createdAt: '2026-01-01T00:00:00.000Z',
+    });
+    seedStrategy(database, 'S-GOOD');
+    seedFill(database, {
+      orderId: 'O-GOOD', strategyId: 'S-GOOD', leg: 'left', symbol: 'GATE_FUTURE_CXMT_USDT', venue: 'GATE',
+      side: 'BUY', quantity: '1', price: '100', fee: '0', createdAt: '2026-01-01T00:00:00.000Z',
+    });
+    seedMark(database, 'GATE_FUTURE_CXMT_USDT', 'GATE', '100');
+
+    const listed = runtime.listStrategies();
+    expect(listed).toHaveLength(2);
+    expect(listed.find((strategy) => strategy.id === 'S-BAD')?.pnl).toBeNull();
+    expect(listed.find((strategy) => strategy.id === 'S-GOOD')?.pnl).not.toBeNull();
+    expect(runtime.getStrategy('S-BAD').pnl).toBeNull();
+  });
+});
