@@ -59,6 +59,12 @@ class ScriptedGateway implements TradingCrossExGateway {
   isolatedAvailableMargins: Record<string, string> = {};
   spotAccounts: GateSpotAccount[] = [];
   holdCancellations = false;
+  /**
+   * Direction-aware rejection predicate, checked BEFORE the per-symbol budget: it lets a test model
+   * a venue that refuses one *side* only (e.g. a reduce-only SELL against a SHORT position) instead
+   * of blanket-refusing every submit on the symbol.
+   */
+  failCreateIf: ((order: CrossExOrderRequest) => boolean) | null = null;
   createFailLabel = 'TRADE_INSUFFICIENT_AVAILABLE_MARGIN_ERROR';
   failPositionsLabel: string | null = null;
   positionQueries = 0;
@@ -125,6 +131,7 @@ class ScriptedGateway implements TradingCrossExGateway {
 
   async createOrder(_credentials: GateCredentials, order: CrossExOrderRequest): Promise<GateOrderActionResponse> {
     this.createAttempts.push({ ...order });
+    if (this.failCreateIf?.(order)) throw new GateApiError(400, this.createFailLabel);
     const budget = order.symbol ? this.failCreateBudget.get(order.symbol) ?? 0 : 0;
     if (order.symbol && budget > 0) {
       this.failCreateBudget.set(order.symbol, budget - 1);
@@ -151,8 +158,9 @@ class StubMarkets implements MarketSource {
 
   set(
     symbol: string, bid: string, ask: string, updatedAt = new Date().toISOString(),
-    receivedAt = updatedAt, fundingRate = '0.0001',
+    receivedAt = updatedAt,     fundingRate = '0.0001',
     nextFundingAt = new Date(Date.now() + 3_600_000).toISOString(),
+    quoteUpdatedAt = updatedAt,
   ): void {
     const [venue = 'GATE', , asset = 'BTC'] = symbol.split('_');
     this.markets.set(symbol, {
@@ -160,7 +168,7 @@ class StubMarkets implements MarketSource {
       askPrice: ask, askSize: '10', open24h: bid, high24h: ask, low24h: bid, volume24h: '100',
       quoteVolume24h: '100000', fundingRate, nextFundingAt,
       openInterest: '1000', openInterestValue: '1000000', receivedAt, updatedAt,
-      source: 'gate_crossex_websocket',
+      quoteUpdatedAt, source: 'gate_crossex_websocket',
     });
     this.database.prepare(`INSERT OR IGNORE INTO crossex_instruments (
       symbol, exchange_type, business_type, state, min_size, min_notional, lot_size,
@@ -279,6 +287,17 @@ const exitConfig = {
   reduceOnly: false, executionMethod: 'MAKER_TAKER' as const, makerLeg: 'left' as const,
 };
 
+/**
+ * Same pair with the leg directions flipped: the maker leg (left) is LONG and the HEDGE leg (right)
+ * is SHORT. Unwinding a short hedge leg is a BUY; this configuration is the one the shipped tests
+ * never covered (they only ever seeded a long hedge leg, where `SELL` happens to be correct).
+ */
+const flippedExitConfig = {
+  ...exitConfig,
+  leftSide: 'BUY' as const,
+  rightSide: 'SELL' as const,
+};
+
 type ExitActor = {
   id: string;
   status: string;
@@ -304,6 +323,8 @@ function setBook(markets: StubMarkets, at: number, lBid: string, lAsk: string, r
 }
 /** Take-profit-level book: exit spread (left.ask − right.bid) ≈ 1 bp ≤ takeProfitBps 2. */
 function armBook(markets: StubMarkets, at: number): void { setBook(markets, at, '100000', '100010', '100000', '100001'); }
+/** Flipped pair (left BUY / right SELL): exit spread (right.ask − left.bid)/left.bid ≈ 1 bp. */
+function armBookFlipped(markets: StubMarkets, at: number): void { setBook(markets, at, '100000', '100001', '100009', '100010'); }
 
 function seedOpen(database: Database.Database, id: string): void {
   seedFilled(database, id, 'seed-left', left, 'SELL', '0.1', 'left');
@@ -724,5 +745,144 @@ describe('QA · MAKER_TAKER exit latch — adversarial', () => {
     expect(rearmed.makerExitHedge).toBeNull();
     expect(exitQuotes(gateway).filter((o) => o.time_in_force === 'POC')).toHaveLength(2); // retired + fresh
     expect(gateway.createdOrders.filter((o) => o.symbol === right && o.type === 'LIMIT')).toHaveLength(1);
+  });
+
+  // ------------------------------------------------ C1: hedge leg SHORT (exit side derivation)
+  it('C1 with the hedge leg SHORT, the exit hedge order must BUY to unwind it — a SELL would grow the short and is invalid reduce-only', async () => {
+    let now = Date.now();
+    const { engine, runtime, gateway, database, markets } = await createHarness({ now: () => now, requoteIntervalMs: 100_000 });
+    const record = await engine.startStrategy(flippedExitConfig);
+    // Maker leg (left) LONG 0.1, hedge leg (right) SHORT 0.1.
+    seedFilled(database, record.id, 'seed-left', left, 'BUY', '0.1', 'left');
+    seedFilled(database, record.id, 'seed-right', right, 'SELL', '0.1', 'right');
+
+    armBookFlipped(markets, now);
+    await engine.tick();
+    const exitQuote = exitQuotes(gateway)[0]!;
+    // The maker leg's exit quote fills partially: maker remaining 0.04 < hedge 0.1 ⇒ target 0.06.
+    ackOrder(runtime, exitQuote.remoteId, 'PARTIALLY_FILLED', '0.06', '100000');
+    runtime.ingestPrivateEvent({ channel: 'usertrades', payload: {
+      transaction_id: 'txn-c1', order_id: exitQuote.remoteId, symbol: left, exchange_type: 'BINANCE',
+      side: 'SELL', qty: '0.06', price: '100000', fee: '0.01', rpnl: '0', match_role: 'TAKER', create_time: String(Date.now()),
+    } });
+    await waitFor(() => runtime.getStrategy(record.id).openPosition === '0.04');
+    await waitFor(() => hedgeOrders(gateway).length === 1, 3_000);
+
+    // Anti-vacuous guard: a hedge order really was submitted before its side is judged.
+    expect(actorOf(engine, record.id).makerExitArmed).toBe(true);
+    expect(hedgeOrders(gateway)).toHaveLength(1);
+    expect(actorOf(engine, record.id).makerExitHedge).not.toBeNull();
+    // The hedge leg is SHORT (right exposure −0.1): unwinding it is a BUY of 0.06. A SELL with
+    // `reduceOnly: true` against a short position is rejected by the venue and, if it were ever
+    // accepted, would grow the very imbalance the exit exists to shrink.
+    expect(hedgeOrders(gateway)[0]!.side).toBe('BUY');
+    expect(hedgeOrders(gateway)[0]!.reduce_only).toBe('true');
+    expect(hedgeOrders(gateway)[0]!.qty).toBe('0.06');
+  });
+
+  // ------------------------------------------------ C2: strike-budget consequence + direction pin
+  it('C2 (consequence) with the hedge leg SHORT and the venue rejecting every hedge submit, the 5-strike pause fires and the imbalance stays un-unwound — and every attempt is the correct BUY', async () => {
+    let now = Date.now();
+    const { engine, runtime, gateway, database, markets } = await createHarness({ now: () => now, requoteIntervalMs: 100_000 });
+    const record = await engine.startStrategy(flippedExitConfig);
+    seedFilled(database, record.id, 'seed-left', left, 'BUY', '0.1', 'left');
+    seedFilled(database, record.id, 'seed-right', right, 'SELL', '0.1', 'right');
+    // Blanket rejection of every hedge-leg submit (direction-independent): this case is about what
+    // happens when the venue refuses to take the unwind order at all, not about which way it points.
+    gateway.failCreate(right, 1_000);
+
+    armBookFlipped(markets, now);
+    await engine.tick();
+    const exitQuote = exitQuotes(gateway)[0]!;
+    ackOrder(runtime, exitQuote.remoteId, 'PARTIALLY_FILLED', '0.06', '100000');
+    runtime.ingestPrivateEvent({ channel: 'usertrades', payload: {
+      transaction_id: 'txn-c2', order_id: exitQuote.remoteId, symbol: left, exchange_type: 'BINANCE',
+      side: 'SELL', qty: '0.06', price: '100000', fee: '0.01', rpnl: '0', match_role: 'TAKER', create_time: String(Date.now()),
+    } });
+    await waitFor(() => runtime.getStrategy(record.id).openPosition === '0.04');
+    await new Promise((r) => setTimeout(r, 80)); // let the fill-triggered reconcile settle
+
+    const actor = () => actorOf(engine, record.id);
+    if (actor().makerExitHedgeFailures === 0) { armBookFlipped(markets, now); await engine.tick(); }
+    expect(actor().makerExitHedgeFailures).toBe(1);
+    // Climb the backoff ladder until the strike budget trips (4 s → 8 s → 16 s → 32 s → 32 s).
+    for (let i = 0; i < 6; i += 1) {
+      const a = actor();
+      if (!a || a.status !== 'RUNNING') break;
+      now = a.makerExitHedgeRetryAt + 100;
+      armBookFlipped(markets, now);
+      await engine.tick();
+      await new Promise((r) => setTimeout(r, 30));
+    }
+
+    // The strategy is paused by the very guard the #52 fix added — and the imbalance the exit was
+    // supposed to unwind is still open (no hedge order ever filled).
+    expect(actorOf(engine, record.id)).toBeUndefined();
+    expect((database.prepare('SELECT status FROM execution_strategies WHERE id = ?').get(record.id) as { status: string }).status).toBe('PAUSED');
+    expect(runtime.strategyLogs(record.id).find((l) => l.event === 'Strategy paused')?.result)
+      .toBe('Maker exit hedge order was rejected 5 consecutive times; the position cannot unwind automatically — review the hedge leg manually');
+    expect(runtime.getStrategy(record.id).openPosition).not.toBe('0');
+    // Direction pin, on `createAttempts` (which records REJECTED submits too) rather than
+    // `createdOrders` (which only records accepted ones): a filter over `createdOrders` here is
+    // empty because every submit was refused, and `.every()` on an empty array is vacuously true.
+    const attempts = gateway.createAttempts.filter((o) => o.symbol === right);
+    expect(attempts.length).toBeGreaterThanOrEqual(5);
+    // Unwinding a SHORT hedge leg is a BUY; a regression back to the absolute-valued
+    // `hedgeQuantity` would make every attempt a SELL and turn this red.
+    expect(attempts.every((o) => o.side === 'BUY')).toBe(true);
+    expect(attempts.every((o) => o.reduce_only === 'true')).toBe(true);
+  });
+
+  // ------------------------------------------------ C3: the payoff of the direction fix
+  it('C3 (payoff) with the hedge leg SHORT and a venue that refuses the WRONG side only, the BUY hedge fills, both legs go flat, and the latch retires without ever tripping the strike budget', async () => {
+    let now = Date.now();
+    const { engine, runtime, gateway, database, markets } = await createHarness({ now: () => now, requoteIntervalMs: 100_000 });
+    const record = await engine.startStrategy(flippedExitConfig);
+    seedFilled(database, record.id, 'seed-left', left, 'BUY', '0.1', 'left');
+    seedFilled(database, record.id, 'seed-right', right, 'SELL', '0.1', 'right');
+    // Direction-aware venue: a reduce-only SELL against a SHORT hedge leg is refused (as a real
+    // exchange would), while the correct BUY is accepted. This is what separates "unwound" from
+    // "stuck" — a blanket `failCreate` could not tell the two apart.
+    gateway.failCreateIf = (order) => order.symbol === right && order.side === 'SELL';
+
+    armBookFlipped(markets, now);
+    await engine.tick();
+    const exitQuote = exitQuotes(gateway)[0]!;
+    // The whole maker leg closes: left 0.1 → 0, leaving the hedge leg short 0.1 to unwind.
+    ackOrder(runtime, exitQuote.remoteId, 'FILLED', '0.1', '100000');
+    runtime.ingestPrivateEvent({ channel: 'usertrades', payload: {
+      transaction_id: 'txn-c3-maker', order_id: exitQuote.remoteId, symbol: left, exchange_type: 'BINANCE',
+      side: 'SELL', qty: '0.1', price: '100000', fee: '0.01', rpnl: '0', match_role: 'TAKER', create_time: String(Date.now()),
+    } });
+    await waitFor(() => runtime.getStrategy(record.id).openPosition === '0');
+    await waitFor(() => hedgeOrders(gateway).length === 1, 3_000);
+
+    // The unwind order is a BUY of the full 0.1 — and it was ACCEPTED, not rejected.
+    const hedge = hedgeOrders(gateway)[0]!;
+    expect(hedge).toMatchObject({ symbol: right, side: 'BUY', type: 'LIMIT', time_in_force: 'GTC', reduce_only: 'true' });
+    expect(hedge.qty).toBe('0.1');
+    expect(gateway.createAttempts.filter((o) => o.symbol === right && o.side === 'SELL')).toEqual([]);
+
+    // It fills: the hedge leg goes flat too, so the exit latch retires.
+    ackOrder(runtime, hedge.remoteId, 'FILLED', '0.1', '100000');
+    runtime.ingestPrivateEvent({ channel: 'usertrades', payload: {
+      transaction_id: 'txn-c3-hedge', order_id: hedge.remoteId, symbol: right, exchange_type: 'OKX',
+      side: 'BUY', qty: '0.1', price: '100000', fee: '0.01', rpnl: '0', match_role: 'TAKER', create_time: String(Date.now()),
+    } });
+    // Drive evaluations until the flat pair retires the latch (a fill alone does not re-evaluate).
+    for (let i = 0; i < 30 && actorOf(engine, record.id)?.makerExitArmed !== false; i += 1) {
+      armBookFlipped(markets, now);
+      await engine.tick();
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    // The payoff: flat position, latch retired, strategy still RUNNING, and the strike budget the
+    // #52 fix added was never touched — no `Leg submission failed`, no 5-strike pause.
+    expect(runtime.getStrategy(record.id).openPosition).toBe('0');
+    expect(actorOf(engine, record.id).makerExitArmed).toBe(false);
+    expect(actorOf(engine, record.id).makerExitHedge).toBeNull();
+    expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+    expect(submitFailCount(runtime, record.id)).toBe(0);
+    expect(runtime.strategyLogs(record.id).some((l) => l.event === 'Strategy paused')).toBe(false);
   });
 });

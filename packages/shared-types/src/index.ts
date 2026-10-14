@@ -931,6 +931,14 @@ export const LiveMarketSchema = z.object({
   receivedAt: z.string(),
   /** Exchange source timestamp carried by the latest ticker frame. */
   updatedAt: z.string(),
+  /**
+   * Exchange source timestamp of the frame (or order-book update) that last supplied this
+   * record's bid/ask. `updatedAt` tracks the latest frame of any kind — a sparse ticker
+   * carrying only `lp` refreshes it — so the freshness of the executable quote must be judged
+   * from this field, never from `updatedAt`. Absent means the record never carried a quote
+   * (a zero-priced placeholder), which no consumer may treat as tradable.
+   */
+  quoteUpdatedAt: z.string().optional(),
   /** rest_book_ticker rows come from the bulk REST sweep and are ~1 TTL cycle stale. */
   source: z.enum(['gate_crossex_websocket', 'demo_seed', 'rest_book_ticker']),
 });
@@ -1331,10 +1339,11 @@ export const STRATEGY_LOG_EVENT_CATEGORY: Record<string, StrategyLogEventCategor
   'Padded residual trim settled': 'maker',
   'Residual top-up unavailable': 'maker',
   'Residual trim deferred': 'maker',
-  // Reduce-only exit size reconciliation. All three are emitted from `reconcileExitQuantity`, which
-  // only the maker quote path reaches (`evaluateMakerQuotes`), so they belong with the rest of the
-  // maker quote lifecycle: the exit quote is re-reported at the venue's reducible size, or
-  // withdrawn entirely when the venue holds nothing reducible.
+  // Reduce-only exit size reconciliation. All three are emitted from `reconcileExitQuantity`, the
+  // single place a reduce-only exit is re-derived from the venue's real position. Both exit paths
+  // reach it — the maker exit quote and the taker exit clip (a stop-loss unwind) — so the three
+  // stay grouped here to keep every size reconciliation in one place: the exit is re-reported at
+  // the venue's reducible size, or withdrawn entirely when the venue holds nothing reducible.
   'Exit size drift': 'maker',
   'Exit size corrected': 'maker',
   'Exit quote withdrawn': 'maker',

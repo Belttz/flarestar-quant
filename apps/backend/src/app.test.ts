@@ -938,7 +938,8 @@ describe('local backend', () => {
       quoteVolume24h: '6400000', fundingRate: '0.0001',
       nextFundingAt: new Date(Date.now() + 3_600_000).toISOString(), openInterest: '100',
       openInterestValue: '6400000', receivedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(), source: 'gate_crossex_websocket',
+      updatedAt: new Date().toISOString(), quoteUpdatedAt: new Date().toISOString(),
+      source: 'gate_crossex_websocket',
     });
     const { app, gateway } = await createTestApp({ liveTradingEnabled: true, marketHub });
     gateway.extraSymbols.push({
@@ -985,7 +986,8 @@ describe('local backend', () => {
       quoteVolume24h: '6400000', fundingRate: '0.0001',
       nextFundingAt: new Date(Date.now() + 3_600_000).toISOString(), openInterest: '100',
       openInterestValue: '6400000', receivedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(), source: 'gate_crossex_websocket',
+      updatedAt: new Date().toISOString(), quoteUpdatedAt: new Date().toISOString(),
+      source: 'gate_crossex_websocket',
     });
     const { app, database, gateway } = await createTestApp({ liveTradingEnabled: true, marketHub });
     gateway.extraSymbols.push(catalogSymbol('OKX_FUTURE_BTC_USDT', 'OKX'));
@@ -1042,7 +1044,8 @@ describe('local backend', () => {
         volume24h: '100', quoteVolume24h: '10000', fundingRate: '0',
         nextFundingAt: new Date(Date.now() + 3_600_000).toISOString(), openInterest: '100',
         openInterestValue: '10000', receivedAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(), source: 'gate_crossex_websocket',
+        updatedAt: new Date().toISOString(), quoteUpdatedAt: new Date().toISOString(),
+        source: 'gate_crossex_websocket',
       };
     };
     const { app, gateway } = await createTestApp({ liveTradingEnabled: true, marketHub });

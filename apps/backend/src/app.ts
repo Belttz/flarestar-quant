@@ -921,6 +921,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     // The engine holds one ticker subscription per running strategy so its legs keep streaming
     // even when no browser page is watching them; releases are ref-counted in the hub.
     watchQuotes: (symbols) => marketHub.watchQuotes(symbols),
+    // ...and one order-book subscription per leg, which is the only other source the hub can
+    // back a quote from when a venue's sparse ticker omits bid/ask.
+    watchOrderBook: (symbol) => marketHub.watchOrderBook(symbol),
     // Unit/injected hubs may deliberately supply static market objects without starting a socket.
     // Production passes startMarketStream=true, where stream health must gate every strategy.
     ...(options.startMarketStream ? { connectionState: () => marketHub.connectionState() } : {}),
@@ -1156,6 +1159,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     openInterest: '0',
     openInterestValue: ticker.openInterestValue ?? '0',
     receivedAt: fetchedAt, updatedAt: fetchedAt, source: 'rest_book_ticker',
+    // The bid/ask come from this very sweep, so the quote is exactly as old as the row says.
+    quoteUpdatedAt: fetchedAt,
   });
   const restSpreadMarkets = (): Promise<Map<string, LiveMarket>> => {
     const sweep = publicMarketGateway.queryVenueBookTickers?.bind(publicMarketGateway);

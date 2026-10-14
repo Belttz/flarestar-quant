@@ -47,6 +47,7 @@ function hubBackedSource(hub: CrossExMarketHub): MarketSource {
       return hub.market(symbol) !== null;
     },
     watchQuotes: (symbols) => hub.watchQuotes(symbols),
+    watchOrderBook: (symbol) => hub.watchOrderBook(symbol),
   };
 }
 

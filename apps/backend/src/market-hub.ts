@@ -57,6 +57,14 @@ export interface LiveMarket {
   openInterestValue: string;
   receivedAt: string;
   updatedAt: string;
+  /**
+   * Exchange source timestamp of the frame (or order-book update) that last supplied this
+   * record's bid/ask. `updatedAt` tracks the latest frame of any kind — a sparse ticker
+   * carrying only `lp` refreshes it — so the freshness of the executable quote must be judged
+   * from this field, never from `updatedAt`. Absent means the record never carried a quote
+   * (a zero-priced placeholder), which no consumer may treat as tradable.
+   */
+  quoteUpdatedAt?: string;
   /** rest_book_ticker marks rows synthesized from a venue's bulk REST sweep (spread board view). */
   source: 'gate_crossex_websocket' | 'demo_seed' | 'rest_book_ticker';
 }
@@ -194,6 +202,8 @@ function pendingMarket(definition: MarketDefinition): LiveMarket {
     open24h: '0', high24h: '0', low24h: '0', volume24h: '0', quoteVolume24h: '0',
     fundingRate: '0', nextFundingAt: new Date(Date.now() + 8 * 60 * 60_000).toISOString(),
     openInterest: '0', openInterestValue: '0', receivedAt: now, updatedAt: now, source: 'demo_seed',
+    // No quote was ever observed: the placeholder's own birth stamp, which ages out immediately.
+    quoteUpdatedAt: now,
   };
 }
 
@@ -211,6 +221,7 @@ function seedMarket(venue: MarketVenue, asset: string, venueIndex: number, asset
     high24h: String(last * 1.02), low24h: String(last * 0.96), volume24h: '0', quoteVolume24h: String(oiValue * 0.72),
     fundingRate: String(funding), nextFundingAt: new Date(Date.now() + 8 * 60 * 60_000).toISOString(),
     openInterest: '0', openInterestValue: String(oiValue), receivedAt: now, updatedAt: now, source: 'demo_seed',
+    quoteUpdatedAt: now,
   };
 }
 
@@ -1013,12 +1024,28 @@ export class CrossExMarketHub {
       // Sparse pushes (low-liquidity instruments) resolve field by field: the push wins, then
       // the maintained order book's top level, then the previously published value — a partial
       // frame must never overwrite live data with zeros.
-      const bookTop = bookTopOf(this.books.get(symbol));
+      const book = this.books.get(symbol);
+      const bookTop = bookTopOf(book);
       const frameBid = usableQuote(value.bp) ? value.bp : bookTop?.bidPrice;
       const frameAsk = usableQuote(value.ap) ? value.ap : bookTop?.askPrice;
       // When the frame carries no quote and the book offers none either, keep the stored record
       // untouched instead of publishing an all-empty update.
       if (!usableQuote(value.lp) && frameBid === undefined && frameAsk === undefined) return true;
+      // Provenance of the executable quote. `updatedAt`/`receivedAt` above describe whichever
+      // frame just arrived, and a sparse ticker carrying only `lp` refreshes them while leaving
+      // bid/ask at whatever the last quote-carrying frame produced — which is how a stale quote
+      // used to be dressed up as fresh market data. `quoteUpdatedAt` therefore moves only when
+      // this record's bid/ask actually did, and only once BOTH sides are resolved: a record whose
+      // bid came from one frame and ask from an older one describes a pair that never coexisted
+      // on any venue, so it must not claim contemporaneity. When the two sides come from
+      // different sources the older stamp wins, which keeps that guarantee conservative.
+      let quoteUpdatedAt = current.quoteUpdatedAt;
+      if (frameBid !== undefined && frameAsk !== undefined) {
+        const stamps: number[] = [];
+        if (usableQuote(value.bp) || usableQuote(value.ap)) stamps.push(value.ts);
+        if (bookTop && book) stamps.push(Date.parse(book.updatedAt));
+        if (stamps.length > 0) quoteUpdatedAt = new Date(Math.min(...stamps)).toISOString();
+      }
       this.publish({
         ...current,
         lastPrice: usableQuote(value.lp) ? value.lp : current.lastPrice,
@@ -1033,12 +1060,14 @@ export class CrossExMarketHub {
         quoteVolume24h: usableText(value.q) ? value.q : current.quoteVolume24h,
         receivedAt: new Date(receivedAt).toISOString(),
         updatedAt: new Date(value.ts).toISOString(), source: 'gate_crossex_websocket',
+        quoteUpdatedAt,
       });
       return true;
     }
-    // The ticker's `updatedAt`, `receivedAt`, and `source` are the strategy engine's evidence that
-    // bid/ask came from the exchange recently and arrived promptly. Funding and open-interest
-    // pushes must never refresh them, or seed, stale, or delayed prices could pass that gate.
+    // The ticker's `updatedAt`, `receivedAt`, `quoteUpdatedAt`, and `source` are the strategy
+    // engine's evidence that bid/ask came from the exchange recently and arrived promptly.
+    // Funding and open-interest pushes must never refresh them, or seed, stale, or delayed
+    // prices could pass that gate.
     if (frame.channel === 'funding_rate') {
       const funding = FundingPushSchema.safeParse(payload);
       if (!funding.success) return false;

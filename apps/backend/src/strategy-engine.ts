@@ -33,6 +33,13 @@ export interface MarketSource {
    * never receive a WebSocket subscription and the launch wait for fresh prices cannot succeed.
    */
   watchQuotes?(symbols: string[]): () => void;
+  /**
+   * Subscribe one symbol to live order-book frames and return an idempotent release. A sparse
+   * ticker that omits bid/ask leaves a leg with no executable quote at all, so a strategy holds
+   * this subscription next to its ticker one: the maintained book is the only other source the
+   * hub can back a quote from, and without it a low-liquidity leg would simply go silent.
+   */
+  watchOrderBook?(symbol: string): () => void;
   /** Current upstream public-stream state, when the source can expose it. */
   connectionState?(): 'connecting' | 'healthy' | 'reconnecting' | 'stale' | 'disconnected';
 }
@@ -50,6 +57,12 @@ export interface StrategyEngineOptions {
   marketMaxTransportLagMs?: number;
   /** Small allowance for clock skew; quotes further in the future are rejected. */
   futureQuoteToleranceMs?: number;
+  /**
+   * Maximum age difference tolerated between the two legs' quotes. Each leg is freshness-gated
+   * on its own, but two individually fresh quotes can still be minutes apart in exchange time,
+   * and a spread computed across them never existed. Arbitrage is a same-instant property.
+   */
+  marketPairMaxSkewMs?: number;
   /** Cooldown between hedge-repair attempts. */
   repairCooldownMs?: number;
   /**
@@ -107,6 +120,12 @@ interface StrategyActor {
    * any new fill so a real event always re-derives from the ledger. Null in the normal case.
    */
   venueExitQuantity: Decimal | null;
+  /**
+   * Symbol {@link venueExitQuantity} was measured for. The clamp is a per-leg quantity and the two
+   * legs of a pair are not in the same units (a hedge leg is sized by the ADR ratio), so a clamp
+   * learned for one symbol must never be applied to an order on the other. Null with the clamp.
+   */
+  venueExitQuantitySymbol: string | null;
   /**
    * True while an entry quote is withheld because the live spread sits outside the maker entry
    * proximity band; drives the one-shot `Maker quoting parked` / `Maker quoting resumed` logs so
@@ -434,6 +453,7 @@ export class StrategyEngine {
       marketFreshnessMs: options.marketFreshnessMs ?? 15_000,
       marketMaxTransportLagMs: options.marketMaxTransportLagMs ?? 3_000,
       futureQuoteToleranceMs: options.futureQuoteToleranceMs ?? 2_000,
+      marketPairMaxSkewMs: options.marketPairMaxSkewMs ?? 2_000,
       repairCooldownMs: options.repairCooldownMs ?? 3_000,
       marketDataWaitTimeoutMs: options.marketDataWaitTimeoutMs ?? 10_000,
       // A missing adapter reports null so carry accounting falls back to the 8h Gate cadence.
@@ -461,7 +481,10 @@ export class StrategyEngine {
       const actor = this.actors.get(fill.strategyId);
       // A real fill moves the ledger: drop any venue-truth exit clamp so the next exit is
       // re-derived from the ledger, and re-clamped only if the venue rejects it again.
-      if (actor) actor.venueExitQuantity = null;
+      if (actor) {
+        actor.venueExitQuantity = null;
+        actor.venueExitQuantitySymbol = null;
+      }
       if (actor) this.enqueue(actor, () => this.afterExecutionChange(actor));
     }));
     this.unsubscribers.push(this.runtime.onOrderUpdate((order) => {
@@ -678,7 +701,7 @@ export class StrategyEngine {
             throw new StrategyEngineError('unknown_strategy_market', 400);
           }
         }
-        launchQuoteWatchRelease = this.markets.watchQuotes?.([legs.left.symbol, legs.right.symbol]) ?? null;
+        launchQuoteWatchRelease = this.openLegWatch([legs.left.symbol, legs.right.symbol]);
         // Dynamic symbols may still be waiting for their first ticker frame; wait for live prices
         // instead of rejecting a tradable strategy at the first size/price check below.
         await this.awaitFreshMarketPair(legs);
@@ -802,10 +825,11 @@ export class StrategyEngine {
             throw new StrategyEngineError('unknown_strategy_market', 400);
           }
         }
-        // The engine owns its legs' ticker subscriptions: nothing else watches strategy symbols,
-        // so without subscribing here the fresh-price wait below would always time out on a
-        // dynamic symbol.
-        resumeQuoteWatchRelease = this.markets.watchQuotes?.([legs.left.symbol, legs.right.symbol]) ?? null;
+        // The engine owns its legs' subscriptions: nothing else watches strategy symbols, so
+        // without subscribing here the fresh-price wait below would always time out on a
+        // dynamic symbol. The book watch is what keeps a quote on the record at all for a
+        // venue whose ticker omits bid/ask.
+        resumeQuoteWatchRelease = this.openLegWatch([legs.left.symbol, legs.right.symbol]);
         await this.awaitFreshMarketPair(legs);
         this.validateStrategyOrderSizes(config, legs);
         await this.prepareStrategy(config, legs);
@@ -925,8 +949,9 @@ export class StrategyEngine {
    * RUNNING strategy receives no ticker frames for its symbols until they are registered and
    * watched — which is why, without this, only the strategy currently on screen appeared to trade.
    * Mirrors the proven start/resume subscription path: `ensureMarket` registers a catalog-known
-   * dynamic symbol and `watchQuotes` opens its ticker subscription, whose release is tracked on the
-   * actor so the existing `releaseQuoteWatch` tears it down on stop/pause/credential change.
+   * dynamic symbol and `openLegWatch` opens its ticker plus order-book subscriptions, whose
+   * releases are tracked on the actor so the existing `releaseQuoteWatch` tears them down on
+   * stop/pause/credential change.
    * Best-effort and throw-free: a symbol that can no longer be registered must not abort recovery.
    */
   private ensureActorMarkets(actor: StrategyActor): void {
@@ -944,16 +969,16 @@ export class StrategyEngine {
       if (actor.config.closePlan) {
         const symbols = [...new Set(actor.config.closePlan.targets.map((target) => target.symbol))];
         for (const symbol of symbols) register(symbol);
-        // Mirror the start/resume paths: hold the symbols' ticker subscription for the whole
-        // strategy lifetime. Without it a long close interval (or a hub sweep) leaves a settlement
-        // slice with no prices and it fails with `strategy_market_data_unavailable`.
-        actor.quoteWatchRelease = this.markets.watchQuotes?.(symbols) ?? null;
+        // Mirror the start/resume paths: hold the symbols' subscriptions for the whole
+        // strategy lifetime. Without them a long close interval (or a hub sweep) leaves a
+        // settlement slice with no prices and it fails with `strategy_market_data_unavailable`.
+        actor.quoteWatchRelease = this.openLegWatch(symbols);
         return;
       }
       const legs = legsOf(actor.config);
       for (const leg of [legs.left, legs.right]) register(leg.symbol);
-      // Keep the legs' ticker subscription alive for the whole recovered strategy lifetime.
-      actor.quoteWatchRelease = this.markets.watchQuotes?.([legs.left.symbol, legs.right.symbol]) ?? null;
+      // Keep the legs' subscriptions alive for the whole recovered strategy lifetime.
+      actor.quoteWatchRelease = this.openLegWatch([legs.left.symbol, legs.right.symbol]);
     } catch { /* Recovery must never fail because a symbol could not be re-registered. */ }
   }
 
@@ -965,6 +990,30 @@ export class StrategyEngine {
     try {
       release();
     } catch { /* A broken release must never break strategy teardown. */ }
+  }
+
+  /**
+   * Opens every hub subscription a strategy's legs need and returns one release for all of
+   * them. The ticker watch keeps the symbols registered and streaming; the order-book watch is
+   * what actually keeps an executable quote on the record when a venue's sparse ticker omits
+   * bid/ask — the hub can then back the quote from the maintained book instead of leaving the
+   * stored one to age out. A source without either capability yields null, and every release is
+   * individually guarded so one broken subscription cannot orphan the others.
+   */
+  private openLegWatch(symbols: string[]): (() => void) | null {
+    const releases: Array<() => void> = [];
+    const quotes = this.markets.watchQuotes?.(symbols);
+    if (quotes) releases.push(quotes);
+    for (const symbol of symbols) {
+      const book = this.markets.watchOrderBook?.(symbol);
+      if (book) releases.push(book);
+    }
+    if (releases.length === 0) return null;
+    return () => {
+      for (const release of releases) {
+        try { release(); } catch { /* One broken release must not orphan the rest. */ }
+      }
+    };
   }
 
   private attach(record: StrategyRecord, suspended = false): StrategyActor {
@@ -980,6 +1029,7 @@ export class StrategyEngine {
       lastCloseAt: Date.parse(record.updatedAt),
       stopLossArmed: false,
       venueExitQuantity: null,
+      venueExitQuantitySymbol: null,
       makerEntryParked: false,
       makerExitArmed: false,
       makerExitStartedAt: null,
@@ -1081,6 +1131,15 @@ export class StrategyEngine {
       || age > this.options.marketFreshnessMs
       || age < -this.options.futureQuoteToleranceMs
       || transportLag > this.options.marketMaxTransportLagMs) return null;
+    // The frame-level gate above says "this symbol is streaming". The quote-level gate says the
+    // bid/ask we are about to read came from that stream: a sparse ticker carrying only `lp`
+    // refreshes `updatedAt` while leaving the stored quote behind, so judging the quote by the
+    // frame's age is what let a stale price pass as fresh market data.
+    const quoteTimestamp = market.quoteUpdatedAt === undefined ? Number.NaN : Date.parse(market.quoteUpdatedAt);
+    const quoteAge = this.options.now() - quoteTimestamp;
+    if (!Number.isFinite(quoteAge)
+      || quoteAge > this.options.marketFreshnessMs
+      || quoteAge < -this.options.futureQuoteToleranceMs) return null;
     return market;
   }
 
@@ -1091,6 +1150,13 @@ export class StrategyEngine {
     const left = this.freshMarket(leftSymbol);
     const right = this.freshMarket(rightSymbol);
     if (!left || !right) return null;
+    // Two individually fresh quotes can still be minutes apart in exchange time. A spread
+    // computed across them describes a pair that never coexisted on either venue, which is
+    // exactly the mismatch that showed up as fills far from the triggered bps.
+    const leftQuote = Date.parse(left.quoteUpdatedAt ?? '');
+    const rightQuote = Date.parse(right.quoteUpdatedAt ?? '');
+    if (!Number.isFinite(leftQuote) || !Number.isFinite(rightQuote)) return null;
+    if (Math.abs(leftQuote - rightQuote) > this.options.marketPairMaxSkewMs) return null;
     return { left, right };
   }
 
@@ -1262,12 +1328,18 @@ export class StrategyEngine {
    * order. The clamp retires itself once the ledger-derived quantity falls to it (the engine's
    * own fills closed the gap) and is cleared outright on any new fill. Null — the normal case —
    * returns the ledger quantity unchanged.
+   *
+   * The clamp is looked up by symbol: it holds one leg's real size, and the two legs of a pair
+   * carry different quantities (the hedge leg is sized by the ADR ratio), so a clamp measured on
+   * one leg is simply not applicable to an order on the other.
    */
-  private exitQuantityFor(actor: StrategyActor, ledgerQuantity: Decimal): Decimal {
+  private exitQuantityFor(actor: StrategyActor, symbol: string, ledgerQuantity: Decimal): Decimal {
     const override = actor.venueExitQuantity;
     if (override === null || !override.isFinite() || override.isNegative()) return ledgerQuantity;
+    if (actor.venueExitQuantitySymbol !== symbol) return ledgerQuantity;
     if (ledgerQuantity.lte(override)) {
       actor.venueExitQuantity = null;
+      actor.venueExitQuantitySymbol = null;
       return ledgerQuantity;
     }
     return override;
@@ -1296,41 +1368,51 @@ export class StrategyEngine {
    * ordinary rejection accounting when the venue confirms the ledger (or cannot be read), so a
    * genuine submission failure still surfaces through the usual path.
    *
-   * The requested quantity and the venue quantity are in the same units — the maker leg is the
-   * perpetual leg whenever the venue enforces reduce-only — so the clamp needs no conversion.
+   * Both exit paths land here — the maker exit quote (`maintainQuote`, which also rests a
+   * reduce-only limit) and the taker exit clip (`executeTakerClip`, which is how a stop-loss or
+   * take-profit unwinds). Leaving the taker path out is what let a stop-loss re-report a ghost
+   * position five times in a minute and then pause the strategy.
+   *
+   * The requested quantity and the venue quantity are in the same units — `exitLegSymbol` is the
+   * leg the venue enforces reduce-only on, i.e. the perpetual leg, and `requested` is that leg's
+   * own order quantity — so the clamp needs no conversion. `'withdrawn'` means the venue holds
+   * nothing reducible at all; the caller owns what that implies (a maker exit quote is withdrawn,
+   * a taker exit clip stops the strategy).
    */
   private async reconcileExitQuantity(
     actor: StrategyActor,
-    makerLegSymbol: string,
-    makerLegSide: 'BUY' | 'SELL',
+    exitLegSymbol: string,
+    exitLegSide: 'BUY' | 'SELL',
     requested: Decimal,
-  ): Promise<'clamped' | 'ordinary'> {
+  ): Promise<'clamped' | 'withdrawn' | 'ordinary'> {
     this.runtime.addStrategyLog(actor.id, 'warning', 'Exit size drift',
-      `Post-only reduce-only exit for ${requested.toString()} ${actor.config.asset}`,
+      `Reduce-only exit for ${requested.toString()} ${actor.config.asset}`,
       requested.toString(), 'Venue rejected the reduce-only exit; reconciling positions');
     const positions = await this.refreshVenuePositions(actor);
-    const venueQuantity = positions === null || isSpotSymbol(makerLegSymbol)
+    const venueQuantity = positions === null || isSpotSymbol(exitLegSymbol)
       ? null
-      : venueReducibleQuantity(positions, makerLegSymbol, makerLegSide);
+      : venueReducibleQuantity(positions, exitLegSymbol, exitLegSide);
     if (venueQuantity === null || !venueQuantity.isFinite() || venueQuantity.gte(requested)) {
       // No new information: the venue agrees with the ledger (or the read failed), so this is
       // an ordinary rejection after all.
       return 'ordinary';
     }
     // The venue is the truth. Remember the clamp so later ticks re-report at this size, and
-    // let the next tick place the corrected quote (a zero means the position is gone and the
-    // exit quote is withdrawn until the venue holds something reducible again).
+    // let the next tick place the corrected exit (a zero means the position is gone and the
+    // exit is withdrawn until the venue holds something reducible again).
+    const reducible = venueQuantity.gt(QUANTITY_EPSILON);
     actor.venueExitQuantity = venueQuantity;
+    actor.venueExitQuantitySymbol = exitLegSymbol;
     actor.failureCount = 0;
     actor.cooldownUntil = this.options.now() + 250;
-    this.runtime.addStrategyLog(actor.id, venueQuantity.gt(QUANTITY_EPSILON) ? 'info' : 'warning',
-      venueQuantity.gt(QUANTITY_EPSILON) ? 'Exit size corrected' : 'Exit quote withdrawn',
+    this.runtime.addStrategyLog(actor.id, reducible ? 'info' : 'warning',
+      reducible ? 'Exit size corrected' : 'Exit quote withdrawn',
       `Reduce-only exit for ${requested.toString()} ${actor.config.asset}`,
       requested.toString(),
-      venueQuantity.gt(QUANTITY_EPSILON)
+      reducible
         ? `Venue holds ${venueQuantity.toString()}; re-reporting at the venue size`
         : 'Venue holds no reducible position on this leg');
-    return 'clamped';
+    return reducible ? 'clamped' : 'withdrawn';
   }
 
   private openStrategyOrders(strategyId: string, excludeIds: Set<string>): ExecutionOrder[] {
@@ -2488,6 +2570,18 @@ export class StrategyEngine {
   }
 
   /**
+   * The leg the venue enforces reduce-only against — the perpetual leg. A spot leg is never
+   * reduce-only (a sell is capped by the balance held, not by a position), so a pair with one
+   * spot leg has exactly one candidate; a pair of two perps is anchored on the left leg, the
+   * same anchor the venue-truth exit clamp uses. Null only when both legs are spot.
+   */
+  private perpetualLegOf(legs: { left: LegDefinition; right: LegDefinition }): LegDefinition | null {
+    if (!isSpotSymbol(legs.left.symbol)) return legs.left;
+    if (!isSpotSymbol(legs.right.symbol)) return legs.right;
+    return null;
+  }
+
+  /**
    * Gate spot market buys must be sized in quote currency: convert the requested base quantity at
    * the current spot mid so the ledger (which tracks base quantities) and the venue order agree.
    * Returns null for non-spot orders and for spot orders without a usable mid.
@@ -2502,17 +2596,47 @@ export class StrategyEngine {
 
   private async executeTakerClip(actor: StrategyActor, intent: QuoteIntent, quantity: Decimal, condition: string, rightQuantityOverride?: Decimal): Promise<void> {
     const legs = this.legsForIntent(actor, intent);
+    const ratio = adrRatioOf(actor.config);
+    const perpetualLeg = this.perpetualLegOf(legs);
     // Default hedge sizing is the strategy's fixed conversion; premium callers override it for
     // equal-notional clips (entry: priced hedge, exit: proportional unwind).
-    const rightRaw = rightQuantityOverride ?? quantity.div(adrRatioOf(actor.config));
+    let leftQuantity = quantity;
+    let rightRaw = rightQuantityOverride ?? quantity.div(ratio);
+    // Venue-truth clamp on exits. A reduce-only rejection remembered the venue's real size for
+    // the perpetual leg, and that size bounds the whole clip: both legs are a hedge, so exiting
+    // the clamped size on one and the ledger's size on the other would leave naked exposure.
+    // Clamp the leg the venue enforces reduce-only on, then scale the counterpart by the same
+    // factor — the hedge leg keeps whatever linear relation the caller configured (the ADR ratio,
+    // or an equal-notional share of the same clip) at the venue's real size. No clamp is a no-op.
+    if (intent === 'exit' && perpetualLeg !== null) {
+      if (perpetualLeg.leg === 'left') {
+        const clamped = this.exitQuantityFor(actor, perpetualLeg.symbol, quantity);
+        if (!clamped.eq(quantity) && quantity.gt(0)) rightRaw = rightRaw.mul(clamped).div(quantity);
+        leftQuantity = clamped;
+      } else {
+        const requestedRight = rightRaw;
+        const clamped = this.exitQuantityFor(actor, perpetualLeg.symbol, requestedRight);
+        if (!clamped.eq(requestedRight) && requestedRight.gt(0)) leftQuantity = quantity.mul(clamped).div(requestedRight);
+        rightRaw = clamped;
+      }
+    }
     const rightQuantity = roundToStep(rightRaw, this.constraintsFor(legs.right.symbol).lotSize, 'down');
-    const sizeError = this.marketOrderSizeError(legs.left.symbol, legs.left.side, quantity)
+    // A clamp can retire to zero when the venue holds nothing reducible: there is then no exit to
+    // place on either leg, and the rejection that set the clamp has already reported why. Exits
+    // that reach zero for any other reason (a hedge leg rounding below one lot) keep the size
+    // preflight below as their voice. Checked before the preflight so a zero-sized order never
+    // reaches the venue.
+    const clampActive = perpetualLeg !== null && actor.venueExitQuantitySymbol === perpetualLeg.symbol
+      && actor.venueExitQuantity !== null;
+    if (intent === 'exit' && clampActive
+      && (!leftQuantity.gt(QUANTITY_EPSILON) || !rightQuantity.gt(QUANTITY_EPSILON))) return;
+    const sizeError = this.marketOrderSizeError(legs.left.symbol, legs.left.side, leftQuantity)
       ?? this.marketOrderSizeError(legs.right.symbol, legs.right.side, rightQuantity);
     if (sizeError) {
       await this.pause(actor, `Order-size compliance check failed: ${sizeError.label ?? sizeError.code}`);
       return;
     }
-    const leftQuoteQty = legs.left.side === 'BUY' ? this.spotMarketBuyQuoteQty(legs.left.symbol, quantity) : null;
+    const leftQuoteQty = legs.left.side === 'BUY' ? this.spotMarketBuyQuoteQty(legs.left.symbol, leftQuantity) : null;
     const rightQuoteQty = legs.right.side === 'BUY' ? this.spotMarketBuyQuoteQty(legs.right.symbol, rightQuantity) : null;
     if ((isSpotSymbol(legs.left.symbol) && legs.left.side === 'BUY' && leftQuoteQty === null)
       || (isSpotSymbol(legs.right.symbol) && legs.right.side === 'BUY' && rightQuoteQty === null)) {
@@ -2531,10 +2655,10 @@ export class StrategyEngine {
         : intent === 'exit' ? 'Take-profit triggered'
         : actor.config.reduceOnly ? 'Reduce-only triggered' : 'Entry triggered';
       this.runtime.addStrategyLog(actor.id, 'info', triggeredEvent, condition,
-        `${quantity.toString()} ${actor.config.asset}`, 'Submitting both taker legs');
+        `${leftQuantity.toString()} ${actor.config.asset}`, 'Submitting both taker legs');
       const submissions = await Promise.allSettled([
         this.runtime.createOrder({ symbol: legs.left.symbol, side: legs.left.side, type: 'MARKET', timeInForce: 'IOC',
-          quantity: quantity.toString(), ...(leftQuoteQty !== null ? { quoteQty: leftQuoteQty.toString() } : {}), reduceOnly },
+          quantity: leftQuantity.toString(), ...(leftQuoteQty !== null ? { quoteQty: leftQuoteQty.toString() } : {}), reduceOnly },
         { strategyId: actor.id, strategyLeg: 'left', strategyClip: clip }),
         this.runtime.createOrder({ symbol: legs.right.symbol, side: legs.right.side, type: 'MARKET', timeInForce: 'IOC',
           quantity: rightQuantity.toString(), ...(rightQuoteQty !== null ? { quoteQty: rightQuoteQty.toString() } : {}), reduceOnly },
@@ -2545,37 +2669,41 @@ export class StrategyEngine {
       if (rejected.length > 0) {
         const gateErrors = rejected.map((entry) => entry.reason).filter((reason): reason is GateApiError => reason instanceof GateApiError);
         // A reduce-only rejection on an exit means the venue holds less than the ledger: the
-        // position was closed outside the engine. Re-anchor the position state now, and when
-        // the venue holds nothing reducible stop immediately with the real reason instead of
-        // spending the five-strike budget on orders the venue cannot accept. A partial
-        // position keeps the ordinary accounting as the backstop — the maker path clamps and
-        // re-reports directly, while this two-leg submission re-reports on the next tick.
+        // position was closed outside the engine. Re-anchor the position state and re-report the
+        // exit at the venue's real size instead of spending the five-strike budget on orders the
+        // venue cannot accept. The maker path has always done this inline; leaving the taker path
+        // out is what let `AUTO-B63B204D` submit the same doomed stop-loss clip five times in 62
+        // seconds and then pause. A state mismatch is not a submission failure, so it is the
+        // reconciliation — not `failureCount` — that owns the outcome.
+        let venueTruthHandled = false;
         if (intent === 'exit' && rejected.some((entry) => isReduceOnlyQuantityRejection(entry.reason))) {
-          const positions = await this.refreshVenuePositions(actor);
-          const perpetualLeg = !isSpotSymbol(legs.left.symbol) ? legs.left
-            : !isSpotSymbol(legs.right.symbol) ? legs.right : null;
-          const venueQuantity = positions !== null && perpetualLeg !== null
-            ? venueReducibleQuantity(positions, perpetualLeg.symbol, perpetualLeg.side)
-            : null;
-          if (venueQuantity !== null && venueQuantity.lte(QUANTITY_EPSILON)) {
-            await this.pause(actor, 'Venue holds no reducible position on the exit leg; the position was closed outside this strategy');
+          if (perpetualLeg !== null) {
+            // The quantities actually submitted: the venue rejected those, not the caller's request.
+            const requested = perpetualLeg.leg === 'left' ? leftQuantity : rightQuantity;
+            const outcome = await this.reconcileExitQuantity(actor, perpetualLeg.symbol, perpetualLeg.side, requested);
+            if (outcome === 'withdrawn') {
+              await this.pause(actor, 'Venue holds no reducible position on the exit leg; the position was closed outside this strategy');
+            }
+            venueTruthHandled = outcome !== 'ordinary';
           }
         }
-        actor.failureCount += 1;
-        const rateLimitWait = gateErrors
-          .filter((error) => error.statusCode === 429)
-          .reduce((longest, error) => Math.max(longest, error.retryAfterMs ?? 30_000), 0);
-        actor.cooldownUntil = this.options.now() + Math.max(
-          rateLimitWait,
-          Math.min(60_000, 2_000 * 2 ** Math.min(4, actor.failureCount)),
-        );
-        this.runtime.addStrategyLog(actor.id, 'warning', 'Leg submission failed', condition, quantity.toString(),
-          rejected.map((entry) => entry.reason instanceof Error ? entry.reason.message.slice(0, 120) : 'submit error').join(' · '));
-        const insufficientMargin = gateErrors.some((error) => /(?:MARGIN|BALANCE)/.test(error.label));
-        if (intent === 'entry' && insufficientMargin && accepted.length === 0) {
-          await this.pause(actor, 'Order rejected for insufficient margin; strategy stopped retrying until manually reviewed');
-        } else if (actor.failureCount >= 5) {
-          await this.pause(actor, 'Five consecutive order submissions failed; check credentials, balances, and venue status');
+        if (!venueTruthHandled) {
+          actor.failureCount += 1;
+          const rateLimitWait = gateErrors
+            .filter((error) => error.statusCode === 429)
+            .reduce((longest, error) => Math.max(longest, error.retryAfterMs ?? 30_000), 0);
+          actor.cooldownUntil = this.options.now() + Math.max(
+            rateLimitWait,
+            Math.min(60_000, 2_000 * 2 ** Math.min(4, actor.failureCount)),
+          );
+          this.runtime.addStrategyLog(actor.id, 'warning', 'Leg submission failed', condition, leftQuantity.toString(),
+            rejected.map((entry) => entry.reason instanceof Error ? entry.reason.message.slice(0, 120) : 'submit error').join(' · '));
+          const insufficientMargin = gateErrors.some((error) => /(?:MARGIN|BALANCE)/.test(error.label));
+          if (intent === 'entry' && insufficientMargin && accepted.length === 0) {
+            await this.pause(actor, 'Order rejected for insufficient margin; strategy stopped retrying until manually reviewed');
+          } else if (actor.failureCount >= 5) {
+            await this.pause(actor, 'Five consecutive order submissions failed; check credentials, balances, and venue status');
+          }
         }
       } else {
         actor.failureCount = 0;
@@ -2722,7 +2850,7 @@ export class StrategyEngine {
           // The venue-truth clamp keeps a drifted ledger from resubmitting an exit the venue already
           // rejected for exceeding the position; a zero clamp drops the intent and the cleanup loop
           // below withdraws any resting exit quote.
-          const exitQuantity = this.exitQuantityFor(actor, Decimal.min(perOrder, makerRemaining));
+          const exitQuantity = this.exitQuantityFor(actor, makerLeg.symbol, Decimal.min(perOrder, makerRemaining));
           if (exitQuantity.gt(QUANTITY_EPSILON)) {
             intents.push({ intent: 'exit', quantity: exitQuantity, tier: 0 });
           }
@@ -2825,9 +2953,11 @@ export class StrategyEngine {
     } catch (error) {
       if (intent === 'exit' && isReduceOnlyQuantityRejection(error)) {
         // The venue holds less than the ledger: reconcile now and re-report at the venue's
-        // real size instead of spending the five-strike budget on a state mismatch.
+        // real size instead of spending the five-strike budget on a state mismatch. A clamp that
+        // reads zero withdraws the exit quote (the intent loop drops it on the next pass) rather
+        // than counting a strike, exactly as a positive clamp re-quotes at the venue size.
         const outcome = await this.reconcileExitQuantity(actor, desired.makerLeg.symbol, desired.makerLeg.side, roundedQuantity);
-        if (outcome === 'clamped') return;
+        if (outcome !== 'ordinary') return;
       }
       actor.failureCount += 1;
       actor.cooldownUntil = this.options.now() + Math.min(60_000, 2_000 * 2 ** Math.min(4, actor.failureCount));
@@ -3137,6 +3267,12 @@ export class StrategyEngine {
     const hedgeLeg = makerLegKey === 'left' ? legs.right : legs.left;
     const makerQuantity = makerLeg.leg === 'left' ? exposure.left.abs() : exposure.right.abs();
     const hedgeQuantity = hedgeLeg.leg === 'left' ? exposure.left.abs() : exposure.right.abs();
+    // Signed hedge exposure, for direction only. `hedgeQuantity` above is absolute and exists to
+    // *size* the unwind (`target`), so it can never express which way the position must be closed:
+    // reaching the submission below already implies `hedgeQuantity > 0`, which made the old
+    // `hedgeQuantity.gt(0) ? 'SELL' : 'BUY'` a constant SELL and left the BUY branch unreachable.
+    // A short hedge leg (negative signed exposure) is closed with a BUY.
+    const signedHedge = hedgeLeg.leg === 'left' ? exposure.left : exposure.right;
     const target = hedgeQuantity.minus(makerQuantity);
     const now = this.options.now();
     // Backoff gate FIRST, before any venue interaction: a persistently rejected hedge submit must
@@ -3173,7 +3309,9 @@ export class StrategyEngine {
     const slippage = new Decimal(widened
       ? MAKER_EXIT_HEDGE_FALLBACK_SLIPPAGE_BPS
       : MAKER_EXIT_HEDGE_SLIPPAGE_BPS);
-    const side: 'BUY' | 'SELL' = hedgeQuantity.gt(0) ? 'SELL' : 'BUY';
+    // Long hedge ⇒ SELL to reduce; short hedge ⇒ BUY to close. Zero is unreachable here:
+    // `target > 0` (checked above) means `|hedge| > |maker| >= 0`, hence a non-zero signed value.
+    const side: 'BUY' | 'SELL' = signedHedge.gt(0) ? 'SELL' : 'BUY';
     const rawPrice = side === 'SELL'
       ? mid.mul(ONE.minus(slippage.div(BPS)))
       : mid.mul(ONE.plus(slippage.div(BPS)));

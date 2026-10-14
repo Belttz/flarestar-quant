@@ -193,6 +193,7 @@ class StubMarkets implements MarketSource {
     receivedAt = updatedAt,
     fundingRate = '0.0001',
     nextFundingAt = new Date(Date.now() + 3_600_000).toISOString(),
+    quoteUpdatedAt = updatedAt,
   ): void {
     const [venue = 'GATE', , asset = 'BTC'] = symbol.split('_');
     this.markets.set(symbol, {
@@ -200,7 +201,7 @@ class StubMarkets implements MarketSource {
       askPrice: ask, askSize: '10', open24h: bid, high24h: ask, low24h: bid, volume24h: '100',
       quoteVolume24h: '100000', fundingRate, nextFundingAt,
       openInterest: '1000', openInterestValue: '1000000', receivedAt, updatedAt,
-      source: 'gate_crossex_websocket',
+      quoteUpdatedAt, source: 'gate_crossex_websocket',
     });
     this.database.prepare(`INSERT OR IGNORE INTO crossex_instruments (
       symbol, exchange_type, business_type, state, min_size, min_notional, lot_size,
@@ -1401,6 +1402,48 @@ describe('strategy engine', () => {
         && /holds no reducible position/i.test(log.result))).toBe(true);
       expect(engine.listActiveStrategyIds()).toEqual([]);
     });
+
+    it('clamps a taker exit clip to the venue size instead of re-reporting the ghost position', async () => {
+      const harness = await createHarness();
+      const { engine, runtime, gateway, markets } = harness;
+      const record = await openCappedPosition(harness, 'TAKER_TAKER');
+      // The venue closed most of the position outside the engine: only 0.04 of the 0.1 short remains.
+      // Without the clamp the tick keeps re-reporting the ledger's 0.1, is rejected again, and the
+      // strategy pauses on the fifth strike — the `AUTO-B63B204D` shape (five `Leg submission
+      // failed` rows inside a minute).
+      gateway.positions = [futuresPosition(left, 'SHORT', '0.04')];
+      gateway.createFailLabel = 'TRADE_REDUCE_ONLY_POSITION_QTY_ERROR';
+      gateway.failCreate(left, 1);
+
+      collapseToTakeProfit(markets);
+      const readsBeforeRejection = gateway.positionQueries;
+      await engine.tick();
+      await waitFor(() => gateway.createAttempts.length === 2);
+      expect(gateway.createAttempts[0]).toMatchObject({
+        symbol: left, side: 'BUY', type: 'MARKET', qty: '0.1', reduce_only: 'true',
+      });
+
+      // The rejection reconciled against the venue rather than counting a strike.
+      await waitFor(() => eventsOf(runtime, record.id).has('Exit size corrected'));
+      const events = eventsOf(runtime, record.id);
+      expect(events.has('Exit size drift')).toBe(true);
+      expect(events.has('Leg submission failed')).toBe(false);
+      expect(gateway.positionQueries).toBe(readsBeforeRejection + 1);
+      expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+
+      // The next tick re-reports at the venue size and re-derives the hedge leg from it, so the
+      // clip stays a hedge instead of exiting the full size on one leg and a clamped size on the
+      // other. BTC auto legs have no ADR ratio, so both legs land on 0.04.
+      await pastCooldown();
+      const requoteTick = engine.tick();
+      await waitFor(() => gateway.createAttempts.length === 4);
+      expect(gateway.createAttempts[2]).toMatchObject({ symbol: left, side: 'BUY', qty: '0.04', reduce_only: 'true' });
+      expect(gateway.createAttempts[3]).toMatchObject({ symbol: right, side: 'SELL', qty: '0.04', reduce_only: 'true' });
+      await requoteTick;
+      expect(eventsOf(runtime, record.id).has('Leg submission failed')).toBe(false);
+      expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+      expect(engine.listActiveStrategyIds()).toEqual([record.id]);
+    });
   });
 
   it('keeps a stop pending until the exchange confirms every cancellation', async () => {
@@ -1579,11 +1622,17 @@ describe('strategy engine', () => {
     await engine.tick();
     expect(gateway.createdOrders).toHaveLength(2);
 
-    // Independently timed quotes are valid when each one is fresh and arrived promptly. The first
-    // qualifying signal executes immediately even though their Gate source times differ by 6s.
+    // Each leg is individually fresh and arrived promptly, but six seconds apart in exchange
+    // time the pair describes a spread that never coexisted on either venue — the very mismatch
+    // that showed up as fills far from the triggered bps. Independently timed is not aligned.
     markets.set('GATE_FUTURE_SKHY_USDT', '143.78', '143.8', new Date(now).toISOString());
     const independentlyTimed = new Date(now - 6_000).toISOString();
     markets.set('GATE_FUTURE_SKHYNIX_USDT', '1083.7', '1083.8', independentlyTimed, independentlyTimed);
+    await engine.tick();
+    expect(gateway.createdOrders).toHaveLength(2);
+
+    // Realign the legs and the very same prices qualify immediately.
+    markets.set('GATE_FUTURE_SKHYNIX_USDT', '1083.7', '1083.8', new Date(now).toISOString());
     const exitTick = engine.tick();
     await waitFor(() => gateway.createdOrders.length === 4);
     expect(gateway.createdOrders.slice(2)).toEqual(expect.arrayContaining([
