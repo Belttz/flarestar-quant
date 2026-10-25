@@ -40,6 +40,14 @@ export interface MarketSource {
    * hub can back a quote from, and without it a low-liquidity leg would simply go silent.
    */
   watchOrderBook?(symbol: string): () => void;
+  /**
+   * Current order-book levels as `[price, size]` string pairs. A taker entry can only be judged
+   * executable against the book it will walk: a top-of-book quote says nothing about how far a
+   * clip of this size pushes the price, which is exactly how a 66 USDT order filled 2.4% worse
+   * than its decision quote on a thin venue. Absent (or a null return) means "depth unknown" and
+   * the slippage guard stands down rather than inventing a number.
+   */
+  orderBook?(symbol: string): { bids: ReadonlyArray<readonly [string, string]>; asks: ReadonlyArray<readonly [string, string]> } | null;
   /** Current upstream public-stream state, when the source can expose it. */
   connectionState?(): 'connecting' | 'healthy' | 'reconnecting' | 'stale' | 'disconnected';
 }
@@ -77,6 +85,12 @@ export interface StrategyEngineOptions {
    * 8h cadence for APR annualization and the accrual clock, with a strategy-log warning.
    */
   fundingIntervalHours?: (symbol: string) => number | null | undefined;
+  /**
+   * Ceiling on the book-walked slippage a taker ENTRY may pay against the live order book
+   * (bps). Exits are never blocked — refusing to close is worse than paying the spread — and a
+   * symbol without a maintained book is not judged at all. 0 disables the guard.
+   */
+  maxTakerSlippageBps?: number;
   now?: () => number;
 }
 
@@ -466,6 +480,9 @@ export class StrategyEngine {
       marketDataWaitTimeoutMs: options.marketDataWaitTimeoutMs ?? 10_000,
       // A missing adapter reports null so carry accounting falls back to the 8h Gate cadence.
       fundingIntervalHours: options.fundingIntervalHours ?? (() => null),
+      // 50 bps of book-walked slippage is already several times the round-trip taker fee; past
+      // that an entry is not an arbitrage, it is a market order into a hole.
+      maxTakerSlippageBps: options.maxTakerSlippageBps ?? 50,
       now: options.now ?? Date.now,
     };
     this.strategyOrderRowsStatement = database.prepare(`SELECT strategy_leg AS leg, symbol, side, quantity, executed_quantity, strategy_clip, reduce_only
@@ -2701,6 +2718,73 @@ export class StrategyEngine {
     return mid.gt(0) ? quantity.mul(mid) : null;
   }
 
+  /**
+   * Walk one leg's live book for a clip of `quantity` and report how far the fill would slip from
+   * that leg's own top-of-book price, plus the notional the visible book actually holds.
+   *
+   * Returns null when the market source maintains no book for the symbol (the guard stands down
+   * instead of inventing a number) and for spot buys, whose quantity is denominated in the quote
+   * currency rather than in book sizes. `shortfall` marks a clip the visible book cannot fill.
+   */
+  private bookWalk(symbol: string, side: 'BUY' | 'SELL', quantity: Decimal): { slippageBps: Decimal; depthUsdt: number; shortfall: boolean } | null {
+    const book = this.markets.orderBook?.(symbol);
+    if (!book) return null;
+    const levels = side === 'BUY' ? book.asks : book.bids;
+    if (levels.length === 0) return null;
+    const top = new Decimal(levels[0][0]);
+    if (!top.gt(0)) return null;
+    let remaining = quantity;
+    let spent = new Decimal(0);
+    let filled = new Decimal(0);
+    let depthUsdt = 0;
+    for (const [priceText, sizeText] of levels) {
+      const price = new Decimal(priceText);
+      const size = new Decimal(sizeText);
+      if (!price.gt(0) || !size.gt(0)) continue;
+      depthUsdt += Number(price.mul(size));
+      if (!remaining.gt(QUANTITY_EPSILON)) continue;
+      const take = Decimal.min(size, remaining);
+      spent = spent.plus(take.mul(price));
+      filled = filled.plus(take);
+      remaining = remaining.minus(take);
+    }
+    if (!filled.gt(0)) return null;
+    // BUY pays above the top ask, SELL receives below the top bid: both are a loss of the same
+    // sign once expressed against the top of book.
+    const vwap = spent.div(filled);
+    const adverse = side === 'BUY' ? vwap.minus(top) : top.minus(vwap);
+    return {
+      slippageBps: Decimal.max(0, adverse).div(top).mul(BPS),
+      depthUsdt,
+      shortfall: remaining.gt(QUANTITY_EPSILON),
+    };
+  }
+
+  /**
+   * Admission check for a taker entry: refuse to walk a book that cannot absorb the clip at the
+   * configured slippage ceiling. Entry-only by design — a thin book is a reason to skip a trade,
+   * never a reason to sit in an unhedged leg, so exits bypass this entirely.
+   */
+  private takerDepthRejection(legs: { left: LegDefinition; right: LegDefinition }, leftQuantity: Decimal, rightQuantity: Decimal): string | null {
+    const ceiling = this.options.maxTakerSlippageBps ?? 0;
+    if (ceiling <= 0) return null;
+    for (const [leg, quantity] of [[legs.left, leftQuantity], [legs.right, rightQuantity]] as const) {
+      if (!quantity.gt(QUANTITY_EPSILON)) continue;
+      // Spot buys are sized in quote currency; their book walk would compare base sizes to a quote
+      // amount, so they are not judged here.
+      if (isSpotSymbol(leg.symbol) && leg.side === 'BUY') continue;
+      const walk = this.bookWalk(leg.symbol, leg.side, quantity);
+      if (!walk) continue;
+      if (walk.shortfall) {
+        return `Book depth too thin: ${leg.side} ${leg.symbol} ${quantity.toString()} needs more size than the book shows ($${walk.depthUsdt.toFixed(2)} visible)`;
+      }
+      if (walk.slippageBps.gt(ceiling)) {
+        return `Book depth too thin: ${leg.side} ${leg.symbol} ${quantity.toString()} would slip ${walk.slippageBps.toFixed(1)} bps (limit ${ceiling} bps, $${walk.depthUsdt.toFixed(2)} visible)`;
+      }
+    }
+    return null;
+  }
+
   private async executeTakerClip(actor: StrategyActor, intent: QuoteIntent, quantity: Decimal, condition: string, rightQuantityOverride?: Decimal): Promise<void> {
     const legs = this.legsForIntent(actor, intent);
     const ratio = adrRatioOf(actor.config);
@@ -2742,6 +2826,16 @@ export class StrategyEngine {
     if (sizeError) {
       await this.pause(actor, `Order-size compliance check failed: ${sizeError.label ?? sizeError.code}`);
       return;
+    }
+    // Depth admission runs after the size preflight (a clip that can never be legal should not be
+    // reported as an illiquid book) and before anything is submitted. Entry only: blocking an
+    // exit would keep a naked leg alive, which is worse than any slippage.
+    if (intent === 'entry') {
+      const depthRejection = this.takerDepthRejection(legs, leftQuantity, rightQuantity);
+      if (depthRejection) {
+        await this.pause(actor, depthRejection);
+        return;
+      }
     }
     const leftQuoteQty = legs.left.side === 'BUY' ? this.spotMarketBuyQuoteQty(legs.left.symbol, leftQuantity) : null;
     const rightQuoteQty = legs.right.side === 'BUY' ? this.spotMarketBuyQuoteQty(legs.right.symbol, rightQuantity) : null;

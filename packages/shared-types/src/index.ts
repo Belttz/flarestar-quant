@@ -1513,6 +1513,28 @@ export const MarketSizeUnitsSchema = z.object({
 });
 export type MarketSizeUnits = z.infer<typeof MarketSizeUnitsSchema>;
 
+/**
+ * Executable depth of one symbol's maintained book. `bidDepthUsdt` / `askDepthUsdt` are the
+ * notional each side currently holds, so a client can size a clip against liquidity instead of
+ * against a top-of-book price that says nothing about size. Zero depth with null quotes means the
+ * book is not streaming yet.
+ */
+export const MarketBookDepthSchema = z.object({
+  symbol: z.string(),
+  bestBid: z.string().nullable(),
+  bestAsk: z.string().nullable(),
+  bidDepthUsdt: z.number().finite().nonnegative(),
+  askDepthUsdt: z.number().finite().nonnegative(),
+  updatedAt: z.string().nullable(),
+});
+export type MarketBookDepth = z.infer<typeof MarketBookDepthSchema>;
+
+export const MarketBookDepthsResponseSchema = z.object({
+  books: z.array(MarketBookDepthSchema),
+  fetchedAt: z.string(),
+});
+export type MarketBookDepthsResponse = z.infer<typeof MarketBookDepthsResponseSchema>;
+
 export const TerminalStreamMessageSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('market.snapshot'), payload: MarketSnapshotSchema }),
   z.object({ type: z.literal('market.status'), payload: z.object({

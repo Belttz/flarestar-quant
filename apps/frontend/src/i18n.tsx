@@ -604,6 +604,11 @@ const chinese: Record<string, string> = {
   'Closing…': '平仓中…',
   // R2 现货保证金提示（合约腿保证金不足）
   'Insufficient margin: the known USDT balance does not cover the spot amount plus the contract margin.': '保证金不足：已知 USDT 余额无法同时覆盖现货金额与合约保证金。',
+  // 盘口深度 / 成交额（可执行性读数）
+  'Bid depth': '买盘深度',
+  'Ask depth': '卖盘深度',
+  '24h turnover': '24h 成交额',
+  'Click to fill the maximum size': '点击填入最大数量',
 };
 
 /**

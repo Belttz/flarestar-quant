@@ -927,6 +927,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     // ...and one order-book subscription per leg, which is the only other source the hub can
     // back a quote from when a venue's sparse ticker omits bid/ask.
     watchOrderBook: (symbol) => marketHub.watchOrderBook(symbol),
+    // Executable depth for the taker-admission guard: the top-of-book quote cannot say how far a
+    // clip of this size walks the price, which is how a small order filled 2.4% off its quote.
+    orderBook: (symbol) => marketHub.orderBook(symbol),
     // Unit/injected hubs may deliberately supply static market objects without starting a socket.
     // Production passes startMarketStream=true, where stream health must gate every strategy.
     ...(options.startMarketStream ? { connectionState: () => marketHub.connectionState() } : {}),
@@ -2858,6 +2861,33 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       hasMore: candleStore.canBackfill(symbol) && candles.length > 0
         && (!candleStore.backfilledRecently(symbol, interval) || candles.length >= query.data.limit),
     } satisfies CandleSeriesResponse;
+  });
+
+  // Executable depth per symbol: the notional each side of the maintained book currently holds,
+  // with the best bid/ask it was measured against. The strategy form uses it to show per-leg
+  // liquidity and to default the maker leg onto the thinner side; the trade ticket uses it to
+  // warn before a market order walks the book.
+  app.get('/api/markets/books', async (request) => {
+    const raw = (request.query as { symbols?: string }).symbols ?? '';
+    const symbols = raw.split(',').map((symbol) => symbol.trim()).filter((symbol) => symbol !== '').slice(0, 12);
+    const books = symbols.map((symbol) => {
+      ensureMarketKnown(symbol);
+      const book = marketHub.orderBook(symbol);
+      if (!book || (book.bids.length === 0 && book.asks.length === 0)) {
+        return { symbol, bestBid: null, bestAsk: null, bidDepthUsdt: 0, askDepthUsdt: 0, updatedAt: null };
+      }
+      const notional = (levels: ReadonlyArray<readonly [string, string]>) => levels
+        .reduce((sum, [price, size]) => sum + Number(price) * Number(size), 0);
+      return {
+        symbol,
+        bestBid: book.bids[0]?.[0] ?? null,
+        bestAsk: book.asks[0]?.[0] ?? null,
+        bidDepthUsdt: notional(book.bids),
+        askDepthUsdt: notional(book.asks),
+        updatedAt: book.updatedAt,
+      };
+    });
+    return { books, fetchedAt: new Date().toISOString() };
   });
 
   // Public book/trade streams are venue-native: contract counts on GATE and OKX, base-coin

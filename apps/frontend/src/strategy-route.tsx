@@ -43,6 +43,7 @@ import {
   balanceUnitFor,
   exchanges,
   formatAmount,
+  formatUsd,
   incrementalExposure,
   isPositiveDecimal,
   liveMarketFor,
@@ -943,6 +944,8 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   // so a malformed parameter keeps its default instead of half-prefilling the form.
   const [executionMethod, setExecutionMethod] = useState<'Taker–Taker' | 'Maker–Taker'>(() => query.get('executionMethod') === 'maker' ? 'Maker–Taker' : 'Taker–Taker');
   const [makerLeg, setMakerLeg] = useState<'left' | 'right'>(() => query.get('makerLeg') === 'right' ? 'right' : 'left');
+  // Per-symbol executable depth, fed by /api/markets/books while the form is open.
+  const [legBookDepths, setLegBookDepths] = useState<Record<string, { bid: number; ask: number }>>({});
   const [amount, setAmount] = useState(() => queryDecimal(query.get('totalAmount')) ?? '');
   const [positionOrderQuantity, setPositionOrderQuantity] = useState(() => queryDecimal(query.get('perOrderQuantity')) ?? '');
   const [threshold, setThreshold] = useState(() => queryDecimal(autoQuery?.get('entryBps')) ?? '0');
@@ -1005,6 +1008,39 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
     priceDifferenceHistoryInterval,
     mode === 'auto',
   );
+  // Executable depth per leg, keyed by the leg's own symbol. A limit (maker) order needs no
+  // depth, so the picker defaults onto the THINNER book and leaves the taker hedge to the deep
+  // one — the reverse of what a top-of-book-only view suggests.
+  const leftDepth = legBookDepths[leftHistorySymbol] ?? null;
+  const rightDepth = legBookDepths[rightHistorySymbol] ?? null;
+  const makerLegPinnedRef = useRef(query.get('makerLeg') !== null);
+  useEffect(() => {
+    const symbols = [leftHistorySymbol, rightHistorySymbol].filter((symbol) => symbol.trim() !== '');
+    if (symbols.length < 2 || symbols[0] === symbols[1]) return;
+    let cancelled = false;
+    const load = () => {
+      api.marketBooks(symbols).then((response) => {
+        if (cancelled) return;
+        const next: Record<string, { bid: number; ask: number }> = {};
+        for (const book of response.books) next[book.symbol] = { bid: book.bidDepthUsdt, ask: book.askDepthUsdt };
+        setLegBookDepths(next);
+      }).catch(() => { /* depth is advisory: a failed read leaves the previous numbers in place */ });
+    };
+    load();
+    // Depth drifts as the book refills; refresh while the form is open instead of freezing the
+    // first snapshot the user happened to see.
+    const timer = window.setInterval(load, 15_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [leftHistorySymbol, rightHistorySymbol]);
+  useEffect(() => {
+    if (makerLegPinnedRef.current || executionMethod !== 'Maker–Taker') return;
+    if (!leftDepth || !rightDepth) return;
+    const leftTotal = leftDepth.bid + leftDepth.ask;
+    const rightTotal = rightDepth.bid + rightDepth.ask;
+    // Both books empty (nothing streamed yet) says nothing about liquidity.
+    if (leftTotal <= 0 || rightTotal <= 0 || leftTotal === rightTotal) return;
+    setMakerLeg(leftTotal < rightTotal ? 'left' : 'right');
+  }, [executionMethod, leftDepth, rightDepth]);
   const makerExchange = makerLeg === 'left' ? leftExchange : rightExchange;
   const configuredExecutionMethod = executionMethod === 'Maker–Taker' ? `${t('Maker–Taker')} · ${makerExchange.name} ${t('maker')}` : t('Taker–Taker');
   const selectedFeeRows = [
@@ -1462,7 +1498,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
       {!reduceOnly && configuredTarget > 0 && riskLimitsReady && <div className={`strategy-size-check strategy-risk-limit-check ${positionRiskLimitExceeded ? 'invalid' : 'valid'}`}><span>{positionRiskLimitExceeded ? '!' : '✓'}</span><p>{positionRiskLimitExceeded
         ? t('Configured position exceeds the maximum at selected leverage')
         : t('Configured position fits the leverage-tier limits')}</p></div>}
-      <div className="strategy-setup-actions">{mode === 'position' && <div className="compact-trigger"><span className={priceDiffBps !== null && priceDiffBps >= Number(threshold) ? 'ready' : ''}>{priceDiffBps !== null && priceDiffBps >= Number(threshold) ? '✓' : '○'}</span><p>{t('Enter at')} <strong>≥ {threshold || '0'} bps</strong></p></div>}<div className="compact-method"><span>{t('Execution method')}</span><div className="method-options execution-method-options" role="radiogroup" aria-label={t('Execution method')}><button type="button" role="radio" className={executionMethod === 'Taker–Taker' ? 'active' : ''} aria-checked={executionMethod === 'Taker–Taker'} onClick={() => setExecutionMethod('Taker–Taker')}>⚡ {t('Taker–Taker')}</button><button type="button" role="radio" className={executionMethod === 'Maker–Taker' ? 'active' : ''} aria-checked={executionMethod === 'Maker–Taker'} onClick={() => setExecutionMethod('Maker–Taker')}>◫ {t('Maker–Taker')}</button></div>{executionMethod === 'Maker–Taker' && <div className="maker-leg-picker execution-maker-leg-options" role="radiogroup" aria-label={t('Choose maker leg')}><button type="button" role="radio" className={makerLeg === 'left' ? 'active' : ''} aria-checked={makerLeg === 'left'} onClick={() => setMakerLeg('left')}><small>{t('Maker')} · A</small><strong>{leftExchange.name}</strong></button><button type="button" role="radio" className={makerLeg === 'right' ? 'active' : ''} aria-checked={makerLeg === 'right'} onClick={() => setMakerLeg('right')}><small>{t('Maker')} · B</small><strong>{rightExchange.name}</strong></button></div>}</div></div>
+      <div className="strategy-setup-actions">{mode === 'position' && <div className="compact-trigger"><span className={priceDiffBps !== null && priceDiffBps >= Number(threshold) ? 'ready' : ''}>{priceDiffBps !== null && priceDiffBps >= Number(threshold) ? '✓' : '○'}</span><p>{t('Enter at')} <strong>≥ {threshold || '0'} bps</strong></p></div>}<div className="compact-method"><span>{t('Execution method')}</span><div className="method-options execution-method-options" role="radiogroup" aria-label={t('Execution method')}><button type="button" role="radio" className={executionMethod === 'Taker–Taker' ? 'active' : ''} aria-checked={executionMethod === 'Taker–Taker'} onClick={() => setExecutionMethod('Taker–Taker')}>⚡ {t('Taker–Taker')}</button><button type="button" role="radio" className={executionMethod === 'Maker–Taker' ? 'active' : ''} aria-checked={executionMethod === 'Maker–Taker'} onClick={() => setExecutionMethod('Maker–Taker')}>◫ {t('Maker–Taker')}</button></div>{executionMethod === 'Maker–Taker' && <div className="maker-leg-picker execution-maker-leg-options" role="radiogroup" aria-label={t('Choose maker leg')}><button type="button" role="radio" className={makerLeg === 'left' ? 'active' : ''} aria-checked={makerLeg === 'left'} title={`${t('Bid depth')} ${formatUsd(leftDepth?.bid ?? 0)} · ${t('Ask depth')} ${formatUsd(leftDepth?.ask ?? 0)}`} onClick={() => { makerLegPinnedRef.current = true; setMakerLeg('left'); }}><small>{t('Maker')} · A · {leftDepth ? formatUsd(leftDepth.bid + leftDepth.ask) : '—'}</small><strong>{leftExchange.name}</strong></button><button type="button" role="radio" className={makerLeg === 'right' ? 'active' : ''} aria-checked={makerLeg === 'right'} title={`${t('Bid depth')} ${formatUsd(rightDepth?.bid ?? 0)} · ${t('Ask depth')} ${formatUsd(rightDepth?.ask ?? 0)}`} onClick={() => { makerLegPinnedRef.current = true; setMakerLeg('right'); }}><small>{t('Maker')} · B · {rightDepth ? formatUsd(rightDepth.bid + rightDepth.ask) : '—'}</small><strong>{rightExchange.name}</strong></button></div>}</div></div>
       {mode === 'position' && <div className="compact-stop"><span>◎</span><p>{`${t('Stops after')} ${amount || '0'} ${asset} ${t('executes')}`}</p></div>}
     </article>
   );

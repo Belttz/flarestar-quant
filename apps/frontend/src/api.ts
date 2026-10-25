@@ -20,6 +20,7 @@ import {
   LeverageResponseSchema,
   LeverageUpdateResponseSchema,
   MarketCatalogResponseSchema,
+  MarketBookDepthsResponseSchema,
   MarketSizeUnitsSchema,
   MarketSnapshotSchema,
   OpportunityResponseSchema,
@@ -551,6 +552,11 @@ export const api = {
     return request(CandleSeriesResponseSchema, `/api/markets/${encodeURIComponent(symbol)}/candles?${params}`);
   },
   sizeUnits: () => request(MarketSizeUnitsSchema, '/api/markets/size-units'),
+  /** Executable depth per symbol; used to size clips and to default the maker leg onto thin books. */
+  marketBooks: (symbols: string[]) => request(
+    MarketBookDepthsResponseSchema,
+    `/api/markets/books?symbols=${encodeURIComponent(symbols.join(','))}`,
+  ),
   fees: () => request(VenueFeeRatesResponseSchema, '/api/crossex/fees', {
     headers: { 'x-gct-read-intent': 'fee-rates' },
   }),

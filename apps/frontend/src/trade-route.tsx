@@ -43,6 +43,7 @@ import {
   floorToStep,
   formatAmount,
   formatCountdown,
+  formatUsd,
   groupLevels,
   isPositiveDecimal,
   liveMarketFor,
@@ -130,9 +131,9 @@ function OrderBookPanel({ book, trades, liveMarket, quote, base, sizeMultiplier,
   const groupSteps = GROUP_STEP_MULTIPLIERS.map((multiplier) => Number((Number(tickText) * multiplier).toFixed(tickScale)));
   const step = groupSteps[groupIndex] ?? groupSteps[0];
   // Keep every book mode inside both terminal row heights (520px normally, 500px
-  // below 920px). The tabs, controls, headings, and mid-price consume 138px,
-  // leaving room for seven rows per side or fourteen rows in a single column.
-  const levelLimit = bookMode === 'Both' ? 7 : 14;
+  // below 920px). The tabs, controls, headings, mid-price and the depth/turnover footer consume
+  // 172px, leaving room for six rows per side or twelve rows in a single column.
+  const levelLimit = bookMode === 'Both' ? 6 : 12;
   // The public feed relays venue-native sizes (contract counts on Gate/OKX, base units elsewhere).
   // When the backend knows the venue's contract size, sizes and sums are converted to base coin
   // and the column headers say so; without it the raw feed numbers are shown unlabeled.
@@ -152,6 +153,12 @@ function OrderBookPanel({ book, trades, liveMarket, quote, base, sizeMultiplier,
   const sumDigits = factor === null ? 0 : 4;
   const sizeHeader = factor === null ? t('Size') : t('Size (BTC)').replace('BTC', base);
   const sumHeader = factor === null ? t('Sum') : t('Sum (USDT)').replace('USDT', base);
+  // Notional each side of the visible book holds, in quote currency. Feed sizes are venue-native
+  // (contract counts on GATE/OKX), so `factor` converts them to base coin before pricing.
+  const depthNotional = (levels: ReadonlyArray<readonly [string, string]>): number =>
+    levels.reduce((sum, [price, size]) => sum + Number(price) * Number(size) * (factor ?? 1), 0);
+  const bidDepthUsdt = depthNotional(book?.bids ?? []);
+  const askDepthUsdt = depthNotional(book?.asks ?? []);
 
   return <aside className="orderbook-panel terminal-panel">
     <div className="panel-tabs">
@@ -224,6 +231,16 @@ function OrderBookPanel({ book, trades, liveMarket, quote, base, sizeMultiplier,
           </div>)}
         </div>
       </div>}
+      {/* Top of book says nothing about size: these two numbers decide whether a clip is
+          executable at the price above. Depth is the notional each side of the visible book
+          holds right now; turnover is the venue's rolling 24h quote volume. */}
+      <div className="book-depth">
+        <div><dt>{t('Bid depth')}</dt><dd className="positive" title={`${bidDepthUsdt.toFixed(2)} ${quote}`}>{formatUsd(bidDepthUsdt)}</dd></div>
+        <div><dt>{t('Ask depth')}</dt><dd className="negative" title={`${askDepthUsdt.toFixed(2)} ${quote}`}>{formatUsd(askDepthUsdt)}</dd></div>
+        <div><dt>{t('24h turnover')}</dt><dd title={liveMarket?.quoteVolume24h ? `${Number(liveMarket.quoteVolume24h).toFixed(2)} ${quote}` : undefined}>
+          {liveMarket?.quoteVolume24h ? formatUsd(Number(liveMarket.quoteVolume24h)) : '—'}
+        </dd></div>
+      </div>
     </>}
     {tab === 'trades' && <>
       <div className="book-head"><span>{t('Price (USDT)').replace('USDT', quote)}</span><span>{sizeHeader}</span><span>{t('Time')}</span></div>
@@ -947,7 +964,7 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
           </button>}
         <dl className="order-summary">
           <div><dt>{t(sharedMarginMode ? 'Shared margin' : 'Available balance')}</dt><dd>{displayedBalance} {availableBalanceUnit}</dd></div>
-          <div><dt>{t(spotQuoteBuy ? 'Amount (USDT)' : 'Max order quantity')}</dt><dd><button className="max-quantity" onClick={() => { if (maxOrderQuantity) { setAmount(maxOrderQuantity); setAllocation(100); } }} disabled={!maxOrderQuantity}>{maxOrderQuantity || '—'} {spotQuoteBuy ? quote : asset}</button></dd></div>
+          <div><dt>{t(spotQuoteBuy ? 'Amount (USDT)' : 'Max order quantity')}</dt><dd><button className="max-quantity" title={t('Click to fill the maximum size')} aria-label={`${t('Max order quantity')} ${maxOrderQuantity || '—'}`} onClick={() => { if (maxOrderQuantity) { setAmount(maxOrderQuantity); setAllocation(100); } }} disabled={!maxOrderQuantity}><b>MAX</b>{maxOrderQuantity || '—'} {spotQuoteBuy ? quote : asset}</button></dd></div>
           {!isSpot && <div><dt>{t('Leverage')}</dt><dd><button className="summary-leverage" onClick={openLeverageEditor} title={leverageTitle}>{leverageValue}×{leverageIsDefault && <small> {t('default')}</small>}</button></dd></div>}
           {!isSpot && <div><dt>{t('Max position at selected leverage')}</dt><dd>{selectedMaxPositionValue !== null ? `${formatAmount(selectedMaxPositionValue)} ${quote}` : '—'}</dd></div>}
           <div><dt>{t('Maker fee')}</dt><dd>{makerFeeText}</dd></div>
