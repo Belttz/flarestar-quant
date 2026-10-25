@@ -2870,9 +2870,28 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   app.get('/api/markets/books', async (request) => {
     const raw = (request.query as { symbols?: string }).symbols ?? '';
     const symbols = raw.split(',').map((symbol) => symbol.trim()).filter((symbol) => symbol !== '').slice(0, 12);
-    const books = symbols.map((symbol) => {
+    // A book is only maintained while something watches it, so an unwatched symbol reads as empty
+    // (which is why the form first showed dashes). Subscribe for the duration of the read and
+    // release immediately after: the hub ref-counts watchers, so this never leaks a stream.
+    const readBook = async (symbol: string) => {
       ensureMarketKnown(symbol);
-      const book = marketHub.orderBook(symbol);
+      const current = marketHub.orderBook(symbol);
+      if (current && (current.bids.length > 0 || current.asks.length > 0)) return current;
+      const release = marketHub.watchOrderBook(symbol);
+      try {
+        const deadline = Date.now() + 1_200;
+        while (Date.now() < deadline) {
+          const book = marketHub.orderBook(symbol);
+          if (book && (book.bids.length > 0 || book.asks.length > 0)) return book;
+          await new Promise((resolve) => setTimeout(resolve, 60));
+        }
+        return marketHub.orderBook(symbol);
+      } finally {
+        release();
+      }
+    };
+    const books = await Promise.all(symbols.map(async (symbol) => {
+      const book = await readBook(symbol);
       if (!book || (book.bids.length === 0 && book.asks.length === 0)) {
         return { symbol, bestBid: null, bestAsk: null, bidDepthUsdt: 0, askDepthUsdt: 0, updatedAt: null };
       }
@@ -2886,7 +2905,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         askDepthUsdt: notional(book.asks),
         updatedAt: book.updatedAt,
       };
-    });
+    }));
     return { books, fetchedAt: new Date().toISOString() };
   });
 

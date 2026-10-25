@@ -2627,6 +2627,17 @@ html[data-theme='light'] .strategy-detail-rows dd { color: #1f2b36; }
 html[data-theme='light'] .order-summary .max-quantity { border-color: #9fd4c7; color: #0d6b58; background: #e9f7f2; }
 html[data-theme='light'] .order-summary .max-quantity b { color: #ffffff; background: #0d9488; }
 
+/* Per-leg executable depth under the maker-leg picker: a limit leg needs no depth, so the two
+ * numbers that matter are the ones on the taker leg. Shown for both venues so the default is
+ * explainable instead of magic. */
+.maker-depth-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px 12px; margin: 8px 0 0; padding: 7px 10px; border: 1px solid #1f2b38; border-radius: 6px; background: #0b1219; }
+.maker-depth-row > div { min-width: 0; display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.maker-depth-row dt { overflow: hidden; color: #6b7a8d; font-size: var(--text-micro); white-space: nowrap; text-overflow: ellipsis; }
+.maker-depth-row dd { margin: 0; color: #b8c2cf; font: 600 var(--text-caption) var(--font-sans); font-variant-numeric: tabular-nums; white-space: nowrap; }
+html[data-theme='light'] .maker-depth-row { border-color: #dfe6ec; background: #f7f9fb; }
+html[data-theme='light'] .maker-depth-row dt { color: #6a7686; }
+html[data-theme='light'] .maker-depth-row dd { color: #33414e; }
+
 /* ── v0.4.1 ──────────────────────────────────────────────────────────────────────────────── */
 /* Depth/turnover footer under the order book: what the visible book can actually absorb on each
  * side, plus the venue's rolling 24h turnover — the two numbers that decide whether a size is
