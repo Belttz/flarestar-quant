@@ -1021,9 +1021,16 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
     const load = () => {
       api.marketBooks(symbols).then((response) => {
         if (cancelled) return;
-        const next: Record<string, { bid: number; ask: number }> = {};
-        for (const book of response.books) next[book.symbol] = { bid: book.bidDepthUsdt, ask: book.askDepthUsdt };
-        setLegBookDepths(next);
+        setLegBookDepths((current) => {
+          const next = { ...current };
+          for (const book of response.books) {
+            // An empty read means "no book yet", not "the venue has no liquidity": keep the last
+            // usable depth instead of blanking a number the user is reading.
+            if (book.bidDepthUsdt <= 0 && book.askDepthUsdt <= 0 && next[book.symbol]) continue;
+            next[book.symbol] = { bid: book.bidDepthUsdt, ask: book.askDepthUsdt };
+          }
+          return next;
+        });
       }).catch(() => { /* depth is advisory: a failed read leaves the previous numbers in place */ });
     };
     load();

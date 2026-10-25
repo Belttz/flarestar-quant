@@ -2863,6 +2863,53 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     } satisfies CandleSeriesResponse;
   });
 
+  // A book only exists while something watches it: releasing the last watcher deletes it. The
+  // strategy form polls depth every 15s, so a subscribe-read-release per request would leave an
+  // empty book on every second poll (the numbers appeared, then went to zero). Keep the watcher
+  // warm for a minute and let each poll extend it; an idle form stops refreshing and the sweeper
+  // releases the streams.
+  const depthWatches = new Map<string, { release: () => void; expiresAt: number }>();
+  const DEPTH_WATCH_TTL_MS = 60_000;
+  const DEPTH_WATCH_LIMIT = 24;
+  const keepBookWarm = (symbol: string): void => {
+    const expiresAt = Date.now() + DEPTH_WATCH_TTL_MS;
+    const existing = depthWatches.get(symbol);
+    if (existing) {
+      existing.expiresAt = expiresAt;
+      return;
+    }
+    if (depthWatches.size >= DEPTH_WATCH_LIMIT) {
+      // Evict the entry closest to expiry so a pathological caller cannot pin open-ended streams.
+      let oldestSymbol: string | null = null;
+      let oldestExpiry = Number.POSITIVE_INFINITY;
+      for (const [key, watch] of depthWatches) {
+        if (watch.expiresAt < oldestExpiry) {
+          oldestExpiry = watch.expiresAt;
+          oldestSymbol = key;
+        }
+      }
+      if (oldestSymbol !== null) {
+        depthWatches.get(oldestSymbol)?.release();
+        depthWatches.delete(oldestSymbol);
+      }
+    }
+    depthWatches.set(symbol, { release: marketHub.watchOrderBook(symbol), expiresAt });
+  };
+  const depthSweeper = setInterval(() => {
+    const now = Date.now();
+    for (const [symbol, watch] of depthWatches) {
+      if (watch.expiresAt > now) continue;
+      watch.release();
+      depthWatches.delete(symbol);
+    }
+  }, 15_000);
+  depthSweeper.unref?.();
+  app.addHook('onClose', async () => {
+    clearInterval(depthSweeper);
+    for (const watch of depthWatches.values()) watch.release();
+    depthWatches.clear();
+  });
+
   // Executable depth per symbol: the notional each side of the maintained book currently holds,
   // with the best bid/ask it was measured against. The strategy form uses it to show per-leg
   // liquidity and to default the maker leg onto the thinner side; the trade ticket uses it to
@@ -2870,25 +2917,20 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   app.get('/api/markets/books', async (request) => {
     const raw = (request.query as { symbols?: string }).symbols ?? '';
     const symbols = raw.split(',').map((symbol) => symbol.trim()).filter((symbol) => symbol !== '').slice(0, 12);
-    // A book is only maintained while something watches it, so an unwatched symbol reads as empty
-    // (which is why the form first showed dashes). Subscribe for the duration of the read and
-    // release immediately after: the hub ref-counts watchers, so this never leaks a stream.
     const readBook = async (symbol: string) => {
-      ensureMarketKnown(symbol);
+      if (!ensureMarketKnown(symbol)) return null;
+      keepBookWarm(symbol);
       const current = marketHub.orderBook(symbol);
       if (current && (current.bids.length > 0 || current.asks.length > 0)) return current;
-      const release = marketHub.watchOrderBook(symbol);
-      try {
-        const deadline = Date.now() + 1_200;
-        while (Date.now() < deadline) {
-          const book = marketHub.orderBook(symbol);
-          if (book && (book.bids.length > 0 || book.asks.length > 0)) return book;
-          await new Promise((resolve) => setTimeout(resolve, 60));
-        }
-        return marketHub.orderBook(symbol);
-      } finally {
-        release();
+      // First call for a symbol waits for the opening frame; later calls are served from the warm
+      // book without waiting.
+      const deadline = Date.now() + 1_500;
+      while (Date.now() < deadline) {
+        const book = marketHub.orderBook(symbol);
+        if (book && (book.bids.length > 0 || book.asks.length > 0)) return book;
+        await new Promise((resolve) => setTimeout(resolve, 60));
       }
+      return marketHub.orderBook(symbol);
     };
     const books = await Promise.all(symbols.map(async (symbol) => {
       const book = await readBook(symbol);
