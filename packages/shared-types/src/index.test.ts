@@ -2,11 +2,18 @@ import { describe, expect, it } from 'vitest';
 import {
   BorosStrategiesResponseSchema,
   BorosUpstreamMarketFeesResponseSchema,
+  CloseLegPlanSchema,
+  ClosePlanRequestSchema,
+  ClosePlanResponseSchema,
   CrossExInstrumentCatalogSchema,
   CrossExPortfolioActivityResponseSchema,
   CrossExTransferRequestSchema,
   EnvironmentSchema,
   PublicMarketSnapshotResponseSchema,
+  ResidualReportSchema,
+  SpreadCombinationSchema,
+  SpreadQualityResponseSchema,
+  SpreadQualityRowSchema,
   StrategyConfigSchema,
   SystemDiscoverySchema,
   TerminalStreamMessageSchema,
@@ -247,6 +254,103 @@ describe('terminal stream contract', () => {
         }],
       },
     }).success).toBe(true);
+  });
+});
+
+describe('close plan / residual schemas', () => {
+  it('accepts a symbol-only close plan request (the venue owns the quantity)', () => {
+    const request = ClosePlanRequestSchema.parse({
+      targets: [{ symbol: 'GATE_SPOT_BTC_USDT' }, { symbol: 'KRAKEN_PERP_BTC_USDT', positionSide: 'SHORT' }],
+    });
+    expect(request.targets).toHaveLength(2);
+    expect(ClosePlanRequestSchema.safeParse({ targets: [] }).success).toBe(false);
+    expect(ClosePlanRequestSchema.safeParse({ targets: [{ symbol: '' }] }).success).toBe(false);
+  });
+
+  it('parses a reconciled close plan with a dust skip', () => {
+    const response = ClosePlanResponseSchema.parse({
+      legs: [
+        {
+          symbol: 'GATE_SPOT_BTC_USDT', venue: 'GATE', marketType: 'SPOT', side: 'SELL',
+          quantity: '0.015', positionSide: null,
+        },
+        {
+          symbol: 'KRAKEN_PERP_BTC_USDT', venue: 'KRAKEN', marketType: 'PERP', side: 'BUY',
+          quantity: '0', positionSide: 'SHORT', skipReason: 'dust',
+        },
+      ],
+      fetchedAt: '2026-08-20T00:00:00.000Z',
+    });
+    expect(response.legs[1]?.skipReason).toBe('dust');
+    // A leg without a skip reason is executable and must carry a positive quantity downstream.
+    expect(response.legs[0]?.skipReason).toBeUndefined();
+  });
+
+  it('rejects an unknown skip reason', () => {
+    expect(CloseLegPlanSchema.safeParse({
+      symbol: 'X', venue: 'GATE', marketType: 'SPOT', side: 'SELL', quantity: '1',
+      positionSide: null, skipReason: 'whatever',
+    }).success).toBe(false);
+  });
+
+  it('parses a residual report and keeps clean flag semantics explicit', () => {
+    const report = ResidualReportSchema.parse({
+      residuals: [{
+        symbol: 'KRAKEN_PERP_BTC_USDT', venue: 'KRAKEN', marketType: 'PERP',
+        residualQuantity: '0.0042', reason: 'venue position changed during close',
+        suggestion: 'retry one-click close or reduce manually',
+      }],
+      clean: false,
+      fetchedAt: '2026-08-20T00:01:00.000Z',
+    });
+    expect(report.clean).toBe(false);
+    expect(ResidualReportSchema.safeParse({ residuals: [], clean: true, fetchedAt: 'x' }).success).toBe(true);
+  });
+});
+
+describe('spread quote alignment fields (v0.4.1)', () => {
+  const baseRow = {
+    pairType: 'SPOT_PERP', asset: 'BTC', leftSymbol: 'GATE_SPOT_BTC_USDT',
+    rightSymbol: 'GATE_FUTURE_BTC_USDT', leftVenue: 'GATE', rightVenue: 'GATE',
+    currentSpreadBps: 3.2, meanSpreadBps: 2.8, spreadVolatilityBps: 1.1, skewness: 0.1,
+    excessKurtosis: 0.2, symmetric: true, ar1Coefficient: 0.4, halfLifeHours: 1.5,
+    holdingCostBps: -0.5, bookDepthUsdt: 12_000, score: 72, sampleCount: 200,
+    source: 'candles', updatedAt: '2026-08-20T00:00:00.000Z',
+  };
+
+  it('keeps a pre-v0.4.1 row parseable — every new field is optional', () => {
+    expect(SpreadQualityRowSchema.parse(baseRow)).toMatchObject({ asset: 'BTC' });
+  });
+
+  it('carries the leg quote timestamps and alignment verdict when present', () => {
+    const row = SpreadQualityRowSchema.parse({
+      ...baseRow,
+      leftQuoteUpdatedAt: '2026-08-20T00:00:00.000Z',
+      rightQuoteUpdatedAt: '2026-08-20T00:00:01.000Z',
+      quoteAligned: true,
+    });
+    expect(row.quoteAligned).toBe(true);
+  });
+
+  it('extends the spread-quality response with the sort/paging echo, optionally', () => {
+    const base = {
+      rows: [], totalCandidates: 0, windowHours: 24,
+      fetchedAt: '2026-08-20T00:00:00.000Z', cacheStatus: 'fresh',
+    };
+    expect(SpreadQualityResponseSchema.parse(base)).toMatchObject({ totalCandidates: 0 });
+    expect(SpreadQualityResponseSchema.parse({
+      ...base, sort: 'mean', dir: 'asc', offset: 20, total: 47,
+    })).toMatchObject({ sort: 'mean', total: 47 });
+  });
+
+  it('carries quote alignment on opportunity combinations', () => {
+    const combination = SpreadCombinationSchema.parse({
+      pairType: 'SPOT_PERP', leftSymbol: 'GATE_SPOT_BTC_USDT', rightSymbol: 'GATE_FUTURE_BTC_USDT',
+      leftVenue: 'GATE', rightVenue: 'GATE', sellBid: '100.1', buyAsk: '100',
+      spreadBps: 10, updatedAt: '2026-08-20T00:00:00.000Z', executable: true,
+      quoteAligned: false,
+    });
+    expect(combination.quoteAligned).toBe(false);
   });
 });
 

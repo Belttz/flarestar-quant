@@ -115,3 +115,22 @@ describe('loadConfig host / origin access', () => {
     expect([...configured.allowedOrigins]).toContain('https://quant.example.com');
   });
 });
+
+describe('loadConfig spread quote skew budget', () => {
+  // The engine's freshMarketPair gate defaults to 2000ms; the display-side budget must match so
+  // the shown spread and the executed spread come from the same alignment yardstick (R4).
+  it('defaults to 2000ms — the same budget the strategy engine uses', () => {
+    expect(loadConfig(env()).spreadQuoteMaxSkewMs).toBe(2_000);
+  });
+
+  it('accepts an explicit GCT_SPREAD_SKEW_MS override', () => {
+    expect(loadConfig(env({ GCT_SPREAD_SKEW_MS: '5000' })).spreadQuoteMaxSkewMs).toBe(5_000);
+  });
+
+  it('rejects zero, negative and non-integer budgets loudly', () => {
+    expect(() => loadConfig(env({ GCT_SPREAD_SKEW_MS: '0' }))).toThrow(/GCT_SPREAD_SKEW_MS/);
+    expect(() => loadConfig(env({ GCT_SPREAD_SKEW_MS: '-1' }))).toThrow(/GCT_SPREAD_SKEW_MS/);
+    expect(() => loadConfig(env({ GCT_SPREAD_SKEW_MS: '1.5' }))).toThrow(/GCT_SPREAD_SKEW_MS/);
+    expect(() => loadConfig(env({ GCT_SPREAD_SKEW_MS: 'abc' }))).toThrow(/GCT_SPREAD_SKEW_MS/);
+  });
+});

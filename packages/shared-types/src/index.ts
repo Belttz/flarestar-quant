@@ -700,6 +700,14 @@ export const SpreadCombinationSchema = z.object({
   buyAsk: z.string(),
   spreadBps: z.number().finite(),
   updatedAt: z.string(),
+  /**
+   * v0.4.1 quote alignment: both legs' `quoteUpdatedAt` and whether their skew fits the backend's
+   * `SPREAD_QUOTE_MAX_SKEW_MS` budget. Optional so payloads produced before v0.4.1 keep parsing;
+   * absent means "unknown", which consumers must treat as not aligned.
+   */
+  leftQuoteUpdatedAt: z.string().optional(),
+  rightQuoteUpdatedAt: z.string().optional(),
+  quoteAligned: z.boolean().optional(),
   executable: z.boolean(),
 });
 export type SpreadCombination = z.infer<typeof SpreadCombinationSchema>;
@@ -723,6 +731,10 @@ export const SpreadOpportunitySchema = z.object({
   /** (sellBid − buyAsk) / buyAsk × 10⁴, signed; the board sorts this descending. */
   spreadBps: z.number().finite(),
   updatedAt: z.string(),
+  /** v0.4.1 quote alignment timestamps/judgement; optional for pre-v0.4.1 payload compatibility. */
+  leftQuoteUpdatedAt: z.string().optional(),
+  rightQuoteUpdatedAt: z.string().optional(),
+  quoteAligned: z.boolean().optional(),
   executable: z.boolean(),
   ...OpportunityRowClassificationSchema.shape,
   /** Volume / open interest of the sell leg. */
@@ -796,6 +808,10 @@ export const SpreadQualityRowSchema = z.object({
   sampleCount: z.number().int().nonnegative(),
   source: z.enum(['candles', 'samples']),
   updatedAt: z.string(),
+  /** v0.4.1 quote alignment timestamps/judgement; optional for pre-v0.4.1 payload compatibility. */
+  leftQuoteUpdatedAt: z.string().optional(),
+  rightQuoteUpdatedAt: z.string().optional(),
+  quoteAligned: z.boolean().optional(),
   ...OpportunityRowClassificationSchema.shape,
 });
 export type SpreadQualityRow = z.infer<typeof SpreadQualityRowSchema>;
@@ -807,8 +823,87 @@ export const SpreadQualityResponseSchema = z.object({
   windowHours: z.number().int().positive().default(24),
   fetchedAt: z.string(),
   cacheStatus: z.enum(['fresh', 'stale']),
+  /**
+   * v0.4.1 server-side sort/paging echo: the sort key and direction actually applied, the offset of
+   * the returned window, and the row count of the *sorted* board (for page rendering). Optional so
+   * a pre-v0.4.1 response payload keeps parsing and the frontend falls back to its own rendering.
+   */
+  sort: z.string().optional(),
+  dir: z.enum(['asc', 'desc']).optional(),
+  offset: z.number().int().nonnegative().optional(),
+  total: z.number().int().nonnegative().optional(),
 });
 export type SpreadQualityResponse = z.infer<typeof SpreadQualityResponseSchema>;
+
+/** Which market a close-plan leg acts on; spot legs hit the balance, perp legs hit the position. */
+export const CloseMarketTypeSchema = z.enum(['SPOT', 'PERP']);
+export type CloseMarketType = z.infer<typeof CloseMarketTypeSchema>;
+
+/**
+ * Why a planned close leg carries no executable quantity. `dust` means the venue holds a residual
+ * smaller than the market's minimum order size — the terminal never auto-liquidates it (PRD Q2);
+ * the user is told and decides.
+ */
+export const CloseSkipReasonSchema = z.enum(['dust', 'no_market', 'no_balance', 'locked_balance']);
+export type CloseSkipReason = z.infer<typeof CloseSkipReasonSchema>;
+
+/** One user-requested close target: symbol only — the server derives the quantity from the venue. */
+export const CloseTargetInputSchema = z.object({
+  symbol: z.string().trim().min(1).max(80),
+  /** For hedge-mode futures: which position side this target refers to. Optional = account default. */
+  positionSide: z.enum(['NONE', 'LONG', 'SHORT']).optional(),
+});
+export type CloseTargetInput = z.infer<typeof CloseTargetInputSchema>;
+
+export const ClosePlanRequestSchema = z.object({
+  targets: z.array(CloseTargetInputSchema).min(1).max(20),
+});
+export type ClosePlanRequest = z.infer<typeof ClosePlanRequestSchema>;
+
+/**
+ * One leg of a server-reconciled close plan. `quantity` is the venue-truth reducible size (floored
+ * to the instrument's lot size for spot); when the residual is below the smallest orderable unit
+ * the leg instead carries `skipReason` (typically `dust`) and an empty/zero quantity.
+ */
+export const CloseLegPlanSchema = z.object({
+  symbol: z.string(),
+  venue: z.string(),
+  marketType: CloseMarketTypeSchema,
+  /** Reducing side: SELL closes a long, BUY closes a short/buyback. */
+  side: z.enum(['BUY', 'SELL']),
+  /** Venue-truth quantity as a decimal string; `'0'` when skipped. */
+  quantity: z.string(),
+  positionSide: z.string().nullable(),
+  skipReason: CloseSkipReasonSchema.optional(),
+});
+export type CloseLegPlan = z.infer<typeof CloseLegPlanSchema>;
+
+export const ClosePlanResponseSchema = z.object({
+  legs: z.array(CloseLegPlanSchema),
+  /** Backend wall-clock time of the venue reads the plan was reconciled against. */
+  fetchedAt: z.string(),
+});
+export type ClosePlanResponse = z.infer<typeof ClosePlanResponseSchema>;
+
+/** One residual position the verify pass found above the market's minimum order unit. */
+export const ResidualLegSchema = z.object({
+  symbol: z.string(),
+  venue: z.string(),
+  marketType: CloseMarketTypeSchema,
+  /** Absolute residual quantity as a decimal string. */
+  residualQuantity: z.string(),
+  reason: z.string(),
+  suggestion: z.string(),
+});
+export type ResidualLeg = z.infer<typeof ResidualLegSchema>;
+
+export const ResidualReportSchema = z.object({
+  residuals: z.array(ResidualLegSchema),
+  /** True when every target leg is flat or below the minimum order unit (dust only). */
+  clean: z.boolean(),
+  fetchedAt: z.string(),
+});
+export type ResidualReport = z.infer<typeof ResidualReportSchema>;
 
 export const FundingHistoryEntrySchema = z.object({
   symbol: z.string(),
@@ -1180,7 +1275,9 @@ export const StrategyConfigSchema = z.object({
   executionMethod: z.enum(['TAKER_TAKER', 'MAKER_TAKER']),
   makerLeg: z.enum(['left', 'right']).optional(),
   closePlan: z.object({
-    orderCount: z.number().int().min(2).max(100),
+    // A single slice (1) is a legitimate timed close — it submits the full quantity once.
+    // The frontend's split-close UI keeps its own >=2 requirement; the API stays permissive.
+    orderCount: z.number().int().min(1).max(100),
     intervalSeconds: z.number().int().min(1).max(86_400),
     targets: z.array(z.object({
       symbol: z.string(),
@@ -1373,6 +1470,9 @@ export const STRATEGY_LOG_EVENT_CATEGORY: Record<string, StrategyLogEventCategor
   // is called from the maker exit path *and* the taker two-leg submission path, so filing it under
   // `maker` would hide a taker strategy's reconciliation failure from the tab that shows taker work.
   'Position reconciliation failed': 'system',
+  // v0.4.1 closePlan convergence (R3): the timed close exhausted its retries with an orderable
+  // residual still open. A lifecycle outcome of the whole close plan, not one leg's stage.
+  'Timed close ended with residual positions': 'system',
 };
 
 const strategyLogEventsIn = (category: StrategyLogEventCategory): string[] =>

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Candle, LiveMarket, MarketSnapshot } from './api.js';
-import { assessMarketPairFreshness, candleTailIsFresh, freshMarketPair, lastKnownLiveMarketPair } from './market-freshness.js';
+import { SPREAD_QUOTE_MAX_SKEW_MS, assessMarketPairFreshness, assessSpreadQuoteAlignment, candleTailIsFresh, freshMarketPair, lastKnownLiveMarketPair } from './market-freshness.js';
 
 function market(
   symbol: string,
@@ -78,5 +78,33 @@ describe('premium market freshness', () => {
     expect(candleTailIsFresh([candle(now - 60_000)], '1m', now)).toBe(true);
     expect(candleTailIsFresh([candle(now - 3 * 60_000)], '1m', now)).toBe(false);
     expect(candleTailIsFresh([candle(now - 9 * 60_000)], '5m', now)).toBe(true);
+  });
+});
+
+describe('spread quote alignment', () => {
+  const now = Date.parse('2026-07-31T12:00:00.000Z');
+  const left = { quoteUpdatedAt: new Date(now - 500).toISOString() };
+  const right = { quoteUpdatedAt: new Date(now + 500).toISOString() };
+
+  it('accepts a pair whose quote timestamps fit the shared 2000ms budget', () => {
+    expect(SPREAD_QUOTE_MAX_SKEW_MS).toBe(2_000);
+    expect(assessSpreadQuoteAlignment(left, right)).toEqual({ aligned: true, skewMs: 1_000 });
+  });
+
+  it('rejects a pair whose quotes are further apart than the budget', () => {
+    const far = { quoteUpdatedAt: new Date(now - 4_000).toISOString() };
+    const verdict = assessSpreadQuoteAlignment(far, right);
+    expect(verdict).toEqual({ aligned: false, skewMs: 4_500, reason: 'skew_exceeded' });
+  });
+
+  it('never treats a missing quote timestamp as aligned', () => {
+    expect(assessSpreadQuoteAlignment({}, right)).toMatchObject({ aligned: false, reason: 'missing_quote_timestamp' });
+    expect(assessSpreadQuoteAlignment(left, {})).toMatchObject({ aligned: false, reason: 'missing_quote_timestamp' });
+    expect(assessSpreadQuoteAlignment({}, {})).toMatchObject({ aligned: false, reason: 'missing_quote_timestamp' });
+  });
+
+  it('honours a caller-provided budget override', () => {
+    expect(assessSpreadQuoteAlignment(left, right, 500).aligned).toBe(false);
+    expect(assessSpreadQuoteAlignment(left, right, 1_000).aligned).toBe(true);
   });
 });

@@ -4,6 +4,7 @@ import {
   AuthenticatedPortfolioSnapshotSchema,
   BorosStrategiesResponseSchema,
   CandleSeriesResponseSchema,
+  ClosePlanResponseSchema,
   CredentialConnectionStatusSchema,
   CrossExPortfolioActivityResponseSchema,
   CrossExRiskLimitResponseSchema,
@@ -24,6 +25,7 @@ import {
   OpportunityResponseSchema,
   PortfolioEquitySeriesResponseSchema,
   PublicMarketSnapshotResponseSchema,
+  ResidualReportSchema,
   SpreadQualityResponseSchema,
   StrategiesResponseSchema,
   StrategyLogsResponseSchema,
@@ -41,6 +43,9 @@ import {
   type Candle,
   type CandleInterval,
   type CandleSeriesResponse,
+  type CloseLegPlan,
+  type ClosePlanResponse,
+  type CloseTargetInput,
   type CredentialConnectionStatus,
   type CrossExAccountBookRecord,
   type CrossExInstrument,
@@ -78,6 +83,7 @@ import {
   type PublicTrade,
   type PublicMarketSnapshot,
   type PublicMarketSnapshotResponse,
+  type ResidualReport,
   type StrategyConfig,
   type StrategyLog,
   type StrategyLogCategory,
@@ -102,6 +108,9 @@ export type {
   Candle,
   CandleInterval,
   CandleSeriesResponse,
+  CloseLegPlan,
+  ClosePlanResponse,
+  CloseTargetInput,
   CredentialConnectionStatus,
   CrossExAccountBookRecord,
   CrossExInstrument,
@@ -138,6 +147,7 @@ export type {
   PublicTrade,
   PublicMarketSnapshot,
   PublicMarketSnapshotResponse,
+  ResidualReport,
   StrategyConfig,
   StrategyLog,
   StrategyLogCategory,
@@ -369,14 +379,23 @@ export const api = {
   },
   /**
    * Spread-quality board rows: the 24h distribution statistics of every (asset, sell venue, buy
-   * venue) spread, composite-scored and pre-ranked server side. The board keeps no other filters,
-   * so only a non-default pair type, row limit, or a forced refresh travels in the query.
+   * venue) spread, composite-scored and ranked server side. v0.4.1 adds server-side sort/paging:
+   * the sort key, direction and page window travel in the query and the backend slices the cached
+   * board, so the client never pulls or sorts more than one page.
    */
   spreadQuality: (options: {
     /** Market-type whitelist; omitted means both `SPOT_PERP` and `PERP_PERP` pairs. */
     pairType?: 'SPOT_PERP' | 'PERP_PERP';
     /** Row cap; omitted keeps the board's own default ranking depth. */
     limit?: number;
+    /** Sort key; omitted keeps the composite-score ranking. */
+    sort?: 'score' | 'current' | 'mean' | 'volatility' | 'halfLife' | 'depth';
+    /** Sort direction; omitted means `desc`. */
+    dir?: 'asc' | 'desc';
+    /** First row to return (server-side paging over the sorted board). */
+    offset?: number;
+    /** Page size; sent as `pageSize` (the server accepts 20/50). */
+    pageSize?: number;
     /** Sends `refresh=1` so the backend recomputes instead of serving its cached board. */
     refresh?: boolean;
   } = {}) => {
@@ -386,6 +405,10 @@ export const api = {
     if (options.limit !== undefined && options.limit !== DEFAULT_SPREAD_QUALITY_LIMIT) {
       params.set('limit', String(options.limit));
     }
+    if (options.sort) params.set('sort', options.sort);
+    if (options.dir && options.dir !== 'desc') params.set('dir', options.dir);
+    if (options.offset !== undefined && options.offset > 0) params.set('offset', String(options.offset));
+    if (options.pageSize !== undefined) params.set('pageSize', String(options.pageSize));
     return request(SpreadQualityResponseSchema, `/api/opportunities/spread-quality?${params}`);
   },
   fundingHistory: (symbols: string[], durationDays: 1 | 7 | 30) => request(FundingHistoryResponseSchema, '/api/markets/funding-history', {
@@ -448,6 +471,24 @@ export const api = {
     headers: { 'x-gct-trading-intent': 'place-order' },
     body: JSON.stringify(body),
   }),
+  /**
+   * Server-reconciled close plan: the backend reads the venue's live balances/positions and
+   * returns each leg's actually closable quantity (dust legs carry `skipReason` instead). The
+   * caller never supplies quantities — the venue truth is the only admissible source (R2/R3).
+   */
+  closePlan: (targets: readonly CloseTargetInput[]) =>
+    request(ClosePlanResponseSchema, '/api/close/plan', {
+      method: 'POST',
+      headers: { 'x-gct-trading-intent': 'close-plan' },
+      body: JSON.stringify({ targets }),
+    }),
+  /** Post-close reconciliation: residuals above the market's minimum order unit, with reasons. */
+  closeVerify: (targets: readonly CloseTargetInput[]) =>
+    request(ResidualReportSchema, '/api/close/verify', {
+      method: 'POST',
+      headers: { 'x-gct-trading-intent': 'close-verify' },
+      body: JSON.stringify({ targets }),
+    }),
   cancelOrder: (id: string) => request(ExecutionOrderSchema, `/api/trading/orders/${encodeURIComponent(id)}`, {
     method: 'DELETE',
     headers: { 'x-gct-trading-intent': 'cancel-order' },

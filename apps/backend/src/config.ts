@@ -42,6 +42,11 @@ export interface BackendConfig {
   gateRestBaseUrl: string;
   gatePublicWebSocketUrl: string;
   gatePrivateWebSocketUrl: string;
+  /**
+   * Max |leftQuoteUpdatedAt − rightQuoteUpdatedAt| still considered "the same moment" when a
+   * spread is built or displayed (R4). Mirrors the engine's `marketPairMaxSkewMs` default.
+   */
+  spreadQuoteMaxSkewMs: number;
 }
 
 const LOOPBACK_HOSTS = ['127.0.0.1', 'localhost', '::1'] as const;
@@ -86,6 +91,20 @@ function parseHostAccess(value: string | undefined): HostAccessMode {
 /** `http://host` / `https://host` pair for every configured host so one env var is enough. */
 function originsFromHosts(hosts: readonly string[]): string[] {
   return hosts.flatMap((host) => [`http://${host}`, `https://${host}`]);
+}
+
+/**
+ * Max leg-to-leg quote timestamp skew (ms) still treated as "the same moment" when a spread is
+ * built or displayed. Defaults to 2000 — the same budget the strategy engine's
+ * `freshMarketPair` gate uses — so display and execution share one alignment yardstick.
+ */
+function parseSpreadQuoteMaxSkewMs(value: string | undefined): number {
+  if (value === undefined || value.trim() === '') return 2_000;
+  const skew = Number(value);
+  if (!Number.isFinite(skew) || !Number.isInteger(skew) || skew <= 0) {
+    throw new Error('GCT_SPREAD_SKEW_MS must be a positive integer (milliseconds)');
+  }
+  return skew;
 }
 
 /**
@@ -182,5 +201,6 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
     gateRestBaseUrl: environment.GCT_GATE_REST_URL ?? 'https://api.gateio.ws/api/v4',
     gatePublicWebSocketUrl: environment.GCT_GATE_PUBLIC_WS_URL ?? 'wss://api.gateio.ws/ws/crossex/public',
     gatePrivateWebSocketUrl: environment.GCT_GATE_PRIVATE_WS_URL ?? 'wss://api.gateio.ws/ws/crossex',
+    spreadQuoteMaxSkewMs: parseSpreadQuoteMaxSkewMs(environment.GCT_SPREAD_SKEW_MS),
   };
 }
