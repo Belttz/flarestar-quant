@@ -14,6 +14,7 @@ import { closeQuantityForPercentage } from './position-close.js';
 import { canonicalPositionAsset, positionGroupLabel } from './position-grouping.js';
 import { formatAmount, symbolParts, useDialogFocus } from './route-shared.js';
 import { ModalPortal } from './modal-portal.js';
+import { settleDeficitsAfterClose } from './deficit-settlement.js';
 import { AdlIndicators } from './adl-indicator.js';
 import { adlRanksForPositions } from './adl-ranking.js';
 
@@ -177,6 +178,9 @@ export function PositionCloseDialog({ targets, portfolio, instruments, onDismiss
         const strategy = await api.startStrategy(config);
         notify('ok', t('Close strategy started'), `${strategy.id} · ${splitOrderCount} ${t('orders')} · ${splitInterval}s`);
         await refreshAfterClose();
+        // The split clip settles asynchronously, so this pass cleans up whatever deficit the
+        // previous fills already left behind; the next close run picks up the rest.
+        void settleDeficitsAfterClose(notify, t);
         onDismiss();
       } catch (error) {
         notify('error', t('Position close failed'), error instanceof ApiError ? error.message : t('Backend unavailable'));
@@ -210,6 +214,7 @@ export function PositionCloseDialog({ targets, portfolio, instruments, onDismiss
       const detail = firstFailure.reason instanceof ApiError ? firstFailure.reason.message : t('Backend unavailable');
       notify('error', t(failures.length === selectedTargets.length ? 'Position close failed' : 'Some positions failed to close'), detail);
     }
+    void settleDeficitsAfterClose(notify, t);
     setClosing(false);
     onDismiss();
   }

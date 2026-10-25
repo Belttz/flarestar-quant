@@ -220,6 +220,123 @@ export const CrossExTransferRequestSchema = z.object({
 });
 export type CrossExTransferRequest = z.infer<typeof CrossExTransferRequestSchema>;
 
+/**
+ * Instant-convert (flash convert) — Gate's own repayment path for a venue deficit: convert
+ * CROSSEX USDT into the coin a venue owes, then either transfer it there or convert straight onto
+ * that venue (`exchange_type`). DERIBIT and CROSSEX are NOT quotable venues.
+ */
+export const CrossExConvertVenueSchema = z.enum([
+  'BINANCE', 'OKX', 'GATE', 'BYBIT', 'HYPERLIQUID', 'KRAKEN', 'LIGHTER',
+]);
+export type CrossExConvertVenue = z.infer<typeof CrossExConvertVenueSchema>;
+
+const CrossExCoinSchema = z.string().trim().regex(/^[A-Z0-9]{1,20}$/);
+
+export const CrossExConvertQuoteRequestSchema = z.object({
+  exchangeType: CrossExConvertVenueSchema,
+  fromCoin: CrossExCoinSchema,
+  toCoin: CrossExCoinSchema,
+  fromAmount: z.string().trim().regex(/^\d+(?:\.\d+)?$/),
+}).refine((value) => value.fromCoin !== value.toCoin, {
+  message: 'coins must differ',
+  path: ['toCoin'],
+});
+export type CrossExConvertQuoteRequest = z.infer<typeof CrossExConvertQuoteRequestSchema>;
+
+export const CrossExConvertQuoteSchema = z.object({
+  quoteId: z.string(),
+  fromCoin: z.string(),
+  toCoin: z.string(),
+  fromAmount: z.string(),
+  toAmount: z.string(),
+  rate: z.string().nullable(),
+  fee: z.string().nullable(),
+  /** Quote validity as an ISO instant, null when Gate only returned a relative window. */
+  expiresAt: z.string().nullable(),
+});
+export type CrossExConvertQuote = z.infer<typeof CrossExConvertQuoteSchema>;
+
+export const CrossExConvertOrderRequestSchema = z.object({ quoteId: z.string().trim().min(1) });
+export const CrossExConvertOrderSchema = z.object({
+  orderId: z.string().nullable(),
+  status: z.string().nullable(),
+  fromCoin: z.string().nullable(),
+  toCoin: z.string().nullable(),
+  fromAmount: z.string().nullable(),
+  toAmount: z.string().nullable(),
+});
+export type CrossExConvertOrder = z.infer<typeof CrossExConvertOrderSchema>;
+
+export const CrossExInterestRateSchema = z.object({
+  coin: z.string(),
+  exchangeType: z.string(),
+  hourlyRate: z.string(),
+});
+export const CrossExInterestRatesResponseSchema = z.object({
+  items: z.array(CrossExInterestRateSchema),
+  fetchedAt: z.string(),
+});
+export type CrossExInterestRatesResponse = z.infer<typeof CrossExInterestRatesResponseSchema>;
+
+/**
+ * One negative venue balance with what it costs and how it can be cleared. `settlement` is the
+ * cheapest legal transfer this account can make today (null when no route exists), and
+ * `autoEligible` says whether the fee is small enough to settle without asking.
+ */
+export const PortfolioDeficitSchema = z.object({
+  venue: z.string(),
+  coin: z.string(),
+  /** Positive magnitude of the negative balance. */
+  deficit: z.string(),
+  /** Hourly borrow rate as a fraction string; null when the venue/coin is not quoted. */
+  hourlyRate: z.string().nullable(),
+  /** Implied monthly carrying cost in the deficit coin; null without a rate. */
+  monthlyCost: z.string().nullable(),
+  settlement: z.object({
+    from: z.string(),
+    to: z.string(),
+    amount: z.string(),
+    fee: z.string(),
+    /** Fee / deficit in bps; null when the deficit is zero. */
+    feeBps: z.number().nullable(),
+    autoEligible: z.boolean(),
+  }).nullable(),
+  /** Why the deficit cannot be settled automatically (machine-readable). */
+  reason: z.string().nullable(),
+});
+export type PortfolioDeficit = z.infer<typeof PortfolioDeficitSchema>;
+
+export const PortfolioDeficitsResponseSchema = z.object({
+  items: z.array(PortfolioDeficitSchema),
+  fetchedAt: z.string(),
+});
+export type PortfolioDeficitsResponse = z.infer<typeof PortfolioDeficitsResponseSchema>;
+
+/** Result of an automatic settlement pass: what moved, what was held back for being too costly, and why. */
+export const SettleDeficitsResponseSchema = z.object({
+  settled: z.array(z.object({
+    venue: z.string(),
+    coin: z.string(),
+    amount: z.string(),
+    transactionId: z.string(),
+  })),
+  /** Legal routes whose fee exceeded the 2% ceiling — the user decides on these. */
+  withheld: z.array(z.object({
+    venue: z.string(),
+    coin: z.string(),
+    amount: z.string(),
+    fee: z.string(),
+    feeBps: z.number(),
+  })),
+  skipped: z.array(z.object({
+    venue: z.string(),
+    coin: z.string(),
+    deficit: z.string(),
+    reason: z.string(),
+  })),
+});
+export type SettleDeficitsResponse = z.infer<typeof SettleDeficitsResponseSchema>;
+
 export function canonicalCrossExTransferAccount(
   account: CrossExTransferAccount,
   coin: string,

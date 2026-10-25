@@ -17,6 +17,8 @@ import {
   BorosUpstreamMarketFeesResponseSchema,
   BorosUpstreamStrategiesResponseSchema,
   ClosePlanRequestSchema,
+  CrossExConvertOrderRequestSchema,
+  CrossExConvertQuoteRequestSchema,
   CrossExTransferAccountSchema,
   CrossExTransferRequestSchema,
   canonicalizeCrossExTransfer,
@@ -27,6 +29,10 @@ import {
   PortfolioEquityRangeSchema,
   STRATEGY_LOG_CATEGORIES,
   UserPreferencesSchema,
+  type CrossExConvertOrder,
+  type CrossExConvertQuote,
+  type PortfolioDeficit,
+  type PortfolioDeficitsResponse,
   type UserPreferencesResponse,
   type UnresolvedOrder,
   type PortfolioEquitySeriesResponse,
@@ -80,6 +86,7 @@ import { AuthSessionStore, AuthUserStore, LoginThrottle, SESSION_COOKIE_NAME, SE
 import { GateApiError, type GateCrossExAccount, type GateCrossExPortfolio, type GateCrossExPosition, type GateCrossExRiskLimit, type GateCrossExSymbol, type GateSpotAccount, type GateTransferRecord, type GateAccountBookRecord, type PortfolioOperationsCrossExGateway, type ReadOnlyCrossExGateway, type TradingCrossExGateway } from './crossex-client.js';
 import { CandleStore } from './candle-store.js';
 import { CloseReconciler } from './close-reconciler.js';
+import { deficitsOf, planDeficitSettlements } from './deficit-settlement.js';
 import { FundingHistoryService } from './funding-history.js';
 import { FundingOverviewService } from './funding-overview.js';
 import { TtlSingleFlightCache } from './funding-rankings-cache.js';
@@ -3286,6 +3293,233 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       return reply.code(500).send({ error: 'transfer_failed' });
     } finally {
       credentials = null;
+    }
+  });
+
+  // Flash convert — Gate's documented repayment path for a venue deficit. The quote is read-only
+  // (it never executes), which is why it is allowed to run under a read intent.
+  app.post('/api/crossex/convert/quote', {
+    config: { rateLimit: { max: 20, timeWindow: '1 minute' } },
+    preHandler: async (request, reply) => {
+      if (request.headers['x-gct-trading-intent'] !== 'convert-quote') {
+        return reply.code(403).send({ error: 'missing_trading_intent' });
+      }
+    },
+  }, async (request, reply) => {
+    const parsed = CrossExConvertQuoteRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_convert_quote' });
+    const operationsGateway = crossExGateway as Partial<PortfolioOperationsCrossExGateway>;
+    if (!operationsGateway.queryConvertQuote) return reply.code(503).send({ error: 'convert_unavailable' });
+    const quoteCredentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
+    if (!quoteCredentials) return reply.code(409).send({ error: 'credential_not_configured' });
+    try {
+      const quote = await operationsGateway.queryConvertQuote(quoteCredentials, {
+        exchange_type: parsed.data.exchangeType,
+        from_coin: parsed.data.fromCoin,
+        to_coin: parsed.data.toCoin,
+        from_amount: parsed.data.fromAmount,
+      });
+      const validMs = Number(quote.valid_ms ?? Number.NaN);
+      return {
+        quoteId: quote.quote_id,
+        fromCoin: quote.from_coin,
+        toCoin: quote.to_coin,
+        fromAmount: quote.from_amount,
+        toAmount: quote.to_amount,
+        rate: quote.rate ?? null,
+        fee: quote.fee ?? null,
+        expiresAt: Number.isFinite(validMs) && validMs > 1_000_000_000_000
+          ? new Date(validMs).toISOString()
+          : null,
+      } satisfies CrossExConvertQuote;
+    } catch (error) {
+      if (error instanceof GateApiError) return reply.code(400).send({ error: 'convert_quote_rejected', label: error.label });
+      throw error;
+    }
+  });
+
+  app.post('/api/crossex/convert/orders', {
+    config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+    preHandler: async (request, reply) => {
+      if (request.headers['x-gct-trading-intent'] !== 'convert-order') {
+        return reply.code(403).send({ error: 'missing_trading_intent' });
+      }
+    },
+  }, async (request, reply) => {
+    const parsed = CrossExConvertOrderRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_convert_order' });
+    const operationsGateway = crossExGateway as Partial<PortfolioOperationsCrossExGateway>;
+    if (!operationsGateway.createConvertOrder) return reply.code(503).send({ error: 'convert_unavailable' });
+    try {
+      return await runAuthenticatedWrite(async () => {
+        if (!tradingSession.liveTradingEnabled) throw new TradingRuntimeError('live_trading_locked', 403);
+        const credentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
+        if (!credentials) throw new TradingRuntimeError('credential_not_configured', 409);
+        const order = await operationsGateway.createConvertOrder!(credentials, parsed.data.quoteId);
+        addAuditEvent(database, 'convert_order_submitted', {
+          orderId: String(order.order_id ?? order.id ?? ''), status: order.status ?? '',
+        });
+        request.log.info({ orderId: order.order_id ?? order.id }, 'convert order submitted');
+        triggerPortfolioRefresh?.();
+        return {
+          orderId: order.order_id !== undefined ? String(order.order_id) : order.id !== undefined ? String(order.id) : null,
+          status: order.status ?? null,
+          fromCoin: order.from_coin ?? null,
+          toCoin: order.to_coin ?? null,
+          fromAmount: order.from_amount ?? null,
+          toAmount: order.to_amount ?? null,
+        } satisfies CrossExConvertOrder;
+      });
+    } catch (error) {
+      if (error instanceof TradingRuntimeError) return reply.code(error.statusCode).send({ error: error.code });
+      if (error instanceof GateApiError) return reply.code(400).send({ error: 'convert_rejected', label: error.label });
+      throw error;
+    }
+  });
+
+  // What it costs to leave a venue's negative balance standing, and the cheapest legal way to
+  // clear it. Read-only: this never moves funds; the UI decides whether to act.
+  app.get('/api/portfolio/deficits', {
+    preHandler: async (request, reply) => {
+      if (request.headers['x-gct-read-intent'] !== 'deficits') {
+        return reply.code(403).send({ error: 'missing_read_intent' });
+      }
+    },
+  }, async (request, reply) => {
+    const operationsGateway = crossExGateway as Partial<PortfolioOperationsCrossExGateway>;
+    if (!operationsGateway.queryAccount) return reply.code(503).send({ error: 'account_unavailable' });
+    const credentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
+    if (!credentials) return reply.code(409).send({ error: 'credential_not_configured' });
+    const [account, transferCoins, spotAccounts, rates] = await Promise.all([
+      operationsGateway.queryAccount(credentials),
+      operationsGateway.queryTransferCoins ? operationsGateway.queryTransferCoins() : Promise.resolve([]),
+      operationsGateway.querySpotAccounts ? operationsGateway.querySpotAccounts(credentials) : Promise.resolve([]),
+      operationsGateway.queryInterestRates
+        ? operationsGateway.queryInterestRates(credentials, {}).catch(() => [])
+        : Promise.resolve([]),
+    ]);
+    const assets = account.assets.map((asset) => ({
+      venue: asset.exchange_type,
+      coin: asset.coin,
+      balance: asset.balance,
+      availableBalance: asset.available_balance,
+    }));
+    const rules = transferCoins.map((coin) => ({
+      coin: coin.coin,
+      minimumAmount: coin.min_trans_amount,
+      estimatedFee: coin.est_fee,
+      disabled: coin.is_disabled !== 0,
+    }));
+    const plan = planDeficitSettlements({
+      assets,
+      coins: rules,
+      accountMode: account.account_mode,
+      spotBalances: spotAccounts.map((balance) => ({ coin: balance.currency, available: balance.available })),
+      crossExAvailable: account.available_margin,
+    });
+    const items: PortfolioDeficit[] = [];
+    for (const asset of deficitsOf(assets)) {
+      const deficit = new Decimal(asset.balance).abs();
+      const rate = rates.find((entry) => entry.coin === asset.coin
+        && entry.exchange_type.toUpperCase() === asset.venue.toUpperCase());
+      const hourlyRate = rate ? new Decimal(rate.hourly_rate) : null;
+      const leg = plan.legs.find((candidate) => candidate.coin === asset.coin
+        && candidate.to === `CROSSEX_${asset.venue.toUpperCase()}`);
+      const skip = plan.skipped.find((candidate) => candidate.venue === asset.venue && candidate.coin === asset.coin);
+      const feeBps = leg && deficit.gt(0) ? Number(new Decimal(leg.fee).div(deficit).mul(10_000).toFixed(2)) : null;
+      items.push({
+        venue: asset.venue,
+        coin: asset.coin,
+        deficit: deficit.toString(),
+        hourlyRate: hourlyRate ? hourlyRate.toString() : null,
+        // 24h × 30d — a stable order of magnitude, not a forecast.
+        monthlyCost: hourlyRate ? hourlyRate.mul(deficit).mul(24 * 30).toFixed(6) : null,
+        settlement: leg ? {
+          from: leg.from,
+          to: leg.to,
+          amount: leg.amount,
+          fee: leg.fee,
+          feeBps,
+          // Paying more than 2% of the debt in fees is never worth it for a small deficit.
+          autoEligible: feeBps !== null && feeBps <= 200,
+        } : null,
+        reason: skip?.reason ?? null,
+      });
+    }
+    return { items, fetchedAt: new Date().toISOString() } satisfies PortfolioDeficitsResponse;
+  });
+
+  /**
+   * Settle the deficits whose fee is small relative to the debt (≤ 2%). Deliberately NOT a
+   * "settle everything" button: a 5 USDC withdrawal against a 12 USDC deficit costs more than
+   * 26 months of the interest it would stop, so those stay in the report for a human decision.
+   */
+  app.post('/api/portfolio/settle-deficits', {
+    config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+    preHandler: async (request, reply) => {
+      if (request.headers['x-gct-trading-intent'] !== 'settle-deficits') {
+        return reply.code(403).send({ error: 'missing_trading_intent' });
+      }
+    },
+  }, async (request, reply) => {
+    const operationsGateway = crossExGateway as Partial<PortfolioOperationsCrossExGateway>;
+    if (!operationsGateway.queryAccount || !operationsGateway.createTransfer) {
+      return reply.code(503).send({ error: 'transfers_unavailable' });
+    }
+    try {
+      return await runAuthenticatedWrite(async () => {
+        if (!tradingSession.liveTradingEnabled) throw new TradingRuntimeError('live_trading_locked', 403);
+        const credentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
+        if (!credentials) throw new TradingRuntimeError('credential_not_configured', 409);
+        const [account, transferCoins, spotAccounts] = await Promise.all([
+          operationsGateway.queryAccount!(credentials),
+          operationsGateway.queryTransferCoins ? operationsGateway.queryTransferCoins() : Promise.resolve([]),
+          operationsGateway.querySpotAccounts ? operationsGateway.querySpotAccounts(credentials) : Promise.resolve([]),
+        ]);
+        const plan = planDeficitSettlements({
+          assets: account.assets.map((asset) => ({
+            venue: asset.exchange_type,
+            coin: asset.coin,
+            balance: asset.balance,
+            availableBalance: asset.available_balance,
+          })),
+          coins: transferCoins.map((coin) => ({
+            coin: coin.coin,
+            minimumAmount: coin.min_trans_amount,
+            estimatedFee: coin.est_fee,
+            disabled: coin.is_disabled !== 0,
+          })),
+          accountMode: account.account_mode,
+          spotBalances: spotAccounts.map((balance) => ({ coin: balance.currency, available: balance.available })),
+          crossExAvailable: account.available_margin,
+        });
+        const settled: Array<{ venue: string; coin: string; amount: string; transactionId: string }> = [];
+        const withheld: Array<{ venue: string; coin: string; amount: string; fee: string; feeBps: number }> = [];
+        for (const leg of plan.legs) {
+          const deficit = new Decimal(leg.deficit);
+          const feeBps = deficit.gt(0) ? Number(new Decimal(leg.fee).div(deficit).mul(10_000).toFixed(2)) : 0;
+          if (feeBps > 200) {
+            withheld.push({ venue: leg.to, coin: leg.coin, amount: leg.amount, fee: leg.fee, feeBps });
+            continue;
+          }
+          const transfer = await operationsGateway.createTransfer!(credentials, canonicalizeCrossExTransfer({
+            coin: leg.coin,
+            amount: leg.amount,
+            from: leg.from,
+            to: leg.to,
+          }, account.account_mode));
+          addAuditEvent(database, 'deficit_settlement_submitted', {
+            transactionId: transfer.tx_id, coin: leg.coin, amount: leg.amount, from: leg.from, to: leg.to,
+          });
+          settled.push({ venue: leg.to, coin: leg.coin, amount: leg.amount, transactionId: transfer.tx_id });
+        }
+        if (settled.length > 0) triggerPortfolioRefresh?.();
+        return { settled, withheld, skipped: plan.skipped };
+      });
+    } catch (error) {
+      if (error instanceof TradingRuntimeError) return reply.code(error.statusCode).send({ error: error.code });
+      if (error instanceof GateApiError) return reply.code(400).send({ error: 'settlement_rejected', label: error.label });
+      throw error;
     }
   });
 

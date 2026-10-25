@@ -21,6 +21,12 @@ import {
   LeverageUpdateResponseSchema,
   MarketCatalogResponseSchema,
   MarketBookDepthsResponseSchema,
+  CrossExConvertOrderRequestSchema,
+  CrossExConvertOrderSchema,
+  CrossExConvertQuoteRequestSchema,
+  CrossExConvertQuoteSchema,
+  PortfolioDeficitsResponseSchema,
+  SettleDeficitsResponseSchema,
   MarketSizeUnitsSchema,
   MarketSnapshotSchema,
   OpportunityResponseSchema,
@@ -59,6 +65,7 @@ import {
   type CrossExTransferCoinsResponse,
   type CrossExTransferRecord,
   type CrossExTransferRequest,
+  type CrossExConvertQuoteRequest,
   type CrossExTransferResponse,
   type ExecutionFill,
   type ExecutionOrder,
@@ -455,6 +462,26 @@ export const api = {
     method: 'POST',
     headers: { 'x-gct-trading-intent': 'transfer-funds' },
     body: JSON.stringify(CrossExTransferRequestSchema.parse(body)),
+  }),
+  /** Flash-convert quote — read-only, Gate's documented path for funding a venue deficit. */
+  convertQuote: (body: CrossExConvertQuoteRequest) => request(CrossExConvertQuoteSchema, '/api/crossex/convert/quote', {
+    method: 'POST',
+    headers: { 'x-gct-trading-intent': 'convert-quote' },
+    body: JSON.stringify(CrossExConvertQuoteRequestSchema.parse(body)),
+  }),
+  convertOrder: (quoteId: string) => request(CrossExConvertOrderSchema, '/api/crossex/convert/orders', {
+    method: 'POST',
+    headers: { 'x-gct-trading-intent': 'convert-order' },
+    body: JSON.stringify(CrossExConvertOrderRequestSchema.parse({ quoteId })),
+  }),
+  /** Negative venue balances, what they cost per month, and the cheapest legal way out. */
+  portfolioDeficits: () => request(PortfolioDeficitsResponseSchema, '/api/portfolio/deficits', {
+    headers: { 'x-gct-read-intent': 'deficits' },
+  }),
+  /** Auto-settle only the deficits whose fee is ≤ 2% of the debt; the rest come back withheld. */
+  settleDeficits: () => request(SettleDeficitsResponseSchema, '/api/portfolio/settle-deficits', {
+    method: 'POST',
+    headers: { 'x-gct-trading-intent': 'settle-deficits' },
   }),
   createOrder: (body: {
     symbol: string;

@@ -21,6 +21,9 @@ const LEVERAGE_ENDPOINT = '/crossex/positions/leverage';
 const FEE_ENDPOINT = '/crossex/fee';
 const TRANSFER_COINS_ENDPOINT = '/crossex/transfers/coin';
 const TRANSFERS_ENDPOINT = '/crossex/transfers';
+const CONVERT_QUOTE_ENDPOINT = '/crossex/convert/quote';
+const CONVERT_ORDER_ENDPOINT = '/crossex/convert/orders';
+const INTEREST_RATE_ENDPOINT = '/crossex/interest_rate';
 const ACCOUNT_BOOK_ENDPOINT = '/crossex/account_book';
 const SPOT_ACCOUNTS_ENDPOINT = '/spot/accounts';
 const ADL_ENRICHMENT_BUDGET_MS = 1_500;
@@ -237,6 +240,52 @@ export type GateTransferCoin = z.infer<typeof GateTransferCoinSchema>;
 const GateTransferResponseSchema = z.object({ tx_id: z.string(), text: z.string() });
 export type GateTransferResponse = z.infer<typeof GateTransferResponseSchema>;
 
+/**
+ * Instant convert (POST /crossex/convert/quote). Gate documents `from_coin`/`to_coin`/
+ * `from_amount`/`exchange_type` on the way in and a quote id plus its monetary terms on the way
+ * out; the response is parsed leniently because the published schema has grown fields (rate,
+ * fee, valid_ms) over API revisions and a stricter parse would reject a working quote.
+ */
+export const GateConvertQuoteRequestSchema = z.object({
+  exchange_type: z.string().min(1),
+  from_coin: z.string().min(1),
+  to_coin: z.string().min(1),
+  from_amount: z.string().regex(/^\d+(?:\.\d+)?$/),
+});
+export type GateConvertQuoteRequest = z.infer<typeof GateConvertQuoteRequestSchema>;
+
+const GateConvertQuoteSchema = z.object({
+  quote_id: z.string(),
+  from_coin: z.string(),
+  to_coin: z.string(),
+  from_amount: z.string(),
+  to_amount: z.string(),
+  /** Millisecond validity timestamp per the docs (their own sample shows 5000). */
+  valid_ms: z.union([z.string(), z.number()]).optional(),
+  rate: z.string().optional(),
+  fee: z.string().optional(),
+}).passthrough();
+export type GateConvertQuote = z.infer<typeof GateConvertQuoteSchema>;
+
+const GateConvertOrderSchema = z.object({
+  /** Gate has shipped `order_id` and `id` across revisions; accept either. */
+  order_id: z.union([z.string(), z.number()]).optional(),
+  id: z.union([z.string(), z.number()]).optional(),
+  status: z.string().optional(),
+  from_coin: z.string().optional(),
+  to_coin: z.string().optional(),
+  from_amount: z.string().optional(),
+  to_amount: z.string().optional(),
+}).passthrough();
+export type GateConvertOrder = z.infer<typeof GateConvertOrderSchema>;
+
+const GateInterestRateSchema = z.object({
+  coin: z.string(),
+  exchange_type: z.string(),
+  hourly_rate: z.string(),
+}).passthrough();
+export type GateInterestRate = z.infer<typeof GateInterestRateSchema>;
+
 const GateTransferRecordSchema = z.object({
   id: z.string(),
   text: z.string(),
@@ -286,6 +335,15 @@ export interface PortfolioOperationsCrossExGateway {
   createTransfer(credentials: GateCredentials, transfer: CrossExTransferRequest): Promise<GateTransferResponse>;
   queryTransfers(credentials: GateCredentials, query: { coin?: string; limit: number }): Promise<GateTransferRecord[]>;
   queryAccountBook(credentials: GateCredentials, query: { coin?: string; limit: number; statementType?: string }): Promise<GateAccountBookRecord[]>;
+  /**
+   * Instant convert (Gate's own repayment path for venue deficits): a quote never moves funds,
+   * and once the order settles the target coin lands where it can repay the liability it belongs
+   * to. `exchange_type` must be a venue account (DERIBIT/CROSSEX are not quotable).
+   */
+  queryConvertQuote?(credentials: GateCredentials, quote: GateConvertQuoteRequest): Promise<GateConvertQuote>;
+  createConvertOrder?(credentials: GateCredentials, quoteId: string): Promise<GateConvertOrder>;
+  /** Hourly borrow rates per coin/venue — the real cost of carrying a deficit. */
+  queryInterestRates?(credentials: GateCredentials, query: { coin?: string; exchangeType?: string }): Promise<GateInterestRate[]>;
 }
 
 export class GateApiError extends Error {
@@ -534,6 +592,42 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
     return this.signedRequest(
       'GET', TRANSFERS_ENDPOINT, queryString, '', credentials,
       z.array(GateTransferRecordSchema), 'INVALID_TRANSFERS_RESPONSE', false, 'normal',
+    );
+  }
+
+  /**
+   * Flash-convert quote. Read-only: requesting a quote never executes it, and Gate rate-limits the
+   * endpoint at 100 requests/day, so callers must cache or only ask on user action.
+   */
+  async queryConvertQuote(credentials: GateCredentials, quote: GateConvertQuoteRequest): Promise<GateConvertQuote> {
+    const body = JSON.stringify(GateConvertQuoteRequestSchema.parse(quote));
+    return this.signedRequest(
+      'POST', CONVERT_QUOTE_ENDPOINT, '', body, credentials,
+      GateConvertQuoteSchema, 'INVALID_CONVERT_QUOTE_RESPONSE', false, 'normal',
+    );
+  }
+
+  /** Execute a quoted conversion. The quote id is opaque and single-use. */
+  async createConvertOrder(credentials: GateCredentials, quoteId: string): Promise<GateConvertOrder> {
+    const body = JSON.stringify({ quote_id: quoteId });
+    return this.signedRequest(
+      'POST', CONVERT_ORDER_ENDPOINT, '', body, credentials,
+      GateConvertOrderSchema, 'INVALID_CONVERT_ORDER_RESPONSE', false, 'high',
+    );
+  }
+
+  /** Hourly borrow rate per coin/venue — what a negative balance actually costs to carry. */
+  async queryInterestRates(
+    credentials: GateCredentials,
+    query: { coin?: string; exchangeType?: string },
+  ): Promise<GateInterestRate[]> {
+    const queryString = new URLSearchParams({
+      ...(query.coin ? { coin: query.coin } : {}),
+      ...(query.exchangeType ? { exchange_type: query.exchangeType } : {}),
+    }).toString();
+    return this.signedRequest(
+      'GET', INTEREST_RATE_ENDPOINT, queryString, '', credentials,
+      z.array(GateInterestRateSchema), 'INVALID_INTEREST_RATE_RESPONSE', false, 'low',
     );
   }
 
