@@ -15,6 +15,10 @@ describe('frontend routes', () => {
     { workspace: 'Trading Fees' },
     { workspace: 'Opportunities', board: 'funding' },
     { workspace: 'Opportunities', board: 'spread' },
+    // R9: the two boards that gained dropdown entries in the collapsed navigation must stay
+    // reachable as first-class routes — the nav collapse must never orphan a page.
+    { workspace: 'Opportunities', board: 'funding-top' },
+    { workspace: 'Opportunities', board: 'spread-quality' },
   ];
 
   it.each(routes)('round-trips $workspace pages through the URL', (route) => {
@@ -46,6 +50,23 @@ describe('frontend routes', () => {
   it('accepts trailing slashes and normalizes funding assets', () => {
     expect(frontendRoute('/portfolio/')).toEqual({ workspace: 'Portfolio' });
     expect(frontendRoute('/funding-rates/eth/')).toEqual({ workspace: 'Funding Rates', asset: 'ETH' });
+  });
+
+  it("keeps the collapsed navigation's six entries resolvable (R9)", () => {
+    // 交易 / 策略▾ / 机会▾ / 资金费率 / 资产 / 更多▾ — every workspace the six entries can
+    // open resolves to a real route, including the More-menu tools (Boros, Trading Fees).
+    const navWorkspaces: FrontendRoute[] = [
+      { workspace: 'Trade' },
+      { workspace: 'Strategy', strategyKind: 'position' },
+      { workspace: 'Opportunities', board: 'spread' },
+      { workspace: 'Funding Rates', asset: null },
+      { workspace: 'Portfolio' },
+      { workspace: 'Strategy', strategyKind: 'boros' },
+      { workspace: 'Trading Fees' },
+    ];
+    for (const route of navWorkspaces) {
+      expect(frontendRoute(frontendPath(route))).toEqual(route);
+    }
   });
 
   it('does not claim unknown or backend paths', () => {

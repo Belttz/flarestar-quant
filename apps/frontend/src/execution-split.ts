@@ -3,6 +3,23 @@ import type { ExecutionFill, ExecutionOrder, MarketSnapshot } from './api.js';
 import type { PortfolioBalance, PortfolioMarginPosition } from '@gate-crossex/shared-types';
 import { orderBusiness, symbolParts } from './route-shared.js';
 
+/** Market type a unified execution row belongs to (R6/R7): contract or spot. */
+export type UnifiedMarketType = 'perp' | 'spot';
+
+/** The ledger symbol's `_SPOT_` segment is the market type; everything else is a perpetual. */
+export function marketTypeOfSymbol(symbol: string): UnifiedMarketType {
+  return symbol.includes('_SPOT_') ? 'spot' : 'perp';
+}
+
+/** Filter any row list carrying a symbol by unified market type; 'all' keeps everything. */
+export function filterByMarketType<T extends { symbol?: string }>(
+  rows: readonly T[],
+  filter: UnifiedMarketType | 'all',
+): T[] {
+  if (filter === 'all') return [...rows];
+  return rows.filter((row) => row.symbol === undefined || marketTypeOfSymbol(row.symbol) === filter);
+}
+
 /** Stable two-bucket split of orders by ledger-symbol business; input order is preserved. */
 export function splitOrdersByBusiness(orders: ExecutionOrder[]): { futures: ExecutionOrder[]; spot: ExecutionOrder[] } {
   const futures: ExecutionOrder[] = [];

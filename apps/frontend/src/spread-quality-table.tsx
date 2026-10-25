@@ -85,6 +85,59 @@ function QualityLegCell({ venue, symbol, leg }: { venue: string; symbol: string;
 }
 
 /**
+ * Server-side sort keys of the spread-quality board (R8). Every key maps onto a column of the
+ * table; the composite score stays the default ranking, and the direction toggles by clicking
+ * the active chip again.
+ */
+export type SpreadQualitySortKey = 'score' | 'current' | 'mean' | 'volatility' | 'halfLife' | 'depth';
+export type SpreadQualitySortDir = 'asc' | 'desc';
+
+/** Chip labels reuse the table's own column translations so the two can never drift apart. */
+export const SPREAD_QUALITY_SORT_OPTIONS: ReadonlyArray<{ key: SpreadQualitySortKey; label: string }> = [
+  { key: 'score', label: 'Opportunity score' },
+  { key: 'current', label: 'Current spread' },
+  { key: 'mean', label: 'Mean spread' },
+  { key: 'volatility', label: 'Spread volatility' },
+  { key: 'halfLife', label: 'Half-life' },
+  { key: 'depth', label: 'Book depth' },
+];
+
+/**
+ * The board's sort chips: one per server sort key. Clicking a chip selects its key (descending,
+ * matching the board's default ranking direction); clicking the active chip flips the direction.
+ * Sorting is executed server side — the chips only change query parameters, never the rows.
+ */
+export function SpreadQualitySortChips({ sort, dir, onSortChange }: {
+  sort: SpreadQualitySortKey;
+  dir: SpreadQualitySortDir;
+  onSortChange: (sort: SpreadQualitySortKey, dir: SpreadQualitySortDir) => void;
+}) {
+  const { t } = useLanguage();
+  return <div className="panel-filter-chips quality-sort-chips" role="group" aria-label={t('Sort by')}>
+    {SPREAD_QUALITY_SORT_OPTIONS.map((option) => {
+      const active = option.key === sort;
+      const nextDir: SpreadQualitySortDir = active ? (dir === 'desc' ? 'asc' : 'desc') : 'desc';
+      return <button key={option.key} type="button" data-sort-chip={option.key}
+        className={active ? 'active' : ''}
+        aria-label={`${t(option.label)} · ${t(nextDir === 'asc' ? 'ascending' : 'descending')}`}
+        onClick={() => onSortChange(option.key, nextDir)}>
+        {t(option.label)}{active ? (dir === 'desc' ? ' ↓' : ' ↑') : ''}
+      </button>;
+    })}
+  </div>;
+}
+
+/**
+ * Stale-quote badge (R4): the two legs' quotes were too far apart in time for the spread to be
+ * executable as displayed. The row still shows (the server sinks it to the bottom) but the
+ * number carries a visible warning instead of silently reading as a live opportunity.
+ */
+export function SpreadQualityStaleBadge() {
+  const { t } = useLanguage();
+  return <span className="quality-stale-badge" title={t('Leg quotes are not time-aligned')}>{t('Quotes misaligned')}</span>;
+}
+
+/**
  * Spread-quality board table: one parent row per asset (its best combination) that expands into
  * the asset's full combination list. Every column is a 24h distribution statistic except the
  * current spread, the book depth and the composite score; the nullable statistics render as an
@@ -138,7 +191,7 @@ export function SpreadQualityTable({ rows, expandedAsset, onToggleExpand }: {
             </span>
           </td>
           {/* Current spread, mean, volatility and holding cost are bps; half-life is hours. */}
-          <td><strong className={best.currentSpreadBps >= 0 ? 'positive' : 'negative'}>{formatSpreadQualityBps(best.currentSpreadBps)}</strong></td>
+          <td><strong className={best.currentSpreadBps >= 0 ? 'positive' : 'negative'}>{formatSpreadQualityBps(best.currentSpreadBps)}</strong>{best.quoteAligned === false && <SpreadQualityStaleBadge />}</td>
           <td className="mono">{formatSpreadQualityBps(best.meanSpreadBps)}</td>
           <td className="mono">{formatSpreadQualityBps(best.spreadVolatilityBps)}</td>
           <td className="mono">{formatSpreadQualityBps(best.skewness)}</td>
@@ -166,7 +219,7 @@ export function SpreadQualityTable({ rows, expandedAsset, onToggleExpand }: {
               <td>{combinationIndex === 0 ? <em className="best-tag">{t('Best')}</em> : combinationIndex + 1}</td>
               <td><QualityLegCell venue={combination.leftVenue} symbol={combination.leftSymbol} leg="Sell leg" /></td>
               <td><QualityLegCell venue={combination.rightVenue} symbol={combination.rightSymbol} leg="Buy leg" /></td>
-              <td><strong className={combination.currentSpreadBps >= 0 ? 'positive' : 'negative'}>{formatSpreadQualityBps(combination.currentSpreadBps)}</strong></td>
+              <td><strong className={combination.currentSpreadBps >= 0 ? 'positive' : 'negative'}>{formatSpreadQualityBps(combination.currentSpreadBps)}</strong>{combination.quoteAligned === false && <SpreadQualityStaleBadge />}</td>
               <td className="mono">{formatOpportunityScore(combination.score)}</td>
               <td><SpreadQualitySymmetryBadge symmetric={combination.symmetric} /></td>
               <td className="mono">{formatHalfLifeHours(combination.halfLifeHours)}</td>

@@ -28,13 +28,12 @@ import {
 import { parseStoredFavorites } from './local-preferences.js';
 import { scopeStrategiesToAccount, strategyBelongsToAccount } from './strategy-accounts.js';
 import { strategyCopyQuery, strategyPrefillKey, strategyRouteKind } from './strategy-copy.js';
-import { DEFAULT_FRONTEND_ROUTE, frontendPath, frontendRoute, type FrontendRoute, type StrategyRouteKind } from './frontend-routes.js';
+import { DEFAULT_FRONTEND_ROUTE, frontendPath, frontendRoute, type FrontendRoute, type OpportunityBoard, type StrategyRouteKind } from './frontend-routes.js';
 import { LanguageContext, translate, useLanguage, type Language, type Theme } from './i18n.js';
 import { LoginPage } from './login-page.js';
 import type { FundingMetric, PairedPositionPrefill } from './route-shared.js';
 import { UnresolvedOrdersNotice } from './trading-mode-recovery.js';
 import brandMark from './assets/brand-mark.svg';
-import borosMark from './assets/boros-mark.svg';
 
 const TradingView = lazy(() => import('./trade-route.js').then((module) => ({ default: module.TradingView })));
 const StrategyView = lazy(() => import('./strategy-route.js').then((module) => ({ default: module.StrategyView })));
@@ -51,19 +50,23 @@ const LICENSE_URL = `${SOURCE_CODE_URL}/blob/main/LICENSE`;
 const RELEASE_VERSION = `v${import.meta.env.VITE_APP_VERSION}`;
 
 type Workspace = 'Trade' | 'Strategy' | 'Funding Rates' | 'Opportunities' | 'Portfolio' | 'Trading Fees';
-type NavigationLabel = Workspace | 'Boros by Pendle';
+/** Labels the topbar can render; 'Trading Fees' lives inside the More menu only. */
+type NavigationLabel = Exclude<Workspace, 'Trading Fees'> | 'More';
 type StrategyKind = StrategyRouteKind;
 /** Matches the backend's market-catalog freshness window; switches inside it reuse client state. */
 const CATALOG_CLIENT_REFRESH_MS = 5 * 60_000;
 type FundingHistoryDuration = 1 | 7 | 30;
 type FundingHistoryCache = Record<FundingHistoryDuration, Record<string, FundingHistoryEntry>>;
 
+// v0.4.1 (R9): six first-level entries — 交易 / 策略▾ / 机会▾ / 资金费率 / 资产 / 更多▾.
+// Opportunities collapses its four boards into one dropdown, Portfolio is promoted to a
+// first-level entry, and Boros moves into the More menu.
 const navItems: { label: NavigationLabel; glyph: string }[] = [
   { label: 'Trade', glyph: '⌁' },
   { label: 'Strategy', glyph: '⇄' },
-  { label: 'Funding Rates', glyph: '%' },
   { label: 'Opportunities', glyph: '✦' },
-  { label: 'Boros by Pendle', glyph: '◐' },
+  { label: 'Funding Rates', glyph: '%' },
+  { label: 'Portfolio', glyph: '◒' },
 ];
 
 function TopbarNavigationContent({ label, glyph, iconSrc }: { label: string; glyph: string; iconSrc?: string }) {
@@ -73,13 +76,22 @@ function TopbarNavigationContent({ label, glyph, iconSrc }: { label: string; gly
     : <span className="topbar-nav-glyph" aria-hidden="true">{glyph}</span>}{t(label)}</>;
 }
 
-// Boros by Pendle keeps its own top-level navigation entry, so it is deliberately not one of the
-// Strategy menu's modes.
+// Boros by Pendle is a strategy route but lives in the More menu (R9), so it is deliberately
+// not one of the Strategy menu's modes.
 const strategyPages: Array<{ kind: StrategyKind; glyph: string; label: string; detail: string }> = [
   { kind: 'position', glyph: '◎', label: 'Cross-exchange hedge', detail: 'Execute a fixed two-venue position, then stop' },
   { kind: 'carry', glyph: '⌛', label: 'Spot-perpetual carry bot', detail: 'Collect funding by holding spot against its perpetual, then exit when the basis converges.' },
   { kind: 'auto', glyph: '∑', label: 'Auto price-difference bot', detail: 'Continuously capture cross-exchange spreads' },
   { kind: 'premium', glyph: '≒', label: 'SK hynix premium bot', detail: 'Trade the SK hynix ADR premium vs the Korean listing' },
+];
+
+// The Opportunities dropdown (R9): all four boards reachable in one click, mirroring the
+// strategy menu's structure so keyboard handling and styling are shared.
+const opportunityPages: Array<{ board: OpportunityBoard; glyph: string; label: string; detail: string }> = [
+  { board: 'funding', glyph: '⌛', label: 'Funding carry board', detail: 'Rank cross-exchange funding hedges by APR' },
+  { board: 'funding-top', glyph: '%', label: 'Venue funding ranking', detail: 'Per-venue funding-rate extremes and history' },
+  { board: 'spread', glyph: '⇄', label: 'Price-difference board', detail: 'Rank executable cross-exchange spreads' },
+  { board: 'spread-quality', glyph: '≒', label: 'Spread quality board', detail: '24h spread-distribution statistics per pair' },
 ];
 
 const DIALOG_FOCUSABLE = [
@@ -514,10 +526,14 @@ function App() {
   // is the menu's containing block (backdrop-filter) and spans the viewport from (0,0), so trigger
   // viewport coordinates apply as-is; fixed positioning also escapes the nav's overflow clipping.
   const [strategyMenuAt, setStrategyMenuAt] = useState<{ top: number; left: number } | null>(null);
+  const [opportunityMenuAt, setOpportunityMenuAt] = useState<{ top: number; left: number } | null>(null);
   const [moreMenuAt, setMoreMenuAt] = useState<{ top: number; left: number } | null>(null);
   const strategyNavRef = useRef<HTMLDivElement | null>(null);
   const strategyTriggerRef = useRef<HTMLButtonElement | null>(null);
   const strategyMenuItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const opportunityNavRef = useRef<HTMLDivElement | null>(null);
+  const opportunityTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const opportunityMenuItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const moreNavRef = useRef<HTMLDivElement | null>(null);
   const moreTriggerRef = useRef<HTMLButtonElement | null>(null);
   const [selectedAsset, setSelectedAsset] = useState('BTC');
@@ -1050,26 +1066,28 @@ function App() {
   }, [settingsOpen, notificationsOpen]);
 
   useEffect(() => {
-    if (!strategyMenuAt && !moreMenuAt) return;
+    if (!strategyMenuAt && !opportunityMenuAt && !moreMenuAt) return;
     const onPointerDown = (event: MouseEvent) => {
       if (strategyNavRef.current && !strategyNavRef.current.contains(event.target as Node)) setStrategyMenuAt(null);
+      if (opportunityNavRef.current && !opportunityNavRef.current.contains(event.target as Node)) setOpportunityMenuAt(null);
       if (moreNavRef.current && !moreNavRef.current.contains(event.target as Node)) setMoreMenuAt(null);
     };
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         const moreWasOpen = moreMenuAt !== null;
         setStrategyMenuAt(null);
+        setOpportunityMenuAt(null);
         setMoreMenuAt(null);
-        (moreWasOpen ? moreTriggerRef.current : strategyTriggerRef.current)?.focus();
+        (moreWasOpen ? moreTriggerRef.current : opportunityMenuAt !== null ? opportunityTriggerRef.current : strategyTriggerRef.current)?.focus();
       }
     };
     // The stored anchor goes stale if the trigger moves, so a resize simply closes the menu.
-    const onResize = () => { setStrategyMenuAt(null); setMoreMenuAt(null); };
+    const onResize = () => { setStrategyMenuAt(null); setOpportunityMenuAt(null); setMoreMenuAt(null); };
     document.addEventListener('mousedown', onPointerDown);
     document.addEventListener('keydown', onKeyDown);
     window.addEventListener('resize', onResize);
     return () => { document.removeEventListener('mousedown', onPointerDown); document.removeEventListener('keydown', onKeyDown); window.removeEventListener('resize', onResize); };
-  }, [strategyMenuAt, moreMenuAt]);
+  }, [strategyMenuAt, opportunityMenuAt, moreMenuAt]);
 
   const openStrategyPage = useCallback((kind: StrategyKind) => {
     navigate({ workspace: 'Strategy', strategyKind: kind });
@@ -1080,14 +1098,31 @@ function App() {
   const openStrategyMenu = (trigger: HTMLButtonElement) => {
     const rect = trigger.getBoundingClientRect();
     setMoreMenuAt(null);
+    setOpportunityMenuAt(null);
     setStrategyMenuAt({ top: rect.bottom + 6, left: rect.left });
     const selectedIndex = Math.max(0, strategyPages.findIndex((page) => page.kind === strategyKind));
     requestAnimationFrame(() => strategyMenuItemRefs.current[selectedIndex]?.focus());
   };
 
+  const openOpportunityPage = useCallback((board: OpportunityBoard) => {
+    navigate({ workspace: 'Opportunities', board });
+    setOpportunityMenuAt(null);
+    opportunityTriggerRef.current?.focus();
+  }, [navigate]);
+
+  const openOpportunityMenu = (trigger: HTMLButtonElement) => {
+    const rect = trigger.getBoundingClientRect();
+    setStrategyMenuAt(null);
+    setMoreMenuAt(null);
+    setOpportunityMenuAt({ top: rect.bottom + 6, left: rect.left });
+    const selectedIndex = Math.max(0, opportunityPages.findIndex((page) => page.board === opportunityBoard));
+    requestAnimationFrame(() => opportunityMenuItemRefs.current[selectedIndex]?.focus());
+  };
+
   const openMoreMenu = (trigger: HTMLButtonElement) => {
     const rect = trigger.getBoundingClientRect();
     setStrategyMenuAt(null);
+    setOpportunityMenuAt(null);
     setMoreMenuAt({ top: rect.bottom + 6, left: rect.left });
   };
 
@@ -1106,12 +1141,29 @@ function App() {
     strategyMenuItemRefs.current[next]?.focus();
   };
 
+  // Identical keyboard model to the strategy menu, over the four opportunity boards.
+  const onOpportunityMenuKeyDown = (event: React.KeyboardEvent<HTMLUListElement>) => {
+    const current = opportunityMenuItemRefs.current.findIndex((item) => item === document.activeElement);
+    let next = current;
+    if (event.key === 'ArrowDown') next = Math.min(opportunityPages.length - 1, current + 1);
+    else if (event.key === 'ArrowUp') next = Math.max(0, current - 1);
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = opportunityPages.length - 1;
+    else if (event.key === 'Tab') {
+      setOpportunityMenuAt(null);
+      return;
+    } else return;
+    event.preventDefault();
+    opportunityMenuItemRefs.current[next]?.focus();
+  };
+
   const orderEvents = useMemo(() => (tradingSnapshot?.orders ?? []).slice().sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 8), [tradingSnapshot]);
   const unseenCount = orderEvents.filter((order) => order.updatedAt > notificationsSeenAt).length;
 
   function openNotifications() {
     const next = !notificationsOpen;
     setStrategyMenuAt(null);
+    setOpportunityMenuAt(null);
     setMoreMenuAt(null);
     setSettingsOpen(false);
     setNotificationsOpen(next);
@@ -1337,6 +1389,7 @@ function App() {
   useEffect(() => {
     if (tradingMode !== 'unset' && !modeDialogOpen) return;
     setStrategyMenuAt(null);
+    setOpportunityMenuAt(null);
     setMoreMenuAt(null);
     setNotificationsOpen(false);
     setSettingsOpen(false);
@@ -1396,19 +1449,39 @@ function App() {
             </li>)}
           </ul>}
         </div>
-        : <button key={item.label} className={`topbar-navigation-button ${item.label === 'Boros by Pendle' ? workspace === 'Strategy' && strategyKind === 'boros' ? 'active' : '' : workspace === item.label ? 'active' : ''}`} onClick={() => {
-          navigate(item.label === 'Trade'
-            ? { workspace: 'Trade' }
-            : item.label === 'Boros by Pendle'
-              ? { workspace: 'Strategy', strategyKind: 'boros' }
-            : item.label === 'Funding Rates'
-              ? { workspace: 'Funding Rates', asset: null }
-              : item.label === 'Opportunities'
-                ? { workspace: 'Opportunities', board: 'funding' }
+        : item.label === 'Opportunities'
+          ? <div className="nav-strategy nav-opportunities" key={item.label} ref={opportunityNavRef}>
+            <button ref={opportunityTriggerRef} className={`topbar-navigation-button ${workspace === 'Opportunities' ? 'active' : ''}${opportunityMenuAt ? ' menu-open' : ''}`}
+              aria-haspopup="menu" aria-expanded={opportunityMenuAt !== null}
+              onClick={(event) => { if (opportunityMenuAt) setOpportunityMenuAt(null); else openOpportunityMenu(event.currentTarget); }}
+              onKeyDown={(event) => {
+                if (!opportunityMenuAt && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+                  event.preventDefault();
+                  openOpportunityMenu(event.currentTarget);
+                }
+              }}>
+              <TopbarNavigationContent label={item.label} glyph={item.glyph} /><svg className="nav-caret" viewBox="0 0 8 5" aria-hidden="true"><path d="M1 1l3 3 3-3" /></svg>
+            </button>
+            {opportunityMenuAt && <ul className="nav-strategy-menu nav-opportunities-menu" role="menu" aria-label={t('Opportunity boards')}
+              style={opportunityMenuAt} onKeyDown={onOpportunityMenuKeyDown}>
+              {opportunityPages.map((page) => <li key={page.board} role="none">
+                <button ref={(node) => { opportunityMenuItemRefs.current[opportunityPages.indexOf(page)] = node; }}
+                  role="menuitem" className={workspace === 'Opportunities' && opportunityBoard === page.board ? 'selected' : ''}
+                  onClick={() => openOpportunityPage(page.board)}>
+                  <strong>{t(page.label)}</strong><small>{t(page.detail)}</small>
+                </button>
+              </li>)}
+            </ul>}
+          </div>
+          : <button key={item.label} className={`topbar-navigation-button ${workspace === item.label ? 'active' : ''}`} onClick={() => {
+            navigate(item.label === 'Trade'
+              ? { workspace: 'Trade' }
+              : item.label === 'Funding Rates'
+                ? { workspace: 'Funding Rates', asset: null }
                 : { workspace: 'Portfolio' });
-        }}><TopbarNavigationContent label={item.label} glyph={item.glyph} iconSrc={item.label === 'Boros by Pendle' ? borosMark : undefined} /></button>)}
+          }}><TopbarNavigationContent label={item.label} glyph={item.glyph} /></button>)}
         <div className="nav-strategy nav-more" ref={moreNavRef}>
-          <button ref={moreTriggerRef} className={`topbar-navigation-button ${workspace === 'Trading Fees' ? 'active' : ''}${moreMenuAt ? ' menu-open' : ''}`}
+          <button ref={moreTriggerRef} className={`topbar-navigation-button ${workspace === 'Trading Fees' || (workspace === 'Strategy' && strategyKind === 'boros') ? 'active' : ''}${moreMenuAt ? ' menu-open' : ''}`}
             aria-label={t('More')} aria-haspopup="menu" aria-expanded={moreMenuAt !== null}
             onClick={(event) => { if (moreMenuAt) setMoreMenuAt(null); else openMoreMenu(event.currentTarget); }}
             onKeyDown={(event) => {
@@ -1421,6 +1494,11 @@ function App() {
             <TopbarNavigationContent label="More" glyph="⋯" /><svg className="nav-caret" viewBox="0 0 8 5" aria-hidden="true"><path d="M1 1l3 3 3-3" /></svg>
           </button>
           {moreMenuAt && <ul className="nav-strategy-menu nav-more-menu" role="menu" aria-label={t('More tools')} style={moreMenuAt}>
+            <li role="none"><button role="menuitem" className={workspace === 'Strategy' && strategyKind === 'boros' ? 'selected' : ''} onClick={() => {
+              navigate({ workspace: 'Strategy', strategyKind: 'boros' });
+              setMoreMenuAt(null);
+              moreTriggerRef.current?.focus();
+            }}><strong>{t('Boros by Pendle')}</strong><small>{t('Borrow, lend and route yield across venues')}</small></button></li>
             <li role="none"><button role="menuitem" className={workspace === 'Trading Fees' ? 'selected' : ''} onClick={() => {
               navigate({ workspace: 'Trading Fees' });
               setMoreMenuAt(null);
@@ -1433,9 +1511,6 @@ function App() {
         {tradingMode !== null && tradingMode !== 'unset' && <button className={`topbar-navigation-button mode-badge ${tradingMode}`} onClick={openModeDialog} title={t('Switch trading mode')} aria-label={t('Switch trading mode')}>
           <i />{t(tradingMode === 'live' ? 'Live trading' : 'Read-only')}
         </button>}
-        <button className={`topbar-navigation-button portfolio-shortcut${workspace === 'Portfolio' ? ' active' : ''}`} onClick={() => navigate({ workspace: 'Portfolio' })}>
-          <TopbarNavigationContent label="Portfolio" glyph="◒" />
-        </button>
         <div className="profile-wrap" ref={notificationsRef}>
           <button className="utility" aria-label={t('Notifications')} aria-haspopup="dialog" aria-expanded={notificationsOpen} onClick={openNotifications}>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" /></svg>
@@ -1451,6 +1526,7 @@ function App() {
         <div className="profile-wrap settings-wrap" ref={settingsRef}>
           <button className="settings-button" aria-label={t('Settings')} title={t('Settings')} aria-haspopup="dialog" aria-expanded={settingsOpen} onClick={() => {
             setStrategyMenuAt(null);
+            setOpportunityMenuAt(null);
             setMoreMenuAt(null);
             setNotificationsOpen(false);
             setSettingsOpen((current) => !current);

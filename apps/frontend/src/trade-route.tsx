@@ -67,11 +67,11 @@ import { useLanguage } from './i18n.js';
 import { executionPageWindow } from './execution-pagination.js';
 import { PositionsTable } from './positions-table.js';
 import { prepareExecutionPositionRows, type PositionTableRow } from './strategy-positions.js';
-import { prepareSpotHoldingsRows, splitFillsByBusiness, splitOrdersByBusiness, type SpotHoldingsRow } from './execution-split.js';
+import { prepareSpotHoldingsRows, filterByMarketType, splitFillsByBusiness, splitOrdersByBusiness, type SpotHoldingsRow, type UnifiedMarketType } from './execution-split.js';
 import { spotCloseAvailable, spotCloseBlocker, spotCloseSymbol, spotCloseVenue } from './spot-close.js';
 import { SpotCloseDialog } from './spot-close-dialog.js';
 import { SpotDebtDialog } from './spot-debt-dialog.js';
-import { EmptyTable, FillTable, OrderTable, SpotHoldingsTable } from './execution-tables.js';
+import { EmptyTable, FillTable, OrderTable, SpotHoldingsTable, UnifiedPositionsTable, mergePositionRows } from './execution-tables.js';
 
 const CandleChart = lazy(() => import('./charts.js').then((module) => ({ default: module.CandleChart })));
 
@@ -275,7 +275,7 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   const [priceDirty, setPriceDirty] = useState(false);
   const [amount, setAmount] = useState('');
   const [allocation, setAllocation] = useState(0);
-  const [bottomTab, setBottomTab] = useState<string>('futures-positions');
+  const [bottomTab, setBottomTab] = useState<string>('positions');
   const [notice, setNotice] = useState<{ kind: 'ok' | 'error'; title: string; text: string } | null>(null);
   const noticeTimer = useRef<number | null>(null);
   const [confirming, setConfirming] = useState(false);
@@ -1005,35 +1005,34 @@ function FundingCountdown({ target }: { target: string | undefined }) {
   return <>{formatCountdown(target, now)}</>;
 }
 
-/** Stable bottom-panel tab keys; legacy display strings map onto the futures tabs via normalize. */
-export type ExecutionTabKey =
-  | 'futures-positions' | 'spot-holdings'
-  | 'futures-open-orders' | 'spot-open-orders'
-  | 'futures-order-history' | 'spot-order-history'
-  | 'futures-trade-history' | 'spot-trade-history';
+/**
+ * Bottom-panel tabs (R6/R7): the eight per-business tabs collapsed into two merged lists —
+ * Positions (contract positions + spot holdings) and Orders (open orders / order history /
+ * trade history, contract + spot). The former per-market tabs survive as in-list filter chips.
+ */
+export type ExecutionTabKey = 'positions' | 'orders';
+
+/** Market-type filter chips inside each merged list (Q4). */
+type MarketTypeFilter = UnifiedMarketType | 'all';
+
+const MARKET_TYPE_FILTERS: MarketTypeFilter[] = ['all', 'perp', 'spot'];
 
 const EXECUTION_TABS: Array<{ key: ExecutionTabKey; label: string }> = [
-  { key: 'futures-positions', label: 'Futures positions' },
-  { key: 'spot-holdings', label: 'Spot holdings' },
-  { key: 'futures-open-orders', label: 'Futures open orders' },
-  { key: 'spot-open-orders', label: 'Spot open orders' },
-  { key: 'futures-order-history', label: 'Futures order history' },
-  { key: 'spot-order-history', label: 'Spot order history' },
-  { key: 'futures-trade-history', label: 'Futures trade history' },
-  { key: 'spot-trade-history', label: 'Spot trade history' },
+  { key: 'positions', label: 'Positions' },
+  { key: 'orders', label: 'Orders' },
 ];
 
 /**
- * Older sessions kept display strings like "Positions (2)" in the tab state. They normalize onto
- * their futures-side tab; anything unrecognized lands on the futures positions tab so a stale
- * value can never blank the panel.
+ * Older sessions kept legacy keys ("futures-positions", "Positions (2)", …). Every pre-0.4.1 tab
+ * value maps onto its merged successor — the per-market positions/holdings tabs onto Positions,
+ * every orders/history/trades tab onto Orders — so a restored session never blanks the panel.
  */
 export function normalizeBottomTab(value: string): ExecutionTabKey {
-  if (value.startsWith('Positions')) return 'futures-positions';
-  if (value.startsWith('Open orders')) return 'futures-open-orders';
-  if (value === 'Order history') return 'futures-order-history';
-  if (value === 'Trade history') return 'futures-trade-history';
-  return EXECUTION_TABS.some((tab) => tab.key === value) ? value as ExecutionTabKey : 'futures-positions';
+  if (value === 'futures-positions' || value === 'spot-holdings' || value.startsWith('Positions')) return 'positions';
+  if (value === 'futures-open-orders' || value === 'spot-open-orders' || value.startsWith('Open orders')) return 'orders';
+  if (value === 'futures-order-history' || value === 'spot-order-history' || value === 'Order history') return 'orders';
+  if (value === 'futures-trade-history' || value === 'spot-trade-history' || value === 'Trade history') return 'orders';
+  return EXECUTION_TABS.some((tab) => tab.key === value) ? value as ExecutionTabKey : 'positions';
 }
 
 export function ExecutionTables({ snapshot, portfolio, instruments, marketSnapshot, spotVenues, bottomTab, setBottomTab, onTradingChanged, onPositionsRefresh, notify, tradingMode, onOpenModeDialog }: {
@@ -1058,12 +1057,14 @@ export function ExecutionTables({ snapshot, portfolio, instruments, marketSnapsh
   // Debt rows the exchange lists no spot market for cannot be closed by trading; they open the
   // repayment explainer instead of a dead button.
   const [spotDebtTarget, setSpotDebtTarget] = useState<SpotHoldingsRow | null>(null);
-  const [tablePages, setTablePages] = useState({
-    futuresOpenOrders: 1, spotOpenOrders: 1,
-    futuresOrderHistory: 1, spotOrderHistory: 1,
-    futuresTradeHistory: 1, spotTradeHistory: 1,
-  });
+  const [tablePages, setTablePages] = useState({ openOrders: 1, orderHistory: 1, tradeHistory: 1 });
   const [spotHoldingsPage, setSpotHoldingsPage] = useState(1);
+  const [unifiedPositionsPage, setUnifiedPositionsPage] = useState(1);
+  // In-list filters (Q4): the former per-market tabs survive as market-type chips, and the
+  // orders tab additionally splits by lifecycle view.
+  const [positionsFilter, setPositionsFilter] = useState<MarketTypeFilter>('all');
+  const [ordersFilter, setOrdersFilter] = useState<MarketTypeFilter>('all');
+  const [ordersView, setOrdersView] = useState<'open' | 'history' | 'trades'>('open');
   const positions = snapshot?.positions.filter((position) => Number(position.quantity) !== 0) ?? [];
   const orders = snapshot?.orders ?? [];
   const fills = snapshot?.fills ?? [];
@@ -1078,16 +1079,14 @@ export function ExecutionTables({ snapshot, portfolio, instruments, marketSnapsh
     [portfolio, marketSnapshot, spotVenues],
   );
   const spotInstrumentFor = (row: SpotHoldingsRow) => instruments?.find((item) => item.symbol === spotCloseSymbol(row.venue, row.coin)) ?? null;
-  // Count badges only on the quantity-bearing tabs (both positions + both open orders).
+  // Count badges on the merged tabs: Positions = contracts + holdings, Orders = open orders.
   const tabBadges: Partial<Record<ExecutionTabKey, number>> = {
-    'futures-positions': positions.length,
-    'spot-holdings': spotHoldingsRows.length,
-    'futures-open-orders': futuresOpenOrders.length,
-    'spot-open-orders': spotOpenOrders.length,
+    positions: positions.length + spotHoldingsRows.length,
+    orders: futuresOpenOrders.length + spotOpenOrders.length,
   };
   const active = normalizeBottomTab(bottomTab);
   useEffect(() => {
-    if (active !== 'futures-positions' || positions.length === 0) return;
+    if (active !== 'positions' || positions.length === 0) return;
     let refreshInProgress = false;
     const timer = window.setInterval(() => {
       if (refreshInProgress) return;
@@ -1096,19 +1095,31 @@ export function ExecutionTables({ snapshot, portfolio, instruments, marketSnapsh
     }, 5_000);
     return () => window.clearInterval(timer);
   }, [active, positions.length, onPositionsRefresh]);
+  // Unified order lists (R6/R7): contract rows first, then spot, filtered by the market-type
+  // chips. Each lifecycle view keeps its own page state so switching chips never resets pages
+  // of the other views.
+  const openOrderRows = useMemo(
+    () => [...filterByMarketType(futuresOpenOrders, ordersFilter), ...filterByMarketType(spotOpenOrders, ordersFilter)],
+    [futuresOpenOrders, spotOpenOrders, ordersFilter],
+  );
+  const historyOrderRows = useMemo(
+    () => [...filterByMarketType(futuresOrders, ordersFilter), ...filterByMarketType(spotOrders, ordersFilter)],
+    [futuresOrders, spotOrders, ordersFilter],
+  );
+  const tradeRows = useMemo(
+    () => [...filterByMarketType(futuresFills, ordersFilter), ...filterByMarketType(spotFills, ordersFilter)],
+    [futuresFills, spotFills, ordersFilter],
+  );
   useEffect(() => {
     setTablePages((current) => {
       const next = {
-        futuresOpenOrders: executionPageWindow(futuresOpenOrders.length, current.futuresOpenOrders).page,
-        spotOpenOrders: executionPageWindow(spotOpenOrders.length, current.spotOpenOrders).page,
-        futuresOrderHistory: executionPageWindow(futuresOrders.length, current.futuresOrderHistory).page,
-        spotOrderHistory: executionPageWindow(spotOrders.length, current.spotOrderHistory).page,
-        futuresTradeHistory: executionPageWindow(futuresFills.length, current.futuresTradeHistory).page,
-        spotTradeHistory: executionPageWindow(spotFills.length, current.spotTradeHistory).page,
+        openOrders: executionPageWindow(openOrderRows.length, current.openOrders).page,
+        orderHistory: executionPageWindow(historyOrderRows.length, current.orderHistory).page,
+        tradeHistory: executionPageWindow(tradeRows.length, current.tradeHistory).page,
       };
       return (Object.keys(next) as Array<keyof typeof next>).every((key) => next[key] === current[key]) ? current : next;
     });
-  }, [futuresOpenOrders.length, spotOpenOrders.length, futuresOrders.length, spotOrders.length, futuresFills.length, spotFills.length]);
+  }, [openOrderRows.length, historyOrderRows.length, tradeRows.length]);
   const requestClose = (targets: PositionTableRow[]) => {
     if (tradingMode !== 'live') {
       onOpenModeDialog();
@@ -1139,19 +1150,54 @@ export function ExecutionTables({ snapshot, portfolio, instruments, marketSnapsh
   };
   // History tabs keep cancellable rows reachable in place: only resting states show the button.
   const cancellableWhenResting = (order: ExecutionOrder) => OPEN_ORDER_STATES.includes(order.state);
+  // Chip badge counts: positions by market type, orders by lifecycle view.
+  const positionsFilterCount = (filter: MarketTypeFilter): number =>
+    filter === 'all' ? positionRows.length + spotHoldingsRows.length
+      : filter === 'perp' ? positionRows.length
+      : spotHoldingsRows.length;
+  const ordersViewCount = (view: 'open' | 'history' | 'trades'): number =>
+    view === 'open' ? futuresOpenOrders.length + spotOpenOrders.length
+      : view === 'history' ? futuresOrders.length + spotOrders.length
+      : futuresFills.length + spotFills.length;
+  const marketFilterLabel = (filter: MarketTypeFilter): string =>
+    filter === 'all' ? t('All') : filter === 'perp' ? t('Perpetual') : t('Spot');
+  // One shared close wiring object for the holdings rows (standalone spot branch + unified table).
+  const spotCloseState = {
+    onRequest: setSpotCloseTarget,
+    isClosable: (row: SpotHoldingsRow) => spotCloseAvailable(row, spotInstrumentFor(row)),
+    blockerFor: (row: SpotHoldingsRow) => spotCloseBlocker(row, spotInstrumentFor(row)),
+    onExplain: setSpotDebtTarget,
+  };
   return <section className="positions-panel terminal-panel">
-    <div className="positions-head"><div className="panel-tabs">{EXECUTION_TABS.map((tab) => {
-      const badge = tabBadges[tab.key];
-      return <button className={active === tab.key ? 'active' : ''} onClick={() => setBottomTab(tab.key)} key={tab.key}>{t(tab.label)}{badge !== undefined ? ` (${badge})` : ''}</button>;
-    })}</div></div>
-    {active === 'futures-positions' && (positionRows.length ? <PositionsTable rows={positionRows} onClose={requestClose} /> : <EmptyTable label="positions" />)}
-    {active === 'spot-holdings' && (spotHoldingsRows.length ? <SpotHoldingsTable rows={spotHoldingsRows} page={spotHoldingsPage} onPageChange={setSpotHoldingsPage} closeState={{ onRequest: setSpotCloseTarget, isClosable: (row) => spotCloseAvailable(row, spotInstrumentFor(row)), blockerFor: (row) => spotCloseBlocker(row, spotInstrumentFor(row)), onExplain: setSpotDebtTarget }} /> : <EmptyTable label="spot holdings" />)}
-    {active === 'futures-open-orders' && (futuresOpenOrders.length ? <OrderTable orders={futuresOpenOrders} page={tablePages.futuresOpenOrders} onPageChange={(page) => setTablePages((current) => ({ ...current, futuresOpenOrders: page }))} cancellable onCancel={cancel} busyOrderIds={cancellingIds} /> : <EmptyTable label="open orders" />)}
-    {active === 'spot-open-orders' && (spotOpenOrders.length ? <OrderTable product="spot" orders={spotOpenOrders} page={tablePages.spotOpenOrders} onPageChange={(page) => setTablePages((current) => ({ ...current, spotOpenOrders: page }))} cancellable onCancel={cancel} busyOrderIds={cancellingIds} /> : <EmptyTable label="spot open orders" />)}
-    {active === 'futures-order-history' && (futuresOrders.length ? <OrderTable orders={futuresOrders} page={tablePages.futuresOrderHistory} onPageChange={(page) => setTablePages((current) => ({ ...current, futuresOrderHistory: page }))} cancellable cancellableFor={cancellableWhenResting} onCancel={cancel} busyOrderIds={cancellingIds} /> : <EmptyTable label="order history" />)}
-    {active === 'spot-order-history' && (spotOrders.length ? <OrderTable product="spot" orders={spotOrders} page={tablePages.spotOrderHistory} onPageChange={(page) => setTablePages((current) => ({ ...current, spotOrderHistory: page }))} cancellable cancellableFor={cancellableWhenResting} onCancel={cancel} busyOrderIds={cancellingIds} /> : <EmptyTable label="spot order history" />)}
-    {active === 'futures-trade-history' && (futuresFills.length ? <FillTable fills={futuresFills} page={tablePages.futuresTradeHistory} onPageChange={(page) => setTablePages((current) => ({ ...current, futuresTradeHistory: page }))} /> : <EmptyTable label="trade history" />)}
-    {active === 'spot-trade-history' && (spotFills.length ? <FillTable product="spot" fills={spotFills} page={tablePages.spotTradeHistory} onPageChange={(page) => setTablePages((current) => ({ ...current, spotTradeHistory: page }))} /> : <EmptyTable label="spot trade history" />)}
+    <div className="positions-head">
+      <div className="panel-tabs">{EXECUTION_TABS.map((tab) => {
+        const badge = tabBadges[tab.key];
+        return <button className={active === tab.key ? 'active' : ''} onClick={() => setBottomTab(tab.key)} key={tab.key}>{t(tab.label)}{badge !== undefined ? ` (${badge})` : ''}</button>;
+      })}</div>
+      {active === 'positions' && <div className="panel-filter-chips" role="group" aria-label={t('Market type filter')}>
+        {MARKET_TYPE_FILTERS.map((filter) => <button key={filter} data-filter-chip={filter} className={positionsFilter === filter ? 'active' : ''} onClick={() => setPositionsFilter(filter)}>{marketFilterLabel(filter)} ({positionsFilterCount(filter)})</button>)}
+      </div>}
+      {active === 'orders' && <div className="positions-head-filters">
+        <div className="panel-filter-chips" role="group" aria-label={t('Order view')}>
+          {(['open', 'history', 'trades'] as const).map((view) => <button key={view} data-orders-view={view} className={ordersView === view ? 'active' : ''} onClick={() => setOrdersView(view)}>{t(view === 'open' ? 'Open orders' : view === 'history' ? 'Order history' : 'Trade history')} ({ordersViewCount(view)})</button>)}
+        </div>
+        <div className="panel-filter-chips" role="group" aria-label={t('Market type filter')}>
+          {MARKET_TYPE_FILTERS.map((filter) => <button key={filter} data-filter-chip={filter} className={ordersFilter === filter ? 'active' : ''} onClick={() => setOrdersFilter(filter)}>{marketFilterLabel(filter)}</button>)}
+        </div>
+      </div>}
+    </div>
+    {active === 'positions' && positionsFilter === 'all' && (positionRows.length + spotHoldingsRows.length > 0 ? <UnifiedPositionsTable
+      rows={mergePositionRows(positionRows, spotHoldingsRows)}
+      page={unifiedPositionsPage}
+      onPageChange={setUnifiedPositionsPage}
+      onClosePerp={(row) => requestClose([row])}
+      spotCloseState={spotCloseState}
+    /> : <EmptyTable label="positions" />)}
+    {active === 'positions' && positionsFilter === 'perp' && (positionRows.length ? <PositionsTable rows={positionRows} onClose={requestClose} /> : <EmptyTable label="positions" />)}
+    {active === 'positions' && positionsFilter === 'spot' && (spotHoldingsRows.length ? <SpotHoldingsTable rows={spotHoldingsRows} page={spotHoldingsPage} onPageChange={setSpotHoldingsPage} closeState={spotCloseState} /> : <EmptyTable label="spot holdings" />)}
+    {active === 'orders' && ordersView === 'open' && (openOrderRows.length ? <OrderTable unified orders={openOrderRows} page={tablePages.openOrders} onPageChange={(page) => setTablePages((current) => ({ ...current, openOrders: page }))} cancellable onCancel={cancel} busyOrderIds={cancellingIds} /> : <EmptyTable label="open orders" />)}
+    {active === 'orders' && ordersView === 'history' && (historyOrderRows.length ? <OrderTable unified orders={historyOrderRows} page={tablePages.orderHistory} onPageChange={(page) => setTablePages((current) => ({ ...current, orderHistory: page }))} cancellable cancellableFor={cancellableWhenResting} onCancel={cancel} busyOrderIds={cancellingIds} /> : <EmptyTable label="order history" />)}
+    {active === 'orders' && ordersView === 'trades' && (tradeRows.length ? <FillTable unified fills={tradeRows} page={tablePages.tradeHistory} onPageChange={(page) => setTablePages((current) => ({ ...current, tradeHistory: page }))} /> : <EmptyTable label="trade history" />)}
     {closeTargets && <PositionCloseDialog
       targets={closeTargets}
       portfolio={portfolio}
@@ -1175,5 +1221,3 @@ export function ExecutionTables({ snapshot, portfolio, instruments, marketSnapsh
     />}
   </section>;
 }
-
-/** Formats the max-size column: explicit totals for position/auto, levels × per-order for grids. */

@@ -2,7 +2,9 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 import type { AuthenticatedPortfolioSnapshot, ExecutionFill, ExecutionOrder, LiveMarket, MarketSnapshot, TradingSnapshot } from './api.js';
 import type { ExecutionPosition } from '@gate-crossex/shared-types';
+import { FillTable, OrderTable } from './execution-tables.js';
 import { LanguageContext } from './i18n.js';
+import { OPEN_ORDER_STATES } from './route-shared.js';
 import { ExecutionTables, normalizeBottomTab } from './trade-route.js';
 
 function order(overrides: Partial<ExecutionOrder> & { id: string; symbol: string }): ExecutionOrder {
@@ -74,7 +76,7 @@ function render(ui: React.ReactNode): string {
   );
 }
 
-function renderTabs({ bottomTab = 'futures-positions', trading, portfolioSnapshot = portfolio([]), market = null, spotVenues = null }: {
+function renderTabs({ bottomTab = 'positions', trading, portfolioSnapshot = portfolio([]), market = null, spotVenues = null }: {
   bottomTab?: string;
   trading?: TradingSnapshot;
   portfolioSnapshot?: AuthenticatedPortfolioSnapshot | null;
@@ -99,27 +101,38 @@ function renderTabs({ bottomTab = 'futures-positions', trading, portfolioSnapsho
 
 function tabLabels(html: string): string[] {
   const start = html.indexOf('panel-tabs');
-  const segment = html.slice(start, html.indexOf('</div></div>', start));
+  const segment = html.slice(start, html.indexOf('</div><div', start));
   return [...segment.matchAll(/<button[^>]*>([^<]+)<\/button>/g)].map((match) => match[1] ?? '');
 }
 
 describe('normalizeBottomTab', () => {
-  it('maps legacy display strings onto their futures-side tab', () => {
-    expect(normalizeBottomTab('Positions (2)')).toBe('futures-positions');
-    expect(normalizeBottomTab('Positions (0)')).toBe('futures-positions');
-    expect(normalizeBottomTab('Open orders (3)')).toBe('futures-open-orders');
-    expect(normalizeBottomTab('Order history')).toBe('futures-order-history');
-    expect(normalizeBottomTab('Trade history')).toBe('futures-trade-history');
+  it('maps every pre-0.4.1 tab value onto its merged successor', () => {
+    // Per-market positions/holdings tabs → Positions.
+    expect(normalizeBottomTab('futures-positions')).toBe('positions');
+    expect(normalizeBottomTab('spot-holdings')).toBe('positions');
+    expect(normalizeBottomTab('Positions (2)')).toBe('positions');
+    expect(normalizeBottomTab('Positions (0)')).toBe('positions');
+    // Per-market orders/history/trades tabs → Orders.
+    expect(normalizeBottomTab('futures-open-orders')).toBe('orders');
+    expect(normalizeBottomTab('spot-open-orders')).toBe('orders');
+    expect(normalizeBottomTab('Open orders (3)')).toBe('orders');
+    expect(normalizeBottomTab('futures-order-history')).toBe('orders');
+    expect(normalizeBottomTab('spot-order-history')).toBe('orders');
+    expect(normalizeBottomTab('Order history')).toBe('orders');
+    expect(normalizeBottomTab('futures-trade-history')).toBe('orders');
+    expect(normalizeBottomTab('spot-trade-history')).toBe('orders');
+    expect(normalizeBottomTab('Trade history')).toBe('orders');
   });
 
-  it('keeps stable keys and lands unknown values on the futures positions tab', () => {
-    expect(normalizeBottomTab('spot-trade-history')).toBe('spot-trade-history');
-    expect(normalizeBottomTab('garbage')).toBe('futures-positions');
+  it('keeps stable keys and lands unknown values on the positions tab', () => {
+    expect(normalizeBottomTab('positions')).toBe('positions');
+    expect(normalizeBottomTab('orders')).toBe('orders');
+    expect(normalizeBottomTab('garbage')).toBe('positions');
   });
 });
 
-describe('ExecutionTables 8-tab panel', () => {
-  it('renders all eight tabs in business order with badges only on quantity tabs', () => {
+describe('ExecutionTables merged 2-tab panel (R6/R7)', () => {
+  it('renders two merged tabs with combined badges', () => {
     const trading = snapshot({
       positions: [position(), position({ position_id: 'position-2' })],
       orders: [order({ id: 'o1', symbol: 'GATE_FUTURE_BTC_USDT' })],
@@ -128,78 +141,99 @@ describe('ExecutionTables 8-tab panel', () => {
       { venue: 'SPOT', coin: 'USDT', balance: '50', unrealizedPnl: '0', equity: '50', futuresInitialMargin: '0', futuresMaintenanceMargin: '0', borrowingInitialMargin: '0', borrowingMaintenanceMargin: '0', availableBalance: '50', liability: '0' },
     ]);
     const html = renderTabs({ trading, portfolioSnapshot: holdings });
-    expect(tabLabels(html)).toEqual([
-      'Futures positions (2)', 'Spot holdings (1)', 'Futures open orders (1)', 'Spot open orders (0)',
-      'Futures order history', 'Spot order history', 'Futures trade history', 'Spot trade history',
-    ]);
+    expect(tabLabels(html)).toEqual(['Positions (3)', 'Orders (1)']);
   });
 
-  it('splits open orders by business and keeps pagination per tab', () => {
+  it('merges contract positions and spot holdings into one value-ordered list with per-row market tags', () => {
+    const market: MarketSnapshot = {
+      connectionState: 'healthy', updatedAt: '2026-09-01T00:00:00.000Z',
+      markets: [spotMarket('GATE_SPOT_BTC_USDT', '62000')],
+    };
+    const trading = snapshot({ positions: [position()] });
+    const holdings = portfolio([
+      { venue: 'SPOT', coin: 'BTC', balance: '0.5', unrealizedPnl: '0', equity: '0', futuresInitialMargin: '0', futuresMaintenanceMargin: '0', borrowingInitialMargin: '0', borrowingMaintenanceMargin: '0', availableBalance: '0.3', liability: '0' },
+      { venue: 'CROSSEX', coin: 'USDT', balance: '999', unrealizedPnl: '0', equity: '999', futuresInitialMargin: '0', futuresMaintenanceMargin: '0', borrowingInitialMargin: '0', borrowingMaintenanceMargin: '0', availableBalance: '999', liability: '0' },
+    ]);
+    const html = renderTabs({ trading, portfolioSnapshot: holdings, market });
+    // The contract position (0.01 × 62000 = $620) trails the $31,000 spot holding.
+    expect(html.indexOf('$31,000')).toBeGreaterThan(-1);
+    expect(html.indexOf('$31,000')).toBeLessThan(html.indexOf('$620'));
+    expect(html).toContain('market-type-tag perp');
+    expect(html).toContain('market-type-tag spot');
+    expect(html).toContain('BTCUSDT');
+    expect(html).toContain('Entry / Available');
+    expect(html).toContain('PnL / Valuation');
+  });
+
+  it('survives legacy tab values without blanking the panel', () => {
+    expect(renderTabs({ bottomTab: 'Positions (2)' })).toContain('<button class="active">Positions (0)</button>');
+    expect(renderTabs({ bottomTab: 'Open orders (3)' })).toContain('<button class="active">Orders (0)</button>');
+    expect(renderTabs({ bottomTab: 'Order history' })).toContain('<button class="active">Orders (0)</button>');
+    expect(renderTabs({ bottomTab: 'Trade history' })).toContain('<button class="active">Orders (0)</button>');
+    expect(renderTabs({ bottomTab: 'spot-trade-history' })).toContain('<button class="active">Orders (0)</button>');
+    expect(renderTabs({ bottomTab: 'spot-holdings' })).toContain('<button class="active">Positions (0)</button>');
+  });
+
+  it('unifies open orders with per-row market naming and tags', () => {
     const trading = snapshot({
       orders: [
         order({ id: 'spot-1', symbol: 'GATE_SPOT_BTC_USDT' }),
         order({ id: 'future-1', symbol: 'GATE_FUTURE_BTC_USDT' }),
       ],
     });
-    const futuresHtml = renderTabs({ bottomTab: 'futures-open-orders', trading });
-    expect(futuresHtml).toContain('remote-future-1');
-    expect(futuresHtml).not.toContain('remote-spot-1');
-    expect(futuresHtml).toContain('>Contract</th>');
-
-    const spotHtml = renderTabs({ bottomTab: 'spot-open-orders', trading });
-    expect(spotHtml).toContain('remote-spot-1');
-    expect(spotHtml).not.toContain('remote-future-1');
-    expect(spotHtml).toContain('BTC/USDT');
-    expect(spotHtml).toContain('>Market</th>');
+    const html = renderTabs({ bottomTab: 'orders', trading });
+    expect(html).toContain('remote-spot-1');
+    expect(html).toContain('remote-future-1');
+    expect(html).toContain('BTC/USDT');
+    expect(html).toContain('BTCUSDT');
+    expect(html).toContain('>Market</th>');
+    expect(html).not.toContain('>Contract</th>');
   });
 
-  it('shows the cancel button on resting history rows only', () => {
-    const trading = snapshot({
-      orders: [
-        order({ id: 'open', symbol: 'GATE_FUTURE_BTC_USDT', state: 'OPEN' }),
-        order({ id: 'filled', symbol: 'GATE_FUTURE_BTC_USDT', state: 'FILLED' }),
-      ],
-    });
-    const html = renderTabs({ bottomTab: 'futures-order-history', trading });
+  it('keeps the cancel button on resting history rows only in the unified history view', () => {
+    const orders = [
+      order({ id: 'open', symbol: 'GATE_FUTURE_BTC_USDT', state: 'OPEN' }),
+      order({ id: 'filled', symbol: 'GATE_FUTURE_BTC_USDT', state: 'FILLED' }),
+    ];
+    // The history view wires OrderTable with cancellableFor={cancellableWhenResting} (identical
+    // to the pre-0.4.1 history tabs) — only resting states keep their cancel reachable.
+    const html = render(<OrderTable unified orders={orders} page={1} onPageChange={vi.fn()} cancellable
+      cancellableFor={(item) => OPEN_ORDER_STATES.includes(item.state)}
+      onCancel={vi.fn().mockResolvedValue(undefined)} busyOrderIds={[]} />);
     expect(html).toContain('remote-open');
     expect(html).toContain('remote-filled');
     expect(html.match(/>Cancel</g)).toHaveLength(1);
   });
 
-  it('splits fills by business and renders — for spot realized PnL', () => {
-    const trading = snapshot({
-      fills: [
-        fill({ id: 'spot-fill', symbol: 'GATE_SPOT_BTC_USDT', realized_pnl: '0' }),
-        fill({ id: 'future-fill', symbol: 'GATE_FUTURE_BTC_USDT', realized_pnl: '4.2' }),
-      ],
-    });
-    const spotHtml = renderTabs({ bottomTab: 'spot-trade-history', trading });
-    expect(spotHtml).toContain('spot-fill');
-    expect(spotHtml).toContain('<td>—</td>');
-
-    const futuresHtml = renderTabs({ bottomTab: 'futures-trade-history', trading });
-    expect(futuresHtml).toContain('4.20');
-    expect(futuresHtml).not.toContain('<td>—</td>');
+  it('renders — for spot realized PnL in the unified trade view', () => {
+    const fills = [
+      fill({ id: 'spot-fill', symbol: 'GATE_SPOT_BTC_USDT', realized_pnl: '0' }),
+      fill({ id: 'future-fill', symbol: 'GATE_FUTURE_BTC_USDT', realized_pnl: '4.2' }),
+    ];
+    const html = render(<FillTable unified fills={fills} page={1} onPageChange={vi.fn()} />);
+    expect(html).toContain('BTC/USDT');
+    expect(html).toContain('BTCUSDT');
+    expect(html).toContain('<td>—</td>');
+    expect(html).toContain('4.20');
   });
 
-  it('builds the spot-holdings tab from the portfolio SPOT rows with market valuation', () => {
+  it('keeps the spot-holdings valuation columns in the spot filter branch', () => {
     const market: MarketSnapshot = {
       connectionState: 'healthy', updatedAt: '2026-09-01T00:00:00.000Z',
       markets: [spotMarket('GATE_SPOT_BTC_USDT', '62000')],
     };
     const holdings = portfolio([
-      { venue: 'SPOT', coin: 'USDT', balance: '250.125', unrealizedPnl: '0', equity: '250.125', futuresInitialMargin: '0', futuresMaintenanceMargin: '0', borrowingInitialMargin: '0', borrowingMaintenanceMargin: '0', availableBalance: '240', liability: '0' },
       { venue: 'SPOT', coin: 'BTC', balance: '0.5', unrealizedPnl: '0', equity: '0', futuresInitialMargin: '0', futuresMaintenanceMargin: '0', borrowingInitialMargin: '0', borrowingMaintenanceMargin: '0', availableBalance: '0.3', liability: '0' },
       { venue: 'CROSSEX', coin: 'USDT', balance: '999', unrealizedPnl: '0', equity: '999', futuresInitialMargin: '0', futuresMaintenanceMargin: '0', borrowingInitialMargin: '0', borrowingMaintenanceMargin: '0', availableBalance: '999', liability: '0' },
     ]);
+    // The legacy key lands on Positions; the unified list shows the BTC holding's valuation
+    // while the CROSSEX settlement balance stays out of the holdings rows.
     const html = renderTabs({ bottomTab: 'spot-holdings', portfolioSnapshot: holdings, market });
-    expect(html).toContain('Valuation (USDT)');
     expect(html).toContain('$31,000');
-    expect(html).toContain('$250.13');
     expect(html).not.toContain('$999');
   });
 
-  it('treats unified-account balances on catalog spot venues as spot holdings, with the venue column', () => {
+  it('treats unified-account balances on catalog spot venues as spot holdings', () => {
     const holdings = portfolio([
       { venue: 'GATE', coin: 'ONE', balance: '2030.03', unrealizedPnl: '0', equity: '0', futuresInitialMargin: '0', futuresMaintenanceMargin: '0', borrowingInitialMargin: '0', borrowingMaintenanceMargin: '0', availableBalance: '2030.03', liability: '0' },
       { venue: 'CROSSEX', coin: 'USDT', balance: '999', unrealizedPnl: '0', equity: '999', futuresInitialMargin: '0', futuresMaintenanceMargin: '0', borrowingInitialMargin: '0', borrowingMaintenanceMargin: '0', availableBalance: '999', liability: '0' },
@@ -212,23 +246,13 @@ describe('ExecutionTables 8-tab panel', () => {
     expect(html).toContain('ONE');
     expect(html).toContain('2,030.03');
     expect(html).not.toContain('$999');
-    expect(html).toContain('>Market</th>');
   });
 
-  it('renders the business-specific empty states', () => {
-    expect(renderTabs({ bottomTab: 'spot-holdings' })).toContain('No spot holdings');
-    expect(renderTabs({ bottomTab: 'spot-open-orders' })).toContain('No spot open orders');
-    expect(renderTabs({ bottomTab: 'spot-order-history' })).toContain('No spot order history');
-    expect(renderTabs({ bottomTab: 'spot-trade-history' })).toContain('No spot trade history');
-    expect(renderTabs({ bottomTab: 'futures-positions' })).toContain('No positions');
-    expect(renderTabs({ bottomTab: 'futures-order-history' })).toContain('No order history');
-  });
-
-  it('normalizes legacy bottom-tab values onto the futures tabs without blanking the panel', () => {
-    expect(renderTabs({ bottomTab: 'Positions (2)' })).toContain('<button class="active">Futures positions (0)</button>');
-    expect(renderTabs({ bottomTab: 'Open orders (0)' })).toContain('<button class="active">Futures open orders (0)</button>');
-    expect(renderTabs({ bottomTab: 'Order history' })).toContain('<button class="active">Futures order history</button>');
-    expect(renderTabs({ bottomTab: 'Trade history' })).toContain('<button class="active">Futures trade history</button>');
-    expect(renderTabs({ bottomTab: 'spot-trade-history' })).toContain('<button class="active">Spot trade history</button>');
+  it('renders per-view empty states on the merged tabs', () => {
+    expect(renderTabs({ bottomTab: 'positions' })).toContain('No positions');
+    expect(renderTabs({ bottomTab: 'orders' })).toContain('No open orders');
+    // A filled order is invisible in the open view but counts on the history chip.
+    expect(renderTabs({ bottomTab: 'orders', trading: snapshot({ orders: [order({ id: 'o1', symbol: 'GATE_FUTURE_BTC_USDT', state: 'FILLED' })] }) })).toContain('Order history (1)');
+    expect(renderTabs({ bottomTab: 'orders', trading: snapshot({ orders: [order({ id: 'o1', symbol: 'GATE_FUTURE_BTC_USDT', state: 'FILLED' })] }) })).toContain('No open orders');
   });
 });
