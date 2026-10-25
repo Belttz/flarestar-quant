@@ -127,6 +127,14 @@ interface StrategyActor {
    */
   venueExitQuantitySymbol: string | null;
   /**
+   * closePlan targets the venue confirmed hold nothing reducible (R3): the ledger believed a
+   * position the venue no longer holds, or the residual is below the smallest order unit. Those
+   * targets count as satisfied — the plan stops resubmitting doomed orders for them and the
+   * whole plan completes as soon as every target is satisfied or fully executed. In-memory only;
+   * a recovered actor re-learns the state from the next rejection.
+   */
+  closePlanSatisfied: Set<number>;
+  /**
    * True while an entry quote is withheld because the live spread sits outside the maker entry
    * proximity band; drives the one-shot `Maker quoting parked` / `Maker quoting resumed` logs so
    * a parked strategy does not write a row on every 500ms tick.
@@ -685,15 +693,11 @@ export class StrategyEngine {
           }
         }
         this.validateClosePlanOrderSizes(input);
-        await this.runtime.prepareReduceOnlyStrategy(input.closePlan.targets.map((target) => ({
-          symbol: target.symbol,
-          venue: target.symbol.split('_', 1)[0] ?? '',
-          side: target.side,
-          leverage: '1',
-          estimatedQuantity: target.quantity,
-          estimatedPrice: '0',
-          positionSide: target.positionSide,
-        })));
+        // No launch-time position preflight (R3): the ledger's quantities may be stale — the user
+        // may have flattened a leg on the exchange itself — and blocking the close on that would
+        // lock the user out of "Close all" exactly when they need it. Every slice reconciles
+        // against the venue at execution time instead: an oversized reduce-only order is rejected,
+        // re-sized from a fresh position read, and retried; an already-flat leg is marked satisfied.
       } else {
         const legs = legsOf(input);
         for (const leg of [legs.left, legs.right]) {
@@ -809,15 +813,7 @@ export class StrategyEngine {
           }
         }
         this.validateClosePlanOrderSizes(config);
-        await this.runtime.prepareReduceOnlyStrategy(config.closePlan.targets.map((target) => ({
-          symbol: target.symbol,
-          venue: target.symbol.split('_', 1)[0] ?? '',
-          side: target.side,
-          leverage: '1',
-          estimatedQuantity: target.quantity,
-          estimatedPrice: '0',
-          positionSide: target.positionSide,
-        })));
+        // No position preflight on resume either (R3): slices reconcile venue truth at execution.
       } else {
         const legs = legsOf(config);
         for (const leg of [legs.left, legs.right]) {
@@ -1030,6 +1026,7 @@ export class StrategyEngine {
       stopLossArmed: false,
       venueExitQuantity: null,
       venueExitQuantitySymbol: null,
+      closePlanSatisfied: new Set<number>(),
       makerEntryParked: false,
       makerExitArmed: false,
       makerExitStartedAt: null,
@@ -1580,25 +1577,70 @@ export class StrategyEngine {
       .reduce((sum, row) => sum.plus(row.executed_quantity || '0'), ZERO);
   }
 
+  /**
+   * Unfilled close-plan quantity per target. Targets confirmed satisfied by a venue reconcile
+   * (the venue holds nothing reducible) are excluded — counting them would make a plan whose
+   * venue side is already flat report phantom residuals and a spurious warning on completion.
+   */
   private closePlanResiduals(actor: StrategyActor): Array<{ symbol: string; quantity: Decimal }> {
     const plan = actor.config.closePlan;
     if (!plan) return [];
     return plan.targets.map((target, targetIndex) => ({
       symbol: target.symbol,
-      quantity: Decimal.max(ZERO, new Decimal(target.quantity).minus(this.closePlanExecutedQuantity(actor, targetIndex))),
+      quantity: actor.closePlanSatisfied.has(targetIndex)
+        ? ZERO
+        : Decimal.max(ZERO, new Decimal(target.quantity).minus(this.closePlanExecutedQuantity(actor, targetIndex))),
     })).filter((target) => target.quantity.gt(QUANTITY_EPSILON));
   }
 
-  private completeClosePlan(actor: StrategyActor): void {
+  private completeClosePlan(actor: StrategyActor, pendingNote: string | null = null): void {
     const now = new Date().toISOString();
     actor.status = 'COMPLETED';
     this.database.prepare(`UPDATE execution_strategies SET status = 'COMPLETED', progress = 100,
       stopped_at = ?, updated_at = ? WHERE id = ?`).run(now, now, actor.id);
-    this.runtime.addStrategyLog(actor.id, 'info', 'Strategy completed',
-      `${actor.config.closePlan?.orderCount ?? 0} timed close slices`, '100%', 'All reduce-only close orders filled');
+    // A close plan always converges to a terminal state (R3/AC-3): legs the venue could not
+    // close are reported as a pending warning, never as a lingering PAUSED/RUNNING strategy.
+    this.runtime.addStrategyLog(actor.id, pendingNote === null ? 'info' : 'warning', 'Strategy completed',
+      `${actor.config.closePlan?.orderCount ?? 0} timed close slices`, '100%',
+      pendingNote ?? 'All reduce-only close orders filled');
     this.releaseQuoteWatch(actor);
     this.actors.delete(actor.id);
     this.runtime.emitStrategyUpdate(this.runtime.getStrategy(actor.id));
+  }
+
+  /**
+   * True when every close-plan target is done: fully executed by the plan's own slices, or
+   * confirmed by a venue reconcile to hold nothing reducible (satisfied, including dust). Drives
+   * the early completion so a plan whose venue side is already flat never idles through its
+   * remaining intervals (R3).
+   */
+  private closePlanFullySatisfied(actor: StrategyActor): boolean {
+    const plan = actor.config.closePlan;
+    if (!plan) return false;
+    return plan.targets.every((target, targetIndex) => actor.closePlanSatisfied.has(targetIndex)
+      || !new Decimal(target.quantity).minus(this.closePlanExecutedQuantity(actor, targetIndex)).gt(QUANTITY_EPSILON));
+  }
+
+  /**
+   * Reduce-only slice of a close plan rejected with TRADE_REDUCE_ONLY_POSITION_QTY_ERROR: the
+   * ledger believed a position the venue no longer holds. Reconcile the venue's real position
+   * once (single-flight via `reconcilePositionsFromRemote`) and return what the venue can
+   * actually reduce, so the caller can retry this leg at the venue's size — or mark it satisfied
+   * when the venue holds nothing. Null when the read failed or the venue confirms the ledger
+   * (no new information; the ordinary failure accounting applies). Spot legs have no
+   * venue-enforced reduce-only position, so they always read as null.
+   */
+  private async reconcileClosePlanQuantity(
+    actor: StrategyActor,
+    submission: { target: { symbol: string; side: 'BUY' | 'SELL' }; requested: Decimal },
+  ): Promise<Decimal | null> {
+    const { target, requested } = submission;
+    if (isSpotSymbol(target.symbol)) return null;
+    const positions = await this.refreshVenuePositions(actor);
+    if (positions === null) return null;
+    const venueQuantity = venueReducibleQuantity(positions, target.symbol, target.side);
+    if (venueQuantity === null || venueQuantity.gte(requested)) return null;
+    return venueQuantity;
   }
 
   private async evaluateClosePlan(actor: StrategyActor): Promise<void> {
@@ -1610,7 +1652,11 @@ export class StrategyEngine {
     if (clipIndex >= plan.orderCount) {
       const residuals = this.closePlanResiduals(actor);
       if (residuals.length > 0) {
-        await this.pause(actor, `Timed close ended with residual positions: ${residuals.map((item) => `${item.quantity.toString()} ${item.symbol}`).join(', ')}`);
+        this.runtime.addStrategyLog(actor.id, 'warning', 'Timed close ended with residual positions',
+          `Slices ${plan.orderCount}/${plan.orderCount}`,
+          residuals.map((item) => `${item.quantity.toString()} ${item.symbol}`).join(', '),
+          'Close ended with residual positions; settle them manually or rerun the close');
+        this.completeClosePlan(actor, `Pending residuals: ${residuals.map((item) => `${item.quantity.toString()} ${item.symbol}`).join(', ')}`);
         return;
       }
       this.completeClosePlan(actor);
@@ -1619,7 +1665,10 @@ export class StrategyEngine {
     const dueAt = clipIndex === 0 ? actor.createdAt : actor.lastCloseAt + plan.intervalSeconds * 1_000;
     if (this.options.now() < dueAt) return;
 
+    // Targets already confirmed satisfied (venue holds nothing) are skipped: resubmitting a
+    // doomed reduce-only order would just burn another interval on the same rejection.
     const submissions = plan.targets.flatMap((target, targetIndex) => {
+      if (actor.closePlanSatisfied.has(targetIndex)) return [];
       const executed = this.closePlanExecutedQuantity(actor, targetIndex);
       const remaining = Decimal.max(ZERO, new Decimal(target.quantity).minus(executed));
       if (!remaining.gt(QUANTITY_EPSILON)) return [];
@@ -1651,18 +1700,71 @@ export class StrategyEngine {
           reduceOnly: true,
           positionSide: target.positionSide,
         }, { strategyId: actor.id, strategyLeg: `close-${targetIndex}`, strategyClip: clip })));
-      const rejected = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
-      const accepted = results.filter((result): result is PromiseFulfilledResult<ExecutionOrder> => result.status === 'fulfilled');
-      const settled = await Promise.all(accepted.map((result) => this.runtime.awaitTerminalOrder(result.value.id, this.options.orderTimeoutMs)));
-      const incomplete = settled.filter((order) => order.state !== 'FILLED');
-      if (rejected.length > 0 || incomplete.length > 0) {
-        const reason = rejected[0]?.reason instanceof Error
-          ? rejected[0].reason.message
-          : incomplete[0]?.failureReason ?? incomplete[0]?.state ?? 'order not filled';
-        this.runtime.addStrategyLog(actor.id, 'error', 'Timed close slice failed',
-          `Slice ${clipIndex + 1}/${plan.orderCount}`, `${settled.length}/${submissions.length} orders accepted`, String(reason).slice(0, 200));
-        await this.pause(actor, `Timed close slice ${clipIndex + 1} failed; review remaining positions`);
-        return;
+      // Per-leg terminal state aligned with `submissions` by index; null = nothing settled.
+      const settled: Array<ExecutionOrder | null> = new Array<ExecutionOrder | null>(results.length).fill(null);
+      const failures: string[] = [];
+      for (let index = 0; index < results.length; index += 1) {
+        const submission = submissions[index]!;
+        const result = results[index]!;
+        if (result.status === 'fulfilled') {
+          settled[index] = await this.runtime.awaitTerminalOrder(result.value.id, this.options.orderTimeoutMs);
+          continue;
+        }
+        const reasonText = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        // R3: a reduce-only quantity rejection means the ledger believed a position the venue no
+        // longer holds. Reconcile from the venue once and retry this leg — and only this leg —
+        // at the venue's real size, instead of pausing the whole plan on a stale quantity.
+        if (!isReduceOnlyQuantityRejection(result.reason)) {
+          failures.push(reasonText.slice(0, 160));
+          continue;
+        }
+        const venueQuantity = await this.reconcileClosePlanQuantity(actor, {
+          target: submission.target,
+          requested: submission.quantity,
+        });
+        if (venueQuantity === null) {
+          failures.push(`reduce-only quantity rejected; ${reasonText.slice(0, 120)}`);
+          continue;
+        }
+        if (venueQuantity.gt(QUANTITY_EPSILON)) {
+          this.runtime.addStrategyLog(actor.id, 'info', 'Exit size corrected',
+            `Reduce-only close for ${submission.quantity.toString()} ${submission.target.symbol}`,
+            submission.quantity.toString(),
+            `Venue holds ${venueQuantity.toString()}; re-reporting at the venue size`);
+          try {
+            const retry = await this.runtime.createOrder({
+              symbol: submission.target.symbol,
+              side: submission.target.side,
+              type: 'MARKET',
+              timeInForce: 'IOC',
+              quantity: venueQuantity.toString(),
+              reduceOnly: true,
+              positionSide: submission.target.positionSide,
+            }, { strategyId: actor.id, strategyLeg: `close-${submission.targetIndex}`, strategyClip: clip });
+            settled[index] = await this.runtime.awaitTerminalOrder(retry.id, this.options.orderTimeoutMs);
+          } catch (error) {
+            failures.push(error instanceof Error ? error.message.slice(0, 160) : 'retry submission failed');
+          }
+        } else {
+          // The venue holds nothing reducible: the target is satisfied (dust/zero) and the plan
+          // stops resubmitting for it. Dust is never auto-liquidated (PRD Q2).
+          actor.closePlanSatisfied.add(submission.targetIndex);
+          this.runtime.addStrategyLog(actor.id, 'warning', 'Exit quote withdrawn',
+            `Reduce-only close for ${submission.quantity.toString()} ${submission.target.symbol}`,
+            submission.quantity.toString(),
+            'Venue holds no reducible position on this leg; target satisfied');
+        }
+      }
+      for (const order of settled) {
+        if (order && order.state !== 'FILLED') failures.push(order.failureReason ?? order.state);
+      }
+      if (failures.length > 0) {
+        // One failed leg must not block the others (R3/AC-2): the failure is a warning and the
+        // plan keeps its schedule — later slices retry whatever is left at venue-truth sizes.
+        this.runtime.addStrategyLog(actor.id, 'warning', 'Timed close slice failed',
+          `Slice ${clipIndex + 1}/${plan.orderCount}`,
+          `${settled.filter((order) => order?.state === 'FILLED').length}/${submissions.length} orders filled`,
+          failures[0] ?? 'order not filled');
       }
 
       const now = new Date().toISOString();
@@ -1672,11 +1774,16 @@ export class StrategyEngine {
         .run(progress, String(clipIndex + 1), now, actor.id);
       this.runtime.addStrategyLog(actor.id, 'info', 'Timed close slice executed',
         `Slice ${clipIndex + 1}/${plan.orderCount}`, `${settled.length} order${settled.length === 1 ? '' : 's'}`,
-        settled.map((order) => `${order.side} ${order.symbol} ${order.executedQuantity}`).join(' · '));
-      if (clipIndex + 1 >= plan.orderCount) {
+        settled.map((order) => `${order?.side ?? '—'} ${order?.symbol ?? '—'} ${order?.executedQuantity ?? '0'}`).join(' · '));
+      // Converge as soon as every target is done (early) or the plan's slices are exhausted.
+      if (clipIndex + 1 >= plan.orderCount || this.closePlanFullySatisfied(actor)) {
         const residuals = this.closePlanResiduals(actor);
         if (residuals.length > 0) {
-          await this.pause(actor, `Timed close ended with residual positions: ${residuals.map((item) => `${item.quantity.toString()} ${item.symbol}`).join(', ')}`);
+          this.runtime.addStrategyLog(actor.id, 'warning', 'Timed close ended with residual positions',
+            `Slice ${clipIndex + 1}/${plan.orderCount}`,
+            residuals.map((item) => `${item.quantity.toString()} ${item.symbol}`).join(', '),
+            'Close ended with residual positions; settle them manually or rerun the close');
+          this.completeClosePlan(actor, `Pending residuals: ${residuals.map((item) => `${item.quantity.toString()} ${item.symbol}`).join(', ')}`);
         } else {
           this.completeClosePlan(actor);
         }

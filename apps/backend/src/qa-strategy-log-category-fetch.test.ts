@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.js';
 import { openDatabase } from './database.js';
 import { TradingSession } from './trading-session.js';
-import { DEFAULT_CREDENTIAL_PROFILE, MemoryCredentialVault } from './credential-vault.js';
+import { MemoryCredentialVault } from './credential-vault.js';
 import { TradingRuntime } from './trading-runtime.js';
 import {
   STRATEGY_LOG_CATEGORY_FETCH_EVENTS,

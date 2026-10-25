@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { FundingOverviewResponse, MarketCatalogVenue, SpreadOpportunity } from '@gate-crossex/shared-types';
 import type { LiveMarket, MarketDefinition, MarketSnapshot } from './market-hub.js';
-import { OpportunityService, legsPricedComparably } from './opportunity-service.js';
+import { OpportunityService, legsPricedComparably, spreadQuoteAlignment } from './opportunity-service.js';
 
 const EPOCH = '2026-08-01T00:00:00.000Z';
 
@@ -10,7 +10,7 @@ function liveMarket(overrides: Partial<LiveMarket> & Pick<LiveMarket, 'symbol' |
     lastPrice: '100', bidPrice: '99', bidSize: '1', askPrice: '101', askSize: '1',
     open24h: '100', high24h: '110', low24h: '90', volume24h: '10', quoteVolume24h: '1000',
     fundingRate: '0', nextFundingAt: EPOCH, openInterest: '0', openInterestValue: '0',
-    receivedAt: EPOCH, updatedAt: EPOCH, source: 'demo_seed',
+    receivedAt: EPOCH, updatedAt: EPOCH, quoteUpdatedAt: EPOCH, source: 'demo_seed',
     ...overrides,
   };
 }
@@ -103,6 +103,8 @@ interface CreateServiceOptions {
   /** Board cache overrides; the production default is a 30s TTL. */
   cacheTtlMs?: number;
   cacheMaxEntries?: number;
+  /** R4 leg-to-leg quote-skew budget (ms); the production default is 2000. */
+  spreadQuoteMaxSkewMs?: number;
 }
 
 function createService(options: CreateServiceOptions): ServiceFixture {
@@ -130,6 +132,7 @@ function createService(options: CreateServiceOptions): ServiceFixture {
     ...(options.spotRegistrationBudget !== undefined ? { spotRegistrationBudget: options.spotRegistrationBudget } : {}),
     ...(options.cacheTtlMs !== undefined ? { cacheTtlMs: options.cacheTtlMs } : {}),
     ...(options.cacheMaxEntries !== undefined ? { cacheMaxEntries: options.cacheMaxEntries } : {}),
+    ...(options.spreadQuoteMaxSkewMs !== undefined ? { spreadQuoteMaxSkewMs: options.spreadQuoteMaxSkewMs } : {}),
   });
   return {
     service,
@@ -1201,5 +1204,77 @@ describe('opportunity board cache', () => {
     }
     // Capacity is a bound, not a promise of growth: the map must never exceed it.
     expect(service.cacheSize()).toBe(2);
+  });
+});
+
+describe('spread quote alignment (R4)', () => {
+  it('accepts legs whose quote timestamps sit inside the skew budget', () => {
+    const base = '2026-08-01T00:00:00.000Z';
+    expect(spreadQuoteAlignment(base, '2026-08-01T00:00:01.999Z', 2_000)).toBe(true);
+    // The boundary itself is still "the same moment".
+    expect(spreadQuoteAlignment(base, '2026-08-01T00:00:02.000Z', 2_000)).toBe(true);
+    expect(spreadQuoteAlignment(base, '2026-08-01T00:00:02.001Z', 2_000)).toBe(false);
+    // Direction does not matter; the skew is absolute.
+    expect(spreadQuoteAlignment('2026-08-01T00:00:05.000Z', base, 2_000)).toBe(false);
+  });
+
+  it('never calls a pair aligned when a leg carries no usable quote timestamp', () => {
+    const base = '2026-08-01T00:00:00.000Z';
+    expect(spreadQuoteAlignment(undefined, base, 2_000)).toBe(false);
+    expect(spreadQuoteAlignment(base, undefined, 2_000)).toBe(false);
+    expect(spreadQuoteAlignment(undefined, undefined, 2_000)).toBe(false);
+    expect(spreadQuoteAlignment('not-a-timestamp', base, 2_000)).toBe(false);
+  });
+
+  it('marks unaligned rows on the board, sorts them below aligned rows, and rides the timestamps along', async () => {
+    const stale = '2026-07-31T23:59:50.000Z'; // 10s before EPOCH — far outside any budget.
+    const markets: LiveMarket[] = [
+      // BTC: both legs quote at the same moment (the fixture epoch).
+      liveMarket({ symbol: 'GATE_FUTURE_BTC_USDT', venue: 'GATE', asset: 'BTC', bidPrice: '101.5', askPrice: '102' }),
+      liveMarket({ symbol: 'BINANCE_FUTURE_BTC_USDT', venue: 'BINANCE', asset: 'BTC', bidPrice: '100.8', askPrice: '100.9' }),
+      // ETH: the BINANCE leg last quoted 10s ago — a genuinely unaligned pair with a wider spread.
+      liveMarket({ symbol: 'GATE_FUTURE_ETH_USDT', venue: 'GATE', asset: 'ETH', bidPrice: '101.5', askPrice: '102' }),
+      liveMarket({
+        symbol: 'BINANCE_FUTURE_ETH_USDT', venue: 'BINANCE', asset: 'ETH', bidPrice: '99', askPrice: '99.1',
+        quoteUpdatedAt: stale,
+      }),
+    ];
+    const { service } = createService({ rows: [], markets, spreadMarkets: markets });
+    const { spread } = await service.list(CATALOG, { funding: false, spread: true, limit: 50 });
+
+    expect(spread).toHaveLength(2);
+    // ETH's 100+ bps spread would normally head the board; the alignment tie-break sinks it.
+    expect(spread.map((row) => row.asset)).toEqual(['BTC', 'ETH']);
+    const btc = spread[0]!;
+    const eth = spread[1]!;
+    expect(btc.quoteAligned).toBe(true);
+    expect(eth).toMatchObject({
+      quoteAligned: false,
+      leftQuoteUpdatedAt: EPOCH,
+      rightQuoteUpdatedAt: stale,
+    });
+    // The timestamps ride on the collapsed combinations too (AC-2).
+    expect(eth.combinations[0]).toMatchObject({
+      leftQuoteUpdatedAt: EPOCH,
+      rightQuoteUpdatedAt: stale,
+      quoteAligned: false,
+    });
+  });
+
+  it('honours a narrower configured skew budget', async () => {
+    const markets: LiveMarket[] = [
+      liveMarket({ symbol: 'GATE_FUTURE_BTC_USDT', venue: 'GATE', asset: 'BTC', bidPrice: '101.5', askPrice: '102' }),
+      liveMarket({
+        symbol: 'BINANCE_FUTURE_BTC_USDT', venue: 'BINANCE', asset: 'BTC', bidPrice: '100.8', askPrice: '100.9',
+        quoteUpdatedAt: '2026-08-01T00:00:01.500Z',
+      }),
+    ];
+    // 1.5s apart: inside the default 2s budget, outside a 1s one.
+    const lenient = createService({ rows: [], markets, spreadMarkets: markets });
+    const strict = createService({ rows: [], markets, spreadMarkets: markets, spreadQuoteMaxSkewMs: 1_000 });
+    const lenientBoard = await lenient.service.list(CATALOG, { funding: false, spread: true, limit: 50 });
+    const strictBoard = await strict.service.list(CATALOG, { funding: false, spread: true, limit: 50 });
+    expect(lenientBoard.spread[0]?.quoteAligned).toBe(true);
+    expect(strictBoard.spread[0]?.quoteAligned).toBe(false);
   });
 });

@@ -16,6 +16,7 @@ import { reconcilePortfolioSnapshots, stalePortfolioReconciliation } from '@gate
 import {
   BorosUpstreamMarketFeesResponseSchema,
   BorosUpstreamStrategiesResponseSchema,
+  ClosePlanRequestSchema,
   CrossExTransferAccountSchema,
   CrossExTransferRequestSchema,
   canonicalizeCrossExTransfer,
@@ -78,8 +79,10 @@ import { OneTimeCsrfTokens } from './csrf.js';
 import { AuthSessionStore, AuthUserStore, LoginThrottle, SESSION_COOKIE_NAME, SESSION_TTL_MS } from './auth-store.js';
 import { GateApiError, type GateCrossExAccount, type GateCrossExPortfolio, type GateCrossExPosition, type GateCrossExRiskLimit, type GateCrossExSymbol, type GateSpotAccount, type GateTransferRecord, type GateAccountBookRecord, type PortfolioOperationsCrossExGateway, type ReadOnlyCrossExGateway, type TradingCrossExGateway } from './crossex-client.js';
 import { CandleStore } from './candle-store.js';
+import { CloseReconciler } from './close-reconciler.js';
 import { FundingHistoryService } from './funding-history.js';
 import { FundingOverviewService } from './funding-overview.js';
+import { TtlSingleFlightCache } from './funding-rankings-cache.js';
 import { canonicalMarketAsset } from './market-asset-aliases.js';
 import { CrossExMarketHub, CANDLE_INTERVALS, type LiveMarket, type MarketDefinition, type MarketHubMessage } from './market-hub.js';
 import { OpportunityService, type SpreadPairType, type SpotSymbolEntry } from './opportunity-service.js';
@@ -1221,6 +1224,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     hub: marketHub,
     spreadMarkets,
     spotSymbolsByAsset,
+  }, {
+    // R4: one alignment yardstick shared with the strategy engine (GCT_SPREAD_SKEW_MS).
+    spreadQuoteMaxSkewMs: config.spreadQuoteMaxSkewMs,
   });
 
   // The spread-quality board ranks capturable spreads rather than wide ones: it reads the
@@ -1373,6 +1379,50 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       livePortfolio.markRemoteUnavailable();
     });
   };
+
+  // R2/R3: server-side close reconciliation. The venue is the only admissible source for "how
+  // much can actually be closed right now": positions come from the runtime's single-flight
+  // remote reconcile, spot balances from a fresh authenticated portfolio snapshot (which merges
+  // the CrossEx account and the legacy isolated Gate spot book), and lot/min constraints from
+  // the cached instrument catalog.
+  const closeReconciler = new CloseReconciler({
+    reconcilePositions: () => tradingRuntime.reconcilePositionsFromRemote(),
+    readBalances: async () => {
+      const snapshot = (await refreshPortfolio()).snapshot;
+      return snapshot.balances.map((balance) => ({
+        venue: balance.venue,
+        coin: balance.coin,
+        balance: balance.balance,
+        availableBalance: balance.availableBalance,
+      }));
+    },
+    instruments: () => {
+      const catalog = readInstrumentCatalog(database);
+      return new Map((catalog?.items ?? []).map((item) => [item.symbol, item]));
+    },
+    referencePrice: (symbol) => {
+      const market = marketHub.market(symbol);
+      if (!market) return null;
+      const last = Number(market.lastPrice);
+      if (Number.isFinite(last) && last > 0) return last;
+      const bid = Number(market.bidPrice);
+      const ask = Number(market.askPrice);
+      const mid = (bid + ask) / 2;
+      return Number.isFinite(mid) && mid > 0 ? mid : null;
+    },
+  });
+
+  // R5: TTL + single-flight caches for the remaining per-request upstream endpoints, sharing
+  // the opportunity board's cache discipline (30s for rankings, 60s for series; failures are
+  // never cached). Keys include the full request body so distinct symbol sets never collide.
+  const fundingRankingsCache = new TtlSingleFlightCache<FundingHistoryResponse>({
+    ttlMs: 30_000,
+    maxEntries: 32,
+  });
+  const fundingHistorySeriesCache = new TtlSingleFlightCache<FundingHistorySeriesResponse>({
+    ttlMs: 60_000,
+    maxEntries: 64,
+  });
 
   let portfolioReconcileTimer: ReturnType<typeof setTimeout> | null = null;
   let databaseMaintenanceTimer: ReturnType<typeof setInterval> | null = null;
@@ -2563,6 +2613,11 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     // Pair-type whitelist; absent means both shapes are ranked together.
     pairType: z.enum(['SPOT_PERP', 'PERP_PERP']).optional(),
     limit: z.coerce.number().int().min(1).max(100).default(100),
+    // R8 server-side sort/paging: the sort key, direction and page offset are applied over the
+    // cached board (never recomputed), so flipping a ranking chip or a page costs no candles.
+    sort: z.enum(['score', 'current', 'mean', 'volatility', 'halfLife', 'depth']).optional(),
+    dir: z.enum(['asc', 'desc']).optional(),
+    offset: z.coerce.number().int().min(0).optional(),
     // refresh=1 drops the 5-minute board cache — what the UI's manual Refresh button sends so a
     // click always follows through even when the user is inside the freshness window.
     refresh: z.literal('1').optional(),
@@ -2590,8 +2645,55 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     if (query.data.refresh === '1') spreadQualityService.invalidateCache();
     return await spreadQualityService.list({ assets: catalog.assets }, {
       ...(query.data.pairType !== undefined ? { pairType: query.data.pairType } : {}),
+      ...(query.data.sort !== undefined ? { sort: query.data.sort } : {}),
+      ...(query.data.dir !== undefined ? { dir: query.data.dir } : {}),
+      ...(query.data.offset !== undefined ? { offset: query.data.offset } : {}),
       limit: query.data.limit,
     }) satisfies SpreadQualityResponse;
+  });
+
+  // R2/R3: server-reconciled close planning. The request names targets only — quantities are
+  // derived from the venue's live balances/positions, never from the client's local snapshots.
+  // Planning performs authenticated reads (portfolio snapshot, position reconcile) but submits
+  // no orders, so it carries the trading-intent gate without the live-trading lock.
+  const CloseIntentPreHandler = (intent: string) => async (request: FastifyRequest, reply: FastifyReply) => {
+    if (request.headers['x-gct-trading-intent'] !== intent) {
+      return reply.code(403).send({ error: 'missing_trading_intent' });
+    }
+  };
+
+  app.post('/api/close/plan', {
+    preHandler: CloseIntentPreHandler('close-plan'),
+  }, async (request, reply) => {
+    const parsed = ClosePlanRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_close_plan_request' });
+    try {
+      return await closeReconciler.planClose(parsed.data);
+    } catch (error) {
+      if (error instanceof TradingRuntimeError) {
+        return reply.code(error.statusCode).send({ error: error.code });
+      }
+      request.log.warn({ reason: error instanceof Error ? error.message : String(error) }, 'close plan reconciliation failed');
+      return reply.code(503).send({ error: 'close_plan_unavailable' });
+    }
+  });
+
+  // Post-close reconciliation: re-reads the venue and reports residuals above the minimum
+  // order unit so the UI can prompt instead of leaving silent liabilities (US-3 AC-3).
+  app.post('/api/close/verify', {
+    preHandler: CloseIntentPreHandler('close-verify'),
+  }, async (request, reply) => {
+    const parsed = ClosePlanRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_close_plan_request' });
+    try {
+      return await closeReconciler.verifyClose(parsed.data);
+    } catch (error) {
+      if (error instanceof TradingRuntimeError) {
+        return reply.code(error.statusCode).send({ error: error.code });
+      }
+      request.log.warn({ reason: error instanceof Error ? error.message : String(error) }, 'close verify reconciliation failed');
+      return reply.code(503).send({ error: 'close_plan_unavailable' });
+    }
   });
 
   app.post('/api/markets/funding-history', {
@@ -2646,9 +2748,19 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     if (parsed.data.symbols.some((symbol) => !catalog?.liveSymbols.has(symbol))) {
       return reply.code(404).send({ error: 'unknown_market_symbol' });
     }
-    return fundingHistoryService.loadRankingSnapshot(
-      parsed.data.symbols,
-      parsed.data.durationDays * 24 * 60 * 60_000,
+    // R5: rankings sweep many symbols per request; one computation per parameter set per TTL
+    // window answers page switches and re-mounts from cache instead of hammering the venue.
+    // `loadRankingSnapshot` is synchronous — wrap it so the cache stores the promise shape.
+    // A cold snapshot reports `pending` rows that a concurrent /funding-history warm-up will
+    // turn `ok`; caching it would pin the stale `pending` for the whole TTL, so only settled
+    // (no pending rows) snapshots are cached.
+    return await fundingRankingsCache.run(
+      JSON.stringify({ symbols: parsed.data.symbols, durationDays: parsed.data.durationDays }),
+      async () => fundingHistoryService.loadRankingSnapshot(
+        parsed.data.symbols,
+        parsed.data.durationDays * 24 * 60 * 60_000,
+      ),
+      { cacheable: (snapshot) => !snapshot.entries.some((entry) => entry.status === 'pending') },
     ) satisfies FundingHistoryResponse;
   });
 
@@ -2675,9 +2787,14 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     if (parsed.data.symbols.some((symbol) => !catalog?.liveSymbols.has(symbol))) {
       return reply.code(404).send({ error: 'unknown_market_symbol' });
     }
-    return await fundingHistoryService.loadSeries(
-      parsed.data.symbols,
-      parsed.data.durationDays * 24 * 60 * 60_000,
+    // R5: series reads fan out to per-symbol funding history; the TTL cache keeps repeated
+    // chart opens (and page round-trips) off the upstream entirely.
+    return await fundingHistorySeriesCache.run(
+      JSON.stringify({ symbols: parsed.data.symbols, durationDays: parsed.data.durationDays }),
+      () => fundingHistoryService.loadSeries(
+        parsed.data.symbols,
+        parsed.data.durationDays * 24 * 60 * 60_000,
+      ),
     ) satisfies FundingHistorySeriesResponse;
   });
 

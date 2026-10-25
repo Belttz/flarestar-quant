@@ -135,6 +135,12 @@ export interface OpportunityServiceOptions {
   cacheTtlMs?: number;
   /** Cache capacity. Paging through many filter combinations must not grow the map without bound. */
   cacheMaxEntries?: number;
+  /**
+   * Max |leftQuoteUpdatedAt − rightQuoteUpdatedAt| (ms) still treated as "the same moment" when a
+   * spread row is built (R4). Mirrors the strategy engine's `marketPairMaxSkewMs` so the displayed
+   * spread and the executable spread share one alignment yardstick. Default 2000.
+   */
+  spreadQuoteMaxSkewMs?: number;
 }
 
 interface CacheEntry {
@@ -154,6 +160,8 @@ export interface OpportunityBoardRows {
 const SPOT_REGISTRATION_BUDGET_PER_REQUEST = 50;
 const DEFAULT_CACHE_TTL_MS = 30_000;
 const DEFAULT_CACHE_MAX_ENTRIES = 64;
+/** Default leg-to-leg quote-skew budget (ms); mirrors the strategy engine's freshMarketPair gate. */
+export const DEFAULT_SPREAD_QUOTE_MAX_SKEW_MS = 2_000;
 /** Annualization of the 8h-equivalent funding fraction, in percent: |rate8h| × 3 × 365 × 100. */
 const ANNUALIZATION_FACTOR = 3 * 365 * 100;
 const CROSSEX_ANY_SPOT_SYMBOL = /^[A-Z0-9]+_SPOT_[A-Z0-9]+_(USDT|USDC)$/;
@@ -237,6 +245,7 @@ export class OpportunityService {
   private readonly spotRegistrationBudget: number;
   private readonly cacheTtlMs: number;
   private readonly cacheMaxEntries: number;
+  private readonly spreadQuoteMaxSkewMs: number;
   /** Cached boards keyed by filter set; `Map` insertion order doubles as the eviction order. */
   private readonly cache = new Map<string, CacheEntry>();
 
@@ -248,6 +257,7 @@ export class OpportunityService {
     this.spotRegistrationBudget = options.spotRegistrationBudget ?? SPOT_REGISTRATION_BUDGET_PER_REQUEST;
     this.cacheTtlMs = Math.max(0, options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS);
     this.cacheMaxEntries = Math.max(1, options.cacheMaxEntries ?? DEFAULT_CACHE_MAX_ENTRIES);
+    this.spreadQuoteMaxSkewMs = options.spreadQuoteMaxSkewMs ?? DEFAULT_SPREAD_QUOTE_MAX_SKEW_MS;
   }
 
   /** Cold funding sweeps are awaited; spread data comes from the merged full-market view. */
@@ -619,7 +629,10 @@ export class OpportunityService {
     const dir = filters.dir ?? 'desc';
     const key = filters.sort ?? 'default';
     const collapsed = this.collapseSpreadByAsset(rows);
-    collapsed.sort((left, right) => this.compareSpread(left, right, key, dir)
+    // Unaligned rows sink below every aligned row (R4): the ascending key puts unaligned
+    // parents (quoteAligned === false → 1) after aligned ones (→ 0), regardless of spread.
+    collapsed.sort((left, right) => Number(left.quoteAligned === false) - Number(right.quoteAligned === false)
+      || this.compareSpread(left, right, key, dir)
       || left.asset.localeCompare(right.asset)
       || left.leftSymbol.localeCompare(right.leftSymbol));
     return collapsed;
@@ -655,6 +668,9 @@ export class OpportunityService {
             buyAsk: row.buyAsk,
             spreadBps: row.spreadBps,
             updatedAt: row.updatedAt,
+            leftQuoteUpdatedAt: row.leftQuoteUpdatedAt,
+            rightQuoteUpdatedAt: row.rightQuoteUpdatedAt,
+            quoteAligned: row.quoteAligned,
             executable: row.executable,
           })),
       });
@@ -750,6 +766,16 @@ export class OpportunityService {
       buyAsk: best.buyAsk,
       spreadBps: best.spreadBps,
       updatedAt: best.sell.updatedAt > best.buy.updatedAt ? best.sell.updatedAt : best.buy.updatedAt,
+      // R4 quote alignment: timestamps ride along (AC-2) and the verdict marks pairs whose two
+      // legs' quotes are further apart than the shared skew budget. Unaligned rows stay on the
+      // board but sort below every aligned row and never feed the quality board's candidates.
+      leftQuoteUpdatedAt: best.sell.quoteUpdatedAt,
+      rightQuoteUpdatedAt: best.buy.quoteUpdatedAt,
+      quoteAligned: spreadQuoteAlignment(
+        best.sell.quoteUpdatedAt,
+        best.buy.quoteUpdatedAt,
+        this.spreadQuoteMaxSkewMs,
+      ),
       executable: true,
       ...this.classificationFields(marketA.asset, classify),
       leftStats: resolveStats(
@@ -784,6 +810,24 @@ export class OpportunityService {
       isPreIpo: classification.isPreIpo,
     };
   }
+}
+
+/**
+ * Quote-alignment verdict for one pair (R4): both legs must carry `quoteUpdatedAt` — the same
+ * field the strategy engine's `freshMarketPair` gate reads — and their skew must fit the
+ * configured budget. A leg without a quote timestamp never carried a quote, so the pair is
+ * never aligned. Shared with `spread-quality.ts` candidate selection so the two boards never
+ * drift apart on what counts as "the same moment".
+ */
+export function spreadQuoteAlignment(
+  leftQuoteUpdatedAt: string | undefined,
+  rightQuoteUpdatedAt: string | undefined,
+  maxSkewMs: number,
+): boolean {
+  const left = leftQuoteUpdatedAt === undefined ? NaN : Date.parse(leftQuoteUpdatedAt);
+  const right = rightQuoteUpdatedAt === undefined ? NaN : Date.parse(rightQuoteUpdatedAt);
+  if (!Number.isFinite(left) || !Number.isFinite(right)) return false;
+  return Math.abs(left - right) <= maxSkewMs;
 }
 
 function pairSpread(sell: LiveMarket, buy: LiveMarket): {

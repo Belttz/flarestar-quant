@@ -417,7 +417,7 @@ describe('QA · MAKER_TAKER exit latch — adversarial', () => {
   // ---------------------------------------------------------------- A3: untracked leftover hedge
   it('A3 (latent) an untracked OPEN hedge row is not respected — the armed path rests a SECOND hedge on the same leg', async () => {
     const now = Date.now();
-    const { engine, gateway, database, markets } = await createHarness({ now: () => now });
+    const { engine, database, markets } = await createHarness({ now: () => now });
     const record = await engine.startStrategy(exitConfig);
     // Maker leg already partially closed, so the hedge target is > 0 once the latch arms.
     seedFilled(database, record.id, 'seed-left', left, 'SELL', '0.04', 'left');
@@ -749,7 +749,7 @@ describe('QA · MAKER_TAKER exit latch — adversarial', () => {
 
   // ------------------------------------------------ C1: hedge leg SHORT (exit side derivation)
   it('C1 with the hedge leg SHORT, the exit hedge order must BUY to unwind it — a SELL would grow the short and is invalid reduce-only', async () => {
-    let now = Date.now();
+    const now = Date.now();
     const { engine, runtime, gateway, database, markets } = await createHarness({ now: () => now, requoteIntervalMs: 100_000 });
     const record = await engine.startStrategy(flippedExitConfig);
     // Maker leg (left) LONG 0.1, hedge leg (right) SHORT 0.1.
@@ -835,7 +835,7 @@ describe('QA · MAKER_TAKER exit latch — adversarial', () => {
 
   // ------------------------------------------------ C3: the payoff of the direction fix
   it('C3 (payoff) with the hedge leg SHORT and a venue that refuses the WRONG side only, the BUY hedge fills, both legs go flat, and the latch retires without ever tripping the strike budget', async () => {
-    let now = Date.now();
+    const now = Date.now();
     const { engine, runtime, gateway, database, markets } = await createHarness({ now: () => now, requoteIntervalMs: 100_000 });
     const record = await engine.startStrategy(flippedExitConfig);
     seedFilled(database, record.id, 'seed-left', left, 'BUY', '0.1', 'left');

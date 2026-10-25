@@ -130,7 +130,9 @@ export const CreateStrategyInputSchema = z.object({
   executionMethod: z.enum(['TAKER_TAKER', 'MAKER_TAKER']),
   makerLeg: z.enum(['left', 'right']).optional(),
   closePlan: z.object({
-    orderCount: z.number().int().min(2).max(100),
+    // Mirrors the shared schema: a single slice (1) is a legitimate timed close; the split UI
+    // keeps its own >=2 requirement.
+    orderCount: z.number().int().min(1).max(100),
     intervalSeconds: z.number().int().min(1).max(86_400),
     targets: z.array(z.object({
       symbol: z.string().regex(/^(GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_[A-Z0-9]+_(USDT|USDC|USD)$/),

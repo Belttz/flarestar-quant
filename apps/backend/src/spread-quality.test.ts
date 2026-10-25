@@ -4,6 +4,7 @@ import type {
   FundingOverviewResponse,
   MarketCatalogVenue,
   SpreadOpportunity,
+  SpreadQualityRow,
 } from '@gate-crossex/shared-types';
 import type { LiveMarket } from './market-hub.js';
 import type { SpreadSampleCoverage, SpreadSampleRow } from './repositories.js';
@@ -20,6 +21,8 @@ import {
   halfLifeFromAr1,
   percentileRanks,
   scoreSpreadQualityInputs,
+  selectSpreadQualityCandidates,
+  sortSpreadQualityRows,
   type SpreadQualityScoreInput,
 } from './spread-quality.js';
 
@@ -112,6 +115,8 @@ interface CombinationFixture {
   rightVenue: string;
   spreadBps: number;
   executable?: boolean;
+  /** R4 quote alignment tri-state; absent means "unknown" (treated as aligned). */
+  quoteAligned?: boolean;
 }
 
 function spreadBoardRow(asset: string, combinations: CombinationFixture[]): SpreadOpportunity {
@@ -139,6 +144,7 @@ function spreadBoardRow(asset: string, combinations: CombinationFixture[]): Spre
       spreadBps: combination.spreadBps,
       updatedAt: EPOCH,
       executable: combination.executable ?? true,
+      ...(combination.quoteAligned !== undefined ? { quoteAligned: combination.quoteAligned } : {}),
     })),
   };
 }
@@ -947,5 +953,81 @@ describe('spread quality samples track', () => {
     const response = await withoutStore.service.list(CATALOG, { limit: 100 });
     expect(response.rows[0]).toMatchObject({ asset: 'BTC', source: 'candles', sampleCount: 288 });
     expect(withoutStore.candleCalls()).toBe(2);
+  });
+});
+
+describe('server-side sort and paging (R8)', () => {
+  /** Rows with distinct `mean` and `current` values so each sort key has a strict order. */
+  function rowsForSort(): SpreadQualityRow[] {
+    return scoreSpreadQualityInputs([
+      scoreInput({ asset: 'A', leftSymbol: 'GATE_FUTURE_A_USDT', rightSymbol: 'BYBIT_FUTURE_A_USDT', currentSpreadBps: 30, meanSpreadBps: 10, spreadVolatilityBps: 3, halfLifeHours: 2, bookDepthUsdt: 300 }),
+      scoreInput({ asset: 'B', leftSymbol: 'GATE_FUTURE_B_USDT', rightSymbol: 'BYBIT_FUTURE_B_USDT', currentSpreadBps: 10, meanSpreadBps: 30, spreadVolatilityBps: 1, halfLifeHours: 3, bookDepthUsdt: 100 }),
+      scoreInput({ asset: 'C', leftSymbol: 'GATE_FUTURE_C_USDT', rightSymbol: 'BYBIT_FUTURE_C_USDT', currentSpreadBps: 20, meanSpreadBps: 20, spreadVolatilityBps: 2, halfLifeHours: 1, bookDepthUsdt: 200 }),
+    ]);
+  }
+
+  it('sorts by every key in both directions', () => {
+    const rows = rowsForSort();
+    expect(sortSpreadQualityRows(rows, 'mean', 'asc').map((row) => row.asset)).toEqual(['A', 'C', 'B']);
+    expect(sortSpreadQualityRows(rows, 'mean', 'desc').map((row) => row.asset)).toEqual(['B', 'C', 'A']);
+    expect(sortSpreadQualityRows(rows, 'current', 'asc').map((row) => row.asset)).toEqual(['B', 'C', 'A']);
+    expect(sortSpreadQualityRows(rows, 'volatility', 'asc').map((row) => row.asset)).toEqual(['B', 'C', 'A']);
+    expect(sortSpreadQualityRows(rows, 'halfLife', 'desc').map((row) => row.asset)).toEqual(['B', 'A', 'C']);
+    expect(sortSpreadQualityRows(rows, 'depth', 'asc').map((row) => row.asset)).toEqual(['B', 'C', 'A']);
+    // Default keeps the composite-score ranking, descending.
+    expect(sortSpreadQualityRows(rows).every((row, index, sorted) =>
+      index === 0 || sorted[index - 1]!.score >= row.score)).toBe(true);
+  });
+
+  it('sinks nulls last in both directions', () => {
+    const rows = scoreSpreadQualityInputs([
+      scoreInput({ asset: 'A', leftSymbol: 'GATE_FUTURE_A_USDT', rightSymbol: 'BYBIT_FUTURE_A_USDT', meanSpreadBps: 10, halfLifeHours: null }),
+      scoreInput({ asset: 'B', leftSymbol: 'GATE_FUTURE_B_USDT', rightSymbol: 'BYBIT_FUTURE_B_USDT', meanSpreadBps: 30, halfLifeHours: 1 }),
+      scoreInput({ asset: 'C', leftSymbol: 'GATE_FUTURE_C_USDT', rightSymbol: 'BYBIT_FUTURE_C_USDT', meanSpreadBps: null }),
+    ]);
+    // C (no mean) is not boardable at all; A has no half-life and sinks below B either way.
+    const board = rows.filter((row) => row.asset !== 'C');
+    expect(sortSpreadQualityRows(board, 'halfLife', 'asc').map((row) => row.asset)).toEqual(['B', 'A']);
+    expect(sortSpreadQualityRows(board, 'halfLife', 'desc').map((row) => row.asset)).toEqual(['B', 'A']);
+  });
+
+  it('pages a server-sorted board without recomputing it', async () => {
+    const flat = (bps: number): number[] => Array.from({ length: 30 }, () => bps);
+    const board = [
+      spreadBoardRow('BTC', [{ leftSymbol: 'GATE_FUTURE_BTC_USDT', rightSymbol: 'BYBIT_FUTURE_BTC_USDT', leftVenue: 'GATE', rightVenue: 'BYBIT', spreadBps: 10 }]),
+      spreadBoardRow('ETH', [{ leftSymbol: 'GATE_FUTURE_ETH_USDT', rightSymbol: 'BYBIT_FUTURE_ETH_USDT', leftVenue: 'GATE', rightVenue: 'BYBIT', spreadBps: 20 }]),
+      spreadBoardRow('SOL', [{ leftSymbol: 'GATE_FUTURE_SOL_USDT', rightSymbol: 'BYBIT_FUTURE_SOL_USDT', leftVenue: 'GATE', rightVenue: 'BYBIT', spreadBps: 30 }]),
+    ];
+    const legs = [
+      { leftSymbol: 'GATE_FUTURE_BTC_USDT', rightSymbol: 'BYBIT_FUTURE_BTC_USDT', series: flat(10) },
+      { leftSymbol: 'GATE_FUTURE_ETH_USDT', rightSymbol: 'BYBIT_FUTURE_ETH_USDT', series: flat(20) },
+      { leftSymbol: 'GATE_FUTURE_SOL_USDT', rightSymbol: 'BYBIT_FUTURE_SOL_USDT', series: flat(30) },
+    ];
+    const fixture = createQualityService({ board, candles: candlesBySymbol(legs) });
+    const ascending = await fixture.service.list(CATALOG, { sort: 'mean', dir: 'asc', offset: 0, limit: 2 });
+    expect(ascending).toMatchObject({ sort: 'mean', dir: 'asc', offset: 0, total: 3 });
+    expect(ascending.rows.map((row) => row.asset)).toEqual(['BTC', 'ETH']);
+    const page2 = await fixture.service.list(CATALOG, { sort: 'mean', dir: 'asc', offset: 2, limit: 2 });
+    expect(page2.rows.map((row) => row.asset)).toEqual(['SOL']);
+    // The board cache is keyed by pair type only: paging and sorting never recompute candles.
+    expect(fixture.boardCalls()).toBe(1);
+    expect(fixture.candleCalls()).toBe(6);
+    const descending = await fixture.service.list(CATALOG, { sort: 'mean', dir: 'desc', limit: 100 });
+    expect(descending.rows.map((row) => row.asset)).toEqual(['SOL', 'ETH', 'BTC']);
+  });
+});
+
+describe('quote-alignment candidate gate (R4)', () => {
+  it('excludes only the combinations the board judged quote-unaligned', () => {
+    const board = [spreadBoardRow('BTC', [
+      { leftSymbol: 'GATE_FUTURE_BTC_USDT', rightSymbol: 'BYBIT_FUTURE_BTC_USDT', leftVenue: 'GATE', rightVenue: 'BYBIT', spreadBps: 10 },
+      { leftSymbol: 'OKX_FUTURE_BTC_USDT', rightSymbol: 'BYBIT_FUTURE_BTC_USDT', leftVenue: 'OKX', rightVenue: 'BYBIT', spreadBps: 40, quoteAligned: false },
+      { leftSymbol: 'BITGET_FUTURE_BTC_USDT', rightSymbol: 'BYBIT_FUTURE_BTC_USDT', leftVenue: 'BITGET', rightVenue: 'BYBIT', spreadBps: 30, quoteAligned: true },
+    ])];
+    const candidates = selectSpreadQualityCandidates(board, undefined, { market: () => null }, 50);
+    // The unaligned OKX combination is excluded; the survivors tie on weight (no hub depth) and
+    // fall back to the alphabetical left-symbol tie-break.
+    expect(candidates.map((candidate) => candidate.combination.leftSymbol))
+      .toEqual(['BITGET_FUTURE_BTC_USDT', 'GATE_FUTURE_BTC_USDT']);
   });
 });

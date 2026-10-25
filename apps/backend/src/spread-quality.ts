@@ -14,6 +14,7 @@ import type {
   OpportunityCatalogView,
   OpportunityFundingView,
   OpportunityMarketHubView,
+  SortDirection,
   SpreadPairType,
 } from './opportunity-service.js';
 import type { SpreadSampleCoverage, SpreadSampleRow } from './repositories.js';
@@ -463,6 +464,56 @@ export interface SpreadQualityServiceOptions {
 export interface SpreadQualityQuery {
   pairType?: SpreadPairType;
   limit: number;
+  /** Server-side sort key over the cached board (R8); default keeps the composite score. */
+  sort?: SpreadQualitySortKey;
+  /** Sort direction; default `desc` matches every board's historical ranking. */
+  dir?: SortDirection;
+  /** First row of the returned page (server-side paging over the sorted board). */
+  offset?: number;
+}
+
+/** Column the quality board can be server-sorted by (R8). */
+export type SpreadQualitySortKey = 'score' | 'current' | 'mean' | 'volatility' | 'halfLife' | 'depth';
+
+/**
+ * Server-side ordering of the quality board (R8): sort on the full cached row set, then slice
+ * the requested page. Nulls sort last in both directions — a missing measurement never ranks —
+ * and the tie-break chain mirrors `scoreSpreadQualityInputs` so the default `score`/`desc` query
+ * reproduces the board's own ranking exactly.
+ */
+export function sortSpreadQualityRows(
+  rows: readonly SpreadQualityRow[],
+  sort: SpreadQualitySortKey = 'score',
+  dir: SortDirection = 'desc',
+): SpreadQualityRow[] {
+  const direction = dir === 'asc' ? 1 : -1;
+  const finiteOrNull = (value: number | null | undefined): number | null =>
+    value !== null && value !== undefined && Number.isFinite(value) ? value : null;
+  const compareNullable = (left: number | null, right: number | null): number => {
+    if (left === null && right === null) return 0;
+    if (left === null) return 1;
+    if (right === null) return -1;
+    return (left - right) * direction;
+  };
+  const key = (row: SpreadQualityRow): number | null => {
+    switch (sort) {
+      case 'current': return finiteOrNull(row.currentSpreadBps);
+      case 'mean': return finiteOrNull(row.meanSpreadBps);
+      case 'volatility': return finiteOrNull(row.spreadVolatilityBps);
+      case 'halfLife': return finiteOrNull(row.halfLifeHours);
+      case 'depth': return finiteOrNull(row.bookDepthUsdt);
+      default: return finiteOrNull(row.score);
+    }
+  };
+  return [...rows].sort((left, right) => compareNullable(key(left), key(right))
+    // The documented board contract (see rankSpreadQualityRows) breaks score ties by the
+    // current spread before falling back to symbols — the route-level QA fixture pins it,
+    // so every sort key reuses the same secondary chain to stay contract-stable.
+    || right.currentSpreadBps - left.currentSpreadBps
+    || right.score - left.score
+    || left.asset.localeCompare(right.asset)
+    || left.leftSymbol.localeCompare(right.leftSymbol)
+    || left.rightSymbol.localeCompare(right.rightSymbol));
 }
 
 /** The complete ranked row set for one query, before the top-N cut. */
@@ -524,6 +575,11 @@ export function selectSpreadQualityCandidates(
     for (const combination of row.combinations) {
       if (!combination.executable) continue;
       if (pairType !== undefined && combination.pairType !== pairType) continue;
+      // R4: a combination the opportunity board judged quote-unaligned (legs' quote timestamps
+      // outside the shared skew budget) would bake a never-existed spread into the 24h series,
+      // so it never becomes a quality candidate — the sampler shares this rule via this
+      // function, keeping both tracks on the same candidate set.
+      if (combination.quoteAligned === false) continue;
       candidates.push({
         pairType: combination.pairType,
         asset: row.asset,
@@ -594,16 +650,26 @@ export class SpreadQualityService {
     this.candleConcurrency = Math.max(1, options.candleConcurrency ?? DEFAULT_CANDLE_CONCURRENCY);
   }
 
-  /** Ranked quality rows for one query, sliced to the requested page size. */
+  /**
+   * Ranked quality rows for one query, sliced to the requested page. Sorting and paging happen
+   * outside the board cache (which only knows the pair type) — exactly how the opportunity board
+   * treats its own paging parameters — so switching sort keys or pages never recomputes candles.
+   */
   async list(catalog: OpportunityCatalogView, query: SpreadQualityQuery): Promise<SpreadQualityResponse> {
-    const limit = Math.min(100, Math.max(1, Math.trunc(query.limit)));
+    const offset = Math.max(0, Math.trunc(query.offset ?? 0));
+    const pageSize = Math.min(100, Math.max(1, Math.trunc(query.limit)));
     const board = await this.board(catalog, query.pairType);
+    const sorted = sortSpreadQualityRows(board.rows, query.sort ?? 'score', query.dir ?? 'desc');
     return {
-      rows: board.rows.slice(0, limit),
+      rows: sorted.slice(offset, offset + pageSize),
       totalCandidates: board.totalCandidates,
       windowHours: board.windowHours,
       fetchedAt: board.fetchedAt,
       cacheStatus: board.cacheStatus,
+      sort: query.sort ?? 'score',
+      dir: query.dir ?? 'desc',
+      offset,
+      total: sorted.length,
     };
   }
 
