@@ -26,9 +26,13 @@ const contexts: AuthTestContext[] = [];
 
 async function buildAuthApp(): Promise<AuthTestContext> {
   const directory = mkdtempSync(join(tmpdir(), 'gate-crossex-auth-'));
+  // The bootstrap credential is always injected explicitly: config no longer ships a default
+  // password, so a test that relied on one would silently drift from real deployments.
   const config = loadConfig({
     GCT_DATA_DIR: directory,
     GCT_MIGRATIONS_DIR: resolve(process.cwd(), '../../migrations'),
+    GCT_AUTH_USERNAME: 'Belttz',
+    GCT_AUTH_PASSWORD: 'test-seed-pass-42',
   });
   const database = openDatabase(config.databasePath, config.migrationsDir);
   const app = await buildApp({
@@ -58,7 +62,7 @@ afterEach(async () => {
   for (const context of contexts.splice(0)) await context.close();
 });
 
-const LOGIN = { username: 'Belttz', password: '2636489471@Be' };
+const LOGIN = { username: 'Belttz', password: 'test-seed-pass-42' };
 
 async function login(app: FastifyInstance, body: Record<string, string> = LOGIN): Promise<string | null> {
   const response = await app.inject({ method: 'POST', url: '/api/auth/login', payload: body });

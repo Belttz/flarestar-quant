@@ -37,15 +37,20 @@ interface AuthUserRow {
 export class AuthUserStore {
   constructor(private readonly database: Database.Database) {}
 
-  /** Seeds the operator account exactly once; later boots keep the stored (possibly changed) password. */
-  ensureSeeded(username: string, password: string): void {
+  /**
+   * Seeds the operator account exactly once; later boots keep the stored (possibly changed)
+   * password. Returns true only when this call performed the seeding — the caller uses that to
+   * print a generated bootstrap password exactly once, to the log and nowhere persistent.
+   */
+  ensureSeeded(username: string, password: string): boolean {
     const existing = this.row();
-    if (existing) return;
+    if (existing) return false;
     const { salt, hash } = hashPassword(password);
     this.database.prepare(`
       INSERT INTO auth_user (id, username, password_hash, password_salt, updated_at)
       VALUES (1, ?, ?, ?, ?)
     `).run(username, hash, salt, new Date().toISOString());
+    return true;
   }
 
   username(): string | null {

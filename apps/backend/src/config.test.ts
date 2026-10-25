@@ -134,3 +134,28 @@ describe('loadConfig spread quote skew budget', () => {
     expect(() => loadConfig(env({ GCT_SPREAD_SKEW_MS: 'abc' }))).toThrow(/GCT_SPREAD_SKEW_MS/);
   });
 });
+
+describe('loadConfig bootstrap credentials', () => {
+  it('generates a different strong random password on every load when GCT_AUTH_PASSWORD is unset', () => {
+    // No secret may ship in the repository (CVE-style hardcoded seed credential): every
+    // deployment must start from fresh CSPRNG entropy.
+    const first = loadConfig(env());
+    const second = loadConfig(env());
+    expect(first.authBootstrapPassword).not.toBe(second.authBootstrapPassword);
+    // 18 bytes → 24 base64url characters: far beyond any brute-forceable seed.
+    expect(first.authBootstrapPassword).toHaveLength(24);
+    expect(first.authBootstrapPassword).toMatch(/^[A-Za-z0-9_-]+$/);
+    // The username is not a secret and keeps its default.
+    expect(first.authUsername).toBe('Belttz');
+  });
+
+  it('uses GCT_AUTH_PASSWORD verbatim when it is configured', () => {
+    const config = loadConfig(env({ GCT_AUTH_PASSWORD: 'operator-chosen-pass-42' }));
+    expect(config.authBootstrapPassword).toBe('operator-chosen-pass-42');
+  });
+
+  it('honours a configured GCT_AUTH_USERNAME', () => {
+    const config = loadConfig(env({ GCT_AUTH_USERNAME: 'ops' }));
+    expect(config.authUsername).toBe('ops');
+  });
+});

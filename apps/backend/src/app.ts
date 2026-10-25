@@ -1011,7 +1011,17 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   // seeded exactly once from config; afterwards the password lives as a scrypt
   // hash in SQLite and is rotated through POST /api/auth/change-password.
   const authUsers = new AuthUserStore(database);
-  authUsers.ensureSeeded(config.authUsername, config.authBootstrapPassword);
+  const seededNow = authUsers.ensureSeeded(config.authUsername, config.authBootstrapPassword);
+  if (seededNow && !options.authDisabled) {
+    // First boot only: the operator needs the password once to sign in, then must rotate it
+    // through the UI. It is shown here and nowhere else — never written to any file or store,
+    // and never printed again on later boots (the stored hash keeps working).
+    app.log.warn(
+      { username: config.authUsername },
+      'Generated a one-time operator password for the first boot — shown ONLY here, change it in the UI immediately: %s',
+      config.authBootstrapPassword,
+    );
+  }
   const authSessions = new AuthSessionStore();
   const loginThrottle = new LoginThrottle();
 

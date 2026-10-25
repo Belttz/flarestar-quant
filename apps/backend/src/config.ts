@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { networkInterfaces } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
@@ -108,6 +109,15 @@ function parseSpreadQuoteMaxSkewMs(value: string | undefined): number {
 }
 
 /**
+ * Generate the first-boot operator password when `GCT_AUTH_PASSWORD` is unset: 18 bytes of
+ * CSPRNG entropy as base64url — a ~24-character strong random that never leaves this call
+ * except through the one-time seed log. No hardcoded default has ever been shipped.
+ */
+function generateBootstrapPassword(): string {
+  return randomBytes(18).toString('base64url');
+}
+
+/**
  * This machine's own non-loopback addresses, i.e. the hosts a browser on the same network can use
  * to reach it. Link-local IPv6 (fe80::/10) and IPv4 automatic addresses (169.254/16) are dropped:
  * they are never typed into a browser and only widen the accepted Host set.
@@ -195,9 +205,11 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
     // Operator login for cloud deployments. Only used to seed the auth_user table on the very
     // first boot; afterwards the password lives as a scrypt hash in SQLite and is changed via
     // the UI (POST /api/auth/change-password). Override before first boot with GCT_AUTH_USERNAME
-    // / GCT_AUTH_PASSWORD.
+    // / GCT_AUTH_PASSWORD. With GCT_AUTH_PASSWORD unset the password is generated at random so
+    // no deployment ever starts with a credential that shipped in the repository; app.ts prints
+    // it exactly once at seed time and nothing persists it.
     authUsername: environment.GCT_AUTH_USERNAME ?? 'Belttz',
-    authBootstrapPassword: environment.GCT_AUTH_PASSWORD ?? '2636489471@Be',
+    authBootstrapPassword: environment.GCT_AUTH_PASSWORD ?? generateBootstrapPassword(),
     gateRestBaseUrl: environment.GCT_GATE_REST_URL ?? 'https://api.gateio.ws/api/v4',
     gatePublicWebSocketUrl: environment.GCT_GATE_PUBLIC_WS_URL ?? 'wss://api.gateio.ws/ws/crossex/public',
     gatePrivateWebSocketUrl: environment.GCT_GATE_PRIVATE_WS_URL ?? 'wss://api.gateio.ws/ws/crossex',

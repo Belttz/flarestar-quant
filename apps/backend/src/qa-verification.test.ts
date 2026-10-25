@@ -9,10 +9,14 @@
  * Every double here is written from scratch against the public interfaces so a bug shared with the
  * production seam (or with the author's fixtures) cannot hide a defect.
  */
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+
+// Every host-gate case boots a full Fastify app over a real SQLite database; under parallel
+// suite load a single case can exceed the default 5s ceiling. Same lift as auth.test.ts.
+vi.setConfig({ testTimeout: 20_000 });
 import type { FastifyInstance } from 'fastify';
 import type Database from 'better-sqlite3';
 import type { Candle, MarketCatalogVenue, PublicMarketSnapshot } from '@gate-crossex/shared-types';
