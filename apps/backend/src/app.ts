@@ -2932,10 +2932,54 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       }
       return marketHub.orderBook(symbol);
     };
+    // Feed sizes are venue-native: GATE/OKX quote contract counts. The deep-table multiplier is
+    // memoized per pair so a form poll never re-queries the venue for the same symbol.
+    const contractUnits = new Map<string, number>();
+    const unitFor = async (symbol: string): Promise<number> => {
+      const cachedUnit = Number(sizeUnitCache?.units[symbol] ?? '');
+      if (Number.isFinite(cachedUnit) && cachedUnit > 0) return cachedUnit;
+      const [venue, , asset, quote] = symbol.split('_');
+      if (venue !== 'GATE' && venue !== 'OKX') return 1;
+      const memoKey = `${venue}:${asset}_${quote}`;
+      const memo = contractUnits.get(memoKey);
+      if (memo !== undefined) return memo;
+      try {
+        const sizes = await publicMarketGateway.queryContractSizes?.(venue) ?? [];
+        const hit = sizes.find((size) => size.base === asset && size.quote === quote);
+        const multiplier = hit ? Number(hit.multiplier) : Number.NaN;
+        const value = Number.isFinite(multiplier) && multiplier > 0 ? multiplier : 1;
+        contractUnits.set(memoKey, value);
+        return value;
+      } catch {
+        return 1;
+      }
+    };
     const books = await Promise.all(symbols.map(async (symbol) => {
       const book = await readBook(symbol);
+      const market = marketHub.market(symbol);
+      const unit = await unitFor(symbol);
+      const topOfBook = () => {
+        if (!market) return null;
+        const bid = Number(market.bidPrice);
+        const ask = Number(market.askPrice);
+        const bidSize = Number(market.bidSize);
+        const askSize = Number(market.askSize);
+        if (!(bid > 0) && !(ask > 0)) return null;
+        return {
+          symbol,
+          bestBid: bid > 0 ? market.bidPrice : null,
+          bestAsk: ask > 0 ? market.askPrice : null,
+          bidDepthUsdt: bid > 0 && bidSize > 0 ? bid * bidSize * unit : 0,
+          askDepthUsdt: ask > 0 && askSize > 0 ? ask * askSize * unit : 0,
+          updatedAt: market.quoteUpdatedAt ?? market.updatedAt,
+          source: 'ticker' as const,
+        };
+      };
       if (!book || (book.bids.length === 0 && book.asks.length === 0)) {
-        return { symbol, bestBid: null, bestAsk: null, bidDepthUsdt: 0, askDepthUsdt: 0, updatedAt: null };
+        // Not every instrument gets an order-book push upstream. Falling back to the ticker's own
+        // bid/ask size keeps a number on screen (labelled as a single level) instead of a
+        // misleading zero.
+        return topOfBook() ?? { symbol, bestBid: null, bestAsk: null, bidDepthUsdt: 0, askDepthUsdt: 0, updatedAt: null, source: 'ticker' as const };
       }
       const notional = (levels: ReadonlyArray<readonly [string, string]>) => levels
         .reduce((sum, [price, size]) => sum + Number(price) * Number(size), 0);
@@ -2943,9 +2987,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         symbol,
         bestBid: book.bids[0]?.[0] ?? null,
         bestAsk: book.asks[0]?.[0] ?? null,
-        bidDepthUsdt: notional(book.bids),
-        askDepthUsdt: notional(book.asks),
+        bidDepthUsdt: notional(book.bids) * unit,
+        askDepthUsdt: notional(book.asks) * unit,
         updatedAt: book.updatedAt,
+        source: 'book' as const,
       };
     }));
     return { books, fetchedAt: new Date().toISOString() };

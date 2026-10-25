@@ -944,8 +944,9 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   // so a malformed parameter keeps its default instead of half-prefilling the form.
   const [executionMethod, setExecutionMethod] = useState<'Taker–Taker' | 'Maker–Taker'>(() => query.get('executionMethod') === 'maker' ? 'Maker–Taker' : 'Taker–Taker');
   const [makerLeg, setMakerLeg] = useState<'left' | 'right'>(() => query.get('makerLeg') === 'right' ? 'right' : 'left');
-  // Per-symbol executable depth, fed by /api/markets/books while the form is open.
-  const [legBookDepths, setLegBookDepths] = useState<Record<string, { bid: number; ask: number }>>({});
+  // Per-symbol executable depth, fed by /api/markets/books while the form is open. `source`
+  // records whether it came from the full book or only the ticker's top level.
+  const [legBookDepths, setLegBookDepths] = useState<Record<string, { bid: number; ask: number; source: 'book' | 'ticker' }>>({});
   const [amount, setAmount] = useState(() => queryDecimal(query.get('totalAmount')) ?? '');
   const [positionOrderQuantity, setPositionOrderQuantity] = useState(() => queryDecimal(query.get('perOrderQuantity')) ?? '');
   const [threshold, setThreshold] = useState(() => queryDecimal(autoQuery?.get('entryBps')) ?? '0');
@@ -1027,7 +1028,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
             // An empty read means "no book yet", not "the venue has no liquidity": keep the last
             // usable depth instead of blanking a number the user is reading.
             if (book.bidDepthUsdt <= 0 && book.askDepthUsdt <= 0 && next[book.symbol]) continue;
-            next[book.symbol] = { bid: book.bidDepthUsdt, ask: book.askDepthUsdt };
+            next[book.symbol] = { bid: book.bidDepthUsdt, ask: book.askDepthUsdt, source: book.source };
           }
           return next;
         });
@@ -1511,6 +1512,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
           <div><dt>{leftExchange.name} · {t('Ask depth')}</dt><dd>{leftDepth ? formatUsd(leftDepth.ask) : '—'}</dd></div>
           <div><dt>{rightExchange.name} · {t('Bid depth')}</dt><dd>{rightDepth ? formatUsd(rightDepth.bid) : '—'}</dd></div>
           <div><dt>{rightExchange.name} · {t('Ask depth')}</dt><dd>{rightDepth ? formatUsd(rightDepth.ask) : '—'}</dd></div>
+          {(leftDepth?.source === 'ticker' || rightDepth?.source === 'ticker') && <p className="maker-depth-note">{t('Top-of-book only: this market pushes no order book')}</p>}
         </dl>}</div></div>
       {mode === 'position' && <div className="compact-stop"><span>◎</span><p>{`${t('Stops after')} ${amount || '0'} ${asset} ${t('executes')}`}</p></div>}
     </article>

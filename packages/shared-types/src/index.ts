@@ -1526,6 +1526,12 @@ export const MarketBookDepthSchema = z.object({
   bidDepthUsdt: z.number().finite().nonnegative(),
   askDepthUsdt: z.number().finite().nonnegative(),
   updatedAt: z.string().nullable(),
+  /**
+   * `book` = summed over the maintained order book; `ticker` = one level only (bidPrice×bidSize),
+   * used when the venue pushes no book for this instrument. Clients should label the difference
+   * rather than present a single level as full depth.
+   */
+  source: z.enum(['book', 'ticker']).default('book'),
 });
 export type MarketBookDepth = z.infer<typeof MarketBookDepthSchema>;
 

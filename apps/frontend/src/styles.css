@@ -2634,6 +2634,7 @@ html[data-theme='light'] .order-summary .max-quantity b { color: #ffffff; backgr
 .maker-depth-row > div { min-width: 0; display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .maker-depth-row dt { overflow: hidden; color: #6b7a8d; font-size: var(--text-micro); white-space: nowrap; text-overflow: ellipsis; }
 .maker-depth-row dd { margin: 0; color: #b8c2cf; font: 600 var(--text-caption) var(--font-sans); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.maker-depth-row .maker-depth-note { grid-column: 1 / -1; margin: 2px 0 0; color: #7d8a9b; font-size: var(--text-micro); line-height: 1.4; }
 html[data-theme='light'] .maker-depth-row { border-color: #dfe6ec; background: #f7f9fb; }
 html[data-theme='light'] .maker-depth-row dt { color: #6a7686; }
 html[data-theme='light'] .maker-depth-row dd { color: #33414e; }

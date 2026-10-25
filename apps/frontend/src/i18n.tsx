@@ -609,6 +609,7 @@ const chinese: Record<string, string> = {
   'Ask depth': '卖盘深度',
   '24h turnover': '24h 成交额',
   'Click to fill the maximum size': '点击填入最大数量',
+  'Top-of-book only: this market pushes no order book': '仅买一/卖一档（该市场不推送盘口）',
 };
 
 /**
