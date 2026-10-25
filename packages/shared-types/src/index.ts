@@ -225,8 +225,15 @@ export type CrossExTransferRequest = z.infer<typeof CrossExTransferRequestSchema
  * CROSSEX USDT into the coin a venue owes, then either transfer it there or convert straight onto
  * that venue (`exchange_type`). DERIBIT and CROSSEX are NOT quotable venues.
  */
+/**
+ * Venues Gate's flash convert can quote onto. Third-party SDK wrappers list only
+ * BINANCE/OKX/GATE/BYBIT/HYPERLIQUID/KRAKEN/LIGHTER, but Gate announced Deribit USDC futures and
+ * Deribit USDT spot on 2026-07-14, so DERIBIT is offered here and the exchange stays the
+ * authority: an unsupported venue is rejected with CONVERT_TRADE_QUOTE_* rather than guessed at
+ * client side.
+ */
 export const CrossExConvertVenueSchema = z.enum([
-  'BINANCE', 'OKX', 'GATE', 'BYBIT', 'HYPERLIQUID', 'KRAKEN', 'LIGHTER',
+  'BINANCE', 'OKX', 'GATE', 'BYBIT', 'HYPERLIQUID', 'KRAKEN', 'LIGHTER', 'DERIBIT',
 ]);
 export type CrossExConvertVenue = z.infer<typeof CrossExConvertVenueSchema>;
 
