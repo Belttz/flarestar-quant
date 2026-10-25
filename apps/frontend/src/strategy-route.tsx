@@ -13,6 +13,7 @@ import {
   type KlineWatch,
   type MarketCatalogAsset,
   type MarketSnapshot,
+  type ResidualReport,
   type StrategyConfig,
   type StrategyLog,
   type StrategyRecord,
@@ -26,7 +27,9 @@ import { VenueSelect } from './venue-select.js';
 import { fundingPercentScaledTo8h } from './funding-rates.js';
 import { marketSymbol } from './market-symbol.js';
 import { usePairCandleHistory } from './pair-candle-history.js';
-import { assessMarketPairFreshness, candleTailIsFresh, candleTimestampIsFresh, lastKnownLiveMarketPair } from './market-freshness.js';
+import { assessMarketPairFreshness, candleTailIsFresh, candleTimestampIsFresh, lastKnownLiveMarketPair, SPREAD_QUOTE_MAX_SKEW_MS, assessSpreadQuoteAlignment } from './market-freshness.js';
+import { closeTargetsFromSymbols, executablePlanLegs } from './close-reconciliation.js';
+import { ResidualDialog } from './residual-dialog.js';
 import { buildPremiumHistory, mergeCandleHistory, premiumHistoryViewKey, type PremiumHistoryPoint } from './premium-history.js';
 import { buildPriceDifferenceHistory, type PriceDifferenceHistoryPoint } from './price-difference-history.js';
 import {
@@ -339,6 +342,10 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   const [historyPage, setHistoryPage] = useState(1);
   const [closeTargets, setCloseTargets] = useState<ClosePositionTarget[] | null>(null);
   const [closeNotice, setCloseNotice] = useState<{ kind: 'ok' | 'error'; title: string; text: string } | null>(null);
+  // R3 one-click carry close: in-flight strategy ids, plus the post-close residual report when
+  // the verify pass finds legs the plan could not fully close.
+  const [closingCarryIds, setClosingCarryIds] = useState<string[]>([]);
+  const [residualReport, setResidualReport] = useState<ResidualReport | null>(null);
   const runningStrategies = strategies.filter((strategy) => ['RUNNING', 'PAUSED'].includes(strategy.status));
   const historicalStrategies = strategies
     .filter((strategy) => !['RUNNING', 'PAUSED', 'STOPPING'].includes(strategy.status))
@@ -369,6 +376,75 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
       return;
     }
     setCloseTargets(positions.map(strategyCloseTarget));
+  }
+
+  /**
+   * R3 one-click carry close (strategy row → venue-truth plan → timed reduce-only closePlan
+   * strategy). The request carries symbols only — the backend sizes every leg from the live
+   * balances/positions — and the residual dialog only opens when the verify pass finds legs
+   * above the smallest orderable unit. Dust is never auto-liquidated.
+   */
+  async function closeCarryStrategy(strategy: StrategyRecord) {
+    const config = strategy.config;
+    if (config.kind !== 'carry') return;
+    if (closingCarryIds.includes(strategy.id)) return;
+    if (tradingMode !== 'live') {
+      onOpenModeDialog();
+      return;
+    }
+    const symbols = [config.leftSymbol, config.rightSymbol].filter((symbol): symbol is string => Boolean(symbol));
+    if (symbols.length === 0) {
+      setCloseNotice({ kind: 'error', title: t('One-click close failed'), text: t('This strategy carries no tradable legs.') });
+      return;
+    }
+    setClosingCarryIds((current) => [...current, strategy.id]);
+    setStopNotice(null);
+    try {
+      const plan = await api.closePlan(closeTargetsFromSymbols(symbols));
+      const legs = executablePlanLegs(plan);
+      if (legs.length === 0) {
+        // Nothing orderable: everything is dust/missing. Verify and surface the residuals
+        // instead of starting a strategy that would idle through its slices.
+        const report = await api.closeVerify(closeTargetsFromSymbols(symbols));
+        if (report.clean) {
+          setCloseNotice({ kind: 'ok', title: t('Nothing left to close'), text: strategy.id });
+        } else {
+          setResidualReport(report);
+        }
+        return;
+      }
+      const first = legs[0]!;
+      const second = legs[1] ?? first;
+      const firstPart = symbolParts(first.symbol);
+      await api.startStrategy({
+        kind: 'position',
+        asset: firstPart.asset,
+        leftVenue: firstPart.venue,
+        rightVenue: symbolParts(second.symbol).venue,
+        leftSide: first.side,
+        rightSide: first.side === 'BUY' ? 'SELL' : 'BUY',
+        totalAmount: first.quantity,
+        perOrderQuantity: first.quantity,
+        reduceOnly: true,
+        executionMethod: 'TAKER_TAKER',
+        closePlan: {
+          orderCount: 2,
+          intervalSeconds: 5,
+          targets: legs.map((leg) => ({
+            symbol: leg.symbol,
+            side: leg.side,
+            quantity: leg.quantity,
+            positionSide: leg.positionSide === 'LONG' || leg.positionSide === 'SHORT' ? leg.positionSide : 'NONE',
+          })),
+        },
+      });
+      await onStrategiesChanged();
+      setCloseNotice({ kind: 'ok', title: t('Close strategy started'), text: `${strategy.id} · 2 ${t('orders')} · 5s` });
+    } catch (error) {
+      setCloseNotice({ kind: 'error', title: t('One-click close failed'), text: error instanceof ApiError ? error.message : t('Backend unavailable') });
+    } finally {
+      setClosingCarryIds((current) => current.filter((id) => id !== strategy.id));
+    }
   }
 
   useEffect(() => {
@@ -660,7 +736,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
         <span className="strategy-log-actions"><button className="logs-button" onClick={() => void openLogs(strategy.id)}>{t('View logs')}</button>{showingHistory && <button className="copy-button" onClick={() => copyStrategyConfig(strategy)}>{t('Copy')}</button>}</span>
         <span>{strategyRuntime(strategy, showingHistory)}</span>
         <span className={`strategy-status ${strategy.status.toLowerCase()}`}><i />{strategy.status}<small>{strategy.progress.toFixed(0)}%</small></span>
-        {!showingHistory && <span className="strategy-actions">{strategy.status === 'PAUSED' && <button className="resume-button" onClick={() => void resumeStrategy(strategy.id)} disabled={resumingIds.includes(strategy.id) || stoppingIds.includes(strategy.id)}>{resumingIds.includes(strategy.id) ? t('Resuming…') : t('Resume')}</button>}<button className="stop-button" onClick={() => void stopStrategy(strategy.id)} disabled={stoppingIds.includes(strategy.id) || resumingIds.includes(strategy.id)}>{stoppingIds.includes(strategy.id) ? t('Stopping…') : t('Stop')}</button></span>}
+        {!showingHistory && <span className="strategy-actions">{config.kind === 'carry' && strategy.status === 'RUNNING' && <button className="close-carry-button" onClick={() => void closeCarryStrategy(strategy)} disabled={closingCarryIds.includes(strategy.id)}>{closingCarryIds.includes(strategy.id) ? t('Closing…') : t('Close all')}</button>}{strategy.status === 'PAUSED' && <button className="resume-button" onClick={() => void resumeStrategy(strategy.id)} disabled={resumingIds.includes(strategy.id) || stoppingIds.includes(strategy.id)}>{resumingIds.includes(strategy.id) ? t('Resuming…') : t('Resume')}</button>}<button className="stop-button" onClick={() => void stopStrategy(strategy.id)} disabled={stoppingIds.includes(strategy.id) || resumingIds.includes(strategy.id)}>{stoppingIds.includes(strategy.id) ? t('Stopping…') : t('Stop')}</button></span>}
       </div>;
     })}</div>{showingHistory && historicalStrategies.length >= HISTORICAL_STRATEGIES_PAGE_SIZE && <div className="funding-pagination strategy-pagination"><span className="page-range">{historyStart + 1}–{Math.min(historyStart + HISTORICAL_STRATEGIES_PAGE_SIZE, historicalStrategies.length)} / {historicalStrategies.length}</span><div className="page-controls"><button onClick={() => setHistoryPage((current) => Math.max(1, current - 1))} disabled={historyPage === 1}>{t('Prev')}</button><span className="page-indicator">{t('Page')} {historyPage} / {historyPages}</span><button onClick={() => setHistoryPage((current) => Math.min(historyPages, current + 1))} disabled={historyPage === historyPages}>{t('Next')}</button></div><span className="page-size">10 {t('per page')}</span></div>}{stopNotice && <div className="launch-notice error panel-notice">{stopNotice}</div>}{visibleStrategies.length === 0 && <div className="no-strategies"><span>◎</span><strong>{t(showingHistory ? 'No historical strategies' : 'No strategies running')}</strong><small>{t(showingHistory ? 'Stopped and completed strategies will appear here.' : 'Configure a strategy above and start it when ready.')}</small></div>}
       </>}
@@ -674,6 +750,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
       onCompleted={async () => { await Promise.all([onPositionsRefresh(), onStrategiesChanged()]); }}
       notify={(kind, title, text) => setCloseNotice({ kind, title, text })}
     />}
+    {residualReport && <ResidualDialog report={residualReport} onDismiss={() => setResidualReport(null)} />}
     {closeNotice && <div className={closeNotice.kind === 'error' ? 'toast toast-error' : 'toast'} role={closeNotice.kind === 'error' ? 'alert' : 'status'}><span>{closeNotice.kind === 'error' ? '!' : '✓'}</span><div><strong>{closeNotice.title}</strong><p>{closeNotice.text}</p></div></div>}
     {selectedLogStrategy && <StrategyExecutionLogDialog
       strategy={selectedLogStrategy}
@@ -887,6 +964,9 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const [leftRiskPositionValue, setLeftRiskPositionValue] = useState<number | null | undefined>(undefined);
   const [rightRiskPositionValue, setRightRiskPositionValue] = useState<number | null | undefined>(undefined);
   const [launching, setLaunching] = useState(false);
+  // R1 double guard: `launching` state alone leaves a same-tick double-tap window (React batches
+  // state updates), so the synchronous ref closes it. Both must agree before a submit proceeds.
+  const launchingRef = useRef(false);
   const [confirmingLaunch, setConfirmingLaunch] = useState(false);
   const [launchNotice, setLaunchNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
   const [priceDifferenceRange, setPriceDifferenceRange] = useState<PairHistoryRange>('24H');
@@ -980,7 +1060,26 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const buyPrice = directionFlipped ? leftPrice : rightPrice;
   // Null while either leg lacks a price: a missing leg must read as "waiting", never as a real
   // 0.00 bps spread.
-  const priceDiffBps = sellPrice > 0 && buyPrice > 0 ? ((sellPrice - buyPrice) / buyPrice) * 10_000 : null;
+  // R4 (AC-3): the displayed spread is judged by the same yardstick as the engine's
+  // `freshMarketPair` gate — both legs' `quoteUpdatedAt` inside the shared skew budget, read from
+  // the same market-hub field. Two legs quoting seconds apart would display a spread that never
+  // existed, so an unaligned pair reads "—" with an explicit reason instead.
+  const legsQuoteAligned = assessSpreadQuoteAlignment(
+    { quoteUpdatedAt: leftLive?.quoteUpdatedAt },
+    { quoteUpdatedAt: rightLive?.quoteUpdatedAt },
+    SPREAD_QUOTE_MAX_SKEW_MS,
+  );
+  // R1 (disabled-reason visibility): the launch button is disabled while the two legs' live quotes
+  // are missing or unaligned — surface that to the user instead of a silent grey button.
+  const marketQuotesReady = legsQuoteAligned && leftPrice > 0 && rightPrice > 0;
+  const priceDiffBps = legsQuoteAligned && sellPrice > 0 && buyPrice > 0
+    ? ((sellPrice - buyPrice) / buyPrice) * 10_000
+    : null;
+  const leftQuotedAt = leftLive?.quoteUpdatedAt ?? null;
+  const rightQuotedAt = rightLive?.quoteUpdatedAt ?? null;
+  const quotedAtText = (timestamp: string | null): string => timestamp === null
+    ? '—'
+    : new Date(timestamp).toLocaleTimeString(language === 'zh' ? 'zh-CN' : 'en-US', { hour12: false });
   const priceDifferenceHistoryIsCurrent = priceDifferenceHistory.key === priceDifferenceHistoryKey;
   const priceDifferencePoints = useMemo(() => priceDifferenceHistoryIsCurrent
     ? buildPriceDifferenceHistory(priceDifferenceHistory.left, priceDifferenceHistory.right, directionFlipped, 0)
@@ -1262,7 +1361,11 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   }, [priceDifferenceSeriesKey]);
 
   async function launchStrategy() {
-    if (launching) return;
+    // R1 (AC-2 root-cause instrumentation): one dev log per confirmed launch, so a real-device
+    // regression can be attributed to a specific stage (confirm-dialog open vs submit).
+    console.info('[R1] strategy launch: submitting', { kind: mode, asset });
+    if (launching || launchingRef.current) return;
+    launchingRef.current = true;
     setLaunching(true);
     setLaunchNotice(null);
     const config: StrategyConfig = {
@@ -1303,6 +1406,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
     } catch (error) {
       setLaunchNotice({ kind: 'error', text: `${t('Strategy rejected')}: ${error instanceof ApiError ? error.message : t('Backend unavailable')}` });
     } finally {
+      launchingRef.current = false;
       setLaunching(false);
       setConfirmingLaunch(false);
       window.setTimeout(() => setLaunchNotice((current) => current?.kind === 'ok' ? null : current), 5000);
@@ -1314,6 +1418,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
       onOpenModeDialog();
       return;
     }
+    console.info('[R1] strategy launch: confirm dialog opened', { kind: mode, asset });
     if (launching || !strategyInputsValid) return;
     setConfirmingLaunch(true);
   }
@@ -1387,6 +1492,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
               </div>
               <dl>
                 <div><dt>{t('Best price')}</dt><dd>{priceText(leftPrice)}</dd></div>
+                <div><dt>{t('Quoted at')}</dt><dd>{quotedAtText(leftQuotedAt)}</dd></div>
                 {mode === 'position' && <div><dt>{t('Funding / 8h')}</dt><dd>{leftFunding === null ? '—' : `${leftFunding > 0 ? '+' : ''}${leftFunding.toFixed(4)}%`}</dd></div>}
                 <div><dt>{t(sharedMarginMode ? 'Shared margin' : 'Available')}</dt><dd>{leftBalance ? `${Number(leftBalance).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${leftBalanceUnit}` : '—'}</dd></div>
               </dl>
@@ -1397,7 +1503,9 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
                 ? <strong>—</strong>
                 : <strong className={priceDiffBps >= 0 ? 'positive' : 'negative'}>{priceDiffBps >= 0 ? '+' : ''}{priceDiffBps.toFixed(2)} bps</strong>}
               <button className="switch-direction" onClick={() => setDirectionFlipped((current) => !current)} aria-label={t('Switch direction')}>⇄</button>
-              <small>{priceDiffBps === null ? t('Waiting for both leg prices') : t('Switch direction')}</small>
+              <small>{priceDiffBps === null
+                ? (legsQuoteAligned ? t('Waiting for both leg prices') : t('Leg quotes are not time-aligned'))
+                : t('Switch direction')}</small>
             </div>
             <div className="strategy-leg buy-leg">
               <div className="leg-top">
@@ -1416,6 +1524,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
               </div>
               <dl>
                 <div><dt>{t('Best price')}</dt><dd>{priceText(rightPrice)}</dd></div>
+                <div><dt>{t('Quoted at')}</dt><dd>{quotedAtText(rightQuotedAt)}</dd></div>
                 {mode === 'position' && <div><dt>{t('Funding / 8h')}</dt><dd>{rightFunding === null ? '—' : `${rightFunding > 0 ? '+' : ''}${rightFunding.toFixed(4)}%`}</dd></div>}
                 <div><dt>{t(sharedMarginMode ? 'Shared margin' : 'Available')}</dt><dd>{rightBalance ? `${Number(rightBalance).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${rightBalanceUnit}` : '—'}</dd></div>
               </dl>
@@ -1541,6 +1650,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
           {marginInsufficient && <div className="launch-warning"><span>!</span><p>{t('Configured maximum exposure exceeds the available margin.')}</p></div>}
           {positionRiskLimitExceeded && <div className="launch-warning"><span>!</span><p>{t('Configured position exceeds the maximum at selected leverage')}</p></div>}
           <button className={tradingEnabled ? 'start-strategy' : 'start-strategy locked'} onClick={requestStrategyLaunch} disabled={launching || (tradingEnabled && !strategyInputsValid)}>{launching ? t('Launching…') : tradingEnabled ? marginInsufficient ? t('Insufficient margin') : positionRiskLimitExceeded ? t('Position exceeds leverage limit') : positionRiskReviewUnavailable ? t('Loading position limits…') : !strategyInputsValid ? t('Enter valid strategy amounts') : t(mode === 'position' ? 'Execute strategy' : 'Launch strategy') : t('Live trading locked')}</button>
+          {tradingEnabled && !marketQuotesReady && <p className="launch-disabled-reason">{t('Live quotes for both legs are missing or not time-aligned — entry estimates may be stale.')}</p>}
           {launchNotice && <div className={`launch-notice ${launchNotice.kind}`}>{launchNotice.text}</div>}
           {mode === 'position' && <p className="background-strategy-note">{t('Runs in background; manage active strategies below.')}</p>}
           {mode === 'position' && <div className="launch-warning"><span>ⓘ</span><p>{tradingEnabled
@@ -1626,6 +1736,9 @@ export function CarryStrategyView({ marketSnapshot, catalog, strategies, balance
   const [basisTakeProfit, setBasisTakeProfit] = useState('20');
   const [inventoryCheck, setInventoryCheck] = useState(false);
   const [launching, setLaunching] = useState(false);
+  // R1 double guard (see the position view): a synchronous ref closes the same-tick double-tap
+  // window that React's batched `launching` state leaves open.
+  const launchingRef = useRef(false);
   const [confirmingLaunch, setConfirmingLaunch] = useState(false);
   const [launchNotice, setLaunchNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
   const [fundingOverview, setFundingOverview] = useState<FundingOverviewResponse | null>(null);
@@ -1684,7 +1797,14 @@ export function CarryStrategyView({ marketSnapshot, catalog, strategies, balance
   const perpMarket = marketSnapshot?.markets.find((item) => item.symbol === perpSymbol) ?? null;
   const spotPrice = Number(spotMarket?.askPrice ?? 0);
   const perpPrice = Number(perpMarket?.bidPrice ?? 0);
-  const basisBps = spotPrice > 0 && perpPrice > 0 ? ((perpPrice - spotPrice) / spotPrice) * 10_000 : null;
+  // R4: the displayed basis is judged by the same quoteUpdatedAt yardstick as the engine's
+  // freshMarketPair gate; unaligned legs read "—" rather than a spread that never existed.
+  const carryLegsAligned = assessSpreadQuoteAlignment(
+    { quoteUpdatedAt: spotMarket?.quoteUpdatedAt },
+    { quoteUpdatedAt: perpMarket?.quoteUpdatedAt },
+    SPREAD_QUOTE_MAX_SKEW_MS,
+  );
+  const basisBps = carryLegsAligned && spotPrice > 0 && perpPrice > 0 ? ((perpPrice - spotPrice) / spotPrice) * 10_000 : null;
   // Pre-submit minimum-notional check mirrors the engine's launch validation: each leg is sized
   // with its own executable-side price (ask for buys, bid for sells).
   const instruments = useInstrumentCatalog();
@@ -1828,7 +1948,9 @@ export function CarryStrategyView({ marketSnapshot, catalog, strategies, balance
     : true;
 
   async function launchStrategy() {
-    if (launching) return;
+    console.info('[R1] strategy launch: submitting', { kind: 'carry', asset });
+    if (launching || launchingRef.current) return;
+    launchingRef.current = true;
     setLaunching(true);
     setLaunchNotice(null);
     const config: StrategyConfig = {
@@ -1857,6 +1979,7 @@ export function CarryStrategyView({ marketSnapshot, catalog, strategies, balance
     } catch (error) {
       setLaunchNotice({ kind: 'error', text: `${t('Strategy rejected')}: ${error instanceof ApiError ? error.message : t('Backend unavailable')}` });
     } finally {
+      launchingRef.current = false;
       setLaunching(false);
       setConfirmingLaunch(false);
       window.setTimeout(() => setLaunchNotice((current) => current?.kind === 'ok' ? null : current), 5000);
@@ -1868,6 +1991,7 @@ export function CarryStrategyView({ marketSnapshot, catalog, strategies, balance
       onOpenModeDialog();
       return;
     }
+    console.info('[R1] strategy launch: confirm dialog opened', { kind: 'carry', asset });
     if (launching || !inputsValid) return;
     setConfirmingLaunch(true);
   }
@@ -1987,6 +2111,7 @@ export function CarryStrategyView({ marketSnapshot, catalog, strategies, balance
             <div><dt>{t('Inventory check')}</dt><dd>{t(effectiveInventoryCheck ? 'Yes' : 'No')}</dd></div>
           </dl>
           <button className={tradingEnabled ? 'start-strategy' : 'start-strategy locked'} onClick={requestStrategyLaunch} disabled={launching || (tradingEnabled && (!inputsValid || !gateCoversEntry))}>{launching ? t('Launching…') : tradingEnabled ? !inputsValid ? t('Enter valid strategy amounts') : !gateCoversEntry ? t('Insufficient margin') : t('Launch strategy') : t('Live trading locked')}</button>
+          {tradingEnabled && !launching && (!inputsValid || !gateCoversEntry) && <p className="launch-disabled-reason">{!inputsValid ? t('Enter valid strategy amounts') : t('Insufficient margin: the known USDT balance does not cover the spot amount plus the contract margin.')}</p>}
           {launchNotice && <div className={`launch-notice ${launchNotice.kind}`}>{launchNotice.text}</div>}
         </article>
       </aside>
@@ -2236,6 +2361,9 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
   const [adrRiskPositionValue, setAdrRiskPositionValue] = useState<number | null | undefined>(undefined);
   const [hedgeRiskPositionValue, setHedgeRiskPositionValue] = useState<number | null | undefined>(undefined);
   const [launching, setLaunching] = useState(false);
+  // R1 double guard (see the position view): a synchronous ref closes the same-tick double-tap
+  // window that React's batched `launching` state leaves open.
+  const launchingRef = useRef(false);
   const [confirmingLaunch, setConfirmingLaunch] = useState(false);
   const [launchNotice, setLaunchNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
   const [premiumRange, setPremiumRange] = useState<PairHistoryRange>('24H');
@@ -2559,7 +2687,9 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
   useEffect(() => setHoveredPremium(null), [historySeriesKey]);
 
   async function launchStrategy() {
-    if (launching) return;
+    console.info('[R1] strategy launch: submitting', { kind: 'premium', asset: ADR_ASSET });
+    if (launching || launchingRef.current) return;
+    launchingRef.current = true;
     setLaunching(true);
     setLaunchNotice(null);
     const config: StrategyConfig = {
@@ -2590,6 +2720,7 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
     } catch (error) {
       setLaunchNotice({ kind: 'error', text: `${t('Strategy rejected')}: ${error instanceof ApiError ? error.message : t('Backend unavailable')}` });
     } finally {
+      launchingRef.current = false;
       setLaunching(false);
       setConfirmingLaunch(false);
       window.setTimeout(() => setLaunchNotice((current) => current?.kind === 'ok' ? null : current), 5000);
@@ -2601,6 +2732,7 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
       onOpenModeDialog();
       return;
     }
+    console.info('[R1] strategy launch: confirm dialog opened', { kind: 'premium', asset: ADR_ASSET });
     if (launching || !premiumLaunchReady) return;
     setConfirmingLaunch(true);
   }
