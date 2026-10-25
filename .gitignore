@@ -22,3 +22,4 @@ release
 .claude/
 # Scratch files written while probing a live venue (never part of the source tree).
 .probe-*
+node_modules.bak/

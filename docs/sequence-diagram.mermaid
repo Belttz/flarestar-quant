@@ -1,0 +1,31 @@
+sequenceDiagram
+    participant U as 用户(移动端)
+    participant FE as PositionCloseDialog
+    participant API as app.ts (Fastify)
+    participant CR as CloseReconciler
+    participant TR as TradingRuntime
+    participant EX as 交易所 REST/WS
+
+    U->>FE: 选择平仓目标(双腿) → 确认
+    FE->>API: POST /api/close/plan {targets: [GATE_SPOT_X_USDT, KRAKEN_PERP_X_USDT]}
+    API->>CR: planClose(targets)
+    CR->>TR: reconcilePositionsFromRemote() [单飞去重]
+    TR->>EX: 实时持仓查询
+    EX-->>TR: 持仓/余额快照
+    CR->>CR: 每腿: 现货→实时余额(floor到lotSize) / 合约→实时持仓; 校验 minSize/minNotional; 残量<最小单位→skipReason='dust'
+    CR-->>FE: ClosePlanResponse{legs:[{symbol,side,quantity,skipReason?}]}
+    FE->>U: 展示每腿实际可平数量(dust 腿标注"碎量不下单")
+    U->>FE: 确认执行
+    FE->>API: POST /api/strategies (closePlan reduce-only slices, 数量=plan)
+    API->>TR: 启动 closePlan 策略(复用现有通道, 止损路径零触碰)
+    Note over TR: 引擎逐 slice reduce-only;数量拒绝→venue-truth clamp(a5b3ab6 机制)
+    TR-->>FE: 策略 STOPPED (emitStrategyUpdate)
+    FE->>API: POST /api/close/verify {targets}
+    API->>CR: verifyClose(targets)
+    CR->>EX: 再拉实时余额/持仓
+    CR-->>FE: ResidualReport{residuals[], clean}
+    alt residuals 非空
+        FE->>U: ResidualDialog(spot-debt-dialog 模式): 残量+原因+建议(手动补平/调仓)
+    else clean
+        FE->>U: 提示平仓完成; 资产分组收敛(R11)
+    end

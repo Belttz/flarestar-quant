@@ -569,6 +569,41 @@ const chinese: Record<string, string> = {
   'Live sampling': '实时采样',
   Candidates: '个候选',
   'Ranked by 24h spread-distribution quality: mean, volatility, skewness, reversion speed, holding cost and book depth.': '按 24h 价差分布质量排名：均值、波动、偏度、回归速度、持有成本与盘口深度。',
+
+  // ── v0.4.1 ────────────────────────────────────────────────────────────────────────────────
+  // R6/R7 合并列表（交易页底部；Positions/Orders/All/Perpetual/Spot 等基础词条已在上方定义）
+  'Market type filter': '市场类型筛选', 'Order view': '委托视图',
+  Orders: '委托',
+  'Entry / Available': '开仓价 / 可用', 'PnL / Valuation': '盈亏 / 估值', Action: '操作',
+  // R8 价差质量榜排序与分页
+  'Sort by': '排序依据', ascending: '升序', descending: '降序',
+  // R4 报价时间对齐
+  'Leg quotes are not time-aligned': '两腿报价时间未对齐',
+  'Quotes misaligned': '报价未对齐',
+  'Quoted at': '报价时间',
+  'Live quotes for both legs are missing or not time-aligned — entry estimates may be stale.': '两腿实时报价缺失或时间未对齐——入场估算可能过期。',
+  // R9 导航收敛
+  'Opportunity boards': '机会榜',
+  'Funding carry board': '资金费套利榜', 'Rank cross-exchange funding hedges by APR': '按年化排名跨所资金费对冲组合',
+  'Venue funding ranking': '交易所资金费排名', 'Per-venue funding-rate extremes and history': '单交易所资金费极值与历史',
+  'Price-difference board': '价差机会榜', 'Rank executable cross-exchange spreads': '按可执行价差排名跨所组合',
+  '24h spread-distribution statistics per pair': '每对组合的 24h 价差分布统计',
+  'Borrow, lend and route yield across venues': '跨所借币、放贷与收益路由',
+  // R2/R3 对账平仓（ResidualDialog 与平仓弹窗）
+  'Close reconciliation': '平仓对账',
+  'Positions could not be fully closed': '部分持仓未能完全平掉',
+  'These legs still hold more than the smallest orderable unit after the close plan ended. The terminal never auto-liquidates dust — settle them manually or rerun the close.': '平仓计划结束后，以下腿仍持有超过最小下单单位的残量。终端不会自动强平碎量——请手动处理或重新执行平仓。',
+  Suggestion: '建议',
+  'Reconciling quantities with the exchange…': '正在与交易所对账实际数量…',
+  'Quantities reconciled with the exchange.': '已按交易所实时数量对账。',
+  'Could not read live quantities from the exchange. Retry by reopening this dialog.': '无法读取交易所实时数量。请重新打开此弹窗重试。',
+  'One-click close failed': '一键平仓失败',
+  'Timed close ended with residual positions': '定时平仓结束仍有残量，请手动处理',
+  'This strategy carries no tradable legs.': '该策略没有可平的腿。',
+  'Nothing left to close': '没有需要平仓的持仓',
+  'Closing…': '平仓中…',
+  // R2 现货保证金提示（合约腿保证金不足）
+  'Insufficient margin: the known USDT balance does not cover the spot amount plus the contract margin.': '保证金不足：已知 USDT 余额无法同时覆盖现货金额与合约保证金。',
 };
 
 /**

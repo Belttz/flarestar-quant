@@ -1,0 +1,57 @@
+classDiagram
+    class CloseLegPlan {
+      +string symbol
+      +string venue
+      +'SPOT'|'PERP' marketType
+      +'BUY'|'SELL' side
+      +string quantity
+      +string | null positionSide
+      +SkipReason skipReason
+    }
+    class SkipReason {
+      <<enumeration>>
+      DUST
+      NO_MARKET
+      NO_BALANCE
+      LOCKED_BALANCE
+    }
+    class ClosePlanRequest {
+      +CloseTargetInput[] targets
+    }
+    class ClosePlanResponse {
+      +CloseLegPlan[] legs
+      +string fetchedAt
+    }
+    class ResidualReport {
+      +ResidualLeg[] residuals
+      +boolean clean
+      +string fetchedAt
+    }
+    class ResidualLeg {
+      +string symbol
+      +string residualQuantity
+      +string reason
+      +string suggestion
+    }
+    class CloseReconciler {
+      +planClose(request) ClosePlanResponse
+      +verifyClose(request) ResidualReport
+    }
+    class SpreadQualityQuery {
+      +string sort
+      +string dir
+      +int offset
+      +int pageSize
+    }
+    class SpreadQualityRow_v041 {
+      +string leftQuoteUpdatedAt
+      +string rightQuoteUpdatedAt
+      +boolean quoteAligned
+    }
+    ClosePlanRequest --> CloseLegPlan
+    ClosePlanResponse --> CloseLegPlan
+    ResidualReport --> ResidualLeg
+    CloseReconciler ..> ClosePlanRequest : consumes
+    CloseReconciler ..> ClosePlanResponse : produces
+    CloseReconciler ..> ResidualReport : produces
+    CloseLegPlan --> SkipReason

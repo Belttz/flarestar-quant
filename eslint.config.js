@@ -10,6 +10,9 @@ export default tseslint.config(
       '**/dist/**',
       '**/dist-ts/**',
       '**/node_modules/**',
+      // A stale node_modules backup accidentally placed at the repo root (not a workspace) —
+      // ESLint's config search walks into it and trips over its vendored config stubs.
+      'node_modules.bak/**',
       '.claude/worktrees/**',
       '.local-data/**',
       'logs/**',
@@ -28,7 +31,7 @@ export default tseslint.config(
       'no-useless-assignment': 'off',
       // A leading underscore is the agreed marker for a parameter that exists only to satisfy a
       // callback signature (fetch mocks, event handlers) without being read in the body.
-      '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
+      '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
     },
   },
   {

@@ -2,6 +2,28 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [0.4.1] - 2026-10-24
+
+### Added
+
+- **Server-side close reconciliation** (R2/R3): two new endpoints, `POST /api/close/plan` and `POST /api/close/verify`, plan a close from the venue's *live* balances and positions instead of the terminal's local snapshot. `planClose` answers each leg with the real orderable quantity (lot-floored, `minSize`/`minNotional` checked) or a skip reason (`dust` / `no_market` / `no_balance` / `locked_balance`); dust is never auto-liquidated. `verifyClose` re-reads the venue after the close and lists residuals with a reason and a suggestion. The position-close dialog now calls the plan before anything is submitted, and a new residual dialog surfaces anything the close could not finish. The carry strategy row gained a one-click **Close all** that plans, submits a two-slice reduce-only close, and verifies afterwards.
+- The closePlan engine path now **reconciles rejected quantities and converges on its own** (R3): a reduce-only quantity rejection re-reads the venue once (single-flight) and retries at the real size; a leg whose venue position is gone is marked satisfied (`Exit quote withdrawn`); when every target is satisfied the strategy stops early instead of idling through the slice interval; a failing leg logs a warning and never blocks the other leg, and the strategy always converges to `COMPLETED`. Residual reporting no longer phantom-counts legs the venue already confirmed as flat.
+- The `funding-rankings` and `funding-history/series` endpoints now answer from a **TTL + single-flight cache** (30s/60s, parameters in the key, failures never cached) instead of hitting the venue on every request (R5). The opportunities boards adopted **stale-while-revalidate**: a board fresh in the client cache paints instantly and revalidates in the background, so navigating back to a page never blanks it behind a spinner.
+- Spread rows now carry their **leg quote timestamps** and an alignment verdict (R4): a spread is only considered executable when both legs' `quoteUpdatedAt` sit inside a shared 2000 ms budget (`GCT_SPREAD_SKEW_MS` configurable). Misaligned combinations are sunk to the bottom of the rankings, excluded from the candidate selection, and badged `Quotes misaligned` on the spread-quality board. The strategy pages display each leg's **Quoted at** time and judge the displayed spread with the *same* yardstick the engine's `freshMarketPair` gate uses — display and execution share one source of truth.
+- The opportunities **spread-quality board gained sort chips and a pager** (R8): six server-side sort keys (score / current / mean / volatility / half-life / depth) with click-to-flip direction, and 20/50-per-page paging executed on the server over the cached board, so browsing the whole candidate set costs one page of rows per view.
+
+### Changed
+
+- The trading page's bottom panel collapsed from **eight per-market tabs to two merged lists** (R6/R7): *Positions* (contract positions + spot holdings, one value-ordered table with a per-row market-type tag) and *Orders* (open orders / order history / trade history across both businesses). The former tabs survive as market-type filter chips (All / Perpetual / Spot), legacy persisted tab keys are normalized so an old session never blanks the panel, and every action (cancel, close, buy-back, repay explainer) keeps its original wiring.
+- The top navigation collapsed to **six first-level entries** (R9): 交易 / 策略▾ / 机会▾ / 资金费率 / 资产 / 更多▾. Opportunities became a dropdown over its four boards, Portfolio was promoted to a first-level entry, and Boros moved into the More menu. All routes stay reachable.
+- Mobile UX hardening (R1/R10): every dialog mounts through a React portal to `document.body`, its backdrop closes only on a *stationary* tap (pointer-down/up within 10 px, so scrolling the page never dismisses it), the launch button pairs `state` with a `ref` double-guard against synchronous double-taps, and a disabled launch button always shows the reason. On phones dialogs go near-fullscreen with internal scrolling over `100dvh`, touch targets in the topbar/tabs/rows meet 44 px, and icon containers can no longer clip. A `console.info('[R1] …')` trace on dialog open and submit supports the root-cause record in `docs/mobile-regression-checklist-v0.4.1.md`.
+- New UI copy ships in English and Chinese throughout (`Quoted at`, `Quotes misaligned`, `Close all`, the residual dialog, the plan-status line, merged-tab labels).
+
+### Fixed
+
+- **Mobile strategy launch could silently die on the confirmation tap** (R1). The root-cause audit found a stack of contributing causes — the old backdrop closed on synthesized `mousedown` (which touch fires *before* `click`), fixed-position dialogs shifted under the iOS keyboard, autofocus landed on the "Go back" button, and silently disabled buttons left no trace. The portal + pointer-exemption + dvh + ref-guard + visible-disabled-reason combination addresses all of them; the checklist document records the trace fields for the on-device verdict.
+- **A cross-exchange close could leave残量 behind when the local snapshot was stale** (R2). Quantities for the close plan now always come from the venue via `/api/close/plan`; the frontend no longer derives close sizes from a portfolio snapshot, and the engine-side reconcile covers the residual path during execution.
+
 ## [0.4.0] - 2026-10-13
 
 ### Added

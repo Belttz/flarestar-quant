@@ -14,7 +14,6 @@ import { StrategyExecutionLogDialog } from './strategy-route.js';
 import {
   classifyStrategyLogEvent,
   localizeStrategyLogResult,
-  prepareStrategyLogView,
   type DisplayStrategyLog,
 } from './strategy-logs.js';
 
@@ -71,6 +70,9 @@ const NEWLY_WORDED: ReadonlyArray<readonly [event: string, chinese: string]> = [
   ['Exit size corrected', '已按交易所真实持仓修正平仓数量'],
   ['Exit quote withdrawn', '交易所已无可平仓位，撤销平仓挂单'],
   ['Position reconciliation failed', '与交易所核对持仓失败'],
+  // v0.4.1 closePlan convergence (R3): a timed close that still leaves an orderable residual
+  // after every retry logs this warning and converges to COMPLETED.
+  ['Timed close ended with residual positions', '定时平仓结束仍有残量，请手动处理'],
 ];
 
 /** Every state the leg dictionary enumerates, and the wording each side must use. */
