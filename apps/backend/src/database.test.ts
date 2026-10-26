@@ -30,8 +30,8 @@ describe('database migrations', () => {
 
     expect(readDatabaseStatus(first)).toEqual({
       state: 'ok',
-      migrationCount: 24,
-      currentMigration: '0024_spread_samples.sql',
+      migrationCount: 25,
+      currentMigration: '0025_saved_strategy_pairs.sql',
     });
     const strategyMetricsColumns = first.prepare('PRAGMA table_info(execution_strategies)').all() as Array<{ name: string }>;
     expect(strategyMetricsColumns.map((column) => column.name)).toContain('metrics_json');
@@ -54,7 +54,7 @@ describe('database migrations', () => {
     first.close();
 
     const reopened = openDatabase(location.path, migrationsDir);
-    expect(readDatabaseStatus(reopened).migrationCount).toBe(24);
+    expect(readDatabaseStatus(reopened).migrationCount).toBe(25);
     reopened.close();
   });
 
@@ -149,7 +149,7 @@ describe('database migrations', () => {
     const database = openDatabase(location.path, resolve(process.cwd(), '../../migrations'));
     const columns = database.prepare('PRAGMA table_info(audit_events)').all() as Array<{ name: string }>;
     expect(columns.map((column) => column.name)).toContain('correlation_id');
-    expect(readDatabaseStatus(database).currentMigration).toBe('0024_spread_samples.sql');
+    expect(readDatabaseStatus(database).currentMigration).toBe('0025_saved_strategy_pairs.sql');
     database.close();
   });
 
@@ -214,6 +214,15 @@ describe('database migrations', () => {
       fillsDeleted: 2,
       ordersDeleted: 2,
       portfolioEquitySamplesDeleted: 0,
+      cacheRowsDeleted: 0,
+      cacheRowsDeletedByTable: {},
+      // No backup directory is configured here, so the monthly archive step is inert.
+      backupOutcome: 'disabled',
+      backupFile: null,
+      backupBytes: null,
+      backupDeletedFiles: [],
+      backupError: null,
+      ranAtMs: Date.parse('2026-07-29T00:00:00.000Z'),
     });
     expect(database.prepare('SELECT id FROM execution_strategy_logs ORDER BY id').all())
       .toEqual([{ id: 'log-running' }]);

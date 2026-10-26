@@ -563,10 +563,13 @@ export interface PortfolioEquitySampleResult {
 
 /**
  * Persist one equity sample at every granularity: the exact raw timestamp plus its floored
- * hour/day buckets (see `migrations/0023_portfolio_equity_samples.sql`). Equity is
- * `snapshot.account.marginBalance` — the same figure the asset page shows as the "Margin
- * balance" KPI — and `unrealizedPnl` sums futures and margin positions. Gate spot balances are
- * denominated per coin and are intentionally out of scope.
+ * hour/day buckets (see `migrations/0023_portfolio_equity_samples.sql`). Equity comes from
+ * `accountEquityOf(snapshot)` — stablecoin cash across the CrossEx venues plus open-position uPnL,
+ * the same figure the asset page shows as the "Total equity" KPI — and deliberately **not** from
+ * `snapshot.account.marginBalance`, which subtracts the locked margin of DEX legs without adding it
+ * back (a hedged pair would halve the curve while it is open). `unrealizedPnl` sums futures and
+ * margin positions. Gate spot balances are kept out: the `SPOT` rows belong to the isolated Gate
+ * spot account, not to the CrossEx margin account.
  *
  * Samples are debounced to at most one per minute per database so refresh-button spam cannot
  * produce dense raw points; the ~5 minute background reconciliation cadence is unaffected.

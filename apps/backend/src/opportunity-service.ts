@@ -15,6 +15,11 @@ import {
 } from '@gate-crossex/shared-types';
 import type { LiveMarket, MarketDefinition } from './market-hub.js';
 import {
+  buildLegFundingRateIndex,
+  spreadLegFunding,
+  type LegFundingRateIndex,
+} from './leg-funding-rates.js';
+import {
   buildMarketStatsIndex,
   buildOpenInterestIndex,
   maxAmount,
@@ -366,6 +371,11 @@ export class OpportunityService {
     filters: OpportunityFilters,
   ): Promise<OpportunityBoardRows> {
     if (filters.funding) await this.deps.fundingOverview.ensureFresh();
+    // The spread board shows each leg's current funding rate, but a cold bulk sweep must never
+    // delay it: the sweep is kicked off in the background and the row's rate stays null until it
+    // lands (the board refreshes at most 30s later, and the funding page / quality board keep the
+    // sweep warm in normal use). Funding-board requests await the same sweep below instead.
+    else if (filters.spread) void this.deps.fundingOverview.ensureFresh().catch(() => undefined);
     const overview = this.deps.fundingOverview.buildResponse(catalog);
     // One merged-view sweep per computation feeds both the spread pairing and the volume/OI
     // lookup, so resolving 24h volume never costs an extra upstream call.
@@ -374,12 +384,15 @@ export class OpportunityService {
       statsIndex: buildMarketStatsIndex(markets),
       openInterestByAssetVenue: buildOpenInterestIndex(overview),
     };
+    // Built from the overview this computation already has, so attaching the legs' funding rates
+    // costs one map and no extra request.
+    const fundingRates = buildLegFundingRateIndex(overview);
     const classify = this.assetClassifier(catalog);
     const fundingRows = filters.funding
       ? this.buildFundingBoard(overview, filters, stats, classify)
       : [];
     const spreadRows = filters.spread
-      ? this.buildSpreadBoard(filters, markets, stats, classify)
+      ? this.buildSpreadBoard(filters, markets, stats, classify, fundingRates)
       : [];
     return {
       funding: fundingRows,
@@ -599,6 +612,7 @@ export class OpportunityService {
     markets: readonly LiveMarket[],
     stats: OpportunityStatsSources,
     classify: (asset: string) => AssetClassification,
+    fundingRates: LegFundingRateIndex,
   ): SpreadOpportunity[] {
     const rows: SpreadOpportunity[] = [];
     // Whitelists are applied while the pairs are built, not after the sort, so `limit` truncates
@@ -614,14 +628,14 @@ export class OpportunityService {
       if (includeSpotPerp) {
         for (let i = 0; i < spot.length; i += 1) {
           for (let j = 0; j < perp.length; j += 1) {
-            this.pushBestPair(rows, spot[i]!, perp[j]!, 'SPOT_PERP', filters, stats, classify);
+            this.pushBestPair(rows, spot[i]!, perp[j]!, 'SPOT_PERP', filters, stats, classify, fundingRates);
           }
         }
       }
       if (includePerpPerp) {
         for (let i = 0; i < perp.length; i += 1) {
           for (let j = i + 1; j < perp.length; j += 1) {
-            this.pushBestPair(rows, perp[i]!, perp[j]!, 'PERP_PERP', filters, stats, classify);
+            this.pushBestPair(rows, perp[i]!, perp[j]!, 'PERP_PERP', filters, stats, classify, fundingRates);
           }
         }
       }
@@ -671,6 +685,11 @@ export class OpportunityService {
             leftQuoteUpdatedAt: row.leftQuoteUpdatedAt,
             rightQuoteUpdatedAt: row.rightQuoteUpdatedAt,
             quoteAligned: row.quoteAligned,
+            // Each combination carries its own legs' funding: the parent row mirrors the best
+            // pair, and a different pair of venues has a different funding differential.
+            leftFundingRate8h: row.leftFundingRate8h,
+            rightFundingRate8h: row.rightFundingRate8h,
+            fundingRateDiffBps: row.fundingRateDiffBps,
             executable: row.executable,
           })),
       });
@@ -745,6 +764,7 @@ export class OpportunityService {
     filters: OpportunityFilters,
     stats: OpportunityStatsSources,
     classify: (asset: string) => AssetClassification,
+    fundingRates: LegFundingRateIndex,
   ): void {
     const aSells = pairSpread(marketA, marketB);
     const bSells = pairSpread(marketB, marketA);
@@ -777,6 +797,9 @@ export class OpportunityService {
         this.spreadQuoteMaxSkewMs,
       ),
       executable: true,
+      // Both legs' current funding rate, so the row shows what holding the pair pays or costs
+      // without a second request. A spot leg is null, never zero.
+      ...spreadLegFunding(fundingRates, best.sell.symbol, best.buy.symbol),
       ...this.classificationFields(marketA.asset, classify),
       leftStats: resolveStats(
         best.sell.symbol,

@@ -48,6 +48,17 @@ export interface BackendConfig {
    * spread is built or displayed (R4). Mirrors the engine's `marketPairMaxSkewMs` default.
    */
   spreadQuoteMaxSkewMs: number;
+  /**
+   * Directory holding the monthly gzipped database archives
+   * (`gate-crossex-YYYY-MM.sqlite.gz`). Defaults to `<dataDir>/backups`, so the archives live next
+   * to the database they snapshot and travel with it when the data directory is moved or mounted.
+   */
+  backupDirectory: string;
+  /**
+   * How many monthly archives are kept before the oldest are deleted. Defaults to 12 — one year of
+   * monthly history, matching "每月打一次包备份起来" plus a sane disk bound.
+   */
+  backupRetentionMonths: number;
 }
 
 const LOOPBACK_HOSTS = ['127.0.0.1', 'localhost', '::1'] as const;
@@ -115,6 +126,19 @@ function parseSpreadQuoteMaxSkewMs(value: string | undefined): number {
  */
 function generateBootstrapPassword(): string {
   return randomBytes(18).toString('base64url');
+}
+
+/**
+ * How many monthly database archives to keep (`GCT_BACKUP_RETENTION_MONTHS`, default 12).
+ * Fails loudly on nonsense instead of silently archiving nothing or never pruning.
+ */
+function parseBackupRetentionMonths(value: string | undefined): number {
+  if (value === undefined || value.trim() === '') return 12;
+  const months = Number(value);
+  if (!Number.isFinite(months) || !Number.isInteger(months) || months < 1 || months > 120) {
+    throw new Error('GCT_BACKUP_RETENTION_MONTHS must be an integer between 1 and 120');
+  }
+  return months;
 }
 
 /**
@@ -214,5 +238,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
     gatePublicWebSocketUrl: environment.GCT_GATE_PUBLIC_WS_URL ?? 'wss://api.gateio.ws/ws/crossex/public',
     gatePrivateWebSocketUrl: environment.GCT_GATE_PRIVATE_WS_URL ?? 'wss://api.gateio.ws/ws/crossex',
     spreadQuoteMaxSkewMs: parseSpreadQuoteMaxSkewMs(environment.GCT_SPREAD_SKEW_MS),
+    // Monthly archives: `<dataDir>/backups/gate-crossex-YYYY-MM.sqlite.gz`, newest 12 kept.
+    backupDirectory: resolve(environment.GCT_BACKUP_DIR ?? join(dataDir, 'backups')),
+    backupRetentionMonths: parseBackupRetentionMonths(environment.GCT_BACKUP_RETENTION_MONTHS),
   };
 }

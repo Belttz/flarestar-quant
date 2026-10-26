@@ -6,7 +6,9 @@ import {
   PortfolioEquityPointSchema,
   PortfolioEquityRangeSchema,
   PortfolioEquitySeriesResponseSchema,
+  type PortfolioEquityBalanceInput,
   type PortfolioEquityPoint,
+  accountEquityOf,
   downsampleEquityPoints,
   equityBucketStart,
   equityGranularityForRange,
@@ -132,27 +134,126 @@ describe('sumDecimalStrings', () => {
   });
 });
 
+/**
+ * The real 2026-10-26T12:09Z snapshot: a fully hedged TREAD pair (HYPERLIQUID short 250 /
+ * KRAKEN long 250). Gate reports `marginBalance = 58.5366` for it, which is wrong — see
+ * `accountEquityOf`.
+ */
+const liveBalances: readonly PortfolioEquityBalanceInput[] = [
+  { venue: 'KRAKEN', coin: 'USDC', balance: '9.905', unrealizedPnl: '0.2822' },
+  { venue: 'CROSSEX', coin: 'USDT', balance: '95.9641', unrealizedPnl: '0' },
+  { venue: 'DERIBIT', coin: 'USDC', balance: '-12.6031', unrealizedPnl: '0' },
+  { venue: 'LIGHTER', coin: 'USDC', balance: '0.3065', unrealizedPnl: '0' },
+  // The DEX leg: Gate reports equity -34.3085 = 6.1625 - 40.4710 (locked margin never added back).
+  { venue: 'HYPERLIQUID', coin: 'USDC', balance: '6.1625', unrealizedPnl: '-0.1044' },
+  // Coin quantities, not dollars: they must never enter the sum.
+  { venue: 'GATE', coin: 'ADA', balance: '0.9486', unrealizedPnl: '0' },
+  { venue: 'GATE', coin: 'ONE', balance: '0.4914', unrealizedPnl: '0' },
+  { venue: 'GATE', coin: 'SUI', balance: '0.0065', unrealizedPnl: '0' },
+];
+
+const liveFuturesPositions = [{ unrealizedPnl: '-0.1044' }];
+const liveMarginPositions = [{ unrealizedPnl: '0.2822' }];
+
+describe('accountEquityOf', () => {
+  it('reproduces the live hedged-pair account as 99.9128 instead of Gate\'s 58.5366', () => {
+    const equity = accountEquityOf(liveBalances, liveFuturesPositions, liveMarginPositions);
+    // 9.905 + 95.9641 - 12.6031 + 0.3065 + 6.1625 = 99.735, plus 0.1778 of position PnL.
+    expect(equity).toBe('99.9128');
+    // The gap against Gate's marginBalance is the DEX leg's duplicated margin deduction: the
+    // "account halves itself while a hedged pair is open" bug, pinned numerically.
+    expect(Number(equity) - 58.5366).toBeCloseTo(41.3762, 4);
+  });
+
+  it('excludes non-stablecoin rows, whose balance is a coin quantity rather than a value', () => {
+    expect(accountEquityOf(
+      [
+        { venue: 'GATE', coin: 'ADA', balance: '0.9486' },
+        { venue: 'CROSSEX', coin: 'USDT', balance: '95.9641' },
+      ],
+      [],
+      [],
+    )).toBe('95.9641');
+  });
+
+  it('skips the isolated Gate spot account (venue SPOT)', () => {
+    expect(accountEquityOf(
+      [
+        { venue: 'SPOT', coin: 'USDT', balance: '260.125' },
+        { venue: 'CROSSEX', coin: 'USDT', balance: '95.9641' },
+      ],
+      [],
+      [],
+    )).toBe('95.9641');
+  });
+
+  it('uses the cash column even when a row equity disagrees with balance + uPnL', () => {
+    // HYPERLIQUID reports equity -34.3085 for balance 6.1625; only the cash 6.1625 is asset value.
+    expect(accountEquityOf(
+      [{ venue: 'HYPERLIQUID', coin: 'USDC', balance: '6.1625', unrealizedPnl: '-0.1044' }],
+      [],
+      [],
+    )).toBe('6.1625');
+  });
+
+  it('sums USDT, USDC and USD at 1:1 and ignores row-level unrealised PnL', () => {
+    // 10 + 5 + 1 = 16; the row-level upnl (999) must not be counted — positions carry PnL.
+    expect(accountEquityOf(
+      [
+        { venue: 'A', coin: 'USDT', balance: '10', unrealizedPnl: '999' },
+        { venue: 'B', coin: 'USDC', balance: '5', unrealizedPnl: '999' },
+        { venue: 'C', coin: 'USD', balance: '1', unrealizedPnl: '999' },
+      ],
+      [],
+      [],
+    )).toBe('16');
+  });
+
+  it('keeps position PnL when the cash side is missing and vice versa', () => {
+    expect(accountEquityOf([], [{ unrealizedPnl: '20' }], [{ unrealizedPnl: '100' }])).toBe('120');
+    expect(accountEquityOf([{ venue: 'A', coin: 'USDT', balance: '7' }], null, null)).toBe('7');
+  });
+
+  it('degrades to 0 when nothing is usable', () => {
+    expect(accountEquityOf([], [], [])).toBe('0');
+    expect(accountEquityOf(null, null, null)).toBe('0');
+    expect(accountEquityOf(undefined, undefined, undefined)).toBe('0');
+    expect(accountEquityOf([{ venue: 'GATE', coin: 'ADA', balance: '0.9486' }], [], [])).toBe('0');
+    expect(accountEquityOf(
+      [{ venue: 'A', coin: 'USDT', balance: 'n/a' as unknown as string }],
+      [{ unrealizedPnl: null }],
+      [],
+    )).toBe('0');
+  });
+});
+
 describe('portfolioEquitySampleFromSnapshot', () => {
   const snapshot = {
-    account: { marginBalance: '12345.67' },
-    futuresPositions: [{ unrealizedPnl: '10.5' }, { unrealizedPnl: '-0.5' }],
-    marginPositions: [{ unrealizedPnl: '2' }],
+    account: { marginBalance: '58.5366' },
+    balances: liveBalances,
+    futuresPositions: liveFuturesPositions,
+    marginPositions: liveMarginPositions,
   };
 
-  it('takes equity from marginBalance, matching the asset page KPI', () => {
+  it('takes equity from the balance rows plus position PnL, not from marginBalance', () => {
     const sample = portfolioEquitySampleFromSnapshot(snapshot, '2026-01-08T00:00:00.000Z');
-    expect(sample.equity).toBe('12345.67');
+    expect(sample.equity).toBe('99.9128');
+    expect(sample.equity).not.toBe(snapshot.account.marginBalance);
     expect(sample.time).toBe(Date.parse('2026-01-08T00:00:00.000Z'));
   });
 
   it('sums unrealised PnL across futures and margin positions', () => {
     const sample = portfolioEquitySampleFromSnapshot(snapshot, 1_700_000_000_000);
-    expect(sample.unrealizedPnl).toBe('12');
+    expect(sample.unrealizedPnl).toBe('0.1778');
   });
 
   it('yields a null PnL when no position carries a value', () => {
-    const sample = portfolioEquitySampleFromSnapshot({ account: { marginBalance: '5' } }, 1_700_000_000_000);
+    const sample = portfolioEquitySampleFromSnapshot(
+      { account: { marginBalance: '5' }, balances: [{ venue: 'A', coin: 'USDT', balance: '5' }] },
+      1_700_000_000_000,
+    );
     expect(sample.unrealizedPnl).toBeNull();
+    expect(sample.equity).toBe('5');
   });
 
   it('degrades gracefully for missing accounts', () => {

@@ -810,6 +810,36 @@ export const OpportunityMarketStatsSchema = z.object({
 });
 export type OpportunityMarketStats = z.infer<typeof OpportunityMarketStatsSchema>;
 
+/**
+ * Current funding rate of both legs of a spread row.
+ *
+ * A cross-exchange spread is only half the story: what the position actually earns or pays while
+ * it is open is the funding differential between its two legs. These three fields carry that
+ * reading next to the pair itself, so the board can show the carry cost without a second request.
+ *
+ * The `…8h` values are the venues' current rates scaled to an 8h settlement, as Decimal
+ * fractions — the same unit and scaling as the funding board's `fundingRate8h` column
+ * (`0.00013` renders as `0.0130%`). They are `null` — never `0` — when the leg has no funding at
+ * all (a spot leg) or when the venue does not publish one: a zero rate is a real measurement
+ * (free carry), a missing one is not, and confusing the two would misprice the trade.
+ *
+ * Every field is optional so payloads produced before this reading existed keep parsing; a
+ * consumer must treat "absent" exactly like "null" (the UI renders `—` for both).
+ */
+export const SpreadLegFundingSchema = z.object({
+  /** Current 8h-equivalent funding fraction of the sell leg; null for spot / unpublished. */
+  leftFundingRate8h: z.string().nullable().optional(),
+  /** Current 8h-equivalent funding fraction of the buy leg; null for spot / unpublished. */
+  rightFundingRate8h: z.string().nullable().optional(),
+  /**
+   * (left − right) × 10⁴, in bps per 8h: the funding the pair collects (positive) or pays
+   * (negative) while both legs are held. Null when either leg's rate is unknown — the
+   * differential of a partially known pair is unknown, not zero.
+   */
+  fundingRateDiffBps: z.number().finite().nullable().optional(),
+});
+export type SpreadLegFunding = z.infer<typeof SpreadLegFundingSchema>;
+
 /** One ranked funding-carry opportunity on the Opportunities board. */
 export const FundingOpportunitySchema = z.object({
   asset: z.string(),
@@ -867,6 +897,7 @@ export const SpreadCombinationSchema = z.object({
   leftQuoteUpdatedAt: z.string().optional(),
   rightQuoteUpdatedAt: z.string().optional(),
   quoteAligned: z.boolean().optional(),
+  ...SpreadLegFundingSchema.shape,
   executable: z.boolean(),
 });
 export type SpreadCombination = z.infer<typeof SpreadCombinationSchema>;
@@ -894,6 +925,8 @@ export const SpreadOpportunitySchema = z.object({
   leftQuoteUpdatedAt: z.string().optional(),
   rightQuoteUpdatedAt: z.string().optional(),
   quoteAligned: z.boolean().optional(),
+  /** Current funding rate of both legs of the best combination, for judging the carry cost. */
+  ...SpreadLegFundingSchema.shape,
   executable: z.boolean(),
   ...OpportunityRowClassificationSchema.shape,
   /** Volume / open interest of the sell leg. */
@@ -971,6 +1004,8 @@ export const SpreadQualityRowSchema = z.object({
   leftQuoteUpdatedAt: z.string().optional(),
   rightQuoteUpdatedAt: z.string().optional(),
   quoteAligned: z.boolean().optional(),
+  /** Current funding rate of both legs, displayed next to the pair (see `SpreadLegFundingSchema`). */
+  ...SpreadLegFundingSchema.shape,
   ...OpportunityRowClassificationSchema.shape,
 });
 export type SpreadQualityRow = z.infer<typeof SpreadQualityRowSchema>;

@@ -103,7 +103,9 @@ import { TradingRuntime, TradingRuntimeError, unresolvedOrderDetails } from './t
 import { CrossExPrivateStream } from './private-stream.js';
 import { LivePortfolioStore, type LivePortfolioSnapshot } from './live-portfolio.js';
 import { readDatabaseStatus } from './database.js';
-import { runDatabaseMaintenance } from './database-maintenance.js';
+import { maintenanceDeletedRowCount, runDatabaseMaintenance, type DatabaseMaintenanceResult } from './database-maintenance.js';
+import { readDatabaseBackupStatus } from './database-backup.js';
+import { CACHE_RETENTION_MS } from './cache-retention.js';
 import {
   addAuditEvent,
   deleteCredentialMetadata,
@@ -1008,10 +1010,28 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
           },
   });
 
-  const maintenanceResult = runDatabaseMaintenance(database);
-  if (Object.values(maintenanceResult).some((deleted) => deleted > 0)) {
-    app.log.info(maintenanceResult, 'pruned expired local database records');
-  }
+  // Retention + monthly archive. The 24h cache window, the long operational windows and the
+  // once-per-calendar-month `VACUUM INTO` snapshot all live in one pass (database-maintenance.ts),
+  // so there is exactly one timer and one place to reason about local data growth.
+  const maintenanceOptions = {
+    backupDirectory: config.backupDirectory,
+    backupRetentionMonths: config.backupRetentionMonths,
+    logger: app.log,
+  };
+  let lastMaintenanceResult: DatabaseMaintenanceResult | null = null;
+  /** Run one maintenance pass; never throws — cleanup must not be able to stop the terminal. */
+  const runMaintenancePass = (): void => {
+    try {
+      const result = runDatabaseMaintenance(database, Date.now(), maintenanceOptions);
+      lastMaintenanceResult = result;
+      if (maintenanceDeletedRowCount(result) > 0) {
+        app.log.info(result, 'pruned expired local database records');
+      }
+    } catch (error) {
+      app.log.warn({ err: error }, 'database retention maintenance failed');
+    }
+  };
+  runMaintenancePass();
 
   await app.register(helmet, { contentSecurityPolicy: false });
   await app.register(rateLimit, { max: options.rateLimitMax ?? 120, timeWindow: '1 minute' });
@@ -1465,14 +1485,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     fundingHistoryService.startBackground();
     spreadSampler.startBackground();
     databaseMaintenanceTimer = setInterval(() => {
-      try {
-        const result = runDatabaseMaintenance(database);
-        if (Object.values(result).some((deleted) => deleted > 0)) {
-          app.log.info(result, 'pruned expired local database records');
-        }
-      } catch (error) {
-        app.log.warn({ err: error }, 'database retention maintenance failed');
-      }
+      runMaintenancePass();
     }, 24 * 60 * 60_000);
     databaseMaintenanceTimer.unref?.();
     schedulePortfolioReconciliation();
@@ -1607,6 +1620,49 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       database: databaseStatus.state,
       apiDocsRetrievedAt: API_DOCS_RETRIEVED_AT,
       connectionState: databaseStatus.state === 'ok' ? marketConnectionState === 'disconnected' ? 'healthy' : marketConnectionState : 'degraded',
+    };
+  });
+
+  /**
+   * Maintenance report (the "维护报告" that stands in for a `/api/diagnostics` route this backend
+   * does not have). Exposes the outcome of the last retention/archive pass and what the archive
+   * directory currently holds, so the operator can answer "when was the last monthly backup, which
+   * file, how big" without reading logs. See `docs/data-retention-and-backups.md`.
+   */
+  app.get('/api/maintenance/status', async () => {
+    const backups = readDatabaseBackupStatus(config.backupDirectory, config.backupRetentionMonths);
+    return {
+      cacheRetentionMs: CACHE_RETENTION_MS,
+      lastPass: lastMaintenanceResult === null
+        ? null
+        : {
+          ranAt: new Date(lastMaintenanceResult.ranAtMs).toISOString(),
+          auditEventsDeleted: lastMaintenanceResult.auditEventsDeleted,
+          strategyLogsDeleted: lastMaintenanceResult.strategyLogsDeleted,
+          fillsDeleted: lastMaintenanceResult.fillsDeleted,
+          ordersDeleted: lastMaintenanceResult.ordersDeleted,
+          portfolioEquitySamplesDeleted: lastMaintenanceResult.portfolioEquitySamplesDeleted,
+          cacheRowsDeleted: lastMaintenanceResult.cacheRowsDeleted,
+          cacheRowsDeletedByTable: lastMaintenanceResult.cacheRowsDeletedByTable,
+          backupOutcome: lastMaintenanceResult.backupOutcome,
+          backupError: lastMaintenanceResult.backupError,
+        },
+      backups: {
+        directory: backups.directory,
+        retentionMonths: backups.retentionMonths,
+        count: backups.count,
+        // Last backup: time (file mtime), file name and compressed size. Null until one exists.
+        lastBackupAt: backups.latest === null ? null : new Date(backups.latest.modifiedAtMs).toISOString(),
+        lastBackupFile: backups.latest?.fileName ?? null,
+        lastBackupBytes: backups.latest?.sizeBytes ?? null,
+        latestMonth: backups.latest?.month ?? null,
+        files: backups.files.map((file) => ({
+          month: file.month,
+          fileName: file.fileName,
+          sizeBytes: file.sizeBytes,
+          modifiedAt: new Date(file.modifiedAtMs).toISOString(),
+        })),
+      },
     };
   });
 
@@ -2892,6 +2948,12 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       // Otherwise the cached series ships now; watchers receive a kline.snapshot push when the
       // background refresh lands.
     }
+    // Nothing servable, or nothing that ever came from the venue's own REST: this symbol's venue
+    // page is unreachable (or the instrument has no venue history), so the CrossEx kline channel
+    // is the only remaining source. Keeping it subscribed lets the series fill from the same feed
+    // the quotes arrive on instead of leaving every price-difference chart permanently blank for
+    // that leg. Polling clients re-extend the subscription; an idle page lets it expire.
+    if (candles.length === 0 || !candleStore.hasVenueHistory(symbol, interval)) candleStore.keepWarm(symbol, interval);
     return {
       symbol,
       interval,

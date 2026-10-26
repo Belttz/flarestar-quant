@@ -7,6 +7,12 @@ import { recordMarketDataFailure } from './repositories.js';
 const MAX_STORED_CANDLES = 500;
 const BACKFILL_LIMIT = 300;
 const BACKFILL_TTL_MS = 30_000;
+/**
+ * How long a REST read keeps the CrossEx kline channel subscribed after asking for an empty
+ * series. Long enough for an idle chart to keep filling, short enough that closing the page
+ * releases the stream within a few minutes.
+ */
+const WARM_WATCH_TTL_MS = 5 * 60_000;
 
 interface CandleRow {
   start_time: number;
@@ -43,6 +49,13 @@ export class CandleStore {
   /** Keys whose persisted history contained a discontinuity and need one older bridge page. */
   private readonly bridgeNeeded = new Set<string>();
   private readonly prefetching = new Set<string>();
+  /**
+   * Keys kept subscribed by {@link keepWarm}, with their release handle and expiry. Only used for
+   * series that came back empty: the venue REST page is the primary history source, and the
+   * CrossEx feed is the fallback that survives a network where that venue is unreachable.
+   */
+  private readonly warmWatches = new Map<string, { release: () => void; expiresAt: number }>();
+  private warmSweepTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly backfillQueue: BackfillJob[] = [];
   private activeBackfills = 0;
 
@@ -97,6 +110,75 @@ export class CandleStore {
         if (candle.closed) this.persistCandles(symbol, interval, [candle]);
       } catch { /* a cache write must never break the stream */ }
     });
+  }
+
+  /**
+   * Keep the CrossEx kline channel subscribed for `symbol:interval` for a few minutes.
+   *
+   * Why this exists: candle history for a leg comes from that venue's own public REST. When the
+   * venue is unreachable from this network (binance / okx / bybit / kraken behind a blocked
+   * route), `refresh` fails, `marketHub.candles` stays empty forever and every price-difference
+   * chart for that leg renders "no data" no matter how long the page is open. The CrossEx public
+   * feed — the same WebSocket connection the quotes arrive on — does publish klines for those
+   * symbols, so a read that finds nothing subscribes it and lets the series fill forward. The
+   * subscription is ref-counted in the hub and released either on the next expired sweep or by
+   * {@link releaseWarmWatches}.
+   */
+  keepWarm(symbol: string, interval: CandleInterval): void {
+    const now = Date.now();
+    this.sweepWarmWatches(now);
+    const key = `${symbol}:${interval}`;
+    const existing = this.warmWatches.get(key);
+    if (existing) {
+      existing.expiresAt = now + WARM_WATCH_TTL_MS;
+      return;
+    }
+    try {
+      this.warmWatches.set(key, {
+        release: this.marketHub.watchKlines(symbol, interval),
+        expiresAt: now + WARM_WATCH_TTL_MS,
+      });
+    } catch { /* a hub that cannot stream must never fail the REST read */ }
+    this.armWarmSweep();
+  }
+
+  /** Release every warm kline watcher. Called on shutdown and by tests. */
+  releaseWarmWatches(): void {
+    if (this.warmSweepTimer !== null) clearTimeout(this.warmSweepTimer);
+    this.warmSweepTimer = null;
+    for (const [, watch] of this.warmWatches) watch.release();
+    this.warmWatches.clear();
+  }
+
+  /** Drop every watcher whose TTL elapsed; returns how many were released. */
+  private sweepWarmWatches(now: number): number {
+    let released = 0;
+    for (const [key, watch] of this.warmWatches) {
+      if (watch.expiresAt > now) continue;
+      this.warmWatches.delete(key);
+      watch.release();
+      released += 1;
+    }
+    return released;
+  }
+
+  /**
+   * Arm one sweep at the next expiry. A page that simply closes stops calling `keepWarm`, so
+   * without this timer the last subscription would outlive the tab. `unref` keeps the timer from
+   * holding the process open, matching how the rest of the backend schedules background work.
+   */
+  private armWarmSweep(): void {
+    if (this.warmSweepTimer !== null || this.warmWatches.size === 0) return;
+    const now = Date.now();
+    let nextExpiry = Number.POSITIVE_INFINITY;
+    for (const watch of this.warmWatches.values()) nextExpiry = Math.min(nextExpiry, watch.expiresAt);
+    const delay = Math.max(1_000, nextExpiry - now + 250);
+    this.warmSweepTimer = setTimeout(() => {
+      this.warmSweepTimer = null;
+      this.sweepWarmWatches(Date.now());
+      this.armWarmSweep();
+    }, delay);
+    this.warmSweepTimer.unref?.();
   }
 
   canBackfill(symbol: string): boolean {

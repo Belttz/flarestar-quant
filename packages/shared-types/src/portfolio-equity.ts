@@ -9,9 +9,14 @@ import { z } from 'zod';
  * sample series (persisted by a dedicated table) and, more importantly, fixes the equity
  * definition in one place so the backend write path and the frontend KPI never diverge.
  *
- * Scope note: equity only covers the CrossEx account (`snapshot.account.marginBalance`). Gate spot
- * balances are denominated per coin and would need a per-coin valuation, which is out of scope;
- * the UI states this explicitly.
+ * Scope note: equity is **computed by us** from the snapshot (`accountEquityOf`): the cash side of
+ * every stablecoin balance row across the CrossEx venues plus the unrealised PnL of the open
+ * futures/margin positions. It is *not* `snapshot.account.marginBalance` any more — that Gate figure
+ * subtracts the locked margin of DEX legs (HYPERLIQUID, LIGHTER, …) from cash without adding the
+ * margin back as an asset, so a fully hedged pair makes the account look half as large right after
+ * the legs open and whole again once they close. The Gate figure survives as a secondary display
+ * ("Gate basis") and as the denominator of every risk ratio, where Gate's own convention is the
+ * authoritative one.
  */
 
 /** Sampling granularity of the persisted equity series. */
@@ -26,7 +31,7 @@ export type PortfolioEquityRange = z.infer<typeof PortfolioEquityRangeSchema>;
 export const PortfolioEquityPointSchema = z.object({
   /** Epoch milliseconds at which the sample was taken. */
   time: z.number().int().nonnegative(),
-  /** Account equity in USD (`snapshot.account.marginBalance`). */
+  /** Account equity in USD (see `accountEquityOf`: stablecoin cash + position PnL). */
   equity: z.string(),
   /** Summed unrealised PnL in USD; `null` when no position rows were available. */
   unrealizedPnl: z.string().nullable(),
@@ -54,8 +59,23 @@ export interface PortfolioEquitySnapshotInput {
   account?: {
     marginBalance?: string | null;
   } | null;
+  /** Per-venue balance rows; only the stablecoin cash column is summed (see `accountEquityOf`). */
+  balances?: readonly PortfolioEquityBalanceInput[] | null;
   futuresPositions?: readonly { unrealizedPnl?: string | null }[] | null;
   marginPositions?: readonly { unrealizedPnl?: string | null }[] | null;
+}
+
+/**
+ * Structural view of one balance row, matching `PortfolioBalance` without importing it (see the
+ * circular-dependency note above). `unrealizedPnl` is accepted but intentionally unused: the
+ * account-level PnL comes from the *position* rows, which keeps the row-level and position-level
+ * PnL from ever being counted twice.
+ */
+export interface PortfolioEquityBalanceInput {
+  venue: string;
+  coin: string;
+  balance: string;
+  unrealizedPnl?: string | null;
 }
 
 /** Window length of every range in milliseconds. */
@@ -157,24 +177,99 @@ function formatScaledDecimal(scaled: bigint): string {
 }
 
 /**
+ * Coins that are worth their face value, i.e. the ones that can be summed as USD 1:1.
+ *
+ * Non-stablecoin rows are deliberately excluded: a `GATE ADA 0.9486` row means *0.9486 ADA*, not
+ * 0.95 USD, so adding it would inflate the total by the coin count (the live 2026-10-26 snapshot
+ * would have been overstated by 1.4465 from ADA + ONE + SUI alone).
+ */
+const EQUITY_QUOTE_COINS: ReadonlySet<string> = new Set(['USDT', 'USDC', 'USD']);
+
+/** Venue code of the isolated Gate spot account, which is not part of the CrossEx margin account. */
+const SPOT_VENUE = 'SPOT';
+
+/**
+ * Total account equity in USD, computed from the snapshot instead of trusting Gate.
+ *
+ * `SUM(stablecoin balance rows)` + `SUM(unrealised PnL of futures + margin positions)`, both summed
+ * as Decimal strings so the result never drifts.
+ *
+ * Why we do not use `account.marginBalance` (Gate's own figure):
+ * - Gate locks the margin of DEX legs (HYPERLIQUID's `initialMargin`, 40.4710 in the 2026-10-26
+ *   snapshot) by subtracting it from the cash of that row, and then never adds the locked margin
+ *   back as an asset. `HYPERLIQUID USDC` reported `balance 6.1625` with `upnl -0.1044` but
+ *   `equity = -34.3085`, i.e. `6.1625 - 40.4710`. The account therefore lost one leg's margin the
+ *   moment a hedged pair opened and recovered it when the pair closed — the "equity drops from 97
+ *   to 50 while a delta-neutral pair is open" symptom.
+ * - Two degradation steps in the curve confirm it: the equity series fell by -39.88 in total, which
+ *   is exactly the single-leg margin, while the real PnL over the same window was ≈ -0.09.
+ *
+ * `SUM(balances.balance) + SUM(positions.upnl)` yields 99.9128 for that snapshot, which is
+ * continuous with the 94.75 recorded before the pair opened (the difference is fees and funding),
+ * whereas Gate's `marginBalance` was 58.5366 = 99.9128 - 40.3666 (DEX double deduction) - 1.0096
+ * (small unconfirmed items, most likely the unvalued residual of the same deduction).
+ *
+ * If Gate ever fixes its side, the two numbers converge on their own and this function stays
+ * internally consistent — nothing here is tuned to Gate's current bug.
+ *
+ * Contract details:
+ * - Only `USDT` / `USDC` / `USD` rows count; other coins are quantities, not values.
+ * - `venue === 'SPOT'` rows are skipped: that is Gate's isolated spot account (see
+ *   `spotBalanceRows()` in the backend, which stamps those rows with `equity: '0'`), not cash
+ *   inside the CrossEx margin account.
+ * - Only `balance` (cash) is read, never `equity`, so a locked-margin quirk on the row level cannot
+ *   leak back in.
+ * - Unparseable / missing input returns `'0'`, matching the previous degradation semantics (the UI
+ *   renders `—`).
+ *
+ * @param balances Per-venue balance rows of the snapshot (may contain non-stablecoin and SPOT rows).
+ * @param futuresPositions Futures positions; only their `unrealizedPnl` is read.
+ * @param marginPositions Margin positions; only their `unrealizedPnl` is read.
+ * @returns The account equity as a Decimal string, never empty, never exponential notation.
+ */
+export function accountEquityOf(
+  balances: readonly PortfolioEquityBalanceInput[] | null | undefined,
+  futuresPositions: readonly { unrealizedPnl?: string | null }[] | null | undefined,
+  marginPositions: readonly { unrealizedPnl?: string | null }[] | null | undefined,
+): string {
+  const cash: Array<string | null> = [];
+  for (const row of balances ?? []) {
+    if (!row) continue;
+    if (typeof row.venue === 'string' && row.venue.trim().toUpperCase() === SPOT_VENUE) continue;
+    if (typeof row.coin !== 'string') continue;
+    if (!EQUITY_QUOTE_COINS.has(row.coin.trim().toUpperCase())) continue;
+    cash.push(typeof row.balance === 'string' ? row.balance : null);
+  }
+  const cashTotal = sumDecimalStrings(cash);
+  const positionPnl = sumDecimalStrings([
+    ...(futuresPositions ?? []).map((position) => position?.unrealizedPnl ?? null),
+    ...(marginPositions ?? []).map((position) => position?.unrealizedPnl ?? null),
+  ]);
+  // `sumDecimalStrings` skips `null` operands, so a missing cash side still yields the PnL side and
+  // two missing sides yield `null`, mapped to `'0'` below.
+  const total = sumDecimalStrings([cashTotal, positionPnl]);
+  return total ?? '0';
+}
+
+/**
  * Derive one equity sample from a portfolio snapshot.
  *
- * Equity is `snapshot.account.marginBalance` — the same number the asset page shows as the
- * "Margin balance" KPI — so the curve and the KPI can never drift apart. `unrealizedPnl` is the
- * sum over futures and margin positions and is informational only.
+ * Equity comes from `accountEquityOf` — the very same function the asset-page KPI uses — so the
+ * curve and the KPI can never drift apart. `unrealizedPnl` is the sum over futures and margin
+ * positions and is informational only.
  */
 export function portfolioEquitySampleFromSnapshot(
   snapshot: PortfolioEquitySnapshotInput | null | undefined,
   fetchedAt: string | number | Date,
 ): PortfolioEquityPoint {
-  const equity = snapshot?.account?.marginBalance ?? null;
+  const equity = accountEquityOf(snapshot?.balances, snapshot?.futuresPositions, snapshot?.marginPositions);
   const unrealizedPnl = sumDecimalStrings([
     ...(snapshot?.futuresPositions ?? []).map((position) => position?.unrealizedPnl ?? null),
     ...(snapshot?.marginPositions ?? []).map((position) => position?.unrealizedPnl ?? null),
   ]);
   return {
     time: normalizeTimestamp(fetchedAt),
-    equity: typeof equity === 'string' && equity.trim().length > 0 ? equity.trim() : '0',
+    equity: equity.trim().length > 0 ? equity.trim() : '0',
     unrealizedPnl,
   };
 }

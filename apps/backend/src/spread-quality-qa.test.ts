@@ -364,6 +364,9 @@ function scoreInput(
     halfLifeHours: 0.25,
     holdingCostBps: 1,
     bookDepthUsdt: 1000,
+    leftFundingRate8h: null,
+    rightFundingRate8h: null,
+    fundingRateDiffBps: null,
     source: 'candles',
     ...overrides,
   };

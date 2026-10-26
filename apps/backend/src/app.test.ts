@@ -10,6 +10,7 @@ import { PublicMarketDataError, type FundingStatVenue, type PublicMarketDataGate
 import type { CrossExTransferRequest, FundingOverviewResponse, MarketSnapshot, OpportunityResponse, PublicMarketSnapshot } from '@gate-crossex/shared-types';
 import type { Candle, CandleInterval } from '@gate-crossex/shared-types';
 import { SpreadQualityResponseSchema } from '@gate-crossex/shared-types';
+import { OpportunityResponseSchema } from '@gate-crossex/shared-types';
 import { buildApp } from './app.js';
 import { loadConfig } from './config.js';
 import { DEFAULT_CREDENTIAL_PROFILE, EnvFileCredentialVault, MemoryCredentialVault, type CredentialVault, type GateCredentials } from './credential-vault.js';
@@ -2014,6 +2015,77 @@ describe('local backend', () => {
     expect((await app.inject({ method: 'GET', url: '/api/opportunities?minApr=abc', headers })).statusCode).toBe(400);
   });
 
+  it('attaches both legs\' current funding rate to the spread board', async () => {
+    const { app, gateway } = await createTestApp();
+    gateway.extraSymbols = [
+      catalogSymbol('GATE_FUTURE_BTC_USDT', 'GATE'),
+      { ...catalogSymbol('GATE_SPOT_BTC_USDT', 'GATE'), business_type: 'SPOT' },
+    ];
+    const headers = { host: '127.0.0.1:17840' };
+    // `funding=1` awaits the venue funding sweep, so the spread rows are built on warm rates.
+    // Two venues only, so the asset's single USDT pair is deterministic: BINANCE sells (higher
+    // seeded price), GATE buys — and both publish a rate (0.0001 and 0.00013 per 8h).
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/opportunities?funding=1&spread=1&asset=BTC&venues=GATE,BINANCE',
+      headers,
+    });
+    expect(response.statusCode).toBe(200);
+    const body = OpportunityResponseSchema.parse(response.json());
+    expect(body.spread).toHaveLength(1);
+    const row = body.spread[0]!;
+    expect(row.leftSymbol).toBe('BINANCE_FUTURE_BTC_USDT');
+    expect(row.rightSymbol).toBe('GATE_FUTURE_BTC_USDT');
+    // The 8h-equivalent fractions the venues published, attached verbatim.
+    expect(row.leftFundingRate8h).toBe('0.0001');
+    expect(row.rightFundingRate8h).toBe('0.00013');
+    // (0.0001 − 0.00013) × 10⁴: the pair pays 0.3 bps per 8h while both legs are held.
+    expect(row.fundingRateDiffBps).toBeCloseTo(-0.3, 9);
+    // The expanded detail rows carry their own combination's legs, not the parent's.
+    expect(row.combinations.length).toBeGreaterThan(0);
+    for (const combination of row.combinations) {
+      const expectedLeft = combination.leftSymbol === 'BINANCE_FUTURE_BTC_USDT' ? '0.0001'
+        : combination.leftSymbol === 'GATE_FUTURE_BTC_USDT' ? '0.00013'
+          : null;
+      const expectedRight = combination.rightSymbol === 'BINANCE_FUTURE_BTC_USDT' ? '0.0001'
+        : combination.rightSymbol === 'GATE_FUTURE_BTC_USDT' ? '0.00013'
+          : null;
+      expect(combination.leftFundingRate8h).toBe(expectedLeft);
+      expect(combination.rightFundingRate8h).toBe(expectedRight);
+      if (expectedLeft === null || expectedRight === null) {
+        expect(combination.fundingRateDiffBps).toBeNull();
+      } else {
+        expect(combination.fundingRateDiffBps).toBeCloseTo((Number(expectedLeft) - Number(expectedRight)) * 10_000, 9);
+      }
+    }
+  });
+
+  it('reports a missing leg funding rate as null instead of zero', async () => {
+    const { app, publicMarketGateway } = await createTestApp();
+    // SIREN has quotes but no venue funding row, and the spot leg never pays funding at all:
+    // both legs must read null — a fabricated 0 would price the carry of this pair as free.
+    publicMarketGateway.bookTickers = [
+      { venue: 'GATE', business: 'FUTURE', base: 'SIREN', quote: 'USDT', bidPrice: '0.120', askPrice: '0.121', lastPrice: '0.1205' },
+      { venue: 'BYBIT', business: 'FUTURE', base: 'SIREN', quote: 'USDT', bidPrice: '0.125', askPrice: '0.126', lastPrice: null },
+      { venue: 'GATE', business: 'SPOT', base: 'SIREN', quote: 'USDT', bidPrice: '0.1192', askPrice: '0.1194', lastPrice: '0.1193' },
+    ];
+    const headers = { host: '127.0.0.1:17840' };
+    const response = await app.inject({ method: 'GET', url: '/api/opportunities?spread=1&asset=SIREN', headers });
+    expect(response.statusCode).toBe(200);
+    const body = OpportunityResponseSchema.parse(response.json());
+    const row = body.spread.find((entry) => entry.asset === 'SIREN');
+    expect(row).toBeDefined();
+    // The best orientation of this fixture sells the perpetual against the Gate spot leg.
+    expect(row?.pairType).toBe('SPOT_PERP');
+    expect(row?.rightSymbol).toBe('GATE_SPOT_SIREN_USDT');
+    expect(row?.leftFundingRate8h).toBeNull();
+    expect(row?.rightFundingRate8h).toBeNull();
+    expect(row?.fundingRateDiffBps).toBeNull();
+    // The fields are present as `null` — the response never omits them, it reports "unknown".
+    expect(row !== undefined && 'leftFundingRate8h' in row).toBe(true);
+    expect(row !== undefined && 'fundingRateDiffBps' in row).toBe(true);
+  });
+
   it('marks funding opportunities without a connected Gate spot leg as not executable', async () => {
     const { app, gateway } = await createTestApp();
     gateway.extraSymbols = [catalogSymbol('GATE_FUTURE_BTC_USDT', 'GATE')];
@@ -2714,6 +2786,8 @@ describe('local backend', () => {
     const dayBucket = Math.floor(sampledAt / 86_400_000) * 86_400_000;
     recordPortfolioEquitySample(database, {
       account: { marginBalance: '1500' },
+      // Equity is our own sum: 1480 of stablecoin cash + 120 of position uPnL = 1600.
+      balances: [{ venue: 'BINANCE', coin: 'USDT', balance: '1480', unrealizedPnl: '0' }],
       futuresPositions: [{ unrealizedPnl: '20' }],
       marginPositions: [{ unrealizedPnl: '100' }],
     }, sampledAt);
@@ -2723,7 +2797,7 @@ describe('local backend', () => {
     expect(day.json()).toEqual({
       range: '24h',
       granularity: 'raw',
-      points: [{ time: sampledAt, equity: '1500', unrealizedPnl: '120' }],
+      points: [{ time: sampledAt, equity: '1600', unrealizedPnl: '120' }],
       firstSampleAt: new Date(dayBucket).toISOString(),
       fetchedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
     });
@@ -2734,7 +2808,7 @@ describe('local backend', () => {
     expect(all.json()).toMatchObject({
       range: 'all',
       granularity: 'day',
-      points: [{ time: dayBucket, equity: '1500', unrealizedPnl: '120' }],
+      points: [{ time: dayBucket, equity: '1600', unrealizedPnl: '120' }],
     });
   });
 
@@ -2747,8 +2821,9 @@ describe('local backend', () => {
     });
     expect(refresh.statusCode).toBe(200);
 
-    // Equity is the snapshot's marginBalance (1500), matching the asset-page KPI; the
-    // unrealized PnL sums the fixture's futures (20) and margin (100) positions.
+    // Equity is computed by us: the fixture's stablecoin cash (BINANCE 1000 + GATE 480 = 1480)
+    // plus the futures (20) and margin (100) position uPnL = 1600. It is deliberately *not* the
+    // account's marginBalance (1500), which drops DEX-leg margin from cash without adding it back.
     const curve = await app.inject({
       method: 'GET', url: '/api/crossex/portfolio-equity?range=24h',
       headers: { host: '127.0.0.1:17840', 'x-gct-read-intent': 'portfolio-equity' },
@@ -2757,7 +2832,7 @@ describe('local backend', () => {
     expect(curve.json()).toMatchObject({
       range: '24h',
       granularity: 'raw',
-      points: [{ time: expect.any(Number), equity: '1500', unrealizedPnl: '120' }],
+      points: [{ time: expect.any(Number), equity: '1600', unrealizedPnl: '120' }],
     });
     expect(curve.json().firstSampleAt).not.toBeNull();
   });

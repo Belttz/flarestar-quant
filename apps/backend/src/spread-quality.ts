@@ -10,6 +10,7 @@ import type {
   SpreadQualityRow,
 } from '@gate-crossex/shared-types';
 import type { LiveMarket } from './market-hub.js';
+import { fundingRateDiffBps } from './leg-funding-rates.js';
 import type {
   OpportunityCatalogView,
   OpportunityFundingView,
@@ -307,6 +308,12 @@ export interface SpreadQualityScoreInput {
   halfLifeHours: number | null;
   holdingCostBps: number | null;
   bookDepthUsdt: number;
+  /** Current 8h-equivalent funding fraction of the sell leg; null for spot / unpublished. */
+  leftFundingRate8h: string | null;
+  /** Current 8h-equivalent funding fraction of the buy leg; null for spot / unpublished. */
+  rightFundingRate8h: string | null;
+  /** (left − right) × 10⁴ bps per 8h; null when either leg's rate is unknown. */
+  fundingRateDiffBps: number | null;
   /** Which track rebuilt the series: 24h candles or the local 30s sample store. */
   source: SpreadQualityRow['source'];
 }
@@ -364,6 +371,11 @@ export function scoreSpreadQualityInputs(inputs: readonly SpreadQualityScoreInpu
     halfLifeHours: input.halfLifeHours,
     holdingCostBps: input.holdingCostBps,
     bookDepthUsdt: Number.isFinite(input.bookDepthUsdt) ? input.bookDepthUsdt : 0,
+    // The legs' current funding rates ride along untouched — the scoring layer never rewrites a
+    // measurement, and a null here means "the venue publishes none", not "free".
+    leftFundingRate8h: input.leftFundingRate8h,
+    rightFundingRate8h: input.rightFundingRate8h,
+    fundingRateDiffBps: input.fundingRateDiffBps,
     score: 100 * (
       FACTOR_WEIGHTS.netMean * percentileNetMean[index]!
       + FACTOR_WEIGHTS.volatility * percentileVolatility[index]!
@@ -606,7 +618,7 @@ export function selectSpreadQualityCandidates(
 }
 
 /** Funding rate per perpetual symbol, keyed by canonical asset then CrossEx symbol. */
-type FundingRateIndex = ReadonlyMap<string, ReadonlyMap<string, { rate: number; intervalHours: number }>>;
+type FundingRateIndex = ReadonlyMap<string, ReadonlyMap<string, { rate: number; intervalHours: number; rate8h: string }>>;
 
 /**
  * Spread-quality board behind GET /api/opportunities/spread-quality.
@@ -908,6 +920,9 @@ export class SpreadQualityService {
     const statistics = computeSpreadStatistics(series, minutesPerPoint);
     if (statistics.mean === null) return null;
     const holdingHours = statistics.halfLifeHours ?? DEFAULT_HOLDING_HOURS;
+    // Both legs' current funding rate, read from the index this computation already built.
+    const leftFundingRate8h = legFundingRate8h(fundingIndex, candidate.asset, combination.leftSymbol);
+    const rightFundingRate8h = legFundingRate8h(fundingIndex, candidate.asset, combination.rightSymbol);
     return {
       pairType: candidate.pairType,
       asset: candidate.asset,
@@ -931,6 +946,9 @@ export class SpreadQualityService {
       halfLifeHours: statistics.halfLifeHours,
       holdingCostBps: holdingCostBpsFor(candidate, fundingIndex, holdingHours),
       bookDepthUsdt,
+      leftFundingRate8h,
+      rightFundingRate8h,
+      fundingRateDiffBps: fundingRateDiffBps(leftFundingRate8h, rightFundingRate8h),
       source,
     };
   }
@@ -1019,18 +1037,31 @@ function holdingCostBpsFor(
 
 /** Index the funding overview by canonical asset and CrossEx symbol, dropping unknown rows. */
 function buildFundingRateIndex(overview: FundingOverviewResponse): FundingRateIndex {
-  const index = new Map<string, Map<string, { rate: number; intervalHours: number }>>();
+  const index = new Map<string, Map<string, { rate: number; intervalHours: number; rate8h: string }>>();
   for (const asset of overview.assets) {
-    const bySymbol = new Map<string, { rate: number; intervalHours: number }>();
+    const bySymbol = new Map<string, { rate: number; intervalHours: number; rate8h: string }>();
     for (const venue of asset.venues) {
       if (venue.fundingRate === null || venue.fundingIntervalHours === null) continue;
       const rate = Number(venue.fundingRate);
       if (!Number.isFinite(rate) || venue.fundingIntervalHours <= 0) continue;
-      bySymbol.set(venue.symbol, { rate, intervalHours: venue.fundingIntervalHours });
+      // The row's own 8h-equivalent rides along so the current-rate column and the holding-cost
+      // factor read exactly the same number the funding board shows.
+      if (venue.fundingRate8h === null || !Number.isFinite(Number(venue.fundingRate8h))) continue;
+      bySymbol.set(venue.symbol, { rate, intervalHours: venue.fundingIntervalHours, rate8h: venue.fundingRate8h });
     }
     index.set(asset.asset, bySymbol);
   }
   return index;
+}
+
+/**
+ * One leg's current 8h-equivalent funding fraction as the venue published it, or null.
+ * A spot leg (`_SPOT_`) never matches the perpetual shape and never pays funding; a perpetual
+ * the sweep does not know yields null too — never zero, which would read as free carry.
+ */
+function legFundingRate8h(index: FundingRateIndex, asset: string, symbol: string): string | null {
+  if (!CROSSEX_FUTURE_SYMBOL.test(symbol)) return null;
+  return index.get(asset)?.get(symbol)?.rate8h ?? null;
 }
 
 /** |funding rate| converted to bps per hour, or null when the venue row is unknown. */

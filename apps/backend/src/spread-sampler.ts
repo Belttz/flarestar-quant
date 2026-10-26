@@ -1,6 +1,7 @@
 import type Database from 'better-sqlite3';
 import type { SpreadOpportunity } from '@gate-crossex/shared-types';
 import { pruneSpreadSamples, recordSpreadSamples, type SpreadSampleRow } from './repositories.js';
+import { SPREAD_SAMPLE_RETENTION_MS } from './cache-retention.js';
 import {
   MAX_SPREAD_QUALITY_CANDIDATES,
   SPREAD_SAMPLE_INTERVAL_MS,
@@ -10,8 +11,13 @@ import {
   type SpreadQualityMarketHubView,
 } from './spread-quality.js';
 
-/** Samples are kept for three days: the board only ever reads the newest 24h window. */
-const DEFAULT_RETENTION_MS = 72 * 60 * 60_000;
+/**
+ * Samples only back the newest 24h window the quality board reads, so they follow the shared cache
+ * retention (24h plus the documented span grace) instead of keeping a private multi-day archive —
+ * see `cache-retention.ts` for why the 24h window needs a small grace. The daily maintenance pass
+ * enforces the same number, so there is exactly one retention story for this table.
+ */
+const DEFAULT_RETENTION_MS = SPREAD_SAMPLE_RETENTION_MS;
 /** Pruning is a bulk DELETE, so once an hour is often enough to bound the table. */
 const DEFAULT_PRUNE_INTERVAL_MS = 60 * 60_000;
 

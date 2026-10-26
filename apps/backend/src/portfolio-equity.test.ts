@@ -39,12 +39,29 @@ const SAMPLE_AT_MS = Date.parse('2026-07-01T03:24:15.678Z');
 const SAMPLE_DAY_BUCKET = Date.parse('2026-07-01T00:00:00.000Z');
 const SAMPLE_HOUR_BUCKET = Date.parse('2026-07-01T03:00:00.000Z');
 
-function sampleInput(marginBalance = '1500') {
+/**
+ * Snapshot fixture for the sampler.
+ *
+ * Equity is **not** `account.marginBalance` (kept at a constant 1500 on purpose, so a wrong
+ * implementation is visible): it is `SUM(stablecoin balance rows) + SUM(position uPnL)` =
+ * `balance + 120`. Pass the desired stablecoin cash to shift the expected equity by the same amount.
+ */
+function sampleInput(balance = '1480') {
   return {
-    account: { marginBalance },
+    account: { marginBalance: '1500' },
+    balances: [
+      { venue: 'BINANCE', coin: 'USDT', balance, unrealizedPnl: '0' },
+      // Coin quantity, not dollars: excluded from equity.
+      { venue: 'GATE', coin: 'ADA', balance: '0.9486', unrealizedPnl: '0' },
+    ],
     futuresPositions: [{ unrealizedPnl: '20' }, { unrealizedPnl: null }],
     marginPositions: [{ unrealizedPnl: '100' }],
   };
+}
+
+/** Equity the sampler must persist for a `sampleInput(balance)` snapshot (cash + 20 + 100). */
+function expectedEquity(balance: string): string {
+  return String(Number(balance) + 120);
 }
 
 function sampleRows(database: Database.Database): Array<{ granularity: string; bucket_start: number; equity: string; unrealized_pnl: string | null }> {
@@ -97,11 +114,13 @@ describe('portfolio equity samples', () => {
     try {
       const result = recordPortfolioEquitySample(database, sampleInput(), SAMPLE_AT_MS);
       expect(result).toEqual({ recorded: true, sampledAtMs: SAMPLE_AT_MS });
+      // 1480 of USDT cash + 120 of position PnL, not the 1500 marginBalance.
       expect(sampleRows(database)).toEqual([
-        { granularity: 'day', bucket_start: SAMPLE_DAY_BUCKET, equity: '1500', unrealized_pnl: '120' },
-        { granularity: 'hour', bucket_start: SAMPLE_HOUR_BUCKET, equity: '1500', unrealized_pnl: '120' },
-        { granularity: 'raw', bucket_start: SAMPLE_AT_MS, equity: '1500', unrealized_pnl: '120' },
+        { granularity: 'day', bucket_start: SAMPLE_DAY_BUCKET, equity: expectedEquity('1480'), unrealized_pnl: '120' },
+        { granularity: 'hour', bucket_start: SAMPLE_HOUR_BUCKET, equity: expectedEquity('1480'), unrealized_pnl: '120' },
+        { granularity: 'raw', bucket_start: SAMPLE_AT_MS, equity: expectedEquity('1480'), unrealized_pnl: '120' },
       ]);
+      expect(expectedEquity('1480')).toBe('1600');
     } finally {
       database.close();
     }
@@ -110,12 +129,12 @@ describe('portfolio equity samples', () => {
   it('overwrites hour and day buckets with the newest sample while raw keeps every point', () => {
     const database = openTestDatabase();
     try {
-      recordPortfolioEquitySample(database, sampleInput('1500'), SAMPLE_AT_MS);
-      recordPortfolioEquitySample(database, sampleInput('1510'), SAMPLE_AT_MS + 20 * 60_000);
+      recordPortfolioEquitySample(database, sampleInput('1480'), SAMPLE_AT_MS);
+      recordPortfolioEquitySample(database, sampleInput('1490'), SAMPLE_AT_MS + 20 * 60_000);
       const rows = sampleRows(database);
       expect(rows.filter((row) => row.granularity === 'raw')).toHaveLength(2);
       expect(rows.filter((row) => row.granularity === 'hour')).toEqual([
-        { granularity: 'hour', bucket_start: SAMPLE_HOUR_BUCKET, equity: '1510', unrealized_pnl: '120' },
+        { granularity: 'hour', bucket_start: SAMPLE_HOUR_BUCKET, equity: expectedEquity('1490'), unrealized_pnl: '120' },
       ]);
     } finally {
       database.close();
@@ -155,24 +174,24 @@ describe('portfolio equity samples', () => {
   it('reads a series filtered by the window start, oldest first', () => {
     const database = openTestDatabase();
     try {
-      recordPortfolioEquitySample(database, sampleInput('1500'), SAMPLE_AT_MS);
-      recordPortfolioEquitySample(database, sampleInput('1510'), SAMPLE_AT_MS + 61_000);
-      recordPortfolioEquitySample(database, sampleInput('1520'), SAMPLE_AT_MS + 122_000);
+      recordPortfolioEquitySample(database, sampleInput('1480'), SAMPLE_AT_MS);
+      recordPortfolioEquitySample(database, sampleInput('1490'), SAMPLE_AT_MS + 61_000);
+      recordPortfolioEquitySample(database, sampleInput('1500'), SAMPLE_AT_MS + 122_000);
       const series = readPortfolioEquitySeries(database, 'raw', SAMPLE_AT_MS + 61_000);
       expect(series).toEqual([
-        { time: SAMPLE_AT_MS + 61_000, equity: '1510', unrealizedPnl: '120' },
-        { time: SAMPLE_AT_MS + 122_000, equity: '1520', unrealizedPnl: '120' },
+        { time: SAMPLE_AT_MS + 61_000, equity: expectedEquity('1490'), unrealizedPnl: '120' },
+        { time: SAMPLE_AT_MS + 122_000, equity: expectedEquity('1500'), unrealizedPnl: '120' },
       ]);
       // An unusable window start clamps to 0, i.e. everything ever sampled.
       expect(readPortfolioEquitySeries(database, 'raw', Number.NaN)).toEqual([
-        { time: SAMPLE_AT_MS, equity: '1500', unrealizedPnl: '120' },
-        { time: SAMPLE_AT_MS + 61_000, equity: '1510', unrealizedPnl: '120' },
-        { time: SAMPLE_AT_MS + 122_000, equity: '1520', unrealizedPnl: '120' },
+        { time: SAMPLE_AT_MS, equity: expectedEquity('1480'), unrealizedPnl: '120' },
+        { time: SAMPLE_AT_MS + 61_000, equity: expectedEquity('1490'), unrealizedPnl: '120' },
+        { time: SAMPLE_AT_MS + 122_000, equity: expectedEquity('1500'), unrealizedPnl: '120' },
       ]);
       // The day bucket (UTC midnight) sits before the raw timestamps, so the window must
       // start at the bucket itself for it to be included.
       expect(readPortfolioEquitySeries(database, 'day', SAMPLE_DAY_BUCKET)).toEqual([
-        { time: SAMPLE_DAY_BUCKET, equity: '1520', unrealizedPnl: '120' },
+        { time: SAMPLE_DAY_BUCKET, equity: expectedEquity('1500'), unrealizedPnl: '120' },
       ]);
     } finally {
       database.close();

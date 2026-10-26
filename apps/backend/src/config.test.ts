@@ -159,3 +159,26 @@ describe('loadConfig bootstrap credentials', () => {
     expect(config.authUsername).toBe('ops');
   });
 });
+
+describe('loadConfig monthly backup knobs', () => {
+  it('defaults to <dataDir>/backups and 12 monthly archives', () => {
+    const config = loadConfig(env());
+    expect(config.backupDirectory).toBe('/tmp/gate-crossex-config-test/backups');
+    expect(config.backupRetentionMonths).toBe(12);
+  });
+
+  it('honours GCT_BACKUP_DIR and GCT_BACKUP_RETENTION_MONTHS', () => {
+    const config = loadConfig(env({ GCT_BACKUP_DIR: '/srv/archives', GCT_BACKUP_RETENTION_MONTHS: '24' }));
+    expect(config.backupDirectory).toBe('/srv/archives');
+    expect(config.backupRetentionMonths).toBe(24);
+  });
+
+  it('rejects nonsense retention counts loudly instead of archiving forever', () => {
+    for (const value of ['0', '-3', '1.5', 'abc', '500']) {
+      expect(() => loadConfig(env({ GCT_BACKUP_RETENTION_MONTHS: value })))
+        .toThrow(/GCT_BACKUP_RETENTION_MONTHS/);
+    }
+    // An empty value means "not configured" and falls back to the default.
+    expect(loadConfig(env({ GCT_BACKUP_RETENTION_MONTHS: '  ' })).backupRetentionMonths).toBe(12);
+  });
+});

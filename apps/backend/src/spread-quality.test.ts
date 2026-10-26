@@ -292,6 +292,9 @@ function scoreInput(
     halfLifeHours: 0.25,
     holdingCostBps: 1,
     bookDepthUsdt: 1000,
+    leftFundingRate8h: null,
+    rightFundingRate8h: null,
+    fundingRateDiffBps: null,
     source: 'candles',
     ...overrides,
   };
@@ -502,6 +505,26 @@ describe('spread quality composite score', () => {
       sampleCount: 288, source: 'candles', updatedAt: EPOCH,
       assetClass: 'TOKEN', assetSuperClass: 'CRYPTO', variantSuffix: null, isPreIpo: false,
     });
+  });
+
+  it('carries the legs\' current funding rates through untouched, nulls included', () => {
+    const rows = scoreSpreadQualityInputs([
+      scoreInput({
+        asset: 'A', leftSymbol: 'GATE_FUTURE_A_USDT', rightSymbol: 'BYBIT_FUTURE_A_USDT',
+        leftFundingRate8h: '0.0001', rightFundingRate8h: '-0.00005', fundingRateDiffBps: 1.5,
+      }),
+      scoreInput({
+        asset: 'B', leftSymbol: 'GATE_SPOT_B_USDT', rightSymbol: 'BYBIT_FUTURE_B_USDT',
+        // A spot leg has no funding at all, so neither the rate nor the differential is known.
+        leftFundingRate8h: null, rightFundingRate8h: null, fundingRateDiffBps: null,
+      }),
+    ]);
+    const known = rows.find((row) => row.asset === 'A');
+    expect(known).toMatchObject({ leftFundingRate8h: '0.0001', rightFundingRate8h: '-0.00005', fundingRateDiffBps: 1.5 });
+    const unknown = rows.find((row) => row.asset === 'B');
+    expect(unknown?.leftFundingRate8h).toBeNull();
+    expect(unknown?.rightFundingRate8h).toBeNull();
+    expect(unknown?.fundingRateDiffBps).toBeNull();
   });
 
   it('scores a lone candidate at the neutral midpoint', () => {

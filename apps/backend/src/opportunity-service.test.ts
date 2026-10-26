@@ -180,8 +180,44 @@ describe('opportunity service', () => {
     });
     await service.list(CATALOG, { funding: true, spread: false, limit: 50 });
     expect(ensureFreshCalls()).toBe(1);
+    // The spread board never *awaits* the sweep (see the next test) — it only asks for one, so the
+    // legs' funding rates are warm by the next refresh.
     await service.list(CATALOG, { funding: false, spread: true, limit: 50 });
-    expect(ensureFreshCalls()).toBe(1);
+    expect(ensureFreshCalls()).toBe(2);
+  });
+
+  it('never blocks the spread board on a cold funding sweep', async () => {
+    const hub = new FakeHub([
+      liveMarket({ symbol: 'GATE_FUTURE_BTC_USDT', venue: 'GATE', asset: 'BTC' }),
+      liveMarket({ symbol: 'BINANCE_FUTURE_BTC_USDT', venue: 'BINANCE', asset: 'BTC' }),
+    ]);
+    let finishSweep!: () => void;
+    const sweep = new Promise<void>((resolve) => { finishSweep = resolve; });
+    let calls = 0;
+    let warmed = false;
+    const service = new OpportunityService({
+      fundingOverview: {
+        ensureFresh: async () => { calls += 1; await sweep; warmed = true; },
+        // Before the sweep lands the venues have published nothing — exactly what a cold start
+        // looks like, and the reason the rates must read null rather than 0.
+        buildResponse: () => overviewResponse(warmed
+          ? [{ asset: 'BTC', venue: 'GATE', symbol: 'GATE_FUTURE_BTC_USDT', rate8h: '0.0001' }]
+          : []),
+      },
+      hub,
+      spreadMarkets: async () => hub.snapshot().markets,
+      spotSymbolsByAsset: () => new Map(),
+    }, { now: () => Date.parse(EPOCH) });
+
+    // The request resolves while the sweep is still in flight: the funding column is a bonus
+    // reading, never a gate on the board.
+    const board = await service.list(CATALOG, { funding: false, spread: true, limit: 50 });
+    expect(calls).toBe(1);
+    expect(board.spread.length).toBeGreaterThan(0);
+    expect(board.spread[0]?.leftFundingRate8h ?? null).toBeNull();
+    expect(board.spread[0]?.rightFundingRate8h ?? null).toBeNull();
+    expect(board.spread[0]?.fundingRateDiffBps ?? null).toBeNull();
+    finishSweep();
   });
 
   it('resolves the GATE spot leg: registered candidates win, others register within budget', async () => {
