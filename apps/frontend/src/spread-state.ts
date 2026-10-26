@@ -1,5 +1,5 @@
 import type { LiveMarket, MarketBookDepth } from './api.js';
-import { SPREAD_QUOTE_MAX_SKEW_MS, STRATEGY_FUTURE_QUOTE_TOLERANCE_MS, STRATEGY_MARKET_FRESHNESS_MS } from './market-freshness.js';
+import { quoteLocalReceivedAt, SPREAD_QUOTE_MAX_SKEW_MS, STRATEGY_FUTURE_QUOTE_TOLERANCE_MS, STRATEGY_MARKET_FRESHNESS_MS, type QuoteTimestamps } from './market-freshness.js';
 
 /**
  * Three-state quote/spread model shared by every price-difference surface.
@@ -43,7 +43,7 @@ export interface LegQuote {
   price: number | null;
   bid: number | null;
   ask: number | null;
-  /** Source timestamp of the quote that produced `price`, in epoch ms. */
+  /** Local arrival time of the quote that produced `price`, in epoch ms. */
   quotedAtMs: number | null;
   /** `now − quotedAtMs`; `null` when the quote carries no usable timestamp. */
   ageMs: number | null;
@@ -55,7 +55,7 @@ export interface LegQuoteInput {
    * The streamed record for this leg, straight from the market snapshot. Its `source` must be
    * `gate_crossex_websocket`: seeded/placeholder rows carry invented prices and are never quotes.
    */
-  market?: Pick<LiveMarket, 'source' | 'bidPrice' | 'askPrice' | 'quoteUpdatedAt'> | null;
+  market?: (Pick<LiveMarket, 'source' | 'bidPrice' | 'askPrice'> & QuoteTimestamps) | null;
   /**
    * Top-of-book read from `GET /api/markets/books`. Same hub record as `market` (see
    * `LegQuoteSource['books-top']`), consumed here when the page's stream carries no usable price
@@ -72,6 +72,12 @@ export interface LegQuoteOptions {
   maxAgeMs?: number;
   /** Future-timestamp tolerance, mirroring the freshness gate's clock-skew allowance. */
   futureToleranceMs?: number;
+  /**
+   * Local time the `/api/markets/books` response was produced. That endpoint only carries venue
+   * event times, so without this the `books-top` fallback would date the quote on the venue's
+   * clock and could not be compared with a streamed leg on ours.
+   */
+  topOfBookReceivedAt?: number | null;
 }
 
 /** A finite, strictly positive number, or `null`. Never fabricates a zero. */
@@ -122,10 +128,14 @@ export function resolveLegQuote(
 
   const market = input.market ?? null;
   if (market && market.source === 'gate_crossex_websocket') {
+    // Age and cross-leg skew are measured on the local clock. `quoteUpdatedAt` is the venue's own
+    // event time: two venues whose clocks differ by seconds would look unaligned forever, which is
+    // precisely the "some exchanges never show a spread" report. The helper falls back to
+    // `quoteUpdatedAt` for records produced before `quoteReceivedAt` existed.
     const streamQuote = quoteFrom(
       usablePrice(market.bidPrice),
       usablePrice(market.askPrice),
-      usableTimestamp(market.quoteUpdatedAt),
+      quoteLocalReceivedAt(market),
       'stream',
       side,
       now,
@@ -137,10 +147,13 @@ export function resolveLegQuote(
 
   const topOfBook = input.topOfBook ?? null;
   if (topOfBook) {
+    // The depth endpoint only reports venue event times, so the caller supplies the moment the
+    // response was produced (a local upper bound for when this quote existed). Without it we keep
+    // the venue timestamp — the pre-existing behaviour — rather than pretending to know.
     const fallbackQuote = quoteFrom(
       usablePrice(topOfBook.bestBid),
       usablePrice(topOfBook.bestAsk),
-      usableTimestamp(topOfBook.updatedAt),
+      options.topOfBookReceivedAt ?? usableTimestamp(topOfBook.updatedAt),
       'books-top',
       side,
       now,
@@ -173,7 +186,7 @@ export interface SpreadReadout {
   /** Display price per leg: the live value, or the last known one while stale. */
   sellPrice: number | null;
   buyPrice: number | null;
-  /** Absolute leg-to-leg quote-age difference when both legs are timestamped. */
+  /** Absolute leg-to-leg difference of the two quotes' local arrival times, when both are dated. */
   skewMs: number | null;
   /** Translations key the UI renders next to the number. */
   messageKey: string;
@@ -189,9 +202,12 @@ export interface SpreadInput {
 
 /**
  * Combine the two legs into one readout. The bps figure is produced **only** when both legs are
- * live and their quote timestamps sit inside the shared skew budget — the same yardstick the
- * strategy engine's `freshMarketPair` gate uses. Anything else returns a named non-live status so
- * the UI can say *why* instead of printing a spread that never existed.
+ * live and their local arrival times sit inside the shared skew budget. Anything else returns a
+ * named non-live status so the UI can say *why* instead of printing a spread that never existed.
+ *
+ * The skew is measured on our clock (`LegQuote.quotedAtMs` is a local arrival time), never by
+ * subtracting two venues' own timestamps: an exchange clock a few seconds off would otherwise put
+ * every pair it trades into the "unaligned" bucket permanently.
  */
 export function buildSpreadReadout(input: SpreadInput): SpreadReadout {
   const maxSkewMs = input.maxSkewMs ?? SPREAD_QUOTE_MAX_SKEW_MS;

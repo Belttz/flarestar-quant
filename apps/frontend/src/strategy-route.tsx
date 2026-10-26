@@ -1035,6 +1035,11 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
     ? { bid: rightBookRecord.bidDepthUsdt, ask: rightBookRecord.askDepthUsdt, source: rightBookRecord.source }
     : null, [rightBookRecord]);
   const makerLegPinnedRef = useRef(query.get('makerLeg') !== null);
+  // Local time the current `legBookDepths` snapshot was produced. The depth endpoint only reports
+  // venue event times, so this is what lets a `books-top` quote be dated on our clock and compared
+  // against a streamed leg instead of against another venue's clock.
+  const legBookFetchedAtRef = useRef<number | null>(null);
+  const [legBookFetchedAt, setLegBookFetchedAt] = useState<number | null>(null);
   useEffect(() => {
     const symbols = [leftHistorySymbol, rightHistorySymbol].filter((symbol) => symbol.trim() !== '');
     if (symbols.length < 2 || symbols[0] === symbols[1]) return;
@@ -1042,6 +1047,11 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
     const load = () => {
       api.marketBooks(symbols).then((response) => {
         if (cancelled) return;
+        const fetchedAt = Date.parse(response.fetchedAt);
+        if (Number.isFinite(fetchedAt)) {
+          legBookFetchedAtRef.current = fetchedAt;
+          setLegBookFetchedAt(fetchedAt);
+        }
         setLegBookDepths((current) => {
           const next = { ...current };
           for (const book of response.books) {
@@ -1135,12 +1145,12 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const leftQuote = resolveLegQuote(
     { market: leftLive, topOfBook: leftBookRecord },
     directionFlipped ? 'ask' : 'bid',
-    { now: quotesNow },
+    { now: quotesNow, topOfBookReceivedAt: legBookFetchedAt },
   );
   const rightQuote = resolveLegQuote(
     { market: rightLive, topOfBook: rightBookRecord },
     directionFlipped ? 'bid' : 'ask',
-    { now: quotesNow },
+    { now: quotesNow, topOfBookReceivedAt: legBookFetchedAt },
   );
   const spreadReadout = buildSpreadReadout({
     sell: directionFlipped ? rightQuote : leftQuote,
@@ -1910,9 +1920,11 @@ export function CarryStrategyView({ marketSnapshot, catalog, strategies, balance
   // freshMarketPair gate; unaligned legs read "—" rather than a spread that never existed.
   // `assessSpreadQuoteAlignment` returns a verdict *object*, so the decision must read `.aligned`:
   // using the object itself as a condition silently disabled this gate (always truthy).
+  // Both legs are compared on the local arrival clock (`quoteReceivedAt`), so a venue whose clock
+  // drifts does not permanently mark the pair as unaligned.
   const carryLegsAligned = assessSpreadQuoteAlignment(
-    { quoteUpdatedAt: spotMarket?.quoteUpdatedAt },
-    { quoteUpdatedAt: perpMarket?.quoteUpdatedAt },
+    spotMarket ?? {},
+    perpMarket ?? {},
     SPREAD_QUOTE_MAX_SKEW_MS,
   );
   const basisBps = carryLegsAligned.aligned && spotPrice > 0 && perpPrice > 0

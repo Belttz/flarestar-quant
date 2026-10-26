@@ -65,6 +65,20 @@ export interface LiveMarket {
    * (a zero-priced placeholder), which no consumer may treat as tradable.
    */
   quoteUpdatedAt?: string;
+  /**
+   * Local (this backend's) wall-clock time, in epoch ms, at which the frame that last supplied
+   * this record's bid/ask arrived. Advances under exactly the same condition as `quoteUpdatedAt`,
+   * so the two always describe the same quote: one by the venue's clock, one by ours.
+   *
+   * Display-side freshness (age, and the leg-to-leg skew of a spread) must be computed from this
+   * field, not from `quoteUpdatedAt`: venue clocks differ by seconds, which made a perfectly
+   * executable pair look "not time-aligned" and hid the spread for every combination involving
+   * the drifting venue. `quoteUpdatedAt` keeps its job of measuring *network* lag against
+   * `quoteReceivedAt` (received − source), which is a different question and must stay on the
+   * venue's clock. Absent on records that never carried a quote, and on payloads persisted before
+   * this field existed — consumers then fall back to `quoteUpdatedAt`.
+   */
+  quoteReceivedAt?: number;
   /** rest_book_ticker marks rows synthesized from a venue's bulk REST sweep (spread board view). */
   source: 'gate_crossex_websocket' | 'demo_seed' | 'rest_book_ticker';
 }
@@ -229,6 +243,12 @@ interface BookState {
   bids: Map<string, string>;
   asks: Map<string, string>;
   updatedAt: string;
+  /**
+   * Local wall-clock arrival time (epoch ms) of the last book frame. A ticker frame whose bid/ask
+   * is resolved from this book inherits it as its own `quoteReceivedAt`, so a quote assembled from
+   * two different transports still reports the older of the two local arrival times.
+   */
+  receivedAt: number;
   dirty: boolean;
   emitTimer: ReturnType<typeof setTimeout> | null;
 }
@@ -1057,6 +1077,16 @@ export class CrossExMarketHub {
         if (bookTop && book) stamps.push(Date.parse(book.updatedAt));
         if (stamps.length > 0) quoteUpdatedAt = new Date(Math.min(...stamps)).toISOString();
       }
+      // Local counterpart of the same decision, on this backend's clock. Everything a browser
+      // shows about quote age or leg-to-leg skew reads this one; venue clocks disagree by seconds
+      // and using them for alignment hid whole venue combinations from the spread panel.
+      let quoteReceivedAt = current.quoteReceivedAt;
+      if (frameBid !== undefined && frameAsk !== undefined) {
+        const localStamps: number[] = [];
+        if (usableQuote(value.bp) || usableQuote(value.ap)) localStamps.push(receivedAt);
+        if (bookTop && book) localStamps.push(book.receivedAt);
+        if (localStamps.length > 0) quoteReceivedAt = Math.min(...localStamps);
+      }
       this.publish({
         ...current,
         lastPrice: usableQuote(value.lp) ? value.lp : current.lastPrice,
@@ -1072,6 +1102,7 @@ export class CrossExMarketHub {
         receivedAt: new Date(receivedAt).toISOString(),
         updatedAt: new Date(value.ts).toISOString(), source: 'gate_crossex_websocket',
         quoteUpdatedAt,
+        quoteReceivedAt,
       });
       return true;
     }
@@ -1098,7 +1129,7 @@ export class CrossExMarketHub {
     if (frame.channel === 'order_book_update') {
       const bookUpdate = OrderBookUpdatePushSchema.safeParse(payload);
       if (!bookUpdate.success) return false;
-      this.applyBookUpdate(bookUpdate.data.result);
+      this.applyBookUpdate(bookUpdate.data.result, receivedAt);
       return true;
     }
     if (frame.channel === 'trade') {
@@ -1117,7 +1148,7 @@ export class CrossExMarketHub {
     return false;
   }
 
-  private applyBookUpdate(result: z.infer<typeof OrderBookUpdatePushSchema>['result']): void {
+  private applyBookUpdate(result: z.infer<typeof OrderBookUpdatePushSchema>['result'], receivedAt: number): void {
     const symbol = this.resolveStreamSymbol(result.s);
     // Clear before the watcher check: a delivered frame proves the channel is live whether or not
     // a client is still listening, and the verdict is this channel's alone.
@@ -1126,7 +1157,7 @@ export class CrossExMarketHub {
     let book = this.books.get(symbol);
     if (!book || result.snapshot) {
       if (book?.emitTimer) clearTimeout(book.emitTimer);
-      book = { bids: new Map(), asks: new Map(), updatedAt: new Date(result.ts).toISOString(), dirty: false, emitTimer: null };
+      book = { bids: new Map(), asks: new Map(), updatedAt: new Date(result.ts).toISOString(), receivedAt, dirty: false, emitTimer: null };
       this.books.set(symbol, book);
     }
     const apply = (levels: Map<string, string>, updates: Array<[string, string]>) => {
@@ -1138,6 +1169,10 @@ export class CrossExMarketHub {
     apply(book.bids, result.b);
     apply(book.asks, result.a);
     book.updatedAt = new Date(result.ts).toISOString();
+    // Local arrival time only moves with the frame that actually changed levels, so a quote built
+    // from this book reports when *that book* was last updated, not when some unrelated channel
+    // last spoke.
+    book.receivedAt = receivedAt;
     this.scheduleBookEmit(symbol, book);
   }
 

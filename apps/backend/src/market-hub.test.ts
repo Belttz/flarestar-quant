@@ -179,8 +179,38 @@ describe('CrossEx ticker sparse-field fallback', () => {
     releaseBook();
   });
 
-  it('keeps previously published 24h fields when a push nulls them out', async () => {
+  /**
+   * `quoteReceivedAt` is the local-clock twin of `quoteUpdatedAt`: same advance condition, different
+   * clock. Browsers judge quote age and leg-to-leg skew by it, so it must move with the quote (and
+   * stay put when a sparse frame only refreshes `lp`).
+   */
+  it('advances quoteReceivedAt only when the record\u2019s bid/ask actually move', async () => {
     const { hub, socket } = await createHubHarness();
+    await waitFor(() => hub.marketCount() > 0);
+    const symbol = 'GATE_FUTURE_BTC_USDT';
+    const before = Date.now();
+    socket.send(JSON.stringify({ time: 1, channel: 'ticker', event: 'update', result: {
+      s: symbol, lp: '118500', bp: '118499.5', bs: '2', ap: '118500.5', as: '1.5',
+      o: '118000', h: '119000', l: '117500', v: '1000', q: '118000000', ts: 1_771_990_800_000,
+    } }));
+    await waitFor(() => hub.market(symbol)?.bidPrice === '118499.5');
+    const quoted = hub.market(symbol)?.quoteReceivedAt;
+    expect(typeof quoted).toBe('number');
+    expect(quoted as number).toBeGreaterThanOrEqual(before - 1_000);
+
+    // A sparse frame carrying only `lp` refreshes `updatedAt` but supplies no quote side, so the
+    // local quote stamp must not move (same rule as `quoteUpdatedAt`).
+    socket.send(JSON.stringify({ time: 2, channel: 'ticker', event: 'update', result: {
+      s: symbol, lp: '118600', bp: null, ap: null,
+      o: null, h: null, l: null, v: null, ts: 1_771_990_810_000,
+    } }));
+    await waitFor(() => hub.market(symbol)?.lastPrice === '118600');
+    expect(hub.market(symbol)?.quoteReceivedAt).toBe(quoted);
+    // The venue clock did move (new frame), which is exactly why the two fields are separate.
+    expect(hub.market(symbol)?.quoteUpdatedAt).toBe(new Date(1_771_990_800_000).toISOString());
+  });
+
+  it('keeps previously published 24h fields when a push nulls them out', async () => {    const { hub, socket } = await createHubHarness();
     await waitFor(() => hub.marketCount() > 0);
     const symbol = 'BINANCE_FUTURE_ETH_USDT';
     socket.send(JSON.stringify({ time: 1, channel: 'ticker', event: 'update', result: {

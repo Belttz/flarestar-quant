@@ -1228,6 +1228,21 @@ export const LiveMarketSchema = z.object({
    * (a zero-priced placeholder), which no consumer may treat as tradable.
    */
   quoteUpdatedAt: z.string().optional(),
+  /**
+   * Local (backend) wall-clock arrival time, in epoch ms, of the frame that last supplied this
+   * record's bid/ask. It advances under exactly the same condition as `quoteUpdatedAt`, so both
+   * describe the same quote — one on the venue's clock, one on ours.
+   *
+   * Display freshness (quote age, and the leg-to-leg skew of a spread) must be judged from this
+   * field: venue clocks disagree by seconds, and comparing two venues' event timestamps declared
+   * an executable pair "not time-aligned", which hid the spread for every combination involving
+   * the drifting venue. `quoteUpdatedAt` remains the field for measuring *network lag* (received
+   * minus source), which is a different question.
+   *
+   * Optional on purpose: records persisted or produced before this field existed omit it, and a
+   * consumer must then fall back to `quoteUpdatedAt` instead of treating the quote as unknown.
+   */
+  quoteReceivedAt: z.number().nullable().optional(),
   /** rest_book_ticker rows come from the bulk REST sweep and are ~1 TTL cycle stale. */
   source: z.enum(['gate_crossex_websocket', 'demo_seed', 'rest_book_ticker']),
 });

@@ -12,24 +12,66 @@ export const STRATEGY_FUTURE_QUOTE_TOLERANCE_MS = 2_000;
  */
 export const SPREAD_QUOTE_MAX_SKEW_MS = 2_000;
 
+/**
+ * The timestamps a streamed quote can be dated by. Every field is optional because they arrive
+ * from three different generations of payload: `quoteReceivedAt` is the newest, `receivedAt` and
+ * `quoteUpdatedAt` predate it, and a record that never carried a quote has none of them.
+ */
+export interface QuoteTimestamps {
+  quoteReceivedAt?: number | null;
+  receivedAt?: string;
+  quoteUpdatedAt?: string;
+}
+
+/**
+ * Two clocks, two questions — and they must never be swapped.
+ *
+ * - **Local arrival time** (`quoteReceivedAt`, epoch ms) answers "is this quote still executable?"
+ *   and "were these two legs quoted at the same moment?" Both are questions about *our* timeline:
+ *   how long ago we learned the price, and how far apart we learned the two. Comparing two venues'
+ *   own event timestamps instead made a pair look unaligned whenever the venues' clocks drifted
+ *   apart by more than the skew budget — a permanent false rejection for every combination that
+ *   involved the drifting venue, which is what "some exchanges' spreads never show up" looked like.
+ * - **Venue event time** (`quoteUpdatedAt`) answers "how long did this frame take to reach us?"
+ *   That is a network measurement (received − source) and legitimately uses the venue's clock.
+ *
+ * `quoteReceivedAt` is optional (older payloads and older rows omit it), so every reader falls back
+ * to `receivedAt` and then to `quoteUpdatedAt` — the pre-existing behaviour — rather than treating
+ * the quote as unknown.
+ */
+export function quoteLocalReceivedAt(market: QuoteTimestamps): number | null {
+  if (typeof market.quoteReceivedAt === 'number' && Number.isFinite(market.quoteReceivedAt)) {
+    return market.quoteReceivedAt;
+  }
+  const received = market.receivedAt === undefined ? NaN : Date.parse(market.receivedAt);
+  if (Number.isFinite(received)) return received;
+  return market.quoteUpdatedAt === undefined ? null : finiteOrNull(Date.parse(market.quoteUpdatedAt));
+}
+
+function finiteOrNull(value: number): number | null {
+  return Number.isFinite(value) ? value : null;
+}
+
 export type SpreadQuoteAlignment =
   | { aligned: true; skewMs: number }
   | { aligned: false; skewMs: number | null; reason: 'missing_quote_timestamp' | 'skew_exceeded' };
 
 /**
- * Judge whether two legs' executable quotes come from (roughly) the same moment. The only
- * admissible timestamp is `quoteUpdatedAt` — the field the engine's `freshMarketPair` gate reads —
- * so this check is same-source with execution by construction. A leg without a quote timestamp
- * never carried a quote and is never aligned.
+ * Judge whether two legs' executable quotes come from (roughly) the same moment.
+ *
+ * Both sides are measured on the backend's own clock (`quoteLocalReceivedAt`), not on the venues'
+ * clocks: an exchange whose clock runs 3s behind its peers would otherwise make every pair it
+ * participates in permanently "unaligned", hiding the spread entirely. A leg that never carried a
+ * quote has no local arrival time and is never aligned.
  */
 export function assessSpreadQuoteAlignment(
-  left: Pick<LiveMarket, 'quoteUpdatedAt'>,
-  right: Pick<LiveMarket, 'quoteUpdatedAt'>,
+  left: QuoteTimestamps,
+  right: QuoteTimestamps,
   maxSkewMs = SPREAD_QUOTE_MAX_SKEW_MS,
 ): SpreadQuoteAlignment {
-  const leftMs = left.quoteUpdatedAt === undefined ? NaN : Date.parse(left.quoteUpdatedAt);
-  const rightMs = right.quoteUpdatedAt === undefined ? NaN : Date.parse(right.quoteUpdatedAt);
-  if (!Number.isFinite(leftMs) || !Number.isFinite(rightMs)) {
+  const leftMs = quoteLocalReceivedAt(left);
+  const rightMs = quoteLocalReceivedAt(right);
+  if (leftMs === null || rightMs === null) {
     return { aligned: false, skewMs: null, reason: 'missing_quote_timestamp' };
   }
   const skewMs = Math.abs(leftMs - rightMs);
@@ -84,12 +126,17 @@ export function assessMarketPairFreshness(
   const rightUpdatedAt = Date.parse(right.updatedAt);
   const leftReceivedAt = Date.parse(left.receivedAt);
   const rightReceivedAt = Date.parse(right.receivedAt);
-  const usableTimestamp = (timestamp: number) => Number.isFinite(timestamp)
-    && now - timestamp <= STRATEGY_MARKET_FRESHNESS_MS
-    && timestamp - now <= STRATEGY_FUTURE_QUOTE_TOLERANCE_MS;
-  if (!usableTimestamp(leftUpdatedAt) || !usableTimestamp(rightUpdatedAt)) {
+  // Age is a question about our own timeline — "how long ago did we learn this price?" — so it is
+  // measured from the local arrival stamp. Using the venue's event time made a quote from a venue
+  // whose clock runs slow look old while it was seconds old in reality.
+  const usableArrival = (receivedAt: number) => Number.isFinite(receivedAt)
+    && now - receivedAt <= STRATEGY_MARKET_FRESHNESS_MS
+    && receivedAt - now <= STRATEGY_FUTURE_QUOTE_TOLERANCE_MS;
+  if (!usableArrival(leftReceivedAt) || !usableArrival(rightReceivedAt)) {
     return { pair: null, reason: 'stale' };
   }
+  // Transport lag stays on the venue's clock: it is `received − source`, a network measurement that
+  // has nothing to do with how stale the quote is.
   const timelyDelivery = (sourceTimestamp: number, receivedTimestamp: number) =>
     Number.isFinite(receivedTimestamp)
     && receivedTimestamp - sourceTimestamp <= STRATEGY_MARKET_MAX_TRANSPORT_LAG_MS;

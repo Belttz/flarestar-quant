@@ -12,12 +12,19 @@ import {
 const NOW = Date.parse('2026-10-26T12:00:00.000Z');
 const at = (offsetMs: number): string => new Date(NOW + offsetMs).toISOString();
 
-function streamMarket(bid: string, ask: string, quoteAgeMs = 0) {
+/**
+ * A streamed market record. `quoteAgeMs` dates the venue's own event time; `localAgeMs` dates the
+ * moment we received it. They are deliberately independent so the tests can reproduce a venue clock
+ * that drifts away from ours.
+ */
+function streamMarket(bid: string, ask: string, quoteAgeMs = 0, localAgeMs = quoteAgeMs) {
   return {
     source: 'gate_crossex_websocket' as const,
     bidPrice: bid,
     askPrice: ask,
     quoteUpdatedAt: at(-quoteAgeMs),
+    quoteReceivedAt: NOW - localAgeMs,
+    receivedAt: at(-localAgeMs),
   };
 }
 
@@ -156,6 +163,54 @@ describe('buildSpreadReadout', () => {
     expect(legQuoteStateKey('live')).toBe('Live');
     expect(legQuoteStateKey('stale')).toBe('Stale quote');
     expect(legQuoteStateKey('missing')).toBe('No quote');
+  });
+});
+
+/**
+ * Cross-leg alignment runs on the local arrival clock. Using the venues' own event timestamps made
+ * every pair involving a drifting exchange permanently "unaligned", which is what users saw as
+ * "the spread for those exchanges never shows up".
+ */
+describe('spread readout clocks', () => {
+  it('pairs two legs whose venue clocks differ by 5s but which arrived 100ms apart', () => {
+    // Venue A's clock is 5s ahead of ours, venue B's is 4s behind: by event time they are 9s apart.
+    const sellLeg = resolveLegQuote({ market: streamMarket('100', '100.1', 5_000, 100) }, 'bid', { now: NOW });
+    const buyLeg = resolveLegQuote({ market: streamMarket('99', '99.1', -4_000, 200) }, 'ask', { now: NOW });
+    expect(sellLeg.quotedAtMs).toBe(NOW - 100);
+    expect(buyLeg.quotedAtMs).toBe(NOW - 200);
+
+    const readout = buildSpreadReadout({ sell: sellLeg, buy: buyLeg });
+    expect(readout.status).toBe('live');
+    expect(readout.skewMs).toBe(100);
+    expect(readout.bps).toBeCloseTo(((100 - 99.1) / 99.1) * 10_000, 6);
+  });
+
+  it('judges quote age on the local clock, not on the venue clock', () => {
+    // The venue claims the quote is 40s old; we received it 1s ago.
+    const freshLocally = resolveLegQuote({ market: streamMarket('100', '101', 40_000, 1_000) }, 'bid', { now: NOW });
+    expect(freshLocally).toMatchObject({ state: 'live', ageMs: 1_000 });
+
+    // The reverse: the venue says "just now" but we have been holding this quote for 20s.
+    const staleLocally = resolveLegQuote({ market: streamMarket('100', '101', 0, 20_000) }, 'bid', { now: NOW });
+    expect(staleLocally).toMatchObject({ state: 'stale', ageMs: 20_000 });
+
+    const readout = buildSpreadReadout({
+      sell: staleLocally,
+      buy: resolveLegQuote({ market: streamMarket('99', '99.1', 0, 0) }, 'ask', { now: NOW }),
+    });
+    expect(readout.status).toBe('stale');
+    expect(readout.bps).toBeNull();
+  });
+
+  it('falls back to the legacy timestamps when quoteReceivedAt is absent', () => {
+    // Pre-upgrade payload: no `quoteReceivedAt`, and no `receivedAt` either, so the venue timestamp
+    // is all we have — exactly the behaviour before the local clock existed.
+    const legacy = { source: 'gate_crossex_websocket' as const, bidPrice: '100', askPrice: '101', quoteUpdatedAt: at(-1_000) };
+    const quote = resolveLegQuote({ market: legacy }, 'bid', { now: NOW });
+    expect(quote).toMatchObject({ state: 'live', ageMs: 1_000, quotedAtMs: NOW - 1_000 });
+
+    const tooOld = { ...legacy, quoteUpdatedAt: at(-20_000) };
+    expect(resolveLegQuote({ market: tooOld }, 'bid', { now: NOW }).state).toBe('stale');
   });
 });
 

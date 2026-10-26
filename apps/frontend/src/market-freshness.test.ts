@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Candle, LiveMarket, MarketSnapshot } from './api.js';
-import { SPREAD_QUOTE_MAX_SKEW_MS, assessMarketPairFreshness, assessSpreadQuoteAlignment, candleTailIsFresh, freshMarketPair, lastKnownLiveMarketPair } from './market-freshness.js';
+import { SPREAD_QUOTE_MAX_SKEW_MS, assessMarketPairFreshness, assessSpreadQuoteAlignment, candleTailIsFresh, freshMarketPair, lastKnownLiveMarketPair, quoteLocalReceivedAt } from './market-freshness.js';
 
 function market(
   symbol: string,
@@ -62,6 +62,21 @@ describe('premium market freshness', () => {
     expect(assessMarketPairFreshness(delayed, leftSymbol, rightSymbol, now).reason).toBe('delayed');
   });
 
+  /**
+   * Age is measured on our clock, lag on the venue's. A venue whose clock runs 20s behind must not
+   * turn a quote we just received into a *stale* quote — the gap is a transport/lag signal, which
+   * is a different verdict with a different fix (and it is the one the engine's own gate reads).
+   */
+  it('measures age locally and lag against the venue clock', () => {
+    const venueClockBehind = snapshot();
+    venueClockBehind.markets[0] = { ...market(leftSymbol, now - 20_000), receivedAt: new Date(now).toISOString() };
+    expect(assessMarketPairFreshness(venueClockBehind, leftSymbol, rightSymbol, now).reason).toBe('delayed');
+
+    const locallyStale = snapshot();
+    locallyStale.markets[0] = { ...market(leftSymbol, now - 16_000), quoteReceivedAt: now - 16_000 };
+    expect(assessMarketPairFreshness(locallyStale, leftSymbol, rightSymbol, now).reason).toBe('stale');
+  });
+
   it('keeps last-known streamed prices displayable without making them executable', () => {
     const stale = snapshot(now - 60_000, now - 45_000);
     expect(freshMarketPair(stale, leftSymbol, rightSymbol, now)).toBeNull();
@@ -106,5 +121,47 @@ describe('spread quote alignment', () => {
   it('honours a caller-provided budget override', () => {
     expect(assessSpreadQuoteAlignment(left, right, 500).aligned).toBe(false);
     expect(assessSpreadQuoteAlignment(left, right, 1_000).aligned).toBe(true);
+  });
+
+  /**
+   * The regression this whole clock split exists for: two venues whose own clocks disagree by
+   * seconds, but whose quotes reached us 100ms apart. Comparing venue event timestamps called this
+   * "not time-aligned" and hid the spread permanently for one side of the pair.
+   */
+  it('aligns on local arrival time even when the venues\u2019 own clocks differ by seconds', () => {
+    const venueClockAhead = {
+      quoteReceivedAt: now - 60,
+      receivedAt: new Date(now - 60).toISOString(),
+      quoteUpdatedAt: new Date(now + 5_000).toISOString(),
+    };
+    const venueClockBehind = {
+      quoteReceivedAt: now - 160,
+      receivedAt: new Date(now - 160).toISOString(),
+      quoteUpdatedAt: new Date(now - 4_000).toISOString(),
+    };
+    // Same instant judged locally (100ms apart), four seconds apart by the venues' own clocks.
+    expect(assessSpreadQuoteAlignment(venueClockAhead, venueClockBehind)).toEqual({ aligned: true, skewMs: 100 });
+    // Reverse control: with only the venue event times, the same pair is rejected.
+    const legacy = assessSpreadQuoteAlignment(
+      { quoteUpdatedAt: venueClockAhead.quoteUpdatedAt },
+      { quoteUpdatedAt: venueClockBehind.quoteUpdatedAt },
+    );
+    expect(legacy).toMatchObject({ aligned: false, reason: 'skew_exceeded' });
+  });
+
+  it('falls back to the legacy timestamps when quoteReceivedAt is absent', () => {
+    // `receivedAt` is the next-best local stamp, so a pre-upgrade payload still aligns on the
+    // local clock rather than on the venues'.
+    const localOnly = assessSpreadQuoteAlignment(
+      { receivedAt: new Date(now - 100).toISOString(), quoteUpdatedAt: new Date(now + 9_000).toISOString() },
+      { receivedAt: new Date(now - 200).toISOString(), quoteUpdatedAt: new Date(now - 9_000).toISOString() },
+    );
+    expect(localOnly).toEqual({ aligned: true, skewMs: 100 });
+    // With neither local stamp, the original behaviour (venue event time) is preserved exactly.
+    expect(assessSpreadQuoteAlignment(
+      { quoteUpdatedAt: new Date(now).toISOString() },
+      { quoteUpdatedAt: new Date(now - 3_000).toISOString() },
+    )).toEqual({ aligned: false, skewMs: 3_000, reason: 'skew_exceeded' });
+    expect(quoteLocalReceivedAt({})).toBeNull();
   });
 });
