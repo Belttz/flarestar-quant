@@ -1134,7 +1134,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   // The displayed difference must never be derived from a placeholder, a stale quote, or two
   // quotes seconds apart: each of those used to land on screen as a real-looking bps number.
   // `resolveLegQuote` prefers the CrossEx stream and falls back to the polled top of book, which
-  // is the documented "ticker's single level" path for instruments whose venue pushes no book.
+  // is the documented "ticker's single level" path, used while a book has no seeded baseline.
   const [quotesNow, setQuotesNow] = useState(() => Date.now());
   useEffect(() => {
     // Quote ages must advance without a new frame, otherwise a quote that aged out keeps claiming
@@ -1168,6 +1168,13 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const rightQuotedAt = rightQuote.quotedAtMs;
   const leftQuoteFallback = leftQuote.source === 'books-top';
   const rightQuoteFallback = rightQuote.source === 'books-top';
+  // Why the pair is not showing a spread. For an unaligned pair the caption also carries the
+  // measured gap: "not time-aligned" alone leaves the operator guessing which leg drags and by how
+  // much, and the number is already here. Other states keep their plain sentence — appending a
+  // skew to "quote is stale" would read as a second, unrelated fact.
+  const spreadHint = spreadReadout.status === 'unaligned' && spreadReadout.skewMs !== null
+    ? `${t(spreadReadout.messageKey)} · ${(spreadReadout.skewMs / 1_000).toFixed(1)}s`
+    : t(spreadReadout.messageKey);
   const quotedAtText = (timestamp: number | null): string => quoteTimestampText(timestamp);
   const priceDifferenceHistoryIsCurrent = priceDifferenceHistory.key === priceDifferenceHistoryKey;
   const priceDifferencePoints = useMemo(() => priceDifferenceHistoryIsCurrent
@@ -1573,7 +1580,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
           <div><dt>{leftExchange.name} · {t('Ask depth')}</dt><dd>{leftDepth ? formatUsd(leftDepth.ask) : '—'}</dd></div>
           <div><dt>{rightExchange.name} · {t('Bid depth')}</dt><dd>{rightDepth ? formatUsd(rightDepth.bid) : '—'}</dd></div>
           <div><dt>{rightExchange.name} · {t('Ask depth')}</dt><dd>{rightDepth ? formatUsd(rightDepth.ask) : '—'}</dd></div>
-          {(leftDepth?.source === 'ticker' || rightDepth?.source === 'ticker') && <p className="maker-depth-note">{t('Top-of-book only: this market pushes no order book')}</p>}
+          {(leftDepth?.source === 'ticker' || rightDepth?.source === 'ticker') && <p className="maker-depth-note">{t('Top-of-book only: this market has no seeded order book yet')}</p>}
         </dl>}</div></div>
       {mode === 'position' && <div className="compact-stop"><span>◎</span><p>{`${t('Stops after')} ${amount || '0'} ${asset} ${t('executes')}`}</p></div>}
     </article>
@@ -1615,7 +1622,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
                 ? <strong>—</strong>
                 : <strong className={priceDiffBps >= 0 ? 'positive' : 'negative'}>{priceDiffBps >= 0 ? '+' : ''}{priceDiffBps.toFixed(2)} bps</strong>}
               <button className="switch-direction" onClick={() => setDirectionFlipped((current) => !current)} aria-label={t('Switch direction')}>⇄</button>
-              <small>{priceDiffBps === null ? t(spreadReadout.messageKey) : t('Switch direction')}</small>
+              <small>{priceDiffBps === null ? spreadHint : t('Switch direction')}</small>
             </div>
             <div className="strategy-leg buy-leg">
               <div className="leg-top">

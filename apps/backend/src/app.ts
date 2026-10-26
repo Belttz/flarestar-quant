@@ -687,6 +687,16 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   // data". Route every degradation signal of the hub into the backend log instead.
   const marketHub = options.marketHub ?? new CrossExMarketHub(config.gatePublicWebSocketUrl, {
     warn: (reason, detail) => app.log.warn(detail ?? {}, reason),
+    // Upstream does not baseline every instrument's order book, and a diff-only book is a book
+    // made of "levels that happened to move". Seeding from the venue's own REST depth endpoint
+    // gives the local book its missing baseline; CrossEx diffs then keep it current (§ book
+    // seeding in market-hub.ts). One log line per attempt, never per frame.
+    depth: async (symbol, limit) => await publicMarketGateway.queryDepth?.(symbol, limit) ?? null,
+    report: (event) => {
+      const detail = { symbol: event.symbol, durationMs: event.durationMs, levels: event.levels, attempts: event.attempts, reason: event.reason };
+      if (event.outcome === 'seeded' || event.outcome === 'reset') app.log.info(detail, `order book ${event.outcome}`);
+      else app.log.warn(detail, `order book seed ${event.outcome}`);
+    },
   });
   const tradingSession = options.tradingSession ?? new TradingSession();
   const credentialOperationGate = new CredentialOperationGate();

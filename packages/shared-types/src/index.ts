@@ -1738,9 +1738,13 @@ export const MarketBookDepthSchema = z.object({
   askDepthUsdt: z.number().finite().nonnegative(),
   updatedAt: z.string().nullable(),
   /**
-   * `book` = summed over the maintained order book; `ticker` = one level only (bidPrice×bidSize),
-   * used when the venue pushes no book for this instrument. Clients should label the difference
-   * rather than present a single level as full depth.
+   * `book` = summed over the maintained order book; `ticker` = one level only (bidPrice×bidSize).
+   *
+   * Since order books are seeded from each venue's REST depth endpoint, a `ticker` row means the
+   * book is **not seeded (yet)** — the snapshot request is still in flight, its retry budget was
+   * spent, or the local book was just dropped by a reconnect — rather than "this venue never
+   * publishes one". Clients should label the difference instead of presenting a single level as
+   * full depth.
    */
   source: z.enum(['book', 'ticker']).default('book'),
 });

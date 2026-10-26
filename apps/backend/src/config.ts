@@ -109,6 +109,11 @@ function originsFromHosts(hosts: readonly string[]): string[] {
  * Max leg-to-leg quote timestamp skew (ms) still treated as "the same moment" when a spread is
  * built or displayed. Defaults to 2000 — the same budget the strategy engine's
  * `freshMarketPair` gate uses — so display and execution share one alignment yardstick.
+ *
+ * Known, deliberate difference: the engine compares the venues' own event timestamps while the UI
+ * compares local arrival timestamps (`quoteReceivedAt`), which is what stops a drifting exchange
+ * clock from hiding a pair forever. The budgets are equal on purpose; if they ever need to differ,
+ * that is a decision to record here rather than an accident to discover.
  */
 function parseSpreadQuoteMaxSkewMs(value: string | undefined): number {
   if (value === undefined || value.trim() === '') return 2_000;

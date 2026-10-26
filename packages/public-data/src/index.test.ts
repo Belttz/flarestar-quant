@@ -1085,3 +1085,158 @@ describe('bulk venue funding stats', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * Depth seeding (§ D): each venue's book snapshot is normalized to base-coin sizes here, so the
+ * market hub can install it as a baseline without knowing any venue's shape.
+ */
+describe('venue depth snapshots', () => {
+  const now = () => 1_783_703_500_000;
+
+  it('parses Binance futures depth, already denominated in base coins', async () => {
+    const fetchMock = vi.fn((url: string | URL | Request) => {
+      expect(String(url)).toContain('/fapi/v1/depth');
+      expect(String(url)).toContain('symbol=BTCUSDT');
+      expect(String(url)).toContain('limit=100');
+      return response({
+        lastUpdateId: 5_432_109,
+        bids: [['63962.00', '1.5'], ['63961.90', '0.4']],
+        asks: [['63962.10', '2.0']],
+        E: 1_783_703_477_021,
+        T: 1_783_703_477_100,
+      });
+    });
+    const client = new VenuePublicMarketDataClient(fetchMock as unknown as typeof fetch, now);
+
+    const book = await client.queryDepth('BINANCE_FUTURE_BTC_USDT', 50);
+    expect(book.bids).toEqual([['63962.00', '1.5'], ['63961.90', '0.4']]);
+    expect(book.asks).toEqual([['63962.10', '2.0']]);
+    expect(book.seq).toBe('5432109');
+    expect(book.ts).toBe(1_783_703_477_100);
+  });
+
+  it('converts OKX contract counts to coins through ct_val and keeps the venue timestamp', async () => {
+    const fetchMock = vi.fn((url: string | URL | Request) => {
+      const target = String(url);
+      if (target.includes('/public/instruments')) {
+        return response({ code: '0', msg: '', data: [{ instId: 'BTC-USDT-SWAP', ctVal: '0.01', ctValCcy: 'BTC' }] });
+      }
+      expect(target).toContain('/api/v5/market/books');
+      expect(target).toContain('sz=50');
+      return response({
+        code: '0',
+        msg: '',
+        data: [{
+          asks: [['63962.1', '300', '0', '2']],
+          bids: [['63962.0', '500', '0', '3']],
+          ts: '1783703477021',
+        }],
+      });
+    });
+    const client = new VenuePublicMarketDataClient(fetchMock as unknown as typeof fetch, now);
+
+    const book = await client.queryDepth('OKX_FUTURE_BTC_USDT', 50);
+    // 300 contracts × 0.01 BTC/contract = 3 coins.
+    expect(book.asks).toEqual([['63962.1', '3']]);
+    expect(book.bids).toEqual([['63962.0', '5']]);
+    expect(book.ts).toBe(1_783_703_477_021);
+  });
+
+  it('asks Bybit for an explicit limit and parses its linear book', async () => {
+    const fetchMock = vi.fn((url: string | URL | Request) => {
+      const target = String(url);
+      // The default is a single level, so the limit must be explicit.
+      expect(target).toContain('/v5/market/orderbook');
+      expect(target).toContain('category=linear');
+      expect(target).toContain('limit=50');
+      return response({
+        retCode: 0,
+        result: { s: 'BTCUSDT', b: [['63962', '0.8']], a: [['63962.5', '1.2']], ts: 1_783_703_477_000, u: 7_654_321 },
+      });
+    });
+    const client = new VenuePublicMarketDataClient(fetchMock as unknown as typeof fetch, now);
+
+    const book = await client.queryDepth('BYBIT_FUTURE_BTC_USDT', 50);
+    expect(book.bids).toEqual([['63962', '0.8']]);
+    expect(book.asks).toEqual([['63962.5', '1.2']]);
+    expect(book.seq).toBe('7654321');
+  });
+
+  it('parses Gate {p,s} depth and scales contracts by quanto_multiplier', async () => {
+    const fetchMock = vi.fn((url: string | URL | Request) => {
+      const target = String(url);
+      if (target.includes('/contracts')) {
+        return response([{
+          name: 'BTC_USDT', quanto_multiplier: '0.0001', type: 'direct', leverage_min: '1', leverage_max: '100',
+        }]);
+      }
+      expect(target).toContain('/futures/usdt/order_book');
+      expect(target).toContain('with_id=true');
+      return response({
+        id: 987_654,
+        current: 1_783_703_477,
+        bids: [{ p: '63962.0', s: 20_000 }],
+        asks: [{ p: '63962.1', s: 10_000 }],
+      });
+    });
+    const client = new VenuePublicMarketDataClient(fetchMock as unknown as typeof fetch, now);
+
+    const book = await client.queryDepth('GATE_FUTURE_BTC_USDT', 50);
+    // 20,000 contracts × 0.0001 BTC = 2 coins; 10,000 × 0.0001 = 1 coin.
+    expect(book.bids).toEqual([['63962.0', '2']]);
+    expect(book.asks).toEqual([['63962.1', '1']]);
+    expect(book.seq).toBe('987654');
+    expect(book.ts).toBe(1_783_703_477_000);
+  });
+
+  it('rejects a spot symbol: seeding only applies to perpetual books', async () => {
+    const client = new VenuePublicMarketDataClient((async () => response({})) as unknown as typeof fetch, now);
+    await expect(client.queryDepth('GATE_SPOT_BTC_USDT', 50)).rejects.toBeInstanceOf(PublicMarketDataError);
+  });
+});
+
+describe('contract multiplier caching', () => {
+  it('fetches a venue\u2019s instrument list once for many symbols', async () => {
+    let instrumentsCalls = 0;
+    const fetchMock = vi.fn((url: string | URL | Request) => {
+      const target = String(url);
+      if (target.includes('/contracts')) {
+        instrumentsCalls += 1;
+        return response([
+          { name: 'BTC_USDT', quanto_multiplier: '0.0001' },
+          { name: 'ETH_USDT', quanto_multiplier: '0.01' },
+        ]);
+      }
+      const contract = /contract=([A-Z]+)_/.exec(target)?.[1] ?? 'BTC';
+      return response({ current: 1_783_703_477, bids: [{ p: '1', s: 10_000 }], asks: [{ p: '2', s: 10_000 }] });
+    });
+    const client = new VenuePublicMarketDataClient(fetchMock as unknown as typeof fetch, () => 1_783_703_500_000);
+
+    // Two symbols, one instrument payload: per-pair caching would have fetched it twice.
+    await client.queryDepth('GATE_FUTURE_BTC_USDT', 50);
+    await client.queryDepth('GATE_FUTURE_ETH_USDT', 50);
+    expect(instrumentsCalls).toBe(1);
+  });
+
+  it('shares one in-flight instrument request between concurrent seeds', async () => {
+    let instrumentsCalls = 0;
+    const fetchMock = vi.fn((url: string | URL | Request) => {
+      const target = String(url);
+      if (target.includes('/contracts')) {
+        instrumentsCalls += 1;
+        // A slow payload: the second seed starts before this resolves.
+        return new Promise((resolve) => setTimeout(() => resolve(response([
+          { name: 'BTC_USDT', quanto_multiplier: '0.0001' },
+        ]).then((value) => value.json())), 5)) as unknown as Promise<Response>;
+      }
+      return response({ current: 1_783_703_477, bids: [{ p: '1', s: 10_000 }], asks: [{ p: '2', s: 10_000 }] });
+    });
+    const client = new VenuePublicMarketDataClient(fetchMock as unknown as typeof fetch, () => 1_783_703_500_000);
+
+    await Promise.all([
+      client.queryDepth('GATE_FUTURE_BTC_USDT', 50),
+      client.queryDepth('GATE_FUTURE_BTC_USDT', 50),
+    ]);
+    expect(instrumentsCalls).toBe(1);
+  });
+});

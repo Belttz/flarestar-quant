@@ -436,12 +436,36 @@ interface BinanceTurnover {
   quoteVolume24h: string | null;
 }
 
+/**
+ * One venue's full order-book snapshot, normalized so callers never have to know the venue's own
+ * shape: `[price, size]` pairs with **size in base coins** (contract-sized venues are converted
+ * through their multiplier), plus whatever ordering information that venue actually publishes.
+ *
+ * `seq` is deliberately opaque text. Sequence ids are venue-specific and unrelated to the CrossEx
+ * `U`/`u` counter, so a consumer must never try to bridge a REST sequence onto a CrossEx diff —
+ * the two numbering schemes have nothing in common. Seeding therefore joins the two streams by
+ * time, not by sequence.
+ */
+export interface PublicBookSnapshot {
+  bids: Array<[string, string]>;
+  asks: Array<[string, string]>;
+  /** Venue source time in epoch ms, when the endpoint reports one. */
+  ts: number | null;
+  /** Venue sequence id in text form (`lastUpdateId`, `seqId`, `u`, `id`), or null when absent. */
+  seq: string | null;
+}
+
 export interface PublicMarketDataGateway {
   querySnapshot(crossExSymbol: string): Promise<PublicMarketSnapshot>;
   /** Optional candle backfill for supported perpetual venues. */
   queryCandles?(crossExSymbol: string, interval: CandleInterval, limit: number, before?: number): Promise<Candle[]>;
   /** Optional contract sizes for venues whose public feeds report contract counts (GATE, OKX). */
   queryContractSizes?(venue: 'GATE' | 'OKX'): Promise<VenueContractSize[]>;
+  /**
+   * Optional full order-book snapshot for a CrossEx perpetual, used to seed a local book when the
+   * CrossEx feed sends no baseline for it. Returns base-coin sizes.
+   */
+  queryDepth?(crossExSymbol: string, limit: number): Promise<PublicBookSnapshot>;
   /** Optional bulk funding/open-interest stats for every perpetual a venue lists. */
   queryVenueFundingStats?(venue: FundingStatVenue): Promise<VenueFundingStat[]>;
   /** Optional all-market best bid/ask sweep across one venue's spot and perpetual listings. */
@@ -470,6 +494,9 @@ export interface VenuePublicMarketDataClientOptions {
   sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
 }
 
+/** How long a venue's contract multiplier is reused before the instruments call is repeated. */
+const MULTIPLIER_CACHE_MS = 10 * 60_000;
+
 const GateCandleSchema = z.array(z.object({
   t: z.number(),
   o: z.string(),
@@ -491,6 +518,44 @@ const OkxCandleSchema = z.object({
 const BybitCandleSchema = z.object({
   retCode: z.number(),
   result: z.object({ list: z.array(z.array(z.string()).min(6)) }),
+});
+
+/**
+ * Depth snapshots, one schema per venue. Each venue reports levels in its own shape — flat
+ * `[price, size]` tuples for Binance and Bybit, four-element tuples for OKX, `{p, s}` objects for
+ * Gate — and only some of them carry a usable timestamp.
+ */
+const depthLevel = z.tuple([z.string(), z.string()]);
+const BinanceDepthSchema = z.object({
+  lastUpdateId: z.number(),
+  bids: z.array(depthLevel),
+  asks: z.array(depthLevel),
+  E: z.number().optional(),
+  T: z.number().optional(),
+});
+const OkxDepthSchema = z.object({
+  code: z.literal('0'),
+  data: z.array(z.object({
+    asks: z.array(z.tuple([z.string(), z.string(), z.string(), z.string()])),
+    bids: z.array(z.tuple([z.string(), z.string(), z.string(), z.string()])),
+    ts: z.string(),
+  })),
+});
+const BybitDepthSchema = z.object({
+  retCode: z.number(),
+  result: z.object({
+    s: z.string(),
+    b: z.array(depthLevel),
+    a: z.array(depthLevel),
+    ts: z.number(),
+    u: z.number(),
+  }),
+});
+const GateDepthSchema = z.object({
+  id: z.number().optional(),
+  current: z.number().optional(),
+  bids: z.array(z.object({ p: z.string(), s: z.number() })),
+  asks: z.array(z.object({ p: z.string(), s: z.number() })),
 });
 const KrakenCandleSchema = z.object({
   candles: z.array(z.object({
@@ -685,6 +750,16 @@ async function optionalPayload<T>(request: Promise<unknown>, schema: z.ZodType<T
 
 export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
   private readonly hyperliquidMetadataStore: HyperliquidPerpMetadataStore | undefined;
+  /**
+   * Whole instrument list per venue, not per symbol.
+   *
+   * The list is what carries every contract multiplier (Gate's is ~1.4 MB), so caching it per pair
+   * would refetch the entire payload once per symbol being seeded — with dozens of symbols that is
+   * the difference between one request an hour and dozens. Kept with the in-flight promise so
+   * concurrent seeds for the same venue share a single request.
+   */
+  private readonly venueSizeCache = new Map<'GATE' | 'OKX', { sizes: VenueContractSize[]; at: number }>();
+  private readonly venueSizeInFlight = new Map<'GATE' | 'OKX', Promise<VenueContractSize[]>>();
   private readonly hyperliquidMetadataFreshMs: number;
   private readonly hyperliquidForcedRefreshMinMs: number;
   private readonly sleep: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
@@ -831,8 +906,157 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
       .map((candle) => ({ ...candle, closed: candle.startTime + INTERVAL_MILLISECONDS[interval] <= now }));
   }
 
-  async queryContractSizes(venue: 'GATE' | 'OKX'): Promise<VenueContractSize[]> {
-    if (venue === 'GATE') {
+  /**
+   * Full order-book snapshot for one CrossEx perpetual, straight from the venue that trades it.
+   *
+   * This exists because the CrossEx feed does not always publish an order-book baseline: without
+   * one, a local book accumulates only the price levels that happened to change after we
+   * subscribed, so its depth and its top level describe a book that never existed. Seeding from the
+   * venue's own REST endpoint gives the local book the missing baseline; CrossEx diffs then keep it
+   * current. Sizes are converted to base coins here so every caller sees one unit.
+   */
+  async queryDepth(crossExSymbol: string, limit: number): Promise<PublicBookSnapshot> {
+    const bounded = Math.max(10, Math.min(1_000, Math.trunc(limit)));
+    const symbol = parseCrossExFutureSymbol(crossExSymbol);
+    switch (symbol.venue) {
+      case 'BINANCE': return await this.queryBinanceDepth(symbol, Math.max(100, bounded));
+      case 'OKX': return await this.queryOkxDepth(symbol, Math.min(400, bounded));
+      case 'BYBIT': return await this.queryBybitDepth(symbol, bounded);
+      case 'GATE': return await this.queryGateDepth(symbol, Math.min(100, bounded));
+      default: throw new PublicMarketDataError('UNSUPPORTED_SYMBOL');
+    }
+  }
+
+  /**
+   * The venue's instrument list, cached per venue and never per symbol: one payload answers every
+   * multiplier on that venue, and a failed lookup falls back to 1 elsewhere rather than retrying
+   * here (the next seed re-asks).
+   */
+  private async contractSizes(venue: 'GATE' | 'OKX'): Promise<VenueContractSize[]> {
+    const cached = this.venueSizeCache.get(venue);
+    const now = this.now();
+    if (cached && now - cached.at < MULTIPLIER_CACHE_MS) return cached.sizes;
+    const running = this.venueSizeInFlight.get(venue);
+    if (running) return await running;
+    const request = this.queryContractSizes(venue).then((sizes) => {
+      this.venueSizeCache.set(venue, { sizes, at: now });
+      return sizes;
+    }).finally(() => {
+      this.venueSizeInFlight.delete(venue);
+    });
+    this.venueSizeInFlight.set(venue, request);
+    return await request;
+  }
+
+  /** Multiplier that turns one venue contract into base coins, or 1 when the venue does not say. */
+  private async contractMultiplier(venue: 'GATE' | 'OKX', base: string, quote: string): Promise<number> {
+    try {
+      const sizes = await this.contractSizes(venue);
+      const hit = sizes.find((size) => size.base === base && size.quote === quote);
+      const value = hit === undefined ? Number.NaN : Number(hit.multiplier);
+      return Number.isFinite(value) && value > 0 ? value : 1;
+    } catch {
+      // A failed lookup must not block seeding: fall back to 1 and let the next seed refresh it.
+      return 1;
+    }
+  }
+
+  private static scaleLevels(levels: Array<[string, string]>, multiplier: number): Array<[string, string]> {
+    if (multiplier === 1) return levels;
+    return levels.map(([price, size]) => {
+      const scaled = Number(size) * multiplier;
+      return [price, Number.isFinite(scaled) ? String(scaled) : size] as [string, string];
+    });
+  }
+
+  private async queryBinanceDepth(symbol: ParsedSymbol, limit: number): Promise<PublicBookSnapshot> {
+    if (!['USDT', 'USDC'].includes(symbol.quote)) throw new PublicMarketDataError('UNSUPPORTED_SETTLEMENT');
+    const venueSymbol = `${symbol.base}${symbol.quote}`;
+    // Depth weight scales with the limit, so the caller's ceiling decides how much budget this
+    // costs: 100 levels is weight 20 against a 2400/min pool.
+    const payload = await fetchJson(
+      this.fetchImplementation,
+      `https://fapi.binance.com/fapi/v1/depth?symbol=${encodeURIComponent(venueSymbol)}&limit=${limit}`,
+      4_000_000,
+    );
+    const parsed = parsePayload(BinanceDepthSchema, payload);
+    // Binance perpetual sizes are already base coins.
+    return {
+      bids: parsed.bids,
+      asks: parsed.asks,
+      ts: typeof parsed.T === 'number' ? parsed.T : typeof parsed.E === 'number' ? parsed.E : null,
+      seq: String(parsed.lastUpdateId),
+    };
+  }
+
+  private async queryOkxDepth(symbol: ParsedSymbol, limit: number): Promise<PublicBookSnapshot> {
+    if (!['USDT', 'USDC'].includes(symbol.quote)) throw new PublicMarketDataError('UNSUPPORTED_SETTLEMENT');
+    const instrument = `${symbol.base}-${symbol.quote}-SWAP`;
+    const payload = await fetchJson(
+      this.fetchImplementation,
+      `https://www.okx.com/api/v5/market/books?instId=${encodeURIComponent(instrument)}&sz=${limit}`,
+      4_000_000,
+    );
+    const envelope = parsePayload(OkxDepthSchema, payload);
+    const book = envelope.data[0];
+    if (book === undefined) throw new PublicMarketDataError('INVALID_RESPONSE_SCHEMA');
+    const multiplier = await this.contractMultiplier('OKX', symbol.base, symbol.quote);
+    const toLevels = (rows: Array<[string, string, string, string]>): Array<[string, string]> =>
+      rows.map(([price, size]) => [price, size] as [string, string]);
+    // `ts` is used as the ordering key for OKX instead of `seqId`: seqId is not comparable across
+    // the venue's own channels, while the timestamp is monotonic and matches how we join by time.
+    return {
+      bids: VenuePublicMarketDataClient.scaleLevels(toLevels(book.bids), multiplier),
+      asks: VenuePublicMarketDataClient.scaleLevels(toLevels(book.asks), multiplier),
+      ts: Number.isFinite(Number(book.ts)) ? Number(book.ts) : null,
+      seq: null,
+    };
+  }
+
+  private async queryBybitDepth(symbol: ParsedSymbol, limit: number): Promise<PublicBookSnapshot> {
+    if (!['USDT', 'USDC'].includes(symbol.quote)) throw new PublicMarketDataError('UNSUPPORTED_SETTLEMENT');
+    const venueSymbol = `${symbol.base}${symbol.quote}`;
+    // `limit` is explicit on purpose: Bybit defaults to a single level when it is omitted.
+    const payload = await fetchJson(
+      this.fetchImplementation,
+      `https://api.bybit.com/v5/market/orderbook?category=linear&symbol=${encodeURIComponent(venueSymbol)}&limit=${limit}`,
+      4_000_000,
+    );
+    const envelope = parsePayload(BybitDepthSchema, payload);
+    if (envelope.retCode !== 0) throw new PublicMarketDataError('UPSTREAM_REJECTED');
+    const ts = Number(envelope.result.ts);
+    return {
+      // Linear perpetual sizes are base coins.
+      bids: envelope.result.b,
+      asks: envelope.result.a,
+      ts: Number.isFinite(ts) && ts > 0 ? ts : null,
+      seq: String(envelope.result.u),
+    };
+  }
+
+  private async queryGateDepth(symbol: ParsedSymbol, limit: number): Promise<PublicBookSnapshot> {
+    const settle = symbol.quote.toLowerCase();
+    if (!['usdt', 'usd', 'usdc'].includes(settle)) throw new PublicMarketDataError('UNSUPPORTED_SETTLEMENT');
+    const contract = `${symbol.base}_${symbol.quote}`;
+    const payload = await fetchJson(
+      this.fetchImplementation,
+      `https://api.gateio.ws/api/v4/futures/${settle}/order_book?contract=${encodeURIComponent(contract)}&limit=${limit}&with_id=true`,
+      4_000_000,
+    );
+    const parsed = parsePayload(GateDepthSchema, payload);
+    const multiplier = await this.contractMultiplier('GATE', symbol.base, symbol.quote);
+    // Gate returns `{p, s}` objects, and `s` counts contracts, not coins.
+    const toLevels = (rows: Array<{ p: string; s: number }>): Array<[string, string]> =>
+      rows.map((row) => [row.p, String(row.s)] as [string, string]);
+    return {
+      bids: VenuePublicMarketDataClient.scaleLevels(toLevels(parsed.bids), multiplier),
+      asks: VenuePublicMarketDataClient.scaleLevels(toLevels(parsed.asks), multiplier),
+      ts: Number.isFinite(Number(parsed.current)) && Number(parsed.current) > 0 ? Number(parsed.current) * 1_000 : null,
+      seq: parsed.id === undefined ? null : String(parsed.id),
+    };
+  }
+
+  async queryContractSizes(venue: 'GATE' | 'OKX'): Promise<VenueContractSize[]> {    if (venue === 'GATE') {
       const payload = await fetchJson(this.fetchImplementation, 'https://api.gateio.ws/api/v4/futures/usdt/contracts', 8_000_000);
       return parsePayload(GateContractListSchema, payload).flatMap((contract) => {
         const match = /^([A-Z0-9]+)_([A-Z0-9]+)$/.exec(contract.name);

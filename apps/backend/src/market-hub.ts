@@ -149,6 +149,20 @@ interface InvalidSymbolRecord {
 /** Optional sink for degradation the operator can act on (capacity pressure, dropped symbols). */
 export type MarketHubWarn = (reason: string, detail?: Record<string, unknown>) => void;
 
+/**
+ * Book-seeding report sink. Called once per seed attempt (success or failure), never per frame, so
+ * the backend can log "did the baseline land, how long did it take" without flooding the log.
+ */
+export type MarketHubReport = (event: {
+  symbol: string;
+  /** `seeded` = baseline installed, `failed` = attempt failed, `abandoned` = retry budget spent. */
+  outcome: 'seeded' | 'failed' | 'abandoned' | 'reset';
+  durationMs: number;
+  levels: number;
+  attempts: number;
+  reason?: string;
+}) => void;
+
 // Low-liquidity instruments omit or null out optional quote fields. bid/ask must stay optional
 // so one sparse frame cannot invalidate the whole ticker push (Bug: best-bid stuck at '0').
 const TickerPushSchema = z.object({
@@ -251,6 +265,94 @@ interface BookState {
   receivedAt: number;
   dirty: boolean;
   emitTimer: ReturnType<typeof setTimeout> | null;
+  /**
+   * Whether this book has an authoritative baseline — either an upstream `snapshot` frame or a
+   * venue REST snapshot fetched by {@link seedOrderBook}.
+   *
+   * Until it does, diffs cannot be applied: each `order_book_update` carries only the levels that
+   * moved, so accumulating them on top of an empty book invents a book made of "levels that
+   * happened to change since we subscribed". Those frames are buffered instead and replayed once
+   * the baseline arrives.
+   */
+  seeded: boolean;
+  /** Local time the in-flight seed request started; only buffered frames newer than this replay. */
+  seedCutoffMs: number;
+  /** Bounded window of frames received while the baseline was in flight (see `BOOK_DIFF_WINDOW`). */
+  pendingDiffs: BufferedBookFrame[];
+  /** Consecutive seed failures; the budget is `BOOK_SEED_MAX_ATTEMPTS`. */
+  seedFailures: number;
+  /** Local time of the last seed attempt, for per-symbol spacing and failure backoff. */
+  lastSeedAttemptAt: number;
+  /** Local time the current baseline landed, for the hourly refresh. */
+  seededAt: number;
+  seedInFlight: boolean;
+  /**
+   * Set once the retry budget is spent. From then on diffs accumulate the old way, because an
+   * unreachable venue must never leave the book permanently blank — a partial book beats no book.
+   */
+  seedAbandoned: boolean;
+  /** Last `U`/`u` seen, for the per-venue sequence rules. Never bridged with the seed's own seq. */
+  lastSeq: number | null;
+}
+
+/**
+ * One buffered `order_book_update` frame, kept only while a seed request is in flight.
+ *
+ * `receivedAt` is this backend's own wall-clock arrival time and is the *only* field the replay
+ * decision reads. The frame's own `ts` belongs to the venue's clock, so comparing it against a
+ * local cut-off mixes two timelines: a venue whose clock runs fast would get pre-snapshot frames
+ * replayed on top of a newer snapshot (silent corruption), and one whose clock runs slow would have
+ * genuinely new frames dropped instead.
+ */
+interface BufferedBookFrame {
+  /** Local arrival time, from the same clock as `BookState.seedCutoffMs`. */
+  receivedAt: number;
+  /** Venue event time; used only to stamp `updatedAt` when replaying. */
+  ts: number;
+  bids: Array<[string, string]>;
+  asks: Array<[string, string]>;
+}
+
+/**
+ * How many frames to keep while waiting for a baseline. Upstream pushes at tens of frames per
+ * second, so this is roughly one second of rebuild work: enough to close the gap, cheap to replay.
+ */
+const BOOK_DIFF_WINDOW = 64;
+/** Attempts before a symbol's book falls back to plain diff accumulation. */
+const BOOK_SEED_MAX_ATTEMPTS = 3;
+/** Minimum spacing between two seed requests for the same symbol (also the failure backoff). */
+const BOOK_SEED_MIN_INTERVAL_MS = 1_000;
+const BOOK_SEED_RETRY_MS = 5_000;
+/** A seeded book is re-seeded from REST on this cadence, which also sweeps any ghost levels. */
+const BOOK_RESET_INTERVAL_MS = 3_600_000;
+/** Sweeper cadence: cheap scan over watched books, no I/O until something is due. */
+const BOOK_SEED_SWEEP_MS = 5_000;
+/** Levels requested from the venue when seeding. */
+const BOOK_SEED_LIMIT = 50;
+/**
+ * Margin added to the seed cut-off.
+ *
+ * Both sides of the comparison are now on our own clock (the cut-off is the local arrival instant
+ * of the response, the buffered frames carry their local arrival instants), so the large margin
+ * that a mixed-clock design needed is no longer required; 200ms only tightens the tiny window where
+ * a frame and the resolution interleave, and it keeps the conservative `+` direction — a frame we
+ * cannot prove arrived after the snapshot is dropped rather than replayed, because a replay can
+ * silently regress a level while a drop is repaired by the next diff that touches it.
+ */
+const BOOK_SEED_CUTOFF_MARGIN_MS = 200;
+/**
+ * Hard cap on retained price levels per side. `bookSnapshot` only truncates its *output*, so
+ * without this the maps keep every level ever seen — a slow, unbounded leak on a long-running
+ * process. Trimming is amortized: it only runs when a side doubles the cap.
+ */
+const BOOK_LEVEL_HARD_LIMIT = 100;
+
+/** Structural type of a venue REST depth snapshot; keeps this module free of a package import. */
+export interface VenueBookSnapshot {
+  bids: Array<[string, string]>;
+  asks: Array<[string, string]>;
+  ts: number | null;
+  seq: string | null;
 }
 
 /** Alternate identifiers some venues use in `trade` pushes (e.g. raw "BTCUSDT") mapped back to CrossEx symbols. */
@@ -343,6 +445,11 @@ export class CrossExMarketHub {
   private readonly warn: MarketHubWarn | undefined;
   /** Injected clock; defaults to `Date.now` and exists so tests can advance the invalid backoff. */
   private readonly clock: () => number;
+  /** Venue REST depth source for seeding books that upstream never baselines. */
+  private readonly depthSource: ((symbol: string, limit: number) => Promise<VenueBookSnapshot | null>) | undefined;
+  private readonly report: MarketHubReport | undefined;
+  /** Sweeper that keeps watched books seeded; started with the first book watcher, unref'd. */
+  private bookSeedSweep: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private readonly url: string,
@@ -355,6 +462,13 @@ export class CrossExMarketHub {
       warn?: MarketHubWarn;
       /** Clock returning epoch ms. Optional: production keeps `Date.now`. */
       now?: () => number;
+      /**
+       * Venue REST depth fetcher used to seed a book that upstream never baselines. Optional: when
+       * absent (tests, injected hubs) books simply keep today's diff-only behaviour.
+       */
+      depth?: (symbol: string, limit: number) => Promise<VenueBookSnapshot | null>;
+      /** Book-seeding report sink; one line per attempt, never per frame. */
+      report?: MarketHubReport;
     } = {},
   ) {
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 25_000;
@@ -364,6 +478,8 @@ export class CrossExMarketHub {
     this.maxShards = Math.ceil((this.maxDynamicSymbols + SEED_SYMBOL_COUNT) / SYMBOLS_PER_SHARD);
     this.warn = options.warn;
     this.clock = options.now ?? (() => Date.now());
+    this.depthSource = options.depth;
+    this.report = options.report;
     MARKET_ASSETS.forEach((asset, assetIndex) => MARKET_VENUES.forEach((venue, venueIndex) => {
       const market = seedMarket(venue, asset, venueIndex, assetIndex);
       this.markets.set(market.symbol, market);
@@ -608,11 +724,26 @@ export class CrossExMarketHub {
   }
 
   watchOrderBook(symbol: string): () => void {
-    return this.watch(this.bookWatchers, 'order_book_update', symbol, () => {
+    const release = this.watch(this.bookWatchers, 'order_book_update', symbol, () => {
       const book = this.books.get(symbol);
       if (book?.emitTimer) clearTimeout(book.emitTimer);
       this.books.delete(symbol);
+      // The sweeper exists only to keep watched books seeded, so it dies with the last watcher.
+      this.stopBookSweeperIfIdle();
     });
+    // Reserve the book now so the seeding request can start before the first frame arrives: the
+    // baseline is then usually in place by the time diffs begin, instead of after a window of them.
+    this.reserveBook(symbol);
+    this.ensureBookSeed(symbol);
+    this.startBookSweeper();
+    return release;
+  }
+
+  /** Create an empty, unseeded book so a seed request has somewhere to land. */
+  private reserveBook(symbol: string): void {
+    if (this.books.has(symbol)) return;
+    const now = this.now();
+    this.books.set(symbol, this.createBookState(now, now, false));
   }
 
   /** Keep dynamically discovered ticker markets registered while a client displays them. */
@@ -937,6 +1068,16 @@ export class CrossExMarketHub {
       shard.reconnectTimer = setTimeout(() => this.connectShard(shard), wait);
       shard.reconnectTimer.unref?.();
       this.refreshConnectionState();
+      // Every book was just dropped above, so every watched symbol needs a fresh baseline: without
+      // one, the reconnected feed's diffs would rebuild a book out of "levels that happened to
+      // change after the reconnect", i.e. ghost levels by construction. Re-reserving the book and
+      // asking now (rather than waiting for the first frame) means the baseline is usually there
+      // before the diffs resume.
+      for (const key of this.bookWatchers.keys()) {
+        const watchedSymbol = key.slice('order_book_update:'.length);
+        this.reserveBook(watchedSymbol);
+        this.ensureBookSeed(watchedSymbol);
+      }
     });
   }
 
@@ -1155,11 +1296,86 @@ export class CrossExMarketHub {
     this.clearInvalid('order_book_update', symbol);
     if (!this.bookWatchers.has(`order_book_update:${symbol}`)) return;
     let book = this.books.get(symbol);
-    if (!book || result.snapshot) {
-      if (book?.emitTimer) clearTimeout(book.emitTimer);
-      book = { bids: new Map(), asks: new Map(), updatedAt: new Date(result.ts).toISOString(), receivedAt, dirty: false, emitTimer: null };
+    if (!book) {
+      book = this.createBookState(result.ts, receivedAt, result.snapshot === true);
       this.books.set(symbol, book);
+      // No baseline yet and none requested: ask the venue right away instead of waiting for the
+      // sweeper, so the very first frame a client sees is already a seeded book.
+      if (!book.seeded) this.ensureBookSeed(symbol);
+    } else if (result.snapshot) {
+      if (book.emitTimer) clearTimeout(book.emitTimer);
+      book.bids = new Map();
+      book.asks = new Map();
+      // An upstream snapshot is itself an authoritative baseline: buffered frames are replayed
+      // below, and no venue REST seed is needed for this book any more.
+      book.seeded = true;
+      book.seedInFlight = false;
+      book.seedFailures = 0;
+      book.seedAbandoned = false;
+      book.seededAt = receivedAt;
+      book.lastSeq = null;
     }
+
+    if (!book.seeded && !book.seedAbandoned && this.depthSource !== undefined) {
+      // A diff without a baseline describes only the levels that moved. Buffer it for replay and
+      // leave the book untouched: half a book is worse than none, because its depth and its top
+      // level would both be wrong while looking perfectly plausible.
+      // Without a depth source there is no way to obtain a baseline, so the pre-seeding behaviour
+      // (accumulate) is the only option — never leave such a book blank.
+      if (book.pendingDiffs.length >= BOOK_DIFF_WINDOW) book.pendingDiffs.shift();
+      book.pendingDiffs.push({ receivedAt, ts: result.ts, bids: result.b, asks: result.a });
+      if (!book.seedInFlight) this.ensureBookSeed(symbol);
+      return;
+    }
+
+    if (this.dropIfStaleSequentialDiff(book, symbol, result)) return;
+    this.applyBookFrame(book, result, receivedAt);
+    this.scheduleBookEmit(symbol, book);
+  }
+
+  /** Fresh book state. `seeded` is only true when the frame that created it was a snapshot. */
+  private createBookState(ts: number, receivedAt: number, seeded: boolean): BookState {
+    return {
+      bids: new Map(),
+      asks: new Map(),
+      updatedAt: new Date(ts).toISOString(),
+      receivedAt,
+      dirty: false,
+      emitTimer: null,
+      seeded,
+      seedCutoffMs: 0,
+      pendingDiffs: [],
+      seedFailures: 0,
+      lastSeedAttemptAt: Number.NEGATIVE_INFINITY,
+      seededAt: seeded ? receivedAt : 0,
+      seedInFlight: false,
+      seedAbandoned: false,
+      lastSeq: null,
+    };
+  }
+
+  /**
+   * Drop the levels furthest from the touch so each side stays bounded.
+   *
+   * Amortized on purpose: sorting on every frame would cost more than the leak it prevents, so this
+   * only runs once a side has doubled the cap. A level that is dropped here can still be restored
+   * by the next diff or by the hourly re-seed.
+   */
+  private trimBookLevels(book: BookState): void {
+    const trim = (levels: Map<string, string>, side: 'bid' | 'ask') => {
+      if (levels.size <= BOOK_LEVEL_HARD_LIMIT * 2) return;
+      const ordered = [...levels.entries()]
+        .sort((a, b) => side === 'bid' ? Number(b[0]) - Number(a[0]) : Number(a[0]) - Number(b[0]))
+        .slice(0, BOOK_LEVEL_HARD_LIMIT);
+      levels.clear();
+      for (const [price, size] of ordered) levels.set(price, size);
+    };
+    trim(book.bids, 'bid');
+    trim(book.asks, 'ask');
+  }
+
+  /** Merge one frame's levels into the book and stamp the two clocks. */
+  private applyBookFrame(book: BookState, result: z.infer<typeof OrderBookUpdatePushSchema>['result'], receivedAt: number): void {
     const apply = (levels: Map<string, string>, updates: Array<[string, string]>) => {
       for (const [price, quantity] of updates) {
         if (Number(quantity) === 0) levels.delete(price);
@@ -1168,12 +1384,193 @@ export class CrossExMarketHub {
     };
     apply(book.bids, result.b);
     apply(book.asks, result.a);
+    this.trimBookLevels(book);
     book.updatedAt = new Date(result.ts).toISOString();
     // Local arrival time only moves with the frame that actually changed levels, so a quote built
     // from this book reports when *that book* was last updated, not when some unrelated channel
     // last spoke.
     book.receivedAt = receivedAt;
-    this.scheduleBookEmit(symbol, book);
+    book.lastSeq = typeof result.u === 'number' && result.u >= 0
+      ? result.u
+      : typeof result.U === 'number' ? result.U : book.lastSeq;
+  }
+
+  /**
+   * Sequence rules, per venue — and never across sources.
+   *
+   * The CrossEx `U`/`u` counter is CrossEx's own numbering; a venue REST snapshot carries a
+   * completely unrelated sequence (Binance `lastUpdateId`, Bybit `u`, Gate `id`) and OKX's seqId is
+   * not comparable either. Bridging the two is impossible, which is why the seed joins by time.
+   *
+   * Two shapes exist upstream, told apart by `u === -1`:
+   * - `u === -1` (Gate, Bybit): `U` is a per-symbol counter that increments by one per frame, so a
+   *   jump means we missed frames and the book must be rebuilt from a fresh baseline.
+   * - otherwise (Binance global sequence, OKX): `U..u` is a range on a venue-wide counter, so gaps
+   *   are expected and only out-of-order frames can be detected — drop those.
+   */
+  private dropIfStaleSequentialDiff(book: BookState, symbol: string, result: z.infer<typeof OrderBookUpdatePushSchema>['result']): boolean {
+    if (book.lastSeq === null) return false;
+    if (result.u === -1) {
+      if (typeof result.U !== 'number' || result.U === book.lastSeq + 1) return false;
+      // A gap: rebuild from REST rather than patching a book we know is missing levels.
+      this.requestReseed(symbol, book, 'sequence_gap');
+      return true;
+    }
+    if (typeof result.u !== 'number') return false;
+    return result.u <= book.lastSeq;
+  }
+
+  /** Ask for a new baseline after the sequence proved this book incomplete. */
+  private requestReseed(symbol: string, book: BookState, reason: string): void {
+    if (book.seedInFlight) return;
+    book.seeded = false;
+    book.pendingDiffs = [];
+    book.lastSeq = null;
+    book.seedFailures = 0;
+    book.seedAbandoned = false;
+    book.lastSeedAttemptAt = Number.NEGATIVE_INFINITY;
+    this.report?.({ symbol, outcome: 'reset', durationMs: 0, levels: book.bids.size + book.asks.size, attempts: 0, reason });
+    this.ensureBookSeed(symbol);
+  }
+
+  /**
+   * Seed one symbol's book from the venue's own REST depth endpoint.
+   *
+   * Serialized per symbol, spaced by at least {@link BOOK_SEED_MIN_INTERVAL_MS}, retried with a
+   * {@link BOOK_SEED_RETRY_MS} backoff, and abandoned after {@link BOOK_SEED_MAX_ATTEMPTS} failures
+   * — after which diffs accumulate the old way rather than leaving the book blank forever.
+   *
+   * The join with the live feed is by *local* time only: every frame arriving while the request is
+   * in flight is buffered, and once the snapshot lands the cut-off is set to that arrival instant, so
+   * only frames we received afterwards replay. Venue `ts` values are never compared against it (that
+   * mixes two clocks), and sequence ids are never compared across sources.
+   */
+  private ensureBookSeed(symbol: string): void {
+    const book = this.books.get(symbol);
+    if (!book || book.seeded || book.seedInFlight || book.seedAbandoned) return;
+    if (this.depthSource === undefined) return;
+    const now = this.now();
+    const spacing = book.seedFailures === 0 ? BOOK_SEED_MIN_INTERVAL_MS : BOOK_SEED_RETRY_MS;
+    if (now - book.lastSeedAttemptAt < spacing) return;
+
+    book.seedInFlight = true;
+    book.lastSeedAttemptAt = now;
+    // Reset rather than stamp: the meaningful cut-off is the *arrival* time of the response, set
+    // below. Stamping the request time here was the bug — it compared a local instant against the
+    // venue's event clock.
+    book.seedCutoffMs = 0;
+    this.startBookSweeper();
+
+    const startedAt = now;
+    void this.depthSource(symbol, BOOK_SEED_LIMIT).then((snapshot) => {
+      const current = this.books.get(symbol);
+      // The book may have been released or replaced while the request was in flight.
+      if (!current || current !== book) return;
+      current.seedInFlight = false;
+      if (snapshot === null || snapshot.bids.length === 0 || snapshot.asks.length === 0) {
+        this.countSeedFailure(symbol, current, startedAt, 'empty_snapshot');
+        return;
+      }
+      current.bids = new Map(snapshot.bids.map(([price, size]) => [price, size]));
+      current.asks = new Map(snapshot.asks.map(([price, size]) => [price, size]));
+      current.seeded = true;
+      current.seedFailures = 0;
+      current.seedAbandoned = false;
+      current.seededAt = this.now();
+      // Join the two streams on **one** clock: our own. The cut-off is when the snapshot arrived, and
+      // a buffered frame replays only if *we received it* after that — its venue `ts` is never
+      // consulted, because a venue clock running fast would replay pre-snapshot frames on top of a
+      // newer snapshot (silent corruption) and a slow one would discard genuinely new frames.
+      // Everything buffered during the request is therefore older than the snapshot's content and is
+      // dropped; the next diff that touches a level restores it, so no ghost can survive.
+      // Single-threaded, so this window is normally empty — it exists for the case where the
+      // resolution and the incoming frame interleave. The margin keeps that window conservative.
+      current.seedCutoffMs = Date.now() + BOOK_SEED_CUTOFF_MARGIN_MS;
+      const replayed = current.pendingDiffs.filter((frame) => frame.receivedAt > current.seedCutoffMs);
+      const droppedBeforeCutoff = current.pendingDiffs.length - replayed.length;
+      current.pendingDiffs = [];
+      for (const frame of replayed) {
+        const apply = (levels: Map<string, string>, updates: Array<[string, string]>) => {
+          for (const [price, size] of updates) {
+            if (Number(size) === 0) levels.delete(price);
+            else levels.set(price, size);
+          }
+        };
+        apply(current.bids, frame.bids);
+        apply(current.asks, frame.asks);
+        current.updatedAt = new Date(frame.ts).toISOString();
+      }
+      this.trimBookLevels(current);
+      this.report?.({
+        symbol,
+        outcome: 'seeded',
+        durationMs: this.now() - startedAt,
+        levels: current.bids.size + current.asks.size,
+        attempts: current.seedFailures + 1,
+        reason: `replayed=${replayed.length} droppedBeforeCutoff=${droppedBeforeCutoff}`,
+      });
+      this.scheduleBookEmit(symbol, current);
+    }).catch((error: unknown) => {
+      const current = this.books.get(symbol);
+      if (!current || current !== book) return;
+      current.seedInFlight = false;
+      this.countSeedFailure(symbol, current, startedAt, error instanceof Error ? error.message : 'seed_failed');
+    });
+  }
+
+  /** One failed attempt: retry with backoff, or fall back to plain accumulation when spent. */
+  private countSeedFailure(symbol: string, book: BookState, startedAt: number, reason: string): void {
+    book.seedFailures += 1;
+    const spent = book.seedFailures >= BOOK_SEED_MAX_ATTEMPTS;
+    if (spent) {
+      // The venue is unreachable: keep the feature alive with the pre-seeding behaviour instead of
+      // rendering an empty book forever.
+      book.seedAbandoned = true;
+      book.pendingDiffs = [];
+    }
+    this.report?.({
+      symbol,
+      outcome: spent ? 'abandoned' : 'failed',
+      durationMs: this.now() - startedAt,
+      levels: book.bids.size + book.asks.size,
+      attempts: book.seedFailures,
+      reason,
+    });
+  }
+
+  /** Start the sweeper that retries unseeded books and refreshes seeded ones hourly. */
+  private startBookSweeper(): void {
+    if (this.bookSeedSweep !== null || this.depthSource === undefined) return;
+    this.bookSeedSweep = setInterval(() => this.sweepBookSeeds(), BOOK_SEED_SWEEP_MS);
+    this.bookSeedSweep.unref?.();
+  }
+
+  /** Stop the sweeper; called when the last book watcher goes away. */
+  private stopBookSweeperIfIdle(): void {
+    if (this.bookWatchers.size > 0 || this.bookSeedSweep === null) return;
+    clearInterval(this.bookSeedSweep);
+    this.bookSeedSweep = null;
+  }
+
+  /**
+   * Periodic pass over watched books: retry a failed/unseeded one, and rebuild a seeded one from
+   * REST every {@link BOOK_RESET_INTERVAL_MS}. The hourly rebuild is what keeps ghost levels — a
+   * price that emptied before we subscribed gets no delete frame — from accumulating forever.
+   */
+  private sweepBookSeeds(): void {
+    const now = this.now();
+    for (const [symbol, book] of this.books) {
+      if (!this.bookWatchers.has(`order_book_update:${symbol}`)) continue;
+      if (!book.seeded) {
+        this.ensureBookSeed(symbol);
+        continue;
+      }
+      if (book.seedInFlight || now - book.seededAt < BOOK_RESET_INTERVAL_MS) continue;
+      // Rebuild in place: `seeded` stays true so the live feed keeps patching until the new
+      // baseline lands, and the replay window closes over anything that arrived meanwhile.
+      book.seedInFlight = false;
+      this.requestReseed(symbol, book, 'hourly_reset');
+    }
   }
 
   private scheduleBookEmit(symbol: string, book: BookState): void {

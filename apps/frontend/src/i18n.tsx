@@ -620,6 +620,7 @@ const chinese: Record<string, string> = {
   '24h turnover': '24h 成交额',
   'Click to fill the maximum size': '点击填入最大数量',
   'Top-of-book only: this market pushes no order book': '仅买一/卖一档（该市场不推送盘口）',
+  'Top-of-book only: this market has no seeded order book yet': '仅买一/卖一档（该市场盘口尚未完成基线播种）',
   // 平仓后负债结算
   'Venue debts settled': '交易所欠款已自动结清',
   'Venue debt remains': '仍有交易所欠款未结清',

@@ -60,8 +60,9 @@ export interface LegQuoteInput {
    * Top-of-book read from `GET /api/markets/books`. Same hub record as `market` (see
    * `LegQuoteSource['books-top']`), consumed here when the page's stream carries no usable price
    * for the requested side — a sparse ticker, a leg missing from the page's watch snapshot, or a
-   * page that has not received its first frame yet. The endpoint's own `source: 'ticker'` marks a
-   * single level for markets whose venue pushes no book.
+   * page that has not received its first frame yet. The endpoint's `source: 'ticker'` means the
+   * local book is **not seeded** (REST baseline pending or abandoned), so only a single level is
+   * available; it no longer means "this venue never publishes a book".
    */
   topOfBook?: Pick<MarketBookDepth, 'bestBid' | 'bestAsk' | 'updatedAt'> | null;
 }

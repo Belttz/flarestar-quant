@@ -270,7 +270,7 @@ describe('CrossEx ticker sparse-field fallback', () => {
       snapshot: true, ts: 1_771_990_810_000, s: 'BTC_USDT',
       a: [['118421', '0.4']], b: [['118419', '0.5']],
     } }));
-    await waitFor(() => hub.orderBook(symbol) !== null);
+    await waitFor(() => (hub.orderBook(symbol)?.bids.length ?? 0) > 0);
     expect(hub.orderBook(symbol)?.bids).toEqual([['118419', '0.5']]);
 
     hub.watchKlines(symbol, '1m');

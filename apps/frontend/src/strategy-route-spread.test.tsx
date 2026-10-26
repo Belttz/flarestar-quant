@@ -111,6 +111,8 @@ describe('price-difference bot live spread states', () => {
     ]));
     expect(html).toContain('data-spread-status="unaligned"');
     expect(html).toContain('Leg quotes are not time-aligned');
+    // The caption carries the measured gap, so "no spread" is explainable at a glance.
+    expect(html).toContain('Leg quotes are not time-aligned · 5.0s');
   });
 
   it('ignores venue clock drift when both legs reached us together', () => {

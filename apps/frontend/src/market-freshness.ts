@@ -9,6 +9,11 @@ export const STRATEGY_FUTURE_QUOTE_TOLERANCE_MS = 2_000;
  * Max |leftQuoteUpdatedAt − rightQuoteUpdatedAt| still considered "the same moment" when a spread
  * is shown. Mirrors the backend's `GCT_SPREAD_SKEW_MS` budget (default 2000) so the displayed
  * spread and the engine's executed spread share one alignment yardstick (PRD R4 / US-7).
+ *
+ * Deliberately NOT wider than the execution gate: the two clocks differ (display reads the local
+ * arrival stamps, execution reads the venues' event times), but the budget is the same on purpose.
+ * Deriving this from `GCT_SPREAD_SKEW_MS` is the only supported way to change it, and any future
+ * divergence between display and execution must be a decision, never a drift.
  */
 export const SPREAD_QUOTE_MAX_SKEW_MS = 2_000;
 
