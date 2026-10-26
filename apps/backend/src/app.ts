@@ -27,6 +27,7 @@ import {
   equityGranularityForRange,
   equityRangeWindow,
   PortfolioEquityRangeSchema,
+  SaveStrategyPairRequestSchema,
   STRATEGY_LOG_CATEGORIES,
   UserPreferencesSchema,
   type CrossExConvertOrder,
@@ -87,6 +88,7 @@ import { GateApiError, type GateCrossExAccount, type GateCrossExPortfolio, type 
 import { CandleStore } from './candle-store.js';
 import { CloseReconciler } from './close-reconciler.js';
 import { deficitsOf, planDeficitSettlements } from './deficit-settlement.js';
+import { deleteStrategyPair, listStrategyPairs, saveStrategyPair } from './strategy-pairs.js';
 import { FundingHistoryService } from './funding-history.js';
 import { FundingOverviewService } from './funding-overview.js';
 import { TtlSingleFlightCache } from './funding-rankings-cache.js';
@@ -2092,6 +2094,39 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
 
   app.get('/api/strategies', async () => ({ strategies: tradingRuntime.listStrategies() }));
 
+  // Saved cross-asset spread pairs (美股价差溢价套利): the two explicit leg symbols plus the
+  // quantity conversion, so a SNDK/SNXX-style pair can be reloaded and relaunched in one click.
+  app.get('/api/strategy-pairs', async () => ({ pairs: listStrategyPairs(database) }));
+
+  app.post('/api/strategy-pairs', {
+    config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+    preHandler: async (request, reply) => {
+      if (request.headers['x-gct-trading-intent'] !== 'save-strategy-pair') {
+        return reply.code(403).send({ error: 'missing_trading_intent' });
+      }
+    },
+  }, async (request, reply) => {
+    const parsed = SaveStrategyPairRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_strategy_pair' });
+    return saveStrategyPair(database, {
+      name: parsed.data.name,
+      leftSymbol: parsed.data.leftSymbol,
+      rightSymbol: parsed.data.rightSymbol,
+      ratio: parsed.data.ratio,
+      entryBps: parsed.data.entryBps ?? null,
+    });
+  });
+
+  app.delete('/api/strategy-pairs/:id', async (request, reply) => {
+    if (request.headers['x-gct-trading-intent'] !== 'delete-strategy-pair') {
+      return reply.code(403).send({ error: 'missing_trading_intent' });
+    }
+    const parsed = z.object({ id: z.string().min(1) }).safeParse(request.params);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_strategy_pair_id' });
+    return deleteStrategyPair(database, parsed.data.id)
+      ? { deleted: true }
+      : reply.code(404).send({ error: 'strategy_pair_not_found' });
+  });
   app.post('/api/strategies', {
     config: { rateLimit: { max: 20, timeWindow: '1 minute' } },
     preHandler: async (request, reply) => {
@@ -3390,13 +3425,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     if (!operationsGateway.queryAccount) return reply.code(503).send({ error: 'account_unavailable' });
     const credentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
     if (!credentials) return reply.code(409).send({ error: 'credential_not_configured' });
-    const [account, transferCoins, spotAccounts, rates] = await Promise.all([
+    const [account, transferCoins, spotAccounts] = await Promise.all([
       operationsGateway.queryAccount(credentials),
       operationsGateway.queryTransferCoins ? operationsGateway.queryTransferCoins() : Promise.resolve([]),
       operationsGateway.querySpotAccounts ? operationsGateway.querySpotAccounts(credentials) : Promise.resolve([]),
-      operationsGateway.queryInterestRates
-        ? operationsGateway.queryInterestRates(credentials, {}).catch(() => [])
-        : Promise.resolve([]),
     ]);
     const assets = account.assets.map((asset) => ({
       venue: asset.exchange_type,
@@ -3404,6 +3436,19 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       balance: asset.balance,
       availableBalance: asset.available_balance,
     }));
+    // Interest rates are quoted per coin AND venue, so a bare query returns nothing useful; ask
+    // once per deficit pair and keep the failures silent (a missing rate is not a missing debt).
+    const deficitRows = deficitsOf(assets);
+    const ratePairs = [...new Map(deficitRows.map((asset) => [
+      `${asset.venue}:${asset.coin}`,
+      { venue: asset.venue, coin: asset.coin },
+    ])).values()];
+    const rates = operationsGateway.queryInterestRates
+      ? (await Promise.all(ratePairs.map((pair) => operationsGateway.queryInterestRates!(
+        credentials,
+        { coin: pair.coin, exchangeType: pair.venue.toUpperCase() },
+      ).catch(() => [])))).flat()
+      : [];
     const rules = transferCoins.map((coin) => ({
       coin: coin.coin,
       minimumAmount: coin.min_trans_amount,
@@ -3418,7 +3463,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       crossExAvailable: account.available_margin,
     });
     const items: PortfolioDeficit[] = [];
-    for (const asset of deficitsOf(assets)) {
+    for (const asset of deficitRows) {
       const deficit = new Decimal(asset.balance).abs();
       const rate = rates.find((entry) => entry.coin === asset.coin
         && entry.exchange_type.toUpperCase() === asset.venue.toUpperCase());

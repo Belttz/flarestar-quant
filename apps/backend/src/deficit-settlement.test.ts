@@ -39,12 +39,12 @@ describe('planDeficitSettlements', () => {
       assets: [asset('DERIBIT', 'USDC', '-12.6')],
       coins: [USDC_RULE],
       accountMode: 'CROSS_EXCHANGE',
-      // Nothing at spot: the only remaining cash is the USDT margin account, and Gate forbids
-      // USDC transfers that touch CROSSEX.
+      // Nothing at spot and no other venue holds USDC: the USDT margin account is not a legal
+      // USDC source, so there is no candidate at all — reported as "no source", not "no route".
       crossExAvailable: '95',
     });
     expect(plan.legs).toHaveLength(0);
-    expect(plan.skipped[0]).toMatchObject({ venue: 'DERIBIT', coin: 'USDC', reason: 'no_route' });
+    expect(plan.skipped[0]).toMatchObject({ venue: 'DERIBIT', coin: 'USDC', reason: 'no_source' });
   });
 
   it('honours the SPOT-only rule for Hyperliquid USDC', () => {

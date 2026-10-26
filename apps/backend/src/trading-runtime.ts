@@ -107,6 +107,13 @@ export const CreateStrategyInputSchema = z.object({
   /** Explicit leg symbols override the venue/asset derivation (required for Gate spot legs). */
   leftSymbol: strategyLegSymbol.optional(),
   rightSymbol: strategyLegSymbol.optional(),
+  /**
+   * LEFT units per ONE right unit, i.e. right quantity = left quantity ÷ ratio. Set it when the two
+   * legs are different assets (a 美股价差 pair such as SNDK vs SNXX): the engine then sizes the
+   * hedge by this conversion instead of assuming one unit hedges one unit. Absent keeps the legacy
+   * 1:1 behaviour, and for premium strategies `adrRatio` still wins.
+   */
+  quantityRatio: signedDecimalText.optional(),
   /** carry: funding direction the strategy harvests; the leg sides derive from it. */
   fundingDirection: z.enum(['POSITIVE', 'NEGATIVE']).default('POSITIVE'),
   /** carry: annualized funding percentage gate that must be met before opening (15 = 15% APR). */

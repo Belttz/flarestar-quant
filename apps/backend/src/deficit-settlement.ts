@@ -191,8 +191,10 @@ export function planDeficitSettlements(input: PlanSettlementInput): SettlementPl
       break;
     }
     if (leg) { legs.push(leg); continue; }
-    // Distinguish "no legal route" from "route exists but nothing to fund it with": the first
-    // needs a product decision, the second only needs the user to free up cash.
+    // Distinguish the three dead ends, because they need different fixes from the user:
+    // nothing to fund with (deposit cash), a route every source is barred from (Gate's rules),
+    // or a route that exists but whose minimum amount is above what is owed.
+    if (candidates.length === 0) { skip('no_source'); continue; }
     const routable = candidates.some((candidate) => !crossExTransferRouteError(
       { coin: deficit.coin, from: candidate.account, to: target }, input.accountMode,
     ));

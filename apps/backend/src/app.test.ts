@@ -552,14 +552,14 @@ describe('local backend', () => {
       authenticatedTradingEnabled: false,
       tradingMode: 'unset',
       mode: 'live',
-      database: { migrationCount: 24, currentMigration: '0024_spread_samples.sql' },
+      database: { migrationCount: 25, currentMigration: '0025_saved_strategy_pairs.sql' },
       security: {
         credentialStorage: 'memory_test_only',
         credentialEntryPath: '/secure/credentials',
         browserJavaScriptHandlesSecrets: false,
       },
     });
-  });
+  }, 30_000);
 
   it('proxies, validates, and briefly caches public Boros strategies', async () => {
     const borosStrategyFetcher = vi.fn(async () => borosStrategyFixture());

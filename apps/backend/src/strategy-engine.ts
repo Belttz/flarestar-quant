@@ -332,8 +332,11 @@ function legsOf(config: CreateStrategyInput): { left: LegDefinition; right: LegD
  * it so exposure, matching, and progress stay in one unit.
  */
 function adrRatioOf(config: CreateStrategyInput): Decimal {
-  if (config.kind !== 'premium') return ONE;
-  const ratio = new Decimal(config.adrRatio ?? '1');
+  // Premium (ADR) strategies own the ratio field; a custom cross-asset pair supplies the same
+  // conversion through `quantityRatio`, so both funnel into one coefficient. Everything else is
+  // 1:1 (one left unit hedges one right unit).
+  if (config.kind !== 'premium' && !config.quantityRatio) return ONE;
+  const ratio = new Decimal(config.kind === 'premium' ? config.adrRatio ?? '1' : config.quantityRatio ?? '1');
   return ratio.gt(0) ? ratio : ONE;
 }
 

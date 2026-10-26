@@ -319,7 +319,6 @@ export const PortfolioDeficitsResponseSchema = z.object({
 });
 export type PortfolioDeficitsResponse = z.infer<typeof PortfolioDeficitsResponseSchema>;
 
-/** Result of an automatic settlement pass: what moved, what was held back for being too costly, and why. */
 export const SettleDeficitsResponseSchema = z.object({
   settled: z.array(z.object({
     venue: z.string(),
@@ -343,6 +342,40 @@ export const SettleDeficitsResponseSchema = z.object({
   })),
 });
 export type SettleDeficitsResponse = z.infer<typeof SettleDeficitsResponseSchema>;
+
+/**
+ * A user-saved spread pair for the 美股价差溢价套利 page. The two legs may be different assets
+ * (SNDK vs SNXX), so the pair is stored as its two explicit symbols plus the quantity conversion;
+ * `ratio` is LEFT units per ONE right unit (right quantity = left quantity ÷ ratio).
+ */
+export const SavedStrategyPairSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  leftSymbol: z.string(),
+  rightSymbol: z.string(),
+  ratio: z.string(),
+  entryBps: z.string().nullable(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+export type SavedStrategyPair = z.infer<typeof SavedStrategyPairSchema>;
+
+export const SavedStrategyPairsResponseSchema = z.object({ pairs: z.array(SavedStrategyPairSchema) });
+export type SavedStrategyPairsResponse = z.infer<typeof SavedStrategyPairsResponseSchema>;
+
+export const SaveStrategyPairRequestSchema = z.object({
+  name: z.string().trim().min(1).max(60),
+  leftSymbol: z.string().trim().min(1).max(80),
+  rightSymbol: z.string().trim().min(1).max(80),
+  ratio: z.string().trim().regex(/^\d+(?:\.\d+)?$/).refine((value) => Number(value) > 0, {
+    message: 'ratio must be positive',
+  }),
+  entryBps: z.string().trim().regex(/^-?\d+(?:\.\d+)?$/).optional(),
+}).refine((value) => value.leftSymbol !== value.rightSymbol, {
+  message: 'the two legs must be different symbols',
+  path: ['rightSymbol'],
+});
+export type SaveStrategyPairRequest = z.infer<typeof SaveStrategyPairRequestSchema>;
 
 export function canonicalCrossExTransferAccount(
   account: CrossExTransferAccount,
