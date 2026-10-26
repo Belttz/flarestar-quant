@@ -273,4 +273,35 @@ describe('CrossEx invalid-symbol backoff', () => {
     await waitFor(() => harness.hub.market(SYMBOL)?.fundingRate === '0.0002');
     expect(recordOf(harness, SYMBOL, 'ticker')).toBeDefined();
   });
+
+  /**
+   * A subscribe is all-or-nothing upstream: one unsupported symbol fails the whole batch, so the
+   * valid symbols in that batch receive nothing. Only `ticker`, `funding_rate` and `open_interest`
+   * used to be re-subscribed after the rejected symbols were dropped, which stranded
+   * `order_book_update`, `trade` and every `kline_*` channel until the last watcher released. That
+   * silently broke the candle backfill: `keepWarm` only renews a watch and never re-subscribes, so
+   * the history chart stayed empty without a single error in the log.
+   */
+  it('re-subscribes the surviving symbols on the book and kline channels after a batch rejection', async () => {
+    const harness = await createHarness();
+    const good = 'GATE_FUTURE_BTC_USDT';
+    const bad = 'NOT_A_REAL_SYMBOL';
+    expect(harness.hub.ensureMarkets([
+      { symbol: good, venue: 'GATE', asset: 'BTC' },
+      { symbol: bad, venue: 'GATE', asset: 'NOT_A_REAL' },
+    ])).toBe(true);
+
+    for (const channel of ['order_book_update', 'kline_1m']) {
+      harness.internals.subscribeSymbols(channel, [good, bad]);
+      await waitFor(() => subscribeFramesFor(harness.received, good, channel).length > 0);
+
+      const before = subscribeFramesFor(harness.received, good, channel).length;
+      await sendVerdict(harness, [bad], channel);
+      // The retry must name the surviving symbol and drop the rejected one.
+      await waitFor(() => subscribeFramesFor(harness.received, good, channel).length === before + 1);
+      const retry = subscribeFramesFor(harness.received, good, channel).at(-1) as { payload: string[] };
+      expect(retry.payload).toContain(good);
+      expect(retry.payload).not.toContain(bad);
+    }
+  });
 });

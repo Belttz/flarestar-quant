@@ -1000,7 +1000,18 @@ export class CrossExMarketHub {
       for (const symbol of invalidFound) subscribed.delete(symbol);
       this.markInvalid(channel, invalidFound, now);
       const socket = shard.socket;
-      if (socket?.readyState === WebSocket.OPEN && subscribed.size > 0 && ['ticker', 'funding_rate', 'open_interest'].includes(channel)) {
+      // Resubscribe without the rejected symbols on every data channel, not just the three that
+      // happened to be listed here. A subscribe is all-or-nothing upstream: one unsupported symbol
+      // makes the whole batch fail, so the *valid* symbols in that batch receive nothing at all.
+      // Dropping them silently used to strand `order_book_update`, `trade` and `kline_*` until the
+      // last watcher released — which also broke the candle backfill (`keepWarm` only renews a
+      // watch, it never re-subscribes), so the history chart stayed empty with no error anywhere.
+      // No loop risk: each rejected symbol was just removed from `subscribed` and moved into the
+      // invalid backoff, so it can trigger at most one extra subscribe.
+      const resubscribable = channel === 'order_book_update' || channel === 'trade'
+        || channel === 'ticker' || channel === 'funding_rate' || channel === 'open_interest'
+        || channel.startsWith('kline_');
+      if (socket?.readyState === WebSocket.OPEN && subscribed.size > 0 && resubscribable) {
         this.sendSubscribe(socket, channel, [...subscribed]);
       }
       return false;
