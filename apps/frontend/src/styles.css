@@ -2640,6 +2640,38 @@ html[data-theme='light'] .maker-depth-row dt { color: #6a7686; }
 html[data-theme='light'] .maker-depth-row dd { color: #33414e; }
 
 /* ── v0.4.1 ──────────────────────────────────────────────────────────────────────────────── */
+/* 美股价差溢价套利：自定义跨标的组合的编辑区。两条腿各自是独立的交易所+代码，因此用两列卡片
+ * 而不是单资产表单；已保存的组合排在编辑区之前，点一下即载入。 */
+.us-stock-view { display: grid; gap: 18px; }
+.us-pair-saved > header { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.us-pair-saved > header strong { font-size: var(--text-body); }
+.us-pair-saved > header span { color: var(--muted); font: var(--text-caption) var(--font-sans); }
+.us-pair-saved ul { display: grid; margin: 0; padding: 0; list-style: none; }
+.us-pair-saved li { display: flex; align-items: center; gap: 10px; padding: 8px 16px; border-top: 1px solid #161f2a; }
+.us-pair-saved li:first-child { border-top: 0; }
+.us-pair-load { flex: 1; min-width: 0; display: grid; gap: 2px; padding: 4px 6px; border: 1px solid transparent; border-radius: 5px; color: inherit; background: transparent; text-align: left; cursor: pointer; }
+.us-pair-load:hover { border-color: #2c3a4a; background: #101a24; }
+.us-pair-load strong { overflow: hidden; color: #d7dee6; font-size: var(--text-small); text-overflow: ellipsis; white-space: nowrap; }
+.us-pair-load small { overflow: hidden; color: #7f8da0; font: var(--text-caption) var(--font-sans); text-overflow: ellipsis; white-space: nowrap; }
+.us-pair-empty { margin: 0; padding: 14px 16px; color: #6b7a8d; font-size: var(--text-small); }
+.us-pair-editor { display: grid; gap: 14px; padding: 16px; }
+.us-pair-editor .us-leg { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 12px; border: 1px solid #22303d; border-radius: 8px; background: #0b1219; }
+.us-pair-editor .us-leg label { display: grid; gap: 5px; color: #7f8da0; font-size: var(--text-small); }
+.us-pair-editor .us-leg select, .us-pair-editor .us-leg input, .us-pair-fields input { min-width: 0; height: 34px; padding: 0 10px; border: 1px solid #2b3949; border-radius: 5px; color: #e4eaf1; background: #0d151e; font: var(--text-body) var(--font-sans); }
+.us-leg-symbol { grid-column: 1 / -1; margin: 0; color: #8b98a8; font: var(--text-caption) var(--font-sans); }
+.us-pair-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 0; }
+.us-pair-metrics > div { display: grid; gap: 3px; padding: 9px 12px; border: 1px solid #1f2b38; border-radius: 7px; background: #0b1219; }
+.us-pair-metrics dt { color: #6b7a8d; font-size: var(--text-micro); }
+.us-pair-metrics dd { margin: 0; color: #d7dee6; font: 600 var(--text-body) var(--font-sans); }
+.us-pair-fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.us-pair-fields label { display: grid; gap: 5px; color: #7f8da0; font-size: var(--text-small); }
+.us-pair-notice { margin: 0; color: #7fd7c2; font-size: var(--text-small); }
+.us-pair-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.us-pair-confirm { flex: 1; display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid #2b3949; border-radius: 7px; background: #0d151e; }
+.us-pair-confirm p { flex: 1; margin: 0; color: #b4becb; font-size: var(--text-small); }
+html[data-theme='light'] .us-pair-editor .us-leg, html[data-theme='light'] .us-pair-metrics > div, html[data-theme='light'] .us-pair-confirm { border-color: #dfe6ec; background: #f7f9fb; }
+html[data-theme='light'] .us-pair-saved li { border-top-color: #e5eaee; }
+
 /* Depth/turnover footer under the order book: what the visible book can actually absorb on each
  * side, plus the venue's rolling 24h turnover — the two numbers that decide whether a size is
  * executable at the quoted price. */

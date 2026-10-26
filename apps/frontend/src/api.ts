@@ -27,6 +27,10 @@ import {
   CrossExConvertQuoteSchema,
   PortfolioDeficitsResponseSchema,
   SettleDeficitsResponseSchema,
+  DeleteStrategyPairResponseSchema,
+  SavedStrategyPairSchema,
+  SavedStrategyPairsResponseSchema,
+  SaveStrategyPairRequestSchema,
   MarketSizeUnitsSchema,
   MarketSnapshotSchema,
   OpportunityResponseSchema,
@@ -92,6 +96,8 @@ import {
   type PublicMarketSnapshot,
   type PublicMarketSnapshotResponse,
   type ResidualReport,
+  type SavedStrategyPair,
+  type SaveStrategyPairRequest,
   type StrategyConfig,
   type StrategyLog,
   type StrategyLogCategory,
@@ -156,6 +162,8 @@ export type {
   PublicMarketSnapshot,
   PublicMarketSnapshotResponse,
   ResidualReport,
+  SavedStrategyPair,
+  SaveStrategyPairRequest,
   StrategyConfig,
   StrategyLog,
   StrategyLogCategory,
@@ -579,6 +587,18 @@ export const api = {
     return request(CandleSeriesResponseSchema, `/api/markets/${encodeURIComponent(symbol)}/candles?${params}`);
   },
   sizeUnits: () => request(MarketSizeUnitsSchema, '/api/markets/size-units'),
+  /** Saved cross-asset spread pairs (美股价差溢价套利). */
+  strategyPairs: () => request(SavedStrategyPairsResponseSchema, '/api/strategy-pairs'),
+  saveStrategyPair: (body: SaveStrategyPairRequest) => request(SavedStrategyPairSchema, '/api/strategy-pairs', {
+    method: 'POST',
+    headers: { 'x-gct-trading-intent': 'save-strategy-pair' },
+    body: JSON.stringify(SaveStrategyPairRequestSchema.parse(body)),
+  }),
+  deleteStrategyPair: (id: string) => request(DeleteStrategyPairResponseSchema, `/api/strategy-pairs/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    headers: { 'x-gct-trading-intent': 'delete-strategy-pair' },
+  }),
+
   /** Executable depth per symbol; used to size clips and to default the maker leg onto thin books. */
   marketBooks: (symbols: string[]) => request(
     MarketBookDepthsResponseSchema,

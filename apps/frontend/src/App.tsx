@@ -40,6 +40,7 @@ const StrategyView = lazy(() => import('./strategy-route.js').then((module) => (
 const PremiumStrategyView = lazy(() => import('./strategy-route.js').then((module) => ({ default: module.PremiumStrategyView })));
 const CarryStrategyView = lazy(() => import('./strategy-route.js').then((module) => ({ default: module.CarryStrategyView })));
 const BorosStrategyView = lazy(() => import('./boros-route.js').then((module) => ({ default: module.BorosStrategyView })));
+const UsStockArbView = lazy(() => import('./us-stock-arb-route.js').then((module) => ({ default: module.UsStockArbView })));
 const FundingDetailView = lazy(() => import('./funding-route.js').then((module) => ({ default: module.FundingDetailView })));
 const FundingRatesView = lazy(() => import('./funding-route.js').then((module) => ({ default: module.FundingRatesView })));
 const OpportunitiesView = lazy(() => import('./opportunity-route.js').then((module) => ({ default: module.OpportunitiesView })));
@@ -83,6 +84,7 @@ const strategyPages: Array<{ kind: StrategyKind; glyph: string; label: string; d
   { kind: 'carry', glyph: '⌛', label: 'Spot-perpetual carry bot', detail: 'Collect funding by holding spot against its perpetual, then exit when the basis converges.' },
   { kind: 'auto', glyph: '∑', label: 'Auto price-difference bot', detail: 'Continuously capture cross-exchange spreads' },
   { kind: 'premium', glyph: '≒', label: 'SK hynix premium bot', detail: 'Trade the SK hynix ADR premium vs the Korean listing' },
+  { kind: 'us-stock', glyph: '⇄', label: 'US-stock spread & premium arbitrage', detail: 'Custom cross-asset pairs (SNDK vs SNXX) sized by quantity ratio, savable and reusable' },
 ];
 
 // The Opportunities dropdown (R9): all four boards reachable in one click, mirroring the
@@ -1226,6 +1228,7 @@ function App() {
       if (strategyKind === 'premium') return <PremiumStrategyView key={strategyPrefillKeyValue} marketSnapshot={marketSnapshot} catalog={availableCatalog} strategies={activeAccountStrategies} balances={balances} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} requestedStrategyId={requestedStrategyId} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} candleSeries={candleSeries} watchQuotes={watchQuotes} watchKlines={watchKlines} onOpenStrategyConfig={openStrategyConfig} onCopyStrategy={copyStrategy} />;
       if (strategyKind === 'carry') return <CarryStrategyView key={strategyPrefillKeyValue} marketSnapshot={marketSnapshot} catalog={availableCatalog} strategies={activeAccountStrategies} balances={balances} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} requestedStrategyId={requestedStrategyId} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} watchQuotes={watchQuotes} onOpenStrategyConfig={openStrategyConfig} onCopyStrategy={copyStrategy} />;
       if (strategyKind === 'boros') return <BorosStrategyView key={strategyPrefillKeyValue} marketSnapshot={marketSnapshot} catalog={availableCatalog} balances={balances} fees={fees} feesReady={feesReady} strategies={activeAccountStrategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} requestedStrategyId={requestedStrategyId} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} watchQuotes={watchQuotes} onOpenStrategyConfig={openStrategyConfig} onCopyStrategy={copyStrategy} />;
+      if (strategyKind === 'us-stock') return <UsStockArbView marketSnapshot={marketSnapshot} catalog={availableCatalog} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} />;
       return <StrategyView key={strategyPrefillKeyValue} mode={strategyKind} prefill={positionPrefill} marketSnapshot={marketSnapshot} catalog={availableCatalog} fees={fees} strategies={activeAccountStrategies} balances={balances} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} requestedStrategyId={requestedStrategyId} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} watchQuotes={watchQuotes} onOpenStrategyConfig={openStrategyConfig} onCopyStrategy={copyStrategy} />;
     }
     if (workspace === 'Funding Rates') return fundingDetailAsset

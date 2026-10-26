@@ -377,6 +377,8 @@ export const SaveStrategyPairRequestSchema = z.object({
 });
 export type SaveStrategyPairRequest = z.infer<typeof SaveStrategyPairRequestSchema>;
 
+export const DeleteStrategyPairResponseSchema = z.object({ deleted: z.boolean() });
+
 export function canonicalCrossExTransferAccount(
   account: CrossExTransferAccount,
   coin: string,
@@ -1388,6 +1390,8 @@ export const StrategyConfigSchema = z.object({
   asset: z.string(),
   hedgeAsset: z.string().optional(),
   adrRatio: PositiveDecimalTextSchema.optional(),
+  /** Cross-asset pairs: LEFT units per ONE right unit (right qty = left qty ÷ ratio). */
+  quantityRatio: PositiveDecimalTextSchema.optional(),
   hedgeMode: z.enum(['SHARE_RATIO', 'EQUAL_NOTIONAL']).optional(),
   leftLeverage: PositiveDecimalTextSchema.optional(),
   rightLeverage: PositiveDecimalTextSchema.optional(),

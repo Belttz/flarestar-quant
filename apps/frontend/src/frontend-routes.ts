@@ -1,4 +1,4 @@
-export type StrategyRouteKind = 'position' | 'auto' | 'premium' | 'carry' | 'boros';
+export type StrategyRouteKind = 'position' | 'auto' | 'premium' | 'carry' | 'boros' | 'us-stock';
 
 /**
  * Which Opportunities board a route opens: the cross-exchange spread ranking, the funding hedge
@@ -26,6 +26,8 @@ const STRATEGY_PATHS: Record<StrategyRouteKind, string> = {
   premium: '/strategies/sk-hynix-premium',
   carry: '/strategies/spot-perp-carry',
   boros: '/strategies/boros',
+  // 美股价差溢价套利: custom cross-asset pairs (SNDK vs SNXX and friends).
+  'us-stock': '/strategies/us-stock-spread',
 };
 
 const OPPORTUNITY_BOARD_PATHS: Record<OpportunityBoard, string> = {
