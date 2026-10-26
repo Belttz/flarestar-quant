@@ -6,6 +6,7 @@ import {
   type MarketCatalogAsset,
   type MarketSnapshot,
   type SavedStrategyPair,
+  type StrategyConfig,
   type TradingMode,
 } from './api.js';
 import { useLanguage } from './i18n.js';
@@ -21,6 +22,14 @@ import {
 import { usePairCandleHistory } from './pair-candle-history.js';
 import { buildPriceDifferenceHistory, type PriceDifferenceHistoryPoint } from './price-difference-history.js';
 import { StrategyLaunchConfirmation } from './strategy-launch-confirmation.js';
+import {
+  availablePresetStorage,
+  readPairPresets,
+  withPairPreset,
+  withoutPairPreset,
+  writePairPresets,
+  type PairExecutionPreset,
+} from './us-stock-pair-preset.js';
 
 /**
  * 美股价差溢价套利 — custom cross-asset spread pairs.
@@ -34,8 +43,9 @@ import { StrategyLaunchConfirmation } from './strategy-launch-confirmation.js';
  *
  * The layout deliberately mirrors the SK hynix premium bot (`PremiumStrategyView`): heading →
  * "Market & venues" panel with two editable legs → price-difference history panel with one large
- * reading → setup sidebar → two-step launch. That page is the reference the operator asked for,
- * and only the leg *identity* differs here.
+ * reading → setup sidebar → two-step launch. That page is the reference the operator asked for, so
+ * it carries the same setup vocabulary: entry / take-profit / stop-loss thresholds, total &
+ * per-order size, max position, reduce-only, and one leverage input **per leg**.
  *
  * Live prices come from the shared three-state model in `spread-state.ts`: a leg price is shown as
  * a number only when a quote actually exists, and the spread is only printed when both legs are
@@ -78,6 +88,77 @@ function legStateLabel(quote: LegQuote, t: (key: string) => string): string {
   if (quote.state === 'live') return t('Live');
   if (quote.state === 'stale') return t('Stale quote');
   return t('Waiting for quote');
+}
+
+const DECIMAL_TEXT = /^-?\d+(?:\.\d+)?$/;
+
+/**
+ * Parse a numeric input without inventing a value. `null` means "not filled in **or** not a
+ * number" — the two are told apart by the caller looking at the raw text, so an empty box is never
+ * silently treated as `0`.
+ */
+function decimalValue(text: string): number | null {
+  const trimmed = text.trim();
+  if (trimmed === '' || !DECIMAL_TEXT.test(trimmed)) return null;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/** Inline error under a field; `null` renders nothing at all. */
+function FieldError({ text }: { text: string | null }) {
+  return text === null ? null : <small className="us-field-error">{text}</small>;
+}
+
+/** Everything the launch payload needs, already parsed and stringified as the schema expects. */
+export interface PositionConfigFields {
+  leftTicker: string;
+  leftVenue: string;
+  rightVenue: string;
+  leftSymbol: string;
+  rightSymbol: string;
+  quantityRatio: string;
+  entryBps: string;
+  takeProfitBps: string;
+  stopLossBps: number | null;
+  totalAmount: string;
+  perOrderQuantity: string;
+  maxPosition: string;
+  leftLeverage: string;
+  rightLeverage: string;
+  reduceOnly: boolean;
+}
+
+/**
+ * Build the `kind: 'position'` config this page submits.
+ *
+ * Extracted from the submit handler so the field mapping is one readable block that can be asserted
+ * directly — every name here is a field of `StrategyConfigSchema`, and optional values are *omitted*
+ * rather than sent as empty strings, because the schema rejects `''` where it accepts absence.
+ * `stopLossBps` is a number in the schema while `takeProfitBps` is decimal text; that asymmetry is
+ * the API's, not this page's.
+ */
+export function buildPositionConfig(fields: PositionConfigFields): StrategyConfig {
+  return {
+    kind: 'position',
+    asset: fields.leftTicker,
+    leftVenue: fields.leftVenue.toUpperCase(),
+    rightVenue: fields.rightVenue.toUpperCase(),
+    leftSymbol: fields.leftSymbol,
+    rightSymbol: fields.rightSymbol,
+    quantityRatio: fields.quantityRatio,
+    leftSide: 'SELL',
+    rightSide: 'BUY',
+    entryBps: fields.entryBps,
+    ...(fields.takeProfitBps.trim() === '' ? {} : { takeProfitBps: fields.takeProfitBps }),
+    ...(fields.stopLossBps === null ? {} : { stopLossBps: fields.stopLossBps }),
+    totalAmount: fields.totalAmount,
+    perOrderQuantity: fields.perOrderQuantity,
+    ...(fields.maxPosition.trim() === '' ? {} : { maxPosition: fields.maxPosition }),
+    leftLeverage: fields.leftLeverage,
+    rightLeverage: fields.rightLeverage,
+    reduceOnly: fields.reduceOnly,
+    executionMethod: 'TAKER_TAKER',
+  };
 }
 
 export interface SavedPairsPanelProps {
@@ -164,6 +245,10 @@ export function UsStockArbView({
   const [pairName, setPairName] = useState('');
   const [saving, setSaving] = useState(false);
   const [pairNotice, setPairNotice] = useState<string | null>(null);
+  // Size / leverage / thresholds have no server-side home (see `us-stock-pair-preset.ts`).
+  const [presets, setPresets] = useState<Record<string, PairExecutionPreset>>(
+    () => readPairPresets(availablePresetStorage()),
+  );
 
   // --- Leg definition ----------------------------------------------------------------------
   const [leftVenue, setLeftVenue] = useState('gate');
@@ -175,9 +260,15 @@ export function UsStockArbView({
   const [ratioTouched, setRatioTouched] = useState(false);
   const [ratio, setRatio] = useState('');
   const [entryBps, setEntryBps] = useState('20');
+  const [takeProfitBps, setTakeProfitBps] = useState('');
+  const [stopLossBps, setStopLossBps] = useState('');
   const [totalAmount, setTotalAmount] = useState('');
   const [perOrderQuantity, setPerOrderQuantity] = useState('');
-  const [leverage, setLeverage] = useState('3');
+  const [maxPosition, setMaxPosition] = useState('');
+  // The premium page keeps one leverage per leg; a cross-asset pair can need different ceilings.
+  const [leftLeverage, setLeftLeverage] = useState('3');
+  const [rightLeverage, setRightLeverage] = useState('3');
+  const [reduceOnly, setReduceOnly] = useState(false);
 
   // --- Launch ------------------------------------------------------------------------------
   const [launching, setLaunching] = useState(false);
@@ -236,10 +327,25 @@ export function UsStockArbView({
     // A reloaded pair must keep the ratio it was saved with; the equal-notional default must not
     // overwrite a number the operator chose earlier.
     setRatioTouched(true);
-    setEntryBps(pair.entryBps ?? '0');
+    setEntryBps(pair.entryBps ?? '');
     setPairName(pair.name);
+    // Restore every field the server record cannot hold, so a reload is a full reload.
+    const preset = presets[pair.name];
+    if (preset) {
+      if (preset.ratio !== '') setRatio(preset.ratio);
+      setEntryBps(preset.entryBps !== '' ? preset.entryBps : pair.entryBps ?? '');
+      setTakeProfitBps(preset.takeProfitBps);
+      setStopLossBps(preset.stopLossBps);
+      setTotalAmount(preset.totalAmount);
+      setPerOrderQuantity(preset.perOrderQuantity);
+      setMaxPosition(preset.maxPosition);
+      if (preset.leftLeverage !== '') setLeftLeverage(preset.leftLeverage);
+      if (preset.rightLeverage !== '') setRightLeverage(preset.rightLeverage);
+      setReduceOnly(preset.reduceOnly);
+    }
     setConfirmingLaunch(false);
     setLaunchNotice(null);
+    setPairNotice(null);
   };
 
   const savePair = async () => {
@@ -254,6 +360,21 @@ export function UsStockArbView({
         ratio: ratio || '1',
         entryBps: entryBps.trim() === '' ? undefined : entryBps.trim(),
       });
+      // Everything the backend cannot store travels with the name, in this browser.
+      const nextPresets = withPairPreset(presets, name, {
+        entryBps,
+        takeProfitBps,
+        stopLossBps,
+        totalAmount,
+        perOrderQuantity,
+        maxPosition,
+        ratio,
+        leftLeverage,
+        rightLeverage,
+        reduceOnly,
+      });
+      setPresets(nextPresets);
+      writePairPresets(availablePresetStorage(), nextPresets);
       await loadPairs();
       // Re-saving under an existing name overwrites it server-side, so say "saved", not "created".
       setPairNotice(`${t('Pair saved')}: ${name}`);
@@ -267,8 +388,14 @@ export function UsStockArbView({
   };
 
   const deletePair = async (id: string) => {
+    const deleted = pairs.find((pair) => pair.id === id);
     try {
       await api.deleteStrategyPair(id);
+      if (deleted) {
+        const nextPresets = withoutPairPreset(presets, deleted.name);
+        setPresets(nextPresets);
+        writePairPresets(availablePresetStorage(), nextPresets);
+      }
       await loadPairs();
     } catch {
       setPairError(t('Backend unavailable'));
@@ -392,10 +519,22 @@ export function UsStockArbView({
   useEffect(() => setHoveredPoint(null), [historyKey]);
 
   // ---------------------------------------------------------------------------------------
-  // Sizing
+  // Inputs: parsed without inventing zeros
   // ---------------------------------------------------------------------------------------
-  const ratioNumber = Number(ratio) || 0;
-  const totalQuantity = Number(totalAmount) || 0;
+  const ratioNumber = decimalValue(ratio);
+  const entryNumber = decimalValue(entryBps);
+  const takeProfitNumber = decimalValue(takeProfitBps);
+  const stopLossNumber = decimalValue(stopLossBps);
+  const totalNumber = decimalValue(totalAmount);
+  const perOrderNumber = decimalValue(perOrderQuantity);
+  const maxPositionNumber = decimalValue(maxPosition);
+  const leftLeverageNumber = decimalValue(leftLeverage);
+  const rightLeverageNumber = decimalValue(rightLeverage);
+
+  // Empty per-order means "one clip for the whole total", exactly like the premium page's default.
+  const effectivePerOrderText = perOrderQuantity.trim() === '' ? totalAmount : perOrderQuantity;
+  const effectivePerOrderNumber = perOrderQuantity.trim() === '' ? totalNumber : perOrderNumber;
+
   const leftPriceForRatio = leftQuote.price !== null && leftQuote.price > 0 ? leftQuote.price : null;
   const rightPriceForRatio = rightQuote.price !== null && rightQuote.price > 0 ? rightQuote.price : null;
   // Equal notional for two different instruments: 1 right unit costs `right/left` left units.
@@ -408,12 +547,14 @@ export function UsStockArbView({
     setRatio(suggestedRatio.toFixed(6));
   }, [ratioTouched, suggestedRatio]);
 
-  const rightQuantity = totalQuantity > 0 && ratioNumber > 0 ? totalQuantity / ratioNumber : null;
+  const rightQuantity = totalNumber !== null && totalNumber > 0 && ratioNumber !== null && ratioNumber > 0
+    ? totalNumber / ratioNumber
+    : null;
   const rightQuantityText = rightQuantity === null ? '—' : formatAmount(rightQuantity, 6);
   // "Absolute spread" = price gap × the left (sell) quantity, in the sell leg's quote currency.
-  const quantityForSpread = totalQuantity > 0
-    ? totalQuantity
-    : Number(perOrderQuantity) > 0 ? Number(perOrderQuantity) : null;
+  const quantityForSpread = totalNumber !== null && totalNumber > 0
+    ? totalNumber
+    : perOrderNumber !== null && perOrderNumber > 0 ? perOrderNumber : null;
   const absoluteSpread = displayedPriceGap !== null && quantityForSpread !== null
     ? displayedPriceGap * quantityForSpread
     : null;
@@ -421,9 +562,57 @@ export function UsStockArbView({
     ? '—'
     : `${absoluteSpread >= 0 ? '+' : '-'}${formatAmount(Math.abs(absoluteSpread))} ${leftQuoteCurrency}`;
 
-  const perOrderOrTotal = perOrderQuantity.trim() === '' ? totalAmount : perOrderQuantity;
-  const amountValid = totalQuantity > 0 && Number(perOrderOrTotal) > 0;
-  const ready = Boolean(legsDistinct && ratioNumber > 0 && amountValid);
+  // ---------------------------------------------------------------------------------------
+  // Validation — every message sits next to its own field, and the launch button repeats the list
+  // ---------------------------------------------------------------------------------------
+  const fieldErrors: Record<string, string | null> = {
+    leftLeverage: leftLeverageNumber === null || leftLeverageNumber < 1 || leftLeverageNumber > 200
+      ? t('Leverage must be between 1× and 200×.')
+      : null,
+    rightLeverage: rightLeverageNumber === null || rightLeverageNumber < 1 || rightLeverageNumber > 200
+      ? t('Leverage must be between 1× and 200×.')
+      : null,
+    entryBps: entryNumber === null ? t('Enter an entry threshold in bps.') : null,
+    takeProfitBps: takeProfitBps.trim() === ''
+      ? null
+      : takeProfitNumber === null || takeProfitNumber <= 0 ? t('Take-profit must be a positive bps value.') : null,
+    stopLossBps: stopLossBps.trim() === ''
+      ? null
+      : stopLossNumber === null || stopLossNumber <= 0 ? t('Stop-loss must be a positive bps value.') : null,
+    ratio: ratioNumber === null || ratioNumber <= 0 ? t('Quantity ratio must be a positive number.') : null,
+    totalAmount: totalNumber === null || totalNumber <= 0 ? t('Enter a total quantity above 0.') : null,
+    perOrderQuantity: perOrderQuantity.trim() === ''
+      ? null
+      : perOrderNumber === null || perOrderNumber <= 0
+        ? t('Per-order quantity must be above 0.')
+        : totalNumber !== null && totalNumber > 0 && perOrderNumber > totalNumber
+          ? t('Per-order quantity cannot exceed the total quantity.')
+          : null,
+    maxPosition: maxPosition.trim() === ''
+      ? null
+      : maxPositionNumber === null || maxPositionNumber <= 0
+        ? t('Max position must be above 0.')
+        : effectivePerOrderNumber !== null && effectivePerOrderNumber > maxPositionNumber
+          ? t('Max position must be at least the per-order quantity.')
+          : null,
+  };
+  // Advisories never block: the engine, not this form, is the authority on threshold ordering.
+  const thresholdNotes: Record<string, string | null> = {
+    takeProfitBps: takeProfitNumber !== null && entryNumber !== null && entryNumber > 0 && takeProfitNumber >= entryNumber
+      ? t('Take-profit is normally below the entry threshold.')
+      : null,
+    stopLossBps: stopLossNumber !== null && entryNumber !== null && stopLossNumber <= Math.abs(entryNumber)
+      ? t('Stop-loss is normally wider than the entry threshold.')
+      : null,
+  };
+  const legsError = leftTicker === '' || rightTicker === ''
+    ? t('Enter a ticker for both legs.')
+    : leftSymbol === rightSymbol ? t('The two legs must be different markets.') : null;
+  const blockingReasons = [
+    legsError,
+    ...Object.values(fieldErrors),
+  ].filter((reason): reason is string => reason !== null);
+  const ready = blockingReasons.length === 0;
   const tradingEnabled = tradingMode === 'live';
 
   const displayedTimeText = displayedPoint === null
@@ -439,30 +628,29 @@ export function UsStockArbView({
   // Launch
   // ---------------------------------------------------------------------------------------
   async function launchStrategy() {
-    if (launching || launchingRef.current) return;
+    if (launching || launchingRef.current || !ready) return;
     launchingRef.current = true;
     setLaunching(true);
     setLaunchNotice(null);
     try {
-      // Unchanged backend contract: the position strategy with an explicit quantity ratio.
-      await api.startStrategy({
-        kind: 'position',
-        asset: leftTicker,
-        leftVenue: leftVenue.toUpperCase(),
-        rightVenue: rightVenue.toUpperCase(),
+      // Backend contract (`StrategyConfigSchema`): only the fields below exist.
+      await api.startStrategy(buildPositionConfig({
+        leftTicker,
+        leftVenue,
+        rightVenue,
         leftSymbol,
         rightSymbol,
-        quantityRatio: ratio || '1',
-        leftSide: 'SELL',
-        rightSide: 'BUY',
-        entryBps,
-        totalAmount,
-        perOrderQuantity: perOrderOrTotal,
-        leftLeverage: leverage,
-        rightLeverage: leverage,
-        reduceOnly: false,
-        executionMethod: 'TAKER_TAKER',
-      });
+        quantityRatio: ratio,
+        entryBps: entryBps.trim(),
+        takeProfitBps: takeProfitBps.trim(),
+        stopLossBps: stopLossNumber,
+        totalAmount: totalAmount.trim(),
+        perOrderQuantity: effectivePerOrderText.trim(),
+        maxPosition: maxPosition.trim(),
+        leftLeverage: leftLeverage.trim(),
+        rightLeverage: rightLeverage.trim(),
+        reduceOnly,
+      }));
       setLaunchNotice({ kind: 'ok', text: t('Strategy launched') });
       await onStrategiesChanged();
     } catch (error) {
@@ -482,6 +670,8 @@ export function UsStockArbView({
     if (launching || !ready) return;
     setConfirmingLaunch(true);
   }
+
+  const optionalText = (text: string) => (text.trim() === '' ? '—' : text);
 
   return <div className="alternate-view strategy-view us-stock-view">
     <section className="view-heading strategy-heading">
@@ -531,6 +721,7 @@ export function UsStockArbView({
                   <dd className={`us-leg-state ${leftQuote.state}`}>{legStateLabel(leftQuote, t)}</dd>
                 </div>
                 <div><dt>{t('Resolved market')}</dt><dd className="us-leg-symbol">{leftSymbol || '—'}</dd></div>
+                <div><dt>{t('Left-leg leverage')}</dt><dd>{leftLeverage.trim() === '' ? '—' : `${leftLeverage}×`}</dd></div>
               </dl>
             </div>
 
@@ -569,9 +760,11 @@ export function UsStockArbView({
                   <dd className={`us-leg-state ${rightQuote.state}`}>{legStateLabel(rightQuote, t)}</dd>
                 </div>
                 <div><dt>{t('Resolved market')}</dt><dd className="us-leg-symbol">{rightSymbol || '—'}</dd></div>
+                <div><dt>{t('Right-leg leverage')}</dt><dd>{rightLeverage.trim() === '' ? '—' : `${rightLeverage}×`}</dd></div>
               </dl>
             </div>
           </div>
+          {legsError !== null && <div className="premium-data-hint us-leg-error" role="alert"><span>!</span><p>{legsError}</p></div>}
           {spreadReadout.status !== 'live' && <div className="premium-data-hint"><span>ⓘ</span><p>{spreadHint}</p></div>}
         </article>
 
@@ -660,12 +853,41 @@ export function UsStockArbView({
           <header className="strategy-panel-head">
             <div><p className="eyebrow">{t('Strategy setup')}</p><h2>{t('Configure the spread pair')}</h2></div>
           </header>
-          <div className="compact-fields">
-            <label>
+          <div className="compact-fields us-fields">
+            <p className="us-field-group">{t('Thresholds')}</p>
+            <label className={fieldErrors.entryBps === null ? '' : 'invalid'}>
               <span>{t('Entry threshold (bps)')}</span>
-              <div><input value={entryBps} onChange={(event) => setEntryBps(event.target.value)} inputMode="decimal" /><b>bps</b></div>
+              <div><input value={entryBps} onChange={(event) => setEntryBps(event.target.value)} inputMode="decimal" aria-label={t('Entry threshold (bps)')} /><b>bps</b></div>
+              <FieldError text={fieldErrors.entryBps} />
             </label>
-            <label>
+            <label className={fieldErrors.takeProfitBps === null ? '' : 'invalid'}>
+              <span>{t('Take-profit (bps)')}</span>
+              <div><input value={takeProfitBps} onChange={(event) => setTakeProfitBps(event.target.value)} inputMode="decimal" placeholder={t('Optional')} aria-label={t('Take-profit (bps)')} /><b>bps</b></div>
+              <FieldError text={fieldErrors.takeProfitBps ?? thresholdNotes.takeProfitBps} />
+            </label>
+            <label className={fieldErrors.stopLossBps === null ? '' : 'invalid'}>
+              <span>{t('Stop-loss (bps)')}</span>
+              <div><input value={stopLossBps} onChange={(event) => setStopLossBps(event.target.value)} inputMode="decimal" placeholder={t('Optional')} aria-label={t('Stop-loss (bps)')} /><b>bps</b></div>
+              <FieldError text={fieldErrors.stopLossBps ?? thresholdNotes.stopLossBps} />
+            </label>
+
+            <p className="us-field-group">{t('Sizing')}</p>
+            <label className={fieldErrors.totalAmount === null ? '' : 'invalid'}>
+              <span>{t('Total quantity')}</span>
+              <div><input value={totalAmount} onChange={(event) => setTotalAmount(event.target.value)} inputMode="decimal" placeholder="e.g. 100" aria-label={t('Total quantity')} /><b>{leftTicker || '—'}</b></div>
+              <FieldError text={fieldErrors.totalAmount} />
+            </label>
+            <label className={fieldErrors.perOrderQuantity === null ? '' : 'invalid'}>
+              <span>{t('Per-order quantity')}</span>
+              <div><input value={perOrderQuantity} onChange={(event) => setPerOrderQuantity(event.target.value)} inputMode="decimal" placeholder={totalAmount || 'e.g. 25'} aria-label={t('Per-order quantity')} /><b>{leftTicker || '—'}</b></div>
+              <FieldError text={fieldErrors.perOrderQuantity} />
+            </label>
+            <label className={fieldErrors.maxPosition === null ? '' : 'invalid'}>
+              <span>{t('Max position')}</span>
+              <div><input value={maxPosition} onChange={(event) => setMaxPosition(event.target.value)} inputMode="decimal" placeholder={totalAmount || t('Optional')} aria-label={t('Max position')} /><b>{leftTicker || '—'}</b></div>
+              <FieldError text={fieldErrors.maxPosition} />
+            </label>
+            <label className={fieldErrors.ratio === null ? '' : 'invalid'}>
               <span>{t('Quantity ratio')}</span>
               <div>
                 <input
@@ -676,32 +898,27 @@ export function UsStockArbView({
                 />
                 <b>×</b>
               </div>
+              <FieldError text={fieldErrors.ratio} />
             </label>
-            <label>
-              <span>{t('Total quantity')}</span>
-              <div><input value={totalAmount} onChange={(event) => setTotalAmount(event.target.value)} inputMode="decimal" placeholder="e.g. 100" /><b>{leftTicker || '—'}</b></div>
+
+            <p className="us-field-group">{t('Per-leg leverage')}</p>
+            <label className={fieldErrors.leftLeverage === null ? '' : 'invalid'}>
+              <span>{t('Left-leg leverage')}</span>
+              <div><input value={leftLeverage} onChange={(event) => setLeftLeverage(event.target.value)} inputMode="decimal" aria-label={t('Left-leg leverage')} /><b>×</b></div>
+              <FieldError text={fieldErrors.leftLeverage} />
             </label>
-            <label>
-              <span>{t('Per-order quantity')}</span>
-              <div>
-                <input
-                  value={perOrderQuantity}
-                  onChange={(event) => setPerOrderQuantity(event.target.value)}
-                  inputMode="decimal"
-                  placeholder={totalAmount || 'e.g. 25'}
-                />
-                <b>{leftTicker || '—'}</b>
-              </div>
-            </label>
-            <label>
-              <span>{t('Leverage')}</span>
-              <div><input value={leverage} onChange={(event) => setLeverage(event.target.value)} inputMode="decimal" /><b>×</b></div>
+            <label className={fieldErrors.rightLeverage === null ? '' : 'invalid'}>
+              <span>{t('Right-leg leverage')}</span>
+              <div><input value={rightLeverage} onChange={(event) => setRightLeverage(event.target.value)} inputMode="decimal" aria-label={t('Right-leg leverage')} /><b>×</b></div>
+              <FieldError text={fieldErrors.rightLeverage} />
             </label>
           </div>
+          <div className="us-field-note">{t('Total quantity is the whole execution; each order sends the per-order quantity; max position caps the open exposure.')}</div>
+          <div className="us-field-note">{t('Take-profit and stop-loss are stored with the strategy; the position engine runs one entry cycle.')}</div>
           <div className="compact-trigger">
             <span className={ready ? 'ready' : ''}>{ready ? '✓' : '○'}</span>
             <p>
-              {t('Sell')} <strong>{totalAmount || '0'} {leftTicker || '—'}</strong>
+              {t('Sell')} <strong>{optionalText(totalAmount)} {leftTicker || '—'}</strong>
               {' · '}
               {t('Buy')} <strong>{rightQuantityText} {rightTicker || '—'}</strong>
             </p>
@@ -711,8 +928,15 @@ export function UsStockArbView({
             <strong>{suggestedRatio === null ? '—' : suggestedRatio.toFixed(6)}</strong>
             <small>{t('Right-leg quantity')} {rightQuantityText} {rightTicker || '—'} · {t('Quantity ratio')} {ratio || '—'}</small>
           </div>
+          <label className="reduce-only-control premium-reduce-only-control us-reduce-only">
+            <span onClick={(event) => event.preventDefault()}>{t('Position handling')}</span>
+            <div>
+              <input type="checkbox" checked={reduceOnly} onChange={(event) => setReduceOnly(event.target.checked)} />
+              <b>{t('Reduce only')}</b>
+            </div>
+          </label>
           <div className="compact-stop">
-            <span>◎</span><p>{t('Runs one entry and take-profit cycle')}</p>
+            <span>◎</span><p>{t(reduceOnly ? 'Only reduces existing positions and stops at the target' : 'Runs one entry and take-profit cycle')}</p>
           </div>
         </article>
 
@@ -731,17 +955,18 @@ export function UsStockArbView({
             </p>
           </div>
           <dl className="launch-summary review-grid">
-            <div><dt>{t('Entry')}</dt><dd>≥ {entryBps || '0'} bps</dd></div>
+            <div><dt>{t('Entry')}</dt><dd>{entryBps.trim() === '' ? '—' : `≥ ${entryBps} bps`}</dd></div>
+            <div><dt>{t('Take profit')}</dt><dd>{optionalText(takeProfitBps)}{takeProfitBps.trim() === '' ? '' : ' bps'}</dd></div>
+            <div><dt>{t('Stop loss')}</dt><dd>{optionalText(stopLossBps)}{stopLossBps.trim() === '' ? '' : ' bps'}</dd></div>
             <div><dt>{t('Quantity ratio')}</dt><dd>{ratio || '—'}</dd></div>
-            <div><dt>{t('Total quantity')}</dt><dd>{totalAmount || '0'} {leftTicker || '—'}</dd></div>
+            <div><dt>{t('Total quantity')}</dt><dd>{optionalText(totalAmount)} {leftTicker || '—'}</dd></div>
+            <div><dt>{t('Per order')}</dt><dd>{optionalText(effectivePerOrderText)} {leftTicker || '—'}</dd></div>
+            <div><dt>{t('Max position')}</dt><dd>{optionalText(maxPosition)} {leftTicker || '—'}</dd></div>
             <div><dt>{t('Right-leg quantity')}</dt><dd>{rightQuantityText} {rightTicker || '—'}</dd></div>
-            <div><dt>{t('Per order')}</dt><dd>{perOrderOrTotal || '0'} {leftTicker || '—'}</dd></div>
-            <div><dt>{t('Leverage')}</dt><dd>{leverage || '—'}×</dd></div>
+            <div><dt>{t('Leverage')}</dt><dd>{optionalText(leftLeverage)}× / {optionalText(rightLeverage)}×</dd></div>
+            <div><dt>{t('Reduce only')}</dt><dd>{t(reduceOnly ? 'Yes' : 'No')}</dd></div>
             <div><dt>{t('Execution')}</dt><dd>{t('Taker–Taker')}</dd></div>
           </dl>
-          {leftSymbol !== '' && leftSymbol === rightSymbol && <div className="launch-warning">
-            <span>!</span><p>{t('The two legs must be different markets.')}</p>
-          </div>}
           {!tradingEnabled && <div className="launch-warning">
             <span>ⓘ</span><p>{t('Live trading is locked. Use the trading-mode switch in the top bar to enable it.')}</p>
           </div>}
@@ -755,9 +980,12 @@ export function UsStockArbView({
               : !tradingEnabled
                 ? t('Live trading locked')
                 : !ready
-                  ? t('Enter valid strategy amounts')
+                  ? t('Complete the strategy setup first')
                   : t('Launch strategy')}
           </button>
+          {!ready && blockingReasons.map((reason) => (
+            <p key={reason} className="launch-disabled-reason">{reason}</p>
+          ))}
           {launchNotice && <div className={`launch-notice ${launchNotice.kind}`}>{launchNotice.text}</div>}
         </article>
       </aside>
@@ -766,11 +994,16 @@ export function UsStockArbView({
     {confirmingLaunch && <StrategyLaunchConfirmation
       market={`${leftTicker || '—'} / ${rightTicker || '—'} · ${leftVenueName} ⇄ ${rightVenueName}`}
       rows={[
-        { label: t('Direction'), value: `${t('Sell')} ${totalAmount || '0'} ${leftTicker || '—'} ⇄ ${t('Buy')} ${rightQuantityText} ${rightTicker || '—'}` },
+        { label: t('Direction'), value: `${t('Sell')} ${optionalText(totalAmount)} ${leftTicker || '—'} ⇄ ${t('Buy')} ${rightQuantityText} ${rightTicker || '—'}` },
         { label: t('Quantity ratio'), value: ratio || '—' },
-        { label: t('Entry'), value: `≥ ${entryBps || '0'} bps` },
-        { label: t('Per order'), value: `${perOrderOrTotal || '0'} ${leftTicker || '—'}` },
-        { label: t('Leverage'), value: `${leverage || '—'}×` },
+        { label: t('Entry'), value: `≥ ${entryBps || '—'} bps` },
+        { label: t('Take profit'), value: `${optionalText(takeProfitBps)}${takeProfitBps.trim() === '' ? '' : ' bps'}` },
+        { label: t('Stop loss'), value: `${optionalText(stopLossBps)}${stopLossBps.trim() === '' ? '' : ' bps'}` },
+        { label: t('Total quantity'), value: `${optionalText(totalAmount)} ${leftTicker || '—'}` },
+        { label: t('Per order'), value: `${optionalText(effectivePerOrderText)} ${leftTicker || '—'}` },
+        { label: t('Max position'), value: `${optionalText(maxPosition)} ${leftTicker || '—'}` },
+        { label: t('Leverage'), value: `${optionalText(leftLeverage)}× / ${optionalText(rightLeverage)}×` },
+        { label: t('Reduce only'), value: t(reduceOnly ? 'Yes' : 'No') },
         { label: t('Execution'), value: t('Taker–Taker') },
       ]}
       busy={launching}

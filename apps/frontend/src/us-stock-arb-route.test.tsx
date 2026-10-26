@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 import type { LiveMarket, MarketSnapshot, SavedStrategyPair } from './api.js';
 import { LanguageContext } from './i18n.js';
-import { SavedPairsPanel, UsStockArbView } from './us-stock-arb-route.js';
+import { SavedPairsPanel, UsStockArbView, buildPositionConfig } from './us-stock-arb-route.js';
 
 /**
  * The US-stock spread page was rebuilt on the SK hynix premium bot's skeleton, with the one
@@ -137,19 +137,45 @@ describe('US-stock spread page structure', () => {
 
   it('renders the parameter block and the two-step action block', () => {
     const html = render(null);
+    expect(html).toContain('Thresholds');
     expect(html).toContain('Entry threshold (bps)');
-    expect(html).toContain('Equal-notional ratio');
+    expect(html).toContain('Take-profit (bps)');
+    expect(html).toContain('Stop-loss (bps)');
+    expect(html).toContain('Sizing');
     expect(html).toContain('Total quantity');
     expect(html).toContain('Per-order quantity');
-    expect(html).toContain('Leverage');
+    expect(html).toContain('Max position');
+    expect(html).toContain('Quantity ratio');
+    expect(html).toContain('Equal-notional ratio');
     expect(html).toContain('Saved pairs');
     expect(html).toContain('Save pair');
     expect(html).toContain('Review &amp; launch');
     expect(html).toContain('start-strategy');
     // Nothing is sized yet, so the action is disabled *and says why* instead of a silent grey
     // button. The enabled label is "Launch strategy"; the confirmation step is a second click.
-    expect(html).toContain('Enter valid strategy amounts');
+    expect(html).toContain('Complete the strategy setup first');
+    expect(html).toContain('launch-disabled-reason');
+    expect(html).toContain('Enter a total quantity above 0.');
     expect(html).not.toContain('strategy-confirm-modal');
+  });
+
+  it('gives each leg its own leverage input instead of one shared field', () => {
+    const html = render(null);
+    expect(html).toContain('Per-leg leverage');
+    // Two independently addressable inputs, not one field reused for both legs.
+    expect(html.match(/aria-label="Left-leg leverage"/g)).toHaveLength(1);
+    expect(html.match(/aria-label="Right-leg leverage"/g)).toHaveLength(1);
+    expect(html).not.toContain('aria-label="Leverage"');
+    // …and the summary shows the pair, so a divergence between the legs stays visible.
+    expect(html).toContain('3× / 3×');
+  });
+
+  it('offers reduce-only and keeps both threshold inputs paired with the entry', () => {
+    const html = render(null);
+    expect(html).toContain('Reduce only');
+    expect(html).toContain('type="checkbox"');
+    // Empty optional inputs read as an em dash, never as 0.
+    expect(html).not.toContain('≥ 0 bps');
   });
 
   it('localises every label through t()', () => {
@@ -158,7 +184,9 @@ describe('US-stock spread page structure', () => {
     expect(html).toContain('zh:Stock ticker');
     expect(html).toContain('zh:Saved pairs');
     expect(html).toContain('zh:Waiting for quote');
-    expect(html).toContain('zh:Enter valid strategy amounts');
+    expect(html).toContain('zh:Complete the strategy setup first');
+    expect(html).toContain('zh:Take-profit (bps)');
+    expect(html).toContain('zh:Right-leg leverage');
   });
 });
 
@@ -197,6 +225,66 @@ describe('US-stock spread leg quotes', () => {
     ]));
     expect(html).toContain('Waiting for the missing leg quote');
     expect(html.match(/Waiting for quote/g)).toHaveLength(1);
+  });
+});
+
+describe('US-stock spread launch payload', () => {
+  const fields = {
+    leftTicker: 'SNDK',
+    leftVenue: 'gate',
+    rightVenue: 'binance',
+    leftSymbol: 'GATE_FUTURE_SNDK_USDT',
+    rightSymbol: 'BINANCE_FUTURE_SNXX_USDT',
+    quantityRatio: '0.951991',
+    entryBps: '20',
+    takeProfitBps: '12',
+    stopLossBps: 90,
+    totalAmount: '100',
+    perOrderQuantity: '25',
+    maxPosition: '100',
+    leftLeverage: '3',
+    rightLeverage: '5',
+    reduceOnly: false,
+  };
+
+  it('maps every field onto the position config the backend already accepts', () => {
+    const config = buildPositionConfig(fields);
+    expect(config).toEqual({
+      kind: 'position',
+      asset: 'SNDK',
+      leftVenue: 'GATE',
+      rightVenue: 'BINANCE',
+      leftSymbol: 'GATE_FUTURE_SNDK_USDT',
+      rightSymbol: 'BINANCE_FUTURE_SNXX_USDT',
+      quantityRatio: '0.951991',
+      leftSide: 'SELL',
+      rightSide: 'BUY',
+      entryBps: '20',
+      takeProfitBps: '12',
+      // `stopLossBps` is a number in the schema while `takeProfitBps` is decimal text.
+      stopLossBps: 90,
+      totalAmount: '100',
+      perOrderQuantity: '25',
+      maxPosition: '100',
+      // Per-leg leverage, not one shared value.
+      leftLeverage: '3',
+      rightLeverage: '5',
+      reduceOnly: false,
+      executionMethod: 'TAKER_TAKER',
+    });
+  });
+
+  it('omits optional fields instead of sending empty strings', () => {
+    const config = buildPositionConfig({
+      ...fields, takeProfitBps: '', stopLossBps: null, maxPosition: '',
+    });
+    expect('takeProfitBps' in config).toBe(false);
+    expect('stopLossBps' in config).toBe(false);
+    expect('maxPosition' in config).toBe(false);
+  });
+
+  it('carries reduce-only through unchanged', () => {
+    expect(buildPositionConfig({ ...fields, reduceOnly: true }).reduceOnly).toBe(true);
   });
 });
 
