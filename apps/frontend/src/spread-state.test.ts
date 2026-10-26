@@ -81,12 +81,22 @@ describe('resolveLegQuote', () => {
     expect(quote.state).toBe('missing');
   });
 
-  it('falls back to the polled top of book when the ticker carries no bid/ask', () => {
+  it('reads the same market through the depth endpoint when the page stream has no side price', () => {
     const quote = resolveLegQuote({
       market: { source: 'gate_crossex_websocket', bidPrice: '0', askPrice: '0', quoteUpdatedAt: at(0) },
       topOfBook: { bestBid: '42.5', bestAsk: '42.6', updatedAt: at(-500) },
     }, 'bid', { now: NOW });
-    expect(quote).toMatchObject({ state: 'live', price: 42.5, source: 'ticker-fallback' });
+    expect(quote).toMatchObject({ state: 'live', price: 42.5, source: 'books-top' });
+  });
+
+  it('answers for a leg the page snapshot does not carry at all', () => {
+    // No streamed record: the depth endpoint also registers the market server-side, which is how a
+    // leg that never entered this page's watch list still gets a quote.
+    const quote = resolveLegQuote({
+      market: null,
+      topOfBook: { bestBid: '42.5', bestAsk: '42.6', updatedAt: at(0) },
+    }, 'ask', { now: NOW });
+    expect(quote).toMatchObject({ state: 'live', price: 42.6, source: 'books-top' });
   });
 
   it('reports missing when neither source has a price for that side', () => {

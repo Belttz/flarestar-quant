@@ -18,8 +18,21 @@ import { SPREAD_QUOTE_MAX_SKEW_MS, STRATEGY_FUTURE_QUOTE_TOLERANCE_MS, STRATEGY_
 
 export type QuoteSide = 'bid' | 'ask';
 
-/** Where a leg's displayed price came from. `none` means there is nothing to show. */
-export type LegQuoteSource = 'stream' | 'ticker-fallback' | 'none';
+/**
+ * Where a leg's displayed price came from.
+ *
+ * - `stream`  — the market record pushed on the page's CrossEx WebSocket watch.
+ * - `books-top` — the same hub record, but read through `GET /api/markets/books` instead of the
+ *   page's stream. This is a **transport** difference, not a second market-data source: the
+ *   endpoint resolves the identical `LiveMarket` and the identical CrossEx ticker. It matters
+ *   because that HTTP read (a) is taken at request time, so it can be newer than the frame this
+ *   page last rendered, (b) is not filtered by the page's watch list, so it still answers for a leg
+ *   the snapshot is missing, and (c) registers/warms the market on demand server-side. The name
+ *   deliberately avoids `ticker-fallback`: both paths carry the CrossEx ticker, and calling one a
+ *   fallback feed once made a staleness investigation point at the wrong layer.
+ * - `none`    — nothing usable; `state` is `missing`.
+ */
+export type LegQuoteSource = 'stream' | 'books-top' | 'none';
 
 /** `live` = executable now, `stale` = a real quote that aged out, `missing` = never quoted. */
 export type LegQuoteState = 'live' | 'stale' | 'missing';
@@ -44,9 +57,11 @@ export interface LegQuoteInput {
    */
   market?: Pick<LiveMarket, 'source' | 'bidPrice' | 'askPrice' | 'quoteUpdatedAt'> | null;
   /**
-   * Top-of-book from `GET /api/markets/books`, which already falls back to the ticker's single
-   * level when the venue pushes no book. Used only when the stream carries no usable price for
-   * the requested side, so a sparse ticker still yields a quote instead of a blank.
+   * Top-of-book read from `GET /api/markets/books`. Same hub record as `market` (see
+   * `LegQuoteSource['books-top']`), consumed here when the page's stream carries no usable price
+   * for the requested side — a sparse ticker, a leg missing from the page's watch snapshot, or a
+   * page that has not received its first frame yet. The endpoint's own `source: 'ticker'` marks a
+   * single level for markets whose venue pushes no book.
    */
   topOfBook?: Pick<MarketBookDepth, 'bestBid' | 'bestAsk' | 'updatedAt'> | null;
 }
@@ -91,9 +106,10 @@ function quoteFrom(
 }
 
 /**
- * Resolve one leg's executable quote, preferring the CrossEx stream and falling back to the
- * polled top of book. The returned `state` is the only thing callers may treat as a truthy
- * "price available" signal — `price` alone may describe a quote that is no longer tradable.
+ * Resolve one leg's executable quote, preferring the record this page is already streaming and
+ * falling back to the same market read through `GET /api/markets/books`. The returned `state` is
+ * the only thing callers may treat as a truthy "price available" signal — `price` alone may
+ * describe a quote that is no longer tradable.
  */
 export function resolveLegQuote(
   input: LegQuoteInput,
@@ -125,7 +141,7 @@ export function resolveLegQuote(
       usablePrice(topOfBook.bestBid),
       usablePrice(topOfBook.bestAsk),
       usableTimestamp(topOfBook.updatedAt),
-      'ticker-fallback',
+      'books-top',
       side,
       now,
       maxAgeMs,

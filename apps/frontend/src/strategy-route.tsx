@@ -1156,8 +1156,8 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
     : new Date(timestampMs).toLocaleTimeString(language === 'zh' ? 'zh-CN' : 'en-US', { hour12: false });
   const leftQuotedAt = leftQuote.quotedAtMs;
   const rightQuotedAt = rightQuote.quotedAtMs;
-  const leftQuoteFallback = leftQuote.source === 'ticker-fallback';
-  const rightQuoteFallback = rightQuote.source === 'ticker-fallback';
+  const leftQuoteFallback = leftQuote.source === 'books-top';
+  const rightQuoteFallback = rightQuote.source === 'books-top';
   const quotedAtText = (timestamp: number | null): string => quoteTimestampText(timestamp);
   const priceDifferenceHistoryIsCurrent = priceDifferenceHistory.key === priceDifferenceHistoryKey;
   const priceDifferencePoints = useMemo(() => priceDifferenceHistoryIsCurrent
