@@ -11,6 +11,7 @@ import {
   type FundingOverviewResponse,
   type LiveBalance,
   type KlineWatch,
+  type MarketBookDepth,
   type MarketCatalogAsset,
   type MarketSnapshot,
   type ResidualReport,
@@ -32,6 +33,7 @@ import { closeTargetsFromSymbols, executablePlanLegs } from './close-reconciliat
 import { ResidualDialog } from './residual-dialog.js';
 import { buildPremiumHistory, mergeCandleHistory, premiumHistoryViewKey, type PremiumHistoryPoint } from './premium-history.js';
 import { buildPriceDifferenceHistory, type PriceDifferenceHistoryPoint } from './price-difference-history.js';
+import { buildPairHistoryReadout, buildSpreadReadout, resolveLegQuote } from './spread-state.js';
 import {
   ADR_ASSET,
   ADR_HEDGE_ASSET,
@@ -930,8 +932,14 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const { language, theme, t } = useLanguage();
   // Prefill query from the Opportunities board is read once on mount; later renders ignore it.
   const [query] = useState(() => new URLSearchParams(window.location.search));
-  const autoQuery = mode === 'auto' ? query : null;
-  const [directionFlipped, setDirectionFlipped] = useState(false);
+  // The one-shot prefill channel serves both form families: the auto form's Opportunity presets and
+  // the position form's one-click copy (see `strategy-copy.ts`) speak the same keys. It stays `null`
+  // only for a form that has no such channel at all.
+  const autoQuery = mode === 'auto' || mode === 'position' ? query : null;
+  // `leftSide` carries the opening direction: the copy query writes `BUY` when the stored strategy
+  // bought venue A, so landing here must flip the legs instead of always selling A. Mirrors the
+  // premium form, which reads the same key for the same reason.
+  const [directionFlipped, setDirectionFlipped] = useState(() => query.get('leftSide') === 'BUY');
   // Only an explicit `reduceOnly=true` opts in, so an absent parameter keeps the safe default.
   const [reduceOnly, setReduceOnly] = useState(() => query.get('reduceOnly') === 'true');
   const [asset, setAsset] = useState(() => prefill?.asset ?? queryAsset(autoQuery?.get('asset')) ?? 'BTC');
@@ -940,13 +948,18 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const [leftExchangeId, setLeftExchangeId] = useState<string>(() => prefill?.shortVenue ?? queryVenueId(autoQuery?.get('left')) ?? 'binance');
   const [rightExchangeId, setRightExchangeId] = useState<string>(() => prefill?.longVenue ?? queryVenueId(autoQuery?.get('right')) ?? 'okx');
   // One-click copy prefill: the same one-shot query channel, carrying the fields a stored strategy
-  // exposes (see `strategy-copy.ts`). Every value still goes through the mount-time guards below,
-  // so a malformed parameter keeps its default instead of half-prefilling the form.
+  // exposes (see `strategy-copy.ts`). It is read for both `mode` values, because a copied `position`
+  // strategy lands on this very form — an auto-only gate would leave every field at its default and
+  // make the copy look like it did nothing. `prefill` still wins where it exists, since `asset` and
+  // the two venues above test it first. Every value still goes through the mount-time guards, so a
+  // malformed parameter keeps its default instead of half-prefilling the form.
   const [executionMethod, setExecutionMethod] = useState<'Taker–Taker' | 'Maker–Taker'>(() => query.get('executionMethod') === 'maker' ? 'Maker–Taker' : 'Taker–Taker');
   const [makerLeg, setMakerLeg] = useState<'left' | 'right'>(() => query.get('makerLeg') === 'right' ? 'right' : 'left');
   // Per-symbol executable depth, fed by /api/markets/books while the form is open. `source`
-  // records whether it came from the full book or only the ticker's top level.
-  const [legBookDepths, setLegBookDepths] = useState<Record<string, { bid: number; ask: number; source: 'book' | 'ticker' }>>({});
+  // records whether it came from the full book or only the ticker's top level. The whole record is
+  // kept (not just the two depth numbers) because the same response is the documented top-of-book
+  // fallback when a venue's ticker pushes no bid/ask for this instrument.
+  const [legBookDepths, setLegBookDepths] = useState<Record<string, MarketBookDepth>>({});
   const [amount, setAmount] = useState(() => queryDecimal(query.get('totalAmount')) ?? '');
   const [positionOrderQuantity, setPositionOrderQuantity] = useState(() => queryDecimal(query.get('perOrderQuantity')) ?? '');
   const [threshold, setThreshold] = useState(() => queryDecimal(autoQuery?.get('entryBps')) ?? '0');
@@ -1012,8 +1025,15 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   // Executable depth per leg, keyed by the leg's own symbol. A limit (maker) order needs no
   // depth, so the picker defaults onto the THINNER book and leaves the taker hedge to the deep
   // one — the reverse of what a top-of-book-only view suggests.
-  const leftDepth = legBookDepths[leftHistorySymbol] ?? null;
-  const rightDepth = legBookDepths[rightHistorySymbol] ?? null;
+  const leftBookRecord = legBookDepths[leftHistorySymbol] ?? null;
+  const rightBookRecord = legBookDepths[rightHistorySymbol] ?? null;
+  // Memoized so the maker-leg effect below does not see a fresh object on every render.
+  const leftDepth = useMemo(() => leftBookRecord
+    ? { bid: leftBookRecord.bidDepthUsdt, ask: leftBookRecord.askDepthUsdt, source: leftBookRecord.source }
+    : null, [leftBookRecord]);
+  const rightDepth = useMemo(() => rightBookRecord
+    ? { bid: rightBookRecord.bidDepthUsdt, ask: rightBookRecord.askDepthUsdt, source: rightBookRecord.source }
+    : null, [rightBookRecord]);
   const makerLegPinnedRef = useRef(query.get('makerLeg') !== null);
   useEffect(() => {
     const symbols = [leftHistorySymbol, rightHistorySymbol].filter((symbol) => symbol.trim() !== '');
@@ -1025,10 +1045,10 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
         setLegBookDepths((current) => {
           const next = { ...current };
           for (const book of response.books) {
-            // An empty read means "no book yet", not "the venue has no liquidity": keep the last
-            // usable depth instead of blanking a number the user is reading.
-            if (book.bidDepthUsdt <= 0 && book.askDepthUsdt <= 0 && next[book.symbol]) continue;
-            next[book.symbol] = { bid: book.bidDepthUsdt, ask: book.askDepthUsdt, source: book.source };
+            // A read with no price at all means "no book yet", not "the venue has no liquidity":
+            // keep the last usable record instead of blanking a number the user is reading.
+            if (book.bestBid === null && book.bestAsk === null && book.bidDepthUsdt <= 0 && book.askDepthUsdt <= 0 && next[book.symbol]) continue;
+            next[book.symbol] = book;
           }
           return next;
         });
@@ -1100,38 +1120,57 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   };
   const leftPrice = livePrice(leftStreamPrice, leftOverview?.lastPrice);
   const rightPrice = livePrice(rightStreamPrice, rightOverview?.lastPrice);
-  const sellPrice = directionFlipped ? rightPrice : leftPrice;
-  const buyPrice = directionFlipped ? leftPrice : rightPrice;
-  // Null while either leg lacks a price: a missing leg must read as "waiting", never as a real
-  // 0.00 bps spread.
-  // R4 (AC-3): the displayed spread is judged by the same yardstick as the engine's
-  // `freshMarketPair` gate — both legs' `quoteUpdatedAt` inside the shared skew budget, read from
-  // the same market-hub field. Two legs quoting seconds apart would display a spread that never
-  // existed, so an unaligned pair reads "—" with an explicit reason instead.
-  const legsQuoteAligned = assessSpreadQuoteAlignment(
-    { quoteUpdatedAt: leftLive?.quoteUpdatedAt },
-    { quoteUpdatedAt: rightLive?.quoteUpdatedAt },
-    SPREAD_QUOTE_MAX_SKEW_MS,
+  // --- Live spread, three-state (see `spread-state.ts`) -------------------------------------
+  // The displayed difference must never be derived from a placeholder, a stale quote, or two
+  // quotes seconds apart: each of those used to land on screen as a real-looking bps number.
+  // `resolveLegQuote` prefers the CrossEx stream and falls back to the polled top of book, which
+  // is the documented "ticker's single level" path for instruments whose venue pushes no book.
+  const [quotesNow, setQuotesNow] = useState(() => Date.now());
+  useEffect(() => {
+    // Quote ages must advance without a new frame, otherwise a quote that aged out keeps claiming
+    // to be live until the tab is reloaded — the exact "sometimes there is no spread" report.
+    const timer = window.setInterval(() => setQuotesNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const leftQuote = resolveLegQuote(
+    { market: leftLive, topOfBook: leftBookRecord },
+    directionFlipped ? 'ask' : 'bid',
+    { now: quotesNow },
   );
-  // R1 (disabled-reason visibility): the launch button is disabled while the two legs' live quotes
-  // are missing or unaligned — surface that to the user instead of a silent grey button.
-  const marketQuotesReady = legsQuoteAligned && leftPrice > 0 && rightPrice > 0;
-  const priceDiffBps = legsQuoteAligned && sellPrice > 0 && buyPrice > 0
-    ? ((sellPrice - buyPrice) / buyPrice) * 10_000
-    : null;
-  const leftQuotedAt = leftLive?.quoteUpdatedAt ?? null;
-  const rightQuotedAt = rightLive?.quoteUpdatedAt ?? null;
-  const quotedAtText = (timestamp: string | null): string => timestamp === null
+  const rightQuote = resolveLegQuote(
+    { market: rightLive, topOfBook: rightBookRecord },
+    directionFlipped ? 'bid' : 'ask',
+    { now: quotesNow },
+  );
+  const spreadReadout = buildSpreadReadout({
+    sell: directionFlipped ? rightQuote : leftQuote,
+    buy: directionFlipped ? leftQuote : rightQuote,
+  });
+  // `null` unless both legs are live *and* contemporaneous — never `0`, never a candle value.
+  const priceDiffBps = spreadReadout.bps;
+  // R1 (disabled-reason visibility): the launch button is disabled while the two legs do not form
+  // an executable, time-aligned pair — surface that to the user instead of a silent grey button.
+  const marketQuotesReady = spreadReadout.status === 'live';
+  const quoteTimestampText = (timestampMs: number | null): string => timestampMs === null
     ? '—'
-    : new Date(timestamp).toLocaleTimeString(language === 'zh' ? 'zh-CN' : 'en-US', { hour12: false });
+    : new Date(timestampMs).toLocaleTimeString(language === 'zh' ? 'zh-CN' : 'en-US', { hour12: false });
+  const leftQuotedAt = leftQuote.quotedAtMs;
+  const rightQuotedAt = rightQuote.quotedAtMs;
+  const leftQuoteFallback = leftQuote.source === 'ticker-fallback';
+  const rightQuoteFallback = rightQuote.source === 'ticker-fallback';
+  const quotedAtText = (timestamp: number | null): string => quoteTimestampText(timestamp);
   const priceDifferenceHistoryIsCurrent = priceDifferenceHistory.key === priceDifferenceHistoryKey;
   const priceDifferencePoints = useMemo(() => priceDifferenceHistoryIsCurrent
     ? buildPriceDifferenceHistory(priceDifferenceHistory.left, priceDifferenceHistory.right, directionFlipped, 0)
     : [], [directionFlipped, priceDifferenceHistory.left, priceDifferenceHistory.right, priceDifferenceHistoryIsCurrent]);
   const latestPriceDifferencePoint = priceDifferencePoints[priceDifferencePoints.length - 1] ?? null;
   const displayedPriceDifferencePoint = hoveredPriceDifference ?? latestPriceDifferencePoint;
+  // The headline number is the live spread whenever one exists. A candle value is only shown
+  // when the live pair is unavailable (or the user is hovering a historical point), and the
+  // caption says which — mixing the two silently was how a stale candle reading passed for live.
   const displayedPriceDifference = hoveredPriceDifference?.value
     ?? priceDiffBps ?? latestPriceDifferencePoint?.value ?? null;
+  const showingLiveSpread = hoveredPriceDifference === null && priceDiffBps !== null;
   const displayedLeftPrice = hoveredPriceDifference?.leftClose
     ?? (leftPrice > 0 ? leftPrice : latestPriceDifferencePoint?.leftClose ?? null);
   const displayedRightPrice = hoveredPriceDifference?.rightClose
@@ -1143,11 +1182,23 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
     : null;
   const priceDifferenceSeriesKey = `${priceDifferenceHistoryKey}:${directionFlipped ? 'flipped' : 'standard'}`;
   const priceDifferenceHistoryStatus = priceDifferenceHistoryIsCurrent ? priceDifferenceHistory.status : 'loading';
-  const priceDifferenceHistoryPlaceholder = priceDifferenceHistoryStatus === 'loading'
-    ? t('Loading price-difference history…')
-    : priceDifferenceHistoryStatus === 'failed'
-      ? t('Price-difference history unavailable')
-      : t('No overlapping candles for this venue pair.');
+  // First round for a new key always answers from cache and may legitimately be empty while the
+  // venue page is being fetched, so "still loading" is only claimed for the first two rounds.
+  const priceDifferenceHistorySettled = priceDifferenceHistory.completedRounds >= 2;
+  const priceDifferenceHistoryReadout = buildPairHistoryReadout({
+    status: priceDifferenceHistoryStatus,
+    pointCount: priceDifferencePoints.length,
+    leftCount: priceDifferenceHistory.left.length,
+    rightCount: priceDifferenceHistory.right.length,
+    leftBuilding: !priceDifferenceHistorySettled,
+    rightBuilding: !priceDifferenceHistorySettled,
+  });
+  const priceDifferenceHistoryPlaceholder = t(priceDifferenceHistoryReadout.messageKey);
+  const priceDifferenceHistoryCanRetry = priceDifferenceHistoryReadout.retryable
+    && priceDifferenceHistoryIsCurrent
+    && priceDifferenceHistoryReadout.phase !== 'ready';
+  const missingHistoryLegs = priceDifferenceHistoryReadout.missingLegs
+    .map((leg) => leg === 'left' ? `${leftExchange.name} ${leftHistorySymbol}` : `${rightExchange.name} ${rightHistorySymbol}`);
   const leftFunding = liveFunding8h(
     leftLive?.source === 'gate_crossex_websocket' ? leftLive.fundingRate : undefined,
     leftOverview?.fundingIntervalHours,
@@ -1542,21 +1593,19 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
                 <em>{t(leftSide)} <span>{leftTicker}</span></em>
               </div>
               <dl>
-                <div><dt>{t('Best price')}</dt><dd>{priceText(leftPrice)}</dd></div>
+                <div><dt>{t('Best price')}</dt><dd>{leftQuote.price !== null ? priceText(leftQuote.price) : '—'}{leftQuote.state === 'stale' ? ` · ${t('Stale quote')}` : ''}{leftQuoteFallback ? ` · ${t('Top of book')}` : ''}</dd></div>
                 <div><dt>{t('Quoted at')}</dt><dd>{quotedAtText(leftQuotedAt)}</dd></div>
                 {mode === 'position' && <div><dt>{t('Funding / 8h')}</dt><dd>{leftFunding === null ? '—' : `${leftFunding > 0 ? '+' : ''}${leftFunding.toFixed(4)}%`}</dd></div>}
                 <div><dt>{t(sharedMarginMode ? 'Shared margin' : 'Available')}</dt><dd>{leftBalance ? `${Number(leftBalance).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${leftBalanceUnit}` : '—'}</dd></div>
               </dl>
             </div>
-            <div className="leg-spread">
+            <div className="leg-spread" data-spread-status={spreadReadout.status}>
               <span>{t('Price difference')}</span>
               {priceDiffBps === null
                 ? <strong>—</strong>
                 : <strong className={priceDiffBps >= 0 ? 'positive' : 'negative'}>{priceDiffBps >= 0 ? '+' : ''}{priceDiffBps.toFixed(2)} bps</strong>}
               <button className="switch-direction" onClick={() => setDirectionFlipped((current) => !current)} aria-label={t('Switch direction')}>⇄</button>
-              <small>{priceDiffBps === null
-                ? (legsQuoteAligned ? t('Waiting for both leg prices') : t('Leg quotes are not time-aligned'))
-                : t('Switch direction')}</small>
+              <small>{priceDiffBps === null ? t(spreadReadout.messageKey) : t('Switch direction')}</small>
             </div>
             <div className="strategy-leg buy-leg">
               <div className="leg-top">
@@ -1574,7 +1623,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
                 <em>{t(rightSide)} <span>{rightTicker}</span></em>
               </div>
               <dl>
-                <div><dt>{t('Best price')}</dt><dd>{priceText(rightPrice)}</dd></div>
+                <div><dt>{t('Best price')}</dt><dd>{rightQuote.price !== null ? priceText(rightQuote.price) : '—'}{rightQuote.state === 'stale' ? ` · ${t('Stale quote')}` : ''}{rightQuoteFallback ? ` · ${t('Top of book')}` : ''}</dd></div>
                 <div><dt>{t('Quoted at')}</dt><dd>{quotedAtText(rightQuotedAt)}</dd></div>
                 {mode === 'position' && <div><dt>{t('Funding / 8h')}</dt><dd>{rightFunding === null ? '—' : `${rightFunding > 0 ? '+' : ''}${rightFunding.toFixed(4)}%`}</dd></div>}
                 <div><dt>{t(sharedMarginMode ? 'Shared margin' : 'Available')}</dt><dd>{rightBalance ? `${Number(rightBalance).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${rightBalanceUnit}` : '—'}</dd></div>
@@ -1647,7 +1696,9 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
               <small>{t('Selected venue pair')}</small>
             </div>
             <div className="premium-history-controls">
-              <span className="premium-live-badge"><i /> {t('Live pair')}</span>
+              <span className={`premium-live-badge ${spreadReadout.status === 'live' ? '' : 'muted'}`} data-role="spread-status">
+                <i /> {t(spreadReadout.status === 'live' ? 'Live pair' : spreadReadout.messageKey)}
+              </span>
               <div role="group" aria-label={t('Historical price difference')}>
                 {(Object.keys(PAIR_HISTORY_RANGES) as PairHistoryRange[]).map((range) =>
                   <button key={range} className={priceDifferenceRange === range ? 'active' : ''} onClick={() => setPriceDifferenceRange(range)}>{range}</button>)}
@@ -1661,10 +1712,12 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
                 {displayedPriceDifference !== null ? `${displayedPriceDifference >= 0 ? '+' : ''}${displayedPriceDifference.toFixed(2)} bps` : '—'}
               </strong>
               <small>{displayedPriceDifferencePoint
-                ? new Date(displayedPriceDifferencePoint.time).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-GB', {
+                ? `${showingLiveSpread ? t('Live pair') : t('Last candle')} · ${new Date(displayedPriceDifferencePoint.time).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-GB', {
                   month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false, timeZoneName: 'short',
-                })
-                : `${marketSymbol(asset, quoteFor(leftExchange.id), 'perpetual')} ↔ ${marketSymbol(asset, quoteFor(rightExchange.id), 'perpetual')} · ${t('Selected price difference')}`}</small>
+                })}`
+                : showingLiveSpread
+                  ? t('Live pair')
+                  : `${marketSymbol(asset, quoteFor(leftExchange.id), 'perpetual')} ↔ ${marketSymbol(asset, quoteFor(rightExchange.id), 'perpetual')} · ${t('Selected price difference')}`}</small>
             </div>
             <dl>
               <div><dt>{t('Exchange A price')}</dt><dd>{displayedLeftPrice !== null ? priceText(displayedLeftPrice) : '—'}</dd></div>
@@ -1673,6 +1726,11 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
               <div><dt>{t('Trade direction')}</dt><dd>A {t(leftSide)} / B {t(rightSide)}</dd></div>
             </dl>
           </div>
+          {(priceDifferenceHistoryReadout.phase === 'missing-leg' || priceDifferenceHistoryReadout.phase === 'failed') && <div className="launch-warning strategy-history-warning" data-role="history-warning">
+            <span>!</span>
+            <p>{t(priceDifferenceHistoryReadout.messageKey)}{missingHistoryLegs.length > 0 ? `: ${missingHistoryLegs.join(', ')}` : ''}{priceDifferenceHistoryReadout.phase === 'missing-leg' ? ` · ${t('Live candles are still being collected from the CrossEx feed.')}` : ''}</p>
+            {priceDifferenceHistoryCanRetry && <button type="button" className="copy-button" onClick={() => priceDifferenceHistory.reload()}>{t('Retry')}</button>}
+          </div>}
           <Suspense fallback={<div className="premium-history-chart chart-module-loading" role="status">{t('Loading price-difference history…')}</div>}>
             <PriceDifferenceHistoryChart
               key={priceDifferenceSeriesKey}
@@ -1850,12 +1908,25 @@ export function CarryStrategyView({ marketSnapshot, catalog, strategies, balance
   const perpPrice = Number(perpMarket?.bidPrice ?? 0);
   // R4: the displayed basis is judged by the same quoteUpdatedAt yardstick as the engine's
   // freshMarketPair gate; unaligned legs read "—" rather than a spread that never existed.
+  // `assessSpreadQuoteAlignment` returns a verdict *object*, so the decision must read `.aligned`:
+  // using the object itself as a condition silently disabled this gate (always truthy).
   const carryLegsAligned = assessSpreadQuoteAlignment(
     { quoteUpdatedAt: spotMarket?.quoteUpdatedAt },
     { quoteUpdatedAt: perpMarket?.quoteUpdatedAt },
     SPREAD_QUOTE_MAX_SKEW_MS,
   );
-  const basisBps = carryLegsAligned && spotPrice > 0 && perpPrice > 0 ? ((perpPrice - spotPrice) / spotPrice) * 10_000 : null;
+  const basisBps = carryLegsAligned.aligned && spotPrice > 0 && perpPrice > 0
+    ? ((perpPrice - spotPrice) / spotPrice) * 10_000
+    : null;
+  // Mirror the price-difference panel: a missing basis says which of the three cases it is.
+  const basisUnavailableKey = basisBps !== null
+    ? null
+    : spotPrice <= 0 || perpPrice <= 0
+      ? 'Waiting for both leg prices'
+      : 'Leg quotes are not time-aligned';
+  const basisSkewSeconds = basisBps === null && basisUnavailableKey === 'Leg quotes are not time-aligned'
+    ? `${Math.round((carryLegsAligned.skewMs ?? 0) / 100) / 10}s`
+    : null;
   // Pre-submit minimum-notional check mirrors the engine's launch validation: each leg is sized
   // with its own executable-side price (ask for buys, bid for sells).
   const instruments = useInstrumentCatalog();
@@ -2073,7 +2144,9 @@ export function CarryStrategyView({ marketSnapshot, catalog, strategies, balance
             <div className="leg-spread">
               <span>{t('Basis')}</span>
               <strong className={basisBps !== null && basisBps >= 0 ? 'positive' : 'negative'}>{basisBps === null ? '—' : `${basisBps >= 0 ? '+' : ''}${basisBps.toFixed(2)} bps`}</strong>
-              <small>{crossVenue ? t('Cross-venue basis: venue-to-venue price differences move it too') : t('Perpetual minus spot')}</small>
+              <small>{basisUnavailableKey !== null
+                ? `${t(basisUnavailableKey)}${basisSkewSeconds ? ` · ${basisSkewSeconds}` : ''}`
+                : crossVenue ? t('Cross-venue basis: venue-to-venue price differences move it too') : t('Perpetual minus spot')}</small>
             </div>
             <div className={`strategy-leg ${fundingDirection === 'POSITIVE' ? 'sell-leg' : 'buy-leg'}`}>
               <div className="leg-top">

@@ -22,6 +22,30 @@ function pnlText(value: number, quote: string): string {
   return `${value >= 0 ? '+' : ''}${value.toFixed(2)} ${quote}`;
 }
 
+/**
+ * The three "unknown, not zero" flags a row can carry (see `PositionTableRow`).
+ *
+ * A perpetual never trades at 0, so a missing price means unknown. Rendering the raw numbers in
+ * that case prints a confident `0` / `0.00`, which reads as a real price and a real loss — the
+ * venues whose public REST is unreachable from this machine (Binance / OKX / Bybit / Kraken) hit
+ * this constantly. Each cell consults its own flag because the underlying facts differ: a venue can
+ * report the position's notional while omitting its mark price, and a venue-reported PnL stays
+ * trustworthy even then.
+ */
+function valueUnknown(position: PositionTableRow): boolean {
+  return position.valueUnavailable === true;
+}
+
+/** No mark price for this leg: the price cell prints `—` instead of `0`. */
+function markUnknown(position: PositionTableRow): boolean {
+  return position.markPriceUnavailable === true;
+}
+
+/** The PnL of this row was derived locally from a price the venue never sent. */
+function pnlUnknown(position: PositionTableRow): boolean {
+  return position.pnlUnavailable === true;
+}
+
 function optionalAmount(value: number | null, quote: string): string {
   return value === null ? '—' : `${signedAmount(value)} ${quote}`;
 }
@@ -57,11 +81,11 @@ export function PositionsTable({ rows, onClose }: PositionsTableProps) {
             <td><strong>{marketSymbol(position.asset, position.quote, 'perpetual')}</strong><small className={position.quantity >= 0 ? 'long-tag' : 'short-tag'}>{t(position.quantity >= 0 ? 'Long' : 'Short')}</small></td>
             <td><VenueFromCode code={position.venue} /></td>
             <td>{position.quantity.toFixed(4)} {position.asset}</td>
-            <td>{formatAmount(position.value)} {position.quote}</td>
-            <td>{compactPrice(position.entryPrice)}</td>
-            <td>{compactPrice(position.markPrice)}</td>
+            <td>{valueUnknown(position) ? '—' : `${formatAmount(position.value)} ${position.quote}`}</td>
+            <td>{position.entryPrice > 0 ? compactPrice(position.entryPrice) : '—'}</td>
+            <td>{markUnknown(position) ? '—' : compactPrice(position.markPrice)}</td>
             <td><AdlIndicators ranks={ranks} /></td>
-            <td className={position.unrealizedPnl >= 0 ? 'positive' : 'negative'}>{pnlText(position.unrealizedPnl, position.quote)}</td>
+            <td className={pnlUnknown(position) ? '' : position.unrealizedPnl >= 0 ? 'positive' : 'negative'}>{pnlUnknown(position) ? '—' : pnlText(position.unrealizedPnl, position.quote)}</td>
             <td>{realizedAmount(position.realizedPnl, position.quote)}</td>
             <td className={amountTone(position.fundingFee)}>{optionalAmount(position.fundingFee, position.quote)}</td>
             <td><button className="row-action close-position-action" onClick={() => onClose([position])}>{t('Close position')}</button></td>
@@ -74,16 +98,21 @@ export function PositionsTable({ rows, onClose }: PositionsTableProps) {
         const fundingValues = group.legs.map((position) => position.fundingFee).filter((value): value is number => value !== null);
         const realizedPnl = realizedValues.length > 0 ? realizedValues.reduce((sum, value) => sum + value, 0) : null;
         const fundingFee = fundingValues.length > 0 ? fundingValues.reduce((sum, value) => sum + value, 0) : null;
+        // A group total is only as good as its worst leg: one unpriced leg would otherwise fold a
+        // fabricated 0 into the sum, so the aggregate cells print `—` whenever any leg is unknown.
+        const groupValueKnown = group.legs.every((leg) => !valueUnknown(leg));
+        const groupPriceKnown = group.legs.every((leg) => !markUnknown(leg));
+        const groupPnlKnown = group.legs.every((leg) => !pnlUnknown(leg));
         return <Fragment key={group.key}>
           <tr className="aggregate-row">
             <td><button type="button" className={expanded ? 'expand-position expanded' : 'expand-position'} aria-expanded={expanded} aria-label={`${t('Positions')} · ${group.label}`} onClick={() => setExpandedPosition(expanded ? null : group.key)}>›</button><strong>{group.label} PERP</strong><small className={group.fullyHedged ? 'hedged-tag' : group.quantity >= 0 ? 'long-tag' : 'short-tag'}>{t(group.fullyHedged ? 'Hedged' : group.quantity >= 0 ? 'Long' : 'Short')}</small></td>
             <td><span className="venue-group"><strong>{group.venueCount} {t(group.venueCount === 1 ? 'exchange' : 'exchanges')}</strong></span></td>
             <td>{group.mixedAssets ? '—' : `${group.quantity.toFixed(4)} ${group.asset}`}</td>
-            <td>${formatAmount(group.grossNotional)}</td>
-            <td>{group.mixedAssets ? '—' : compactPrice(group.weightedEntryPrice)}</td>
-            <td>{group.mixedAssets ? '—' : compactPrice(group.weightedMarkPrice)}</td>
+            <td>{group.mixedAssets || !groupValueKnown ? '—' : `$${formatAmount(group.grossNotional)}`}</td>
+            <td>{group.mixedAssets || !groupPriceKnown ? '—' : compactPrice(group.weightedEntryPrice)}</td>
+            <td>{group.mixedAssets || !groupPriceKnown ? '—' : compactPrice(group.weightedMarkPrice)}</td>
             <td>—</td>
-            <td className={group.unrealizedPnl >= 0 ? 'positive' : 'negative'}>{pnlText(group.unrealizedPnl, aggregateQuote)}</td>
+            <td className={groupPnlKnown && group.unrealizedPnl >= 0 ? 'positive' : groupPnlKnown ? 'negative' : ''}>{groupPnlKnown ? pnlText(group.unrealizedPnl, aggregateQuote) : '—'}</td>
             <td>{realizedAmount(realizedPnl, aggregateQuote)}</td>
             <td className={amountTone(fundingFee)}>{optionalAmount(fundingFee, aggregateQuote)}</td>
             <td><button className="row-action close-position-action" onClick={() => onClose(group.legs)}>{t('Close all')}</button></td>
@@ -92,11 +121,11 @@ export function PositionsTable({ rows, onClose }: PositionsTableProps) {
             <td><span className="leg-branch">↳</span><strong>{marketSymbol(position.asset, position.quote, 'perpetual')}</strong><small>{t('Venue leg')}</small></td>
             <td><VenueFromCode code={position.venue} /></td>
             <td>{position.quantity.toFixed(4)} {position.asset}</td>
-            <td>{formatAmount(position.value)} {position.quote}</td>
-            <td>{compactPrice(position.entryPrice)}</td>
-            <td>{compactPrice(position.markPrice)}</td>
+            <td>{valueUnknown(position) ? '—' : `${formatAmount(position.value)} ${position.quote}`}</td>
+            <td>{position.entryPrice > 0 ? compactPrice(position.entryPrice) : '—'}</td>
+            <td>{markUnknown(position) ? '—' : compactPrice(position.markPrice)}</td>
             <td><AdlIndicators ranks={[{ key: position.id, venue: position.venue, crossExRank: position.crossExAdlRank, exchangeRank: position.exchangeAdlRank }]} /></td>
-            <td className={position.unrealizedPnl >= 0 ? 'positive' : 'negative'}>{pnlText(position.unrealizedPnl, position.quote)}</td>
+            <td className={pnlUnknown(position) ? '' : position.unrealizedPnl >= 0 ? 'positive' : 'negative'}>{pnlUnknown(position) ? '—' : pnlText(position.unrealizedPnl, position.quote)}</td>
             <td>{realizedAmount(position.realizedPnl, position.quote)}</td>
             <td className={amountTone(position.fundingFee)}>{optionalAmount(position.fundingFee, position.quote)}</td>
             <td><button className="row-action close-position-action" onClick={() => onClose([position])}>{t('Close position')}</button></td>

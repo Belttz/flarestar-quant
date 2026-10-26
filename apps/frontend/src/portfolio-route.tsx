@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
-import { crossExTransferRouteError, type CrossExTransferRouteError } from '@gate-crossex/shared-types';
+import { accountEquityOf, crossExTransferRouteError, type CrossExTransferRouteError } from '@gate-crossex/shared-types';
 import type {
   AuthenticatedPortfolioSnapshot,
   CrossExPortfolioActivityResponse,
@@ -32,9 +32,23 @@ import { executionPageWindow } from './execution-pagination.js';
 import { ExecutionPagination } from './execution-pagination-control.js';
 import { marginRatePercent } from './portfolio-metrics.js';
 import { PositionsTable } from './positions-table.js';
-import type { PositionTableRow } from './strategy-positions.js';
+import { futuresNotional, knownPrice, type PositionTableRow } from './strategy-positions.js';
 import { PositionCloseDialog, type ClosePositionTarget } from './position-close-dialog.js';
 import { PortfolioEquityCard, type EquityChartPoint } from './portfolio-equity-card.js';
+
+/**
+ * Notional of one margin leg: reported value, then quantity × index price, else `null` (unknown).
+ *
+ * Margin rows never leave this file, so they simply keep `null` fields and every cell below prints
+ * `—` for them. Futures rows go through the shared `knownPrice` / `futuresNotional` helpers plus the
+ * `markPriceUnavailable` / `valueUnavailable` / `pnlUnavailable` flags on `PositionTableRow`, because
+ * that contract is shared with the trade and strategy pages.
+ */
+function marginNotional(assetQuantity: number | null, indexPrice: number | null, reportedValue: number | null): number | null {
+  const reported = Math.abs(reportedValue ?? 0);
+  if (reported > 0) return reported;
+  return assetQuantity !== null && indexPrice !== null ? Math.abs(assetQuantity * indexPrice) : null;
+}
 
 function VenueFromCode({ code }: { code: string }) {
   const exchange = exchanges.find((item) => item.id === code.toLowerCase());
@@ -132,8 +146,10 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
         .map((position) => {
           const part = symbolParts(position.symbol);
           const quantity = parseNumber(position.quantity) ?? 0;
-          const markPrice = parseNumber(position.markPrice) ?? 0;
-          const reportedValue = Math.abs(parseNumber(position.value) ?? 0);
+          // `null` = the venue did not send a price (see `knownPrice`). The row keeps finite numbers
+          // for the shared `PositionTableRow` contract and flags the unknown cells instead.
+          const markPrice = knownPrice(position.markPrice);
+          const notional = futuresNotional(quantity, markPrice, parseNumber(position.value));
           return {
             id: position.positionId || position.symbol,
             positionId: position.positionId,
@@ -143,9 +159,15 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
             quote: part.quote,
             side: position.positionSide?.toUpperCase() === 'SHORT' || quantity < 0 ? 'Short' as const : 'Long' as const,
             quantity,
-            value: reportedValue > 0 ? reportedValue : Math.abs(quantity * markPrice),
-            entryPrice: parseNumber(position.entryPrice) ?? 0,
-            markPrice,
+            // CrossEx already marked a notional here: trust it even without a mark price.
+            value: notional.value,
+            entryPrice: knownPrice(position.entryPrice) ?? 0,
+            markPrice: markPrice ?? 0,
+            // One vocabulary, three facts: no price / no notional / no *locally derived* PnL.
+            // Gate reports uPnL itself, so that number stays trustworthy without a mark price.
+            markPriceUnavailable: markPrice === null,
+            valueUnavailable: !notional.known,
+            pnlUnavailable: false,
             unrealizedPnl: parseNumber(position.unrealizedPnl) ?? 0,
             leverage: position.leverage || null,
             realizedPnl: parseNumber(position.realizedPnl),
@@ -159,9 +181,12 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
     return (tradingSnapshot?.positions ?? [])
       .filter((position) => Number(position.quantity) !== 0)
       .map((position) => {
-        const quantity = Number(position.quantity) || 0;
-        const entryPrice = Number(position.entry_price) || 0;
-        const markPrice = Number(position.mark_price) || 0;
+        const quantity = parseNumber(position.quantity) ?? 0;
+        // The local execution store only carries prices: with no mark price nothing here can be
+        // derived, so the derived cells are flagged unknown instead of collapsing to 0.
+        const entryPrice = knownPrice(position.entry_price);
+        const markPrice = knownPrice(position.mark_price);
+        const notional = futuresNotional(quantity, markPrice, null);
         return {
           id: `${position.venue}:${position.symbol}`,
           positionId: position.position_id,
@@ -171,10 +196,18 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
           quote: symbolParts(position.symbol).quote,
           side: quantity < 0 ? 'Short' as const : 'Long' as const,
           quantity,
-          value: Math.abs(quantity * markPrice),
-          entryPrice,
-          markPrice,
-          unrealizedPnl: (markPrice - entryPrice) * quantity,
+          value: notional.value,
+          entryPrice: entryPrice ?? 0,
+          markPrice: markPrice ?? 0,
+          // Same rule as the snapshot path, except the PnL: this branch derives it locally
+          // (`(mark - entry) * qty`), so a missing price makes it unknown too — unlike the
+          // venue-reported uPnL above.
+          markPriceUnavailable: markPrice === null,
+          valueUnavailable: !notional.known,
+          pnlUnavailable: markPrice === null || entryPrice === null,
+          // `(0 - entryPrice) * quantity` used to fabricate a huge fake loss from a missing price;
+          // the neutral 0 keeps the page-level PnL total honest (the cell itself renders `—`).
+          unrealizedPnl: markPrice !== null && entryPrice !== null ? (markPrice - entryPrice) * quantity : 0,
           leverage: null,
           realizedPnl: parseNumber(position.realized_pnl),
           fundingFee: parseNumber(position.funding_fee),
@@ -189,6 +222,8 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
     .filter((position) => (parseNumber(position.assetQuantity) ?? 0) !== 0 || (parseNumber(position.liability) ?? 0) !== 0)
     .map((position) => {
       const part = symbolParts(position.symbol);
+      const assetQuantity = parseNumber(position.assetQuantity);
+      const indexPrice = knownPrice(position.indexPrice);
       return {
         id: position.positionId || position.symbol,
         symbol: position.symbol,
@@ -196,13 +231,15 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
         asset: position.assetCoin || part.asset,
         quote: part.quote,
         side: position.positionSide?.toUpperCase() === 'SHORT' ? 'Short' as const : 'Long' as const,
-        assetQuantity: parseNumber(position.assetQuantity) ?? 0,
-        value: Math.abs(parseNumber(position.value) ?? 0),
-        entryPrice: parseNumber(position.entryPrice) ?? 0,
-        indexPrice: parseNumber(position.indexPrice) ?? 0,
+        // These rows are rendered inline in this file, so an unknown number is simply `null` and
+        // every cell below prints `—` for it — no flag needed, no fabricated 0.00 / $0.
+        assetQuantity,
+        value: marginNotional(assetQuantity, indexPrice, parseNumber(position.value)),
+        entryPrice: knownPrice(position.entryPrice),
+        indexPrice,
         upnl: parseNumber(position.unrealizedPnl) ?? 0,
         leverage: position.leverage || null,
-        liability: parseNumber(position.liability) ?? 0,
+        liability: parseNumber(position.liability),
         liabilityCoin: position.liabilityCoin || '',
         interest: parseNumber(position.interest),
       };
@@ -299,10 +336,22 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
   // Snapshot balances first for coverage, live stream rows on top: the asset channel pushes
   // between slower REST reconciliation checks.
   const balanceRows = useMemo(() => {
-    const merged = new Map<string, { venue: string; coin: string; available: number; equity: number; upnl: number }>();
+    const merged = new Map<string, {
+      venue: string;
+      coin: string;
+      /** Parsed cash balance (handy for numeric comparisons in this page). */
+      balance: number;
+      /** Raw Decimal cash balance; `accountEquityOf` sums on the exact string, never on a float. */
+      balanceText: string;
+      available: number;
+      equity: number;
+      upnl: number;
+    }>();
     for (const balance of snapshot?.balances ?? []) {
       merged.set(`${balance.venue}:${balance.coin}`, {
         venue: balance.venue, coin: balance.coin,
+        balance: parseNumber(balance.balance) ?? 0,
+        balanceText: balance.balance,
         available: parseNumber(balance.availableBalance) ?? 0,
         equity: parseNumber(balance.equity) ?? 0,
         upnl: parseNumber(balance.unrealizedPnl) ?? 0,
@@ -311,6 +360,8 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
     for (const balance of Object.values(balances)) {
       merged.set(`${balance.venue}:${balance.coin}`, {
         venue: balance.venue, coin: balance.coin,
+        balance: parseNumber(balance.balance) ?? 0,
+        balanceText: balance.balance,
         available: parseNumber(balance.availableBalance) ?? 0,
         equity: parseNumber(balance.equity) ?? 0,
         upnl: parseNumber(balance.unrealizedPnl) ?? 0,
@@ -457,13 +508,38 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
 
   const futuresUnrealized = positionRows.reduce((sum, row) => sum + row.unrealizedPnl, 0);
   const unrealized = futuresUnrealized + marginRows.reduce((sum, row) => sum + row.upnl, 0);
-  const exposure = positionRows.reduce((sum, row) => sum + row.value, 0) + marginRows.reduce((sum, row) => sum + row.value, 0);
+  // Total equity — the "Total equity" KPI and the live endpoint of the curve. Same shared function
+  // the backend sampler uses: stablecoin cash of every CrossEx venue plus the open-position uPnL.
+  // The SPOT rows of the merged list are skipped inside `accountEquityOf` (isolated Gate spot
+  // account), and only the raw Decimal strings are summed, so no float drift can enter.
+  // Gate's own `account.marginBalance` stays visible next to it as a secondary figure: it subtracts
+  // the locked margin of DEX legs from cash without adding it back, so a fully hedged pair makes
+  // the account look half as large while the legs are open.
+  const totalEquity = parseNumber(accountEquityOf(
+    balanceRows.map((row) => ({ venue: row.venue, coin: row.coin, balance: row.balanceText })),
+    snapshot?.futuresPositions,
+    snapshot?.marginPositions,
+  )) ?? null;
+  // Legs whose notional the venues never reported stay out of both totals — counting them as 0
+  // would quietly claim the position is worth nothing — and the chip below the table header says so.
+  const legsMissingNotional = positionRows.filter((row) => row.valueUnavailable === true).length
+    + marginRows.filter((row) => row.value === null).length;
+  const exposure = positionRows.reduce((sum, row) => sum + (row.valueUnavailable === true ? 0 : row.value), 0)
+    + marginRows.reduce((sum, row) => sum + (row.value ?? 0), 0);
   const openLegCount = positionRows.length + marginRows.length;
 
   const venueEntries = useMemo(() => {
     const totals = new Map<string, number>();
-    for (const row of positionRows) totals.set(row.venue, (totals.get(row.venue) ?? 0) + row.value);
-    for (const row of marginRows) totals.set(row.venue, (totals.get(row.venue) ?? 0) + row.value);
+    // Skip unknown notionals so one unpriced venue leg cannot silently shrink another venue's
+    // share of the donut to zero.
+    for (const row of positionRows) {
+      if (row.valueUnavailable === true) continue;
+      totals.set(row.venue, (totals.get(row.venue) ?? 0) + row.value);
+    }
+    for (const row of marginRows) {
+      if (row.value === null) continue;
+      totals.set(row.venue, (totals.get(row.venue) ?? 0) + row.value);
+    }
     return [...totals.entries()]
       .map(([venue, value]) => ({ venue, value }))
       .filter((entry) => entry.value > 0)
@@ -494,10 +570,12 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
   const usageTone = marginUsage === null ? '' : marginUsage >= 85 ? 'critical' : marginUsage >= 60 ? 'hot' : '';
 
   // Latest equity from the live snapshot, appended to the persisted curve so the line's
-  // endpoint tracks the "Margin balance" KPI between background reconciliations.
+  // endpoint tracks the "Total equity" KPI between background reconciliations. It must use the
+  // same definition as the KPI and the sampler, otherwise the card would read $99.9 while the
+  // curve ends at Gate's $58.5.
   const equityFetchedMs = snapshot ? Date.parse(snapshot.fetchedAt) : Number.NaN;
-  const currentEquity: EquityChartPoint | null = marginBalance !== null && Number.isFinite(equityFetchedMs) && equityFetchedMs > 0
-    ? { time: equityFetchedMs, value: marginBalance }
+  const currentEquity: EquityChartPoint | null = totalEquity !== null && Number.isFinite(equityFetchedMs) && equityFetchedMs > 0
+    ? { time: equityFetchedMs, value: totalEquity }
     : null;
 
   const stream = accountStream ?? portfolio?.live?.stream;
@@ -553,7 +631,11 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
       positionId: position.positionId,
       symbol: position.symbol,
       quantity: String(position.quantity),
-      markPrice: String(position.markPrice),
+      // The dialog only uses this to print "notional = quantity × markPrice". Handing it a `0` price
+      // would print `$0` for a real position, so an unknown price is passed as `NaN`, which the
+      // dialog's own `formatAmount` renders as `—`. Sizing never uses this field (the server plan
+      // owns it), so nothing executable depends on the sentinel.
+      markPrice: position.markPriceUnavailable === true ? 'NaN' : String(position.markPrice),
     })));
   }
 
@@ -685,9 +767,11 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
 
     <section className="portfolio-summary">
       <article>
-        <span>{t('Margin balance')}</span>
-        <strong>{marginBalance !== null ? `$${formatAmount(marginBalance)}` : '—'}</strong>
-        <em>{account ? `${account.accountMode} · ${account.positionMode}` : t('Awaiting first snapshot')}</em>
+        <span>{t('Total equity')}</span>
+        <strong>{totalEquity !== null ? `$${formatAmount(totalEquity)}` : '—'}</strong>
+        <em>
+          {`${t('Gate basis')} ${marginBalance !== null ? `$${formatAmount(marginBalance)}` : '—'} · ${t('Initial margin')} ${initialMargin !== null ? `$${formatAmount(initialMargin)}` : '—'}`}
+        </em>
       </article>
       <article>
         <span>{t('Available margin')}</span>
@@ -697,12 +781,12 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
       <article>
         <MetricLabel label={t('Current total initial margin ratio')} explanation={t('Margin balance divided by total initial margin. Above 110%, margin can be transferred out; between 100% and 110%, outbound margin transfers are blocked; below 100%, the system automatically cancels open orders and only reduce-only orders are accepted.')} />
         <strong className={initialMarginRate !== null && initialMarginRate < 100 ? 'negative' : initialMarginRate !== null && initialMarginRate < 110 ? 'margin-rate-warning' : ''}>{initialMarginRate !== null ? `${formatAmount(initialMarginRate, 2)}%` : '—'}</strong>
-        <em>{t('Margin balance divided by total initial margin')}</em>
+        <em>{t('Margin balance divided by total initial margin')} · {t('Gate basis: the denominator is Gate margin balance, where DEX legs have already netted their margin.')}</em>
       </article>
       <article>
         <MetricLabel label={t('Current total maintenance margin ratio')} explanation={t('Margin balance divided by total maintenance margin. At or below 100%, CrossEx force-liquidates positions.')} />
         <strong className={maintenanceMarginRate !== null && maintenanceMarginRate <= 100 ? 'negative' : ''}>{maintenanceMarginRate !== null ? `${formatAmount(maintenanceMarginRate, 2)}%` : '—'}</strong>
-        <em>{t('Margin balance divided by total maintenance margin')}</em>
+        <em>{t('Margin balance divided by total maintenance margin')} · {t('Gate basis: the denominator is Gate margin balance, where DEX legs have already netted their margin.')}</em>
       </article>
       <article>
         <span>{t('Unrealized PnL')}</span>
@@ -718,7 +802,7 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
         <span>{t('Margin usage')}</span>
         <strong>{marginUsage !== null ? `${marginUsage.toFixed(1)}%` : '—'}</strong>
         <span className="margin-meter"><i className={usageTone} style={{ width: `${Math.min(100, Math.max(0, marginUsage ?? 0))}%` }} /></span>
-        <em>{maintenanceMargin !== null ? `${t('Maintenance margin')} $${formatAmount(maintenanceMargin)}` : '—'}</em>
+        <em>{maintenanceMargin !== null ? `${t('Maintenance margin')} $${formatAmount(maintenanceMargin)}` : '—'} · {t('Gate basis: the denominator is Gate margin balance, where DEX legs have already netted their margin.')}</em>
       </article>
     </section>
 
@@ -876,6 +960,10 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
       <div className="panel-tabs">
         {tabs.map((item) => <button key={item.id} className={activeTab === item.id ? 'active' : ''} onClick={() => setTab(item.id)}>{t(item.label)}{item.count !== null ? ` (${item.count})` : ''}</button>)}
         <span className="spacer" />
+        {legsMissingNotional > 0 && <span
+          className="portfolio-sync warn"
+          title={t('No live price for this market.')}
+        ><i />{`${t('Position notional')} — · ${legsMissingNotional}`}</span>}
         <span className="table-source">{tableSource}</span>
       </div>
       {activeTab === 'positions' && (positionRows.length ? <PositionsTable rows={positionRows} onClose={requestPositionClose} /> : <EmptyTable label="positions" />)}
@@ -912,12 +1000,12 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
         <tbody>{marginRows.slice(marginPage.start, marginPage.end).map((row) => <tr key={row.id}>
           <td><strong>{marketSymbol(row.asset, row.quote, 'spot')}</strong><small className={row.side === 'Long' ? 'long-tag' : 'short-tag'}>{t(row.side)}</small></td>
           <td><VenueFromCode code={row.venue} /></td>
-          <td>{formatAmount(row.assetQuantity, 6)} {row.asset}</td>
-          <td>${formatAmount(row.value)}</td>
-          <td>{priceText(row.entryPrice)}</td>
-          <td>{priceText(row.indexPrice)}</td>
+          <td>{row.assetQuantity !== null ? `${formatAmount(row.assetQuantity, 6)} ${row.asset}` : '—'}</td>
+          <td>{row.value !== null ? `$${formatAmount(row.value)}` : '—'}</td>
+          <td>{row.entryPrice !== null ? priceText(row.entryPrice) : '—'}</td>
+          <td>{row.indexPrice !== null ? priceText(row.indexPrice) : '—'}</td>
           <td>{row.leverage ? `${row.leverage}×` : '—'}</td>
-          <td>{formatAmount(row.liability)}{row.liabilityCoin ? ` ${row.liabilityCoin}` : ''}</td>
+          <td>{row.liability !== null ? `${formatAmount(row.liability)}${row.liabilityCoin ? ` ${row.liabilityCoin}` : ''}` : '—'}</td>
           <td>{row.interest !== null ? formatAmount(row.interest, 6) : '—'}</td>
           <td className={row.upnl >= 0 ? 'positive' : 'negative'}>{signedAmount(row.upnl)}</td>
         </tr>)}</tbody>

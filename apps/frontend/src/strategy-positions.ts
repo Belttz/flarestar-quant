@@ -21,9 +21,58 @@ export interface PositionTableRow {
   fundingFee: number | null;
   crossExAdlRank?: string | null;
   exchangeAdlRank?: string | null;
+  /**
+   * The venue returned no mark price for this leg.
+   *
+   * A perpetual never trades at 0, so a missing price means "unknown", not "free". Before this flag
+   * the row fell back to `markPrice = 0` and the cell printed a confident `0`, which reads as a real
+   * price — and it happens constantly for the venues whose public REST is unreachable from this
+   * machine (Binance / OKX / Bybit / Kraken, see the spread-display fix).
+   */
+  markPriceUnavailable?: boolean;
+  /**
+   * Neither a venue-reported notional nor a mark price is available, so the position's value is
+   * unknown. Kept separate from `markPriceUnavailable`: CrossEx usually still sends `value` even
+   * when `markPrice` is missing, and hiding a known notional would be a regression.
+   */
+  valueUnavailable?: boolean;
+  /**
+   * The row's unrealised PnL was derived locally from a missing mark price, so it is unknown too.
+   *
+   * Only the local execution-store fallback derives PnL (`(mark - entry) * qty`); a venue-reported
+   * `unrealizedPnl` stays trustworthy even when the mark price is missing.
+   */
+  pnlUnavailable?: boolean;
 }
 
 export type StrategyPositionRow = PositionTableRow;
+
+/**
+ * A price the venue reported, or `null` when it is missing, empty or a non-positive filler.
+ *
+ * Perpetuals never trade at 0, so a `"0"` in a price field always means "no price". This is the one
+ * place that turns a venue string into that judgement, so every page builds its rows the same way.
+ */
+export function knownPrice(value: string | null | undefined): number | null {
+  const parsed = parseNumber(value);
+  return parsed !== null && parsed > 0 ? parsed : null;
+}
+
+/**
+ * Notional of one futures leg, most authoritative source first: the value the venue already marked,
+ * then quantity × mark price. `known: false` means the venue sent neither, so the cell prints `—`
+ * and the page totals skip the leg instead of counting it as a position worth 0.
+ */
+export function futuresNotional(
+  quantity: number,
+  markPrice: number | null,
+  reportedValue: number | null,
+): { value: number; known: boolean } {
+  const reported = Math.abs(reportedValue ?? 0);
+  if (reported > 0) return { value: reported, known: true };
+  if (markPrice !== null) return { value: Math.abs(quantity * markPrice), known: true };
+  return { value: 0, known: false };
+}
 
 export interface StrategyPositionsView {
   status: 'unavailable' | 'stale' | 'fresh';
@@ -55,8 +104,8 @@ function portfolioRows(portfolio: AuthenticatedPortfolioSnapshot): StrategyPosit
       const quantity = parseNumber(position.quantity) ?? 0;
       if (quantity === 0) return null;
       const symbol = symbolParts(position.symbol);
-      const markPrice = parseNumber(position.markPrice) ?? 0;
-      const reportedValue = Math.abs(parseNumber(position.value) ?? 0);
+      const markPrice = knownPrice(position.markPrice);
+      const notional = futuresNotional(quantity, markPrice, parseNumber(position.value));
       return {
         id: `${symbol.venue}:${position.positionId || position.symbol}`,
         positionId: position.positionId,
@@ -66,9 +115,14 @@ function portfolioRows(portfolio: AuthenticatedPortfolioSnapshot): StrategyPosit
         quote: symbol.quote,
         side: position.positionSide.toUpperCase() === 'SHORT' || quantity < 0 ? 'Short' : 'Long',
         quantity,
-        value: reportedValue > 0 ? reportedValue : Math.abs(quantity * markPrice),
-        entryPrice: parseNumber(position.entryPrice) ?? 0,
-        markPrice,
+        // The venue reported the notional: trust it even when the mark price is missing.
+        value: notional.value,
+        entryPrice: knownPrice(position.entryPrice) ?? 0,
+        markPrice: markPrice ?? 0,
+        markPriceUnavailable: markPrice === null,
+        valueUnavailable: !notional.known,
+        // Gate reports uPnL itself, so it stays trustworthy without a mark price.
+        pnlUnavailable: false,
         leverage: position.leverage || null,
         unrealizedPnl: parseNumber(position.unrealizedPnl) ?? 0,
         realizedPnl: parseNumber(position.realizedPnl),
@@ -94,8 +148,11 @@ export function prepareExecutionPositionRows(
       const quantity = parseNumber(position.quantity) ?? 0;
       if (quantity === 0) return null;
       const symbol = symbolParts(position.symbol);
-      const entryPrice = parseNumber(position.entry_price) ?? 0;
-      const markPrice = parseNumber(position.mark_price) ?? 0;
+      // Both prices are required to derive anything here: the local execution store carries no
+      // notional of its own.
+      const entryPrice = knownPrice(position.entry_price);
+      const markPrice = knownPrice(position.mark_price);
+      const notional = futuresNotional(quantity, markPrice, null);
       const portfolioPosition = freshPortfolioPositions.find((candidate) =>
         candidate.positionId === position.position_id || candidate.symbol === position.symbol);
       const reportedPnl = portfolioPosition ? parseNumber(portfolioPosition.unrealizedPnl) : null;
@@ -108,11 +165,17 @@ export function prepareExecutionPositionRows(
         quote: symbol.quote,
         side: quantity < 0 ? 'Short' : 'Long',
         quantity,
-        value: Math.abs(quantity * markPrice),
-        entryPrice,
-        markPrice,
+        value: notional.value,
+        entryPrice: entryPrice ?? 0,
+        markPrice: markPrice ?? 0,
+        markPriceUnavailable: markPrice === null,
+        valueUnavailable: !notional.known,
+        // The PnL below is derived locally from these prices, so a missing price makes it unknown
+        // too; a venue-reported PnL (`reportedPnl`) stays trustworthy.
+        pnlUnavailable: reportedPnl === null && (markPrice === null || entryPrice === null),
         leverage: portfolioPosition?.leverage || null,
-        unrealizedPnl: reportedPnl ?? ((markPrice - entryPrice) * quantity),
+        unrealizedPnl: reportedPnl
+          ?? (markPrice !== null && entryPrice !== null ? (markPrice - entryPrice) * quantity : 0),
         realizedPnl: parseNumber(position.realized_pnl),
         fundingFee: positionFundingFee(position, freshPortfolioPositions),
         crossExAdlRank: portfolioPosition?.crossExAdlRank ?? null,

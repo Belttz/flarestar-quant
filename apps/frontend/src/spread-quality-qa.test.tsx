@@ -32,6 +32,10 @@ function qualityRow(overrides: Partial<SpreadQualityRow> = {}): SpreadQualityRow
     ar1Coefficient: 0.77, halfLifeHours: 2.5, holdingCostBps: 0.75,
     bookDepthUsdt: 180000, score: 63.5, sampleCount: 288, source: 'candles',
     updatedAt: '2026-10-07T00:00:00.000Z',
+    // The legs' current funding rate is a separate column with its own dash rule. These fixtures
+    // pin the *statistics* dash counts, so they carry published rates — a missing rate would add
+    // three dashes of its own and blur exactly what this suite measures.
+    leftFundingRate8h: '0.0001', rightFundingRate8h: '0.0002', fundingRateDiffBps: -1,
     assetClass: 'TOKEN', assetSuperClass: 'CRYPTO', variantSuffix: null, isPreIpo: false,
     ...overrides,
   };
@@ -222,9 +226,11 @@ describe('controlled expansion', () => {
 });
 
 describe('v1 table shape', () => {
-  it('renders 13 plain header cells, no sorting affordance, and a matching detail colSpan', () => {
+  it('renders 14 plain header cells, no sorting affordance, and a matching detail colSpan', () => {
     const html = renderTable([qualityRow()]);
-    expect([...html.matchAll(/<th[\s>]/g)]).toHaveLength(13);
+    // 14 = the original 13 columns plus the legs' current funding rate, which sits next to the
+    // asset cell (the pair it belongs to).
+    expect([...html.matchAll(/<th[\s>]/g)]).toHaveLength(14);
     expect(html).not.toContain('aria-sort');
     const thead = html.slice(html.indexOf('<thead>'), html.indexOf('</thead>'));
     expect(thead).not.toContain('<button');
@@ -232,7 +238,7 @@ describe('v1 table shape', () => {
     expect(html).toContain('class="mono">1</td>');
     // The expanded detail row spans exactly the header width (React serializes colSpan
     // case-preserved in static markup; HTML parsing lowercases it either way).
-    expect(renderTable([qualityRow()], 'BTC')).toMatch(/colspan="13"/i);
+    expect(renderTable([qualityRow()], 'BTC')).toMatch(/colspan="14"/i);
   });
 
   it('renders deterministically: the same payload twice yields identical markup', () => {

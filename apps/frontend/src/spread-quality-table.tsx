@@ -1,6 +1,7 @@
 import { Fragment } from 'react';
 import type { SpreadQualityRow } from '@gate-crossex/shared-types';
 import { useLanguage } from './i18n.js';
+import { LegFundingRates } from './leg-funding-rates.js';
 import { assetIcon, assetName, formatOpportunityAmount, fundingVenueName } from './route-shared.js';
 
 /**
@@ -159,6 +160,8 @@ export function SpreadQualityTable({ rows, expandedAsset, onToggleExpand }: {
       <th aria-label={t('Expand combinations')} />
       <th>#</th>
       <th>{t('Asset')}</th>
+      {/* Both legs' current funding rate, next to the pair it applies to. */}
+      <th>{t('Funding rate')}</th>
       <th>{t('Current spread')}</th>
       <th>{t('Mean spread')}</th>
       <th>{t('Spread volatility')}</th>
@@ -190,6 +193,11 @@ export function SpreadQualityTable({ rows, expandedAsset, onToggleExpand }: {
               <QualityLegCell venue={best.rightVenue} symbol={best.rightSymbol} leg="Buy leg" />
             </span>
           </td>
+          <td className="opportunity-funding-cell"><LegFundingRates
+            leftFundingRate8h={best.leftFundingRate8h}
+            rightFundingRate8h={best.rightFundingRate8h}
+            fundingRateDiffBps={best.fundingRateDiffBps}
+          /></td>
           {/* Current spread, mean, volatility and holding cost are bps; half-life is hours. */}
           <td><strong className={best.currentSpreadBps >= 0 ? 'positive' : 'negative'}>{formatSpreadQualityBps(best.currentSpreadBps)}</strong>{best.quoteAligned === false && <SpreadQualityStaleBadge />}</td>
           <td className="mono">{formatSpreadQualityBps(best.meanSpreadBps)}</td>
@@ -202,12 +210,13 @@ export function SpreadQualityTable({ rows, expandedAsset, onToggleExpand }: {
           <td className="mono" title={`${best.bookDepthUsdt} USDT`}>{formatOpportunityAmount(String(best.bookDepthUsdt))}</td>
           <td className="mono"><strong className="positive quality-score">{formatOpportunityScore(best.score)}</strong></td>
         </tr>
-        {open && <tr className="spread-quality-detail-row"><td colSpan={13}>
+        {open && <tr className="spread-quality-detail-row"><td colSpan={14}>
           <table className="spread-quality-combination-table">
             <thead><tr>
               <th>{t('Pair')}</th>
               <th>{t('Sell leg')}</th>
               <th>{t('Buy leg')}</th>
+              <th>{t('Funding rate')}</th>
               <th>{t('Current spread')}</th>
               <th>{t('Opportunity score')}</th>
               <th>{t('Symmetric')}</th>
@@ -219,6 +228,11 @@ export function SpreadQualityTable({ rows, expandedAsset, onToggleExpand }: {
               <td>{combinationIndex === 0 ? <em className="best-tag">{t('Best')}</em> : combinationIndex + 1}</td>
               <td><QualityLegCell venue={combination.leftVenue} symbol={combination.leftSymbol} leg="Sell leg" /></td>
               <td><QualityLegCell venue={combination.rightVenue} symbol={combination.rightSymbol} leg="Buy leg" /></td>
+              <td className="opportunity-funding-cell"><LegFundingRates
+                leftFundingRate8h={combination.leftFundingRate8h}
+                rightFundingRate8h={combination.rightFundingRate8h}
+                fundingRateDiffBps={combination.fundingRateDiffBps}
+              /></td>
               <td><strong className={combination.currentSpreadBps >= 0 ? 'positive' : 'negative'}>{formatSpreadQualityBps(combination.currentSpreadBps)}</strong>{combination.quoteAligned === false && <SpreadQualityStaleBadge />}</td>
               <td className="mono">{formatOpportunityScore(combination.score)}</td>
               <td><SpreadQualitySymmetryBadge symmetric={combination.symmetric} /></td>

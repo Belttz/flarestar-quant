@@ -296,6 +296,11 @@ const chinese: Record<string, string> = {
   'OI averaged across venues reporting it': '持仓量均值取自有数据的交易所', 'Binance publishes no bulk open-interest feed': 'Binance 不提供批量持仓量数据',
   'Portfolio overview': '资产概览', 'Your capital, in focus.': '资金状况，一目了然。', 'Track balances, positions, and open orders across every venue.': '跟踪各交易所的余额、持仓与委托。', 'Gross exposure': '总敞口', 'open venue legs': '个开放交易所分腿', 'Marked from CrossEx prices': '按 CrossEx 价格标记', Exposure: '敞口', 'Venue allocation': '交易所分配', 'Marked value': '标记价值', Balances: '余额', 'Streamed from the private asset channel': '来自私有资产频道的实时数据', Equity: '权益', 'No balances yet': '暂无余额数据', 'Balances stream in once credentials are configured.': '配置凭证后余额将实时推送。',
   'Margin balance': '保证金余额', 'Available margin': '可用保证金', 'Initial margin': '起始保证金', 'Maintenance margin': '维持保证金', 'Margin usage': '保证金使用率', 'Margin positions': '杠杆持仓', 'Funding fee': '资金费用', Value: '价值', Role: '角色', Liability: '负债', Interest: '利息', 'Index price': '指数价格', Refresh: '刷新', 'Refreshing…': '刷新中…', Synced: '已同步', 'Stale snapshot': '快照滞后', 'Awaiting first snapshot': '等待首个快照', 'No open exposure': '暂无敞口', 'Open a position to see venue allocation.': '开仓后即可查看交易所分配。', 'Gate CrossEx REST · refreshed every 60s': 'Gate CrossEx REST · 每 60 秒刷新', 'Local execution store': '本地执行数据',
+  // Asset-page KPI: total equity is our own sum (stablecoin cash + position uPnL); the Gate figure
+  // is only a secondary "Gate basis" line and the denominator of the risk ratios.
+  'Total equity': '总权益',
+  'Gate basis': 'Gate 口径',
+  'Gate basis: the denominator is Gate margin balance, where DEX legs have already netted their margin.': '按 Gate 口径：分母为 Gate 保证金余额，DEX 分腿已扣掉其保证金。',
   'Current total initial margin ratio': '当前总起始保证金率', 'Current total maintenance margin ratio': '当前总维持保证金率',
   'Margin balance divided by total initial margin': '保证金余额 ÷ 总起始保证金', 'Margin balance divided by total maintenance margin': '保证金余额 ÷ 总维持保证金',
   'Margin balance divided by total initial margin. Above 110%, margin can be transferred out; between 100% and 110%, outbound margin transfers are blocked; below 100%, the system automatically cancels open orders and only reduce-only orders are accepted.': '保证金余额除以总起始保证金。110% 以上可转出；100% 至 110% 禁止转出保证金；低于 100% 时系统会自动撤单，且只能减仓。',
@@ -449,7 +454,7 @@ const chinese: Record<string, string> = {
   'Equity curve unavailable': '净值曲线暂不可用',
   'Loading equity curve…': '正在加载净值曲线…',
   'Range change': '区间涨跌',
-  'Curve covers the CrossEx account margin balance; Gate spot balances are not included.': '曲线仅统计 CrossEx 账户保证金余额，不含 Gate 现货余额。',
+  'Curve tracks total equity: stablecoin cash on every CrossEx venue plus open-position PnL. Before 2026-10-26 the series recorded the Gate margin balance.': '曲线统计总权益：各交易所稳定币现金加上持仓浮动盈亏；2026-10-26 之前为 Gate 保证金余额口径。',
   // Trade-page execution panel: 8 business-split tabs
   'Futures positions': '合约持仓', 'Spot holdings': '现货持仓', 'Futures open orders': '合约挂单', 'Spot open orders': '现货挂单',
   'Futures order history': '合约历史委托', 'Spot order history': '现货历史委托', 'Futures trade history': '合约成交', 'Spot trade history': '现货成交',
@@ -569,6 +574,11 @@ const chinese: Record<string, string> = {
   'Live sampling': '实时采样',
   Candidates: '个候选',
   'Ranked by 24h spread-distribution quality: mean, volatility, skewness, reversion speed, holding cost and book depth.': '按 24h 价差分布质量排名：均值、波动、偏度、回归速度、持有成本与盘口深度。',
+  // 价差榜 / 价差质量榜：两腿当前资金费率（卖出腿在前、买入腿在后；缺失显示 —，绝不用 0 冒充）
+  'Funding rate': '资金费率',
+  'Funding rate (current)': '当前资金费率',
+  'Funding rate unavailable': '资金费率不可用',
+  'Funding differential while both legs are held, per 8h': '两腿同时持有期间的净资金费率（每 8 小时）',
 
   // ── v0.4.1 ────────────────────────────────────────────────────────────────────────────────
   // R6/R7 合并列表（交易页底部；Positions/Orders/All/Perpetual/Spot 等基础词条已在上方定义）
@@ -614,6 +624,13 @@ const chinese: Record<string, string> = {
   'Venue debts settled': '交易所欠款已自动结清',
   'Venue debt remains': '仍有交易所欠款未结清',
   'Settlement fee is too high for this deficit; handle it on the assets page.': '该笔欠款的手续费过高，未自动结算，请到资产页手动处理。',
+  // 价差行情三态（实时价差 / 历史价差）：空、过期、加载中是三种不同状态，文案必须能区分
+  'Waiting for the missing leg quote': '等待缺失一侧的报价',
+  'Stale quote': '报价已过期',
+  'No quote': '无报价',
+  'No candle history for this venue leg': '该交易所腿暂无K线历史',
+  'Last candle': '最后一根K线',
+  'Live candles are still being collected from the CrossEx feed.': '正在从 CrossEx 行情流累积实时K线。',
 };
 
 /**

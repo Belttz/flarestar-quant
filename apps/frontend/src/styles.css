@@ -2588,9 +2588,16 @@ html[data-theme='light'] .strategy-ladder-note { color: #71808e; }
 .strategy-copy-notice strong { color: #cfe9e1; font-family: var(--font-sans); }
 .strategy-copy-notice button { flex: 0 0 auto; height: 26px; padding: 0 9px; border: 1px solid #2f5f55; border-radius: 4px; color: #9fd6c7; background: #10332c; font-size: var(--text-caption); cursor: pointer; }
 .strategy-copy-notice button:hover { border-color: #468a7b; color: #d6f4ec; }
-/* Read-only strategy configuration / PnL detail dialog. */
-.strategy-config-detail-modal { width: min(760px, 100%); }
-.strategy-config-detail-modal .strategy-detail-body { display: grid; gap: 16px; margin: 14px 0; }
+/* Read-only strategy configuration / PnL detail dialog.
+ * The dialog is a three-part column: a fixed header, the only scrolling box (`.strategy-detail-body`)
+ * and an always-visible action bar. Before this, the whole card scrolled and `.modal-backdrop`
+ * starts dialogs at 16vh, so `16vh + (100vh - 48px)` overshot the viewport and pushed the action
+ * bar below the fold on 1440x900 and on phones. The height budget therefore subtracts the 16vh
+ * offset plus a 24px bottom gap; the `dvh` line is a deliberate second declaration (not a typo) so
+ * mobile browser chrome cannot shrink the usable box out from under the bar. */
+.strategy-config-detail-modal { display: flex; flex-direction: column; width: min(760px, 100%); max-height: calc(100vh - 16vh - 24px); max-height: calc(100dvh - 16vh - 24px); overflow: hidden; }
+.strategy-config-detail-modal > header { flex: 0 0 auto; }
+.strategy-config-detail-modal .strategy-detail-body { flex: 1 1 auto; min-height: 0; display: grid; gap: 16px; margin: 14px 0; overflow-y: auto; overscroll-behavior: contain; }
 .strategy-detail-body h3 { margin: 0 0 8px; color: #8b98a8; font-size: var(--text-small); font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
 .strategy-detail-rows { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0; margin: 0; overflow: hidden; border: 1px solid #1d2834; border-radius: 6px; }
 .strategy-detail-rows > div { min-width: 0; display: grid; gap: 3px; padding: 7px 10px; border-bottom: 1px solid #1d2834; background: #0c1219; }
@@ -2598,7 +2605,9 @@ html[data-theme='light'] .strategy-ladder-note { color: #71808e; }
 .strategy-detail-rows dt { color: #617084; font-size: var(--text-caption); }
 .strategy-detail-rows dd { margin: 0; overflow-wrap: anywhere; color: #c6cfd9; font-family: var(--font-sans); font-size: var(--text-small); }
 .strategy-detail-note { margin: 8px 0 0; color: #687588; font-size: var(--text-caption); line-height: 1.45; }
-.strategy-detail-actions { display: flex; align-items: stretch; gap: 8px; }
+/* The action bar is a flex child that never shrinks, and the body is the only scroll container, so
+ * the buttons stay reachable at any viewport height. */
+.strategy-detail-actions { display: flex; flex: 0 0 auto; align-items: stretch; gap: 8px; margin-top: 0; padding-top: 12px; border-top: 1px solid #1d2834; }
 .strategy-detail-actions .confirm-back { flex: 0 0 auto; width: auto; }
 .strategy-detail-actions .strategy-detail-secondary { flex: 0 0 auto; padding: 0 14px; border: 1px solid #294b56; border-radius: 5px; color: #8fc7d4; background: #0d2027; font-size: var(--text-small); font-weight: 600; cursor: pointer; }
 .strategy-detail-actions .strategy-detail-secondary:hover { border-color: #3d7280; color: #bce9f1; }
@@ -2616,6 +2625,7 @@ html[data-theme='light'] .strategy-detail-rows > div { border-bottom-color: #e7e
 html[data-theme='light'] .strategy-detail-rows > div:nth-child(odd) { border-right-color: #e7ecef; }
 html[data-theme='light'] .strategy-detail-rows dt { color: #71808e; }
 html[data-theme='light'] .strategy-detail-rows dd { color: #1f2b36; }
+html[data-theme='light'] .strategy-detail-actions { border-top-color: #dfe6ec; }
 
 /* One-click max size: the number IS the control — a chip so the affordance is visible, not a
  * bare green number that reads as a label. */
@@ -2763,4 +2773,27 @@ html[data-theme='light'] .close-plan-status.pending { color: #7a5c00; background
   .modal-backdrop, .confirm-order-backdrop { padding: 8px; padding-top: max(8px, env(safe-area-inset-top)); place-items: start center; overflow-y: auto; }
   .modal-backdrop > *, .confirm-order-backdrop > * { width: 100%; max-width: 640px; max-height: calc(100dvh - 16px); overflow-y: auto; }
   .confirm-order-modal { max-height: calc(100dvh - 16px); }
+}
+
+/* Short viewports (13"/14" laptops, phones in landscape) — trim the vertical rhythm of the detail
+ * dialog's three sections so fewer rows have to scroll. This is spacing only: the action bar keeps
+ * its own non-shrinking box, so the buttons stay on screen regardless of how tall the content is. */
+@media (max-height: 820px) {
+  .strategy-config-detail-modal { padding-top: 16px; padding-bottom: 14px; }
+  .strategy-config-detail-modal .strategy-detail-body { gap: 12px; margin: 10px 0; }
+  .strategy-config-detail-modal .strategy-detail-body h3 { margin-bottom: 6px; }
+  .strategy-config-detail-modal .strategy-detail-rows > div { padding: 5px 10px; }
+  .strategy-config-detail-modal .strategy-detail-note { margin-top: 6px; }
+}
+
+/* Phones: the dialog owns the whole viewport band (dvh so iOS chrome cannot push it down), the
+ * body keeps the only scrollbar, and the action bar wraps into two rows — the two secondary
+ * buttons share one row, the primary action takes a full-width row of its own with a >=44px touch
+ * target. Written after the `.modal-backdrop > *` block above so it wins at equal specificity. */
+@media (max-width: 640px) {
+  .strategy-config-detail-modal { max-height: calc(100dvh - 16px); overflow: hidden; }
+  .strategy-config-detail-modal .strategy-detail-actions { flex-wrap: wrap; }
+  .strategy-config-detail-modal .strategy-detail-actions .confirm-back,
+  .strategy-config-detail-modal .strategy-detail-actions .strategy-detail-secondary { flex: 1 1 calc(50% - 4px); min-width: 0; min-height: 44px; }
+  .strategy-config-detail-modal .strategy-detail-actions .confirm-submit { flex: 1 1 100%; min-height: 46px; }
 }

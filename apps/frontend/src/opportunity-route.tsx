@@ -27,6 +27,7 @@ import {
 } from './funding-hedge.js';
 import { FundingHedgeTable, FundingRankingTable } from './funding-hedge-tables.js';
 import { useLanguage } from './i18n.js';
+import { LegFundingRates } from './leg-funding-rates.js';
 import { assetIcon, assetName, exchanges, formatOpportunityAmount, fundingVenueName, VenueIcon, type PairedPositionPrefill } from './route-shared.js';
 import { SpreadQualitySortChips, SpreadQualitySourceBadge, SpreadQualityTable, type SpreadQualitySortDir, type SpreadQualitySortKey } from './spread-quality-table.js';
 
@@ -1276,6 +1277,8 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
             <th aria-label={t('Expand combinations')} />
             <OpportunitySortHeader label={t('Asset')} sortKey="asset" state={sortState} onToggle={onSortToggle} />
             <th>{t('Best path')}</th>
+            {/* Both legs' current funding rate: the carry the spread pays or collects while open. */}
+            <th>{t('Funding rate')}</th>
             <OpportunitySortHeader label={t('Spread')} sortKey="spread" state={sortState} onToggle={onSortToggle} />
             <th>{t('Pairs')}</th><th>{t('Venues')}</th>
             <OpportunitySortHeader label={t('24h volume')} sortKey="volume" state={sortState} onToggle={onSortToggle} />
@@ -1293,6 +1296,11 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
                 <td><span className="opportunity-asset"><i aria-hidden="true">{assetIcon(row.asset)}</i><strong>{row.asset}</strong><small>{assetName(row.asset)}</small></span>
                   <OpportunityClassBadge row={row} /></td>
                 <td><span className="spread-path"><b>{fundingVenueName(row.leftVenue)}</b><i aria-hidden="true">→</i><b>{fundingVenueName(row.rightVenue)}</b></span></td>
+                <td className="opportunity-funding-cell"><LegFundingRates
+                  leftFundingRate8h={row.leftFundingRate8h}
+                  rightFundingRate8h={row.rightFundingRate8h}
+                  fundingRateDiffBps={row.fundingRateDiffBps}
+                /></td>
                 <td><strong className={row.spreadBps >= 0 ? 'positive' : 'negative'}>{formatSpreadPercent(row.spreadBps)}</strong></td>
                 <td className="mono">{row.combinations.length}</td>
                 <td><span className="spread-venues">{venues.map((venue) => <b key={venue} className="venue-badge">{fundingVenueName(venue)}</b>)}</span></td>
@@ -1304,17 +1312,22 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
                   {row.executable ? t('Execute') : t('Not connected')}
                 </button></td>
               </tr>
-              {open && <tr className="spread-detail-row"><td colSpan={9}>
+              {open && <tr className="spread-detail-row"><td colSpan={10}>
                 <table className="spread-combination-table">
                   <thead><tr>
                     <th>{t('Pair')}</th><th>{t('Sell leg')}</th><th>{t('Buy leg')}</th>
-                    <th>{t('Pair type')}</th><th>{t('Spread')}</th><th>{t('Sell bid / Buy ask')}</th><th />
+                    <th>{t('Pair type')}</th><th>{t('Funding rate')}</th><th>{t('Spread')}</th><th>{t('Sell bid / Buy ask')}</th><th />
                   </tr></thead>
                   <tbody>{row.combinations.map((combination, index) => <tr key={`${combination.leftSymbol}:${combination.rightSymbol}`} className={index === 0 ? 'best' : ''}>
                     <td>{index === 0 ? <em className="best-tag">{t('Best')}</em> : index + 1}</td>
                     <td><span className="opportunity-leg"><b>{fundingVenueName(combination.leftVenue)}</b><small className="mono">{combination.leftSymbol}</small></span></td>
                     <td><span className="opportunity-leg"><b>{fundingVenueName(combination.rightVenue)}</b><small className="mono">{combination.rightSymbol}</small></span></td>
                     <td><span className="pair-type-tag">{combination.pairType === 'SPOT_PERP' ? t('Spot ⇄ perpetual') : t('Perpetual')}</span></td>
+                    <td className="opportunity-funding-cell"><LegFundingRates
+                      leftFundingRate8h={combination.leftFundingRate8h}
+                      rightFundingRate8h={combination.rightFundingRate8h}
+                      fundingRateDiffBps={combination.fundingRateDiffBps}
+                    /></td>
                     <td><strong className={combination.spreadBps >= 0 ? 'positive' : 'negative'}>{formatSpreadPercent(combination.spreadBps)}</strong></td>
                     <td className="mono">{combination.sellBid} / {combination.buyAsk}</td>
                     <td><button className="row-action execute-action" onClick={() => executeSpread({ ...row, ...combination })} disabled={!combination.executable}>

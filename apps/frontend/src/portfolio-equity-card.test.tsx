@@ -40,7 +40,8 @@ describe('portfolio equity card', () => {
     // Effects never run in SSR, so the card shows its loading state.
     expect(html).toContain('Loading equity curve…');
     expect(html).toContain('role="status"');
-    expect(html).toContain('Curve covers the CrossEx account margin balance');
+    expect(html).toContain('Curve tracks total equity');
+    expect(html).toContain('Before 2026-10-26 the series recorded the Gate margin balance.');
   });
 
   it('renders the empty state as a normal condition, never an error', () => {
@@ -104,7 +105,7 @@ describe('portfolio equity card', () => {
     expect(html).toContain('>全部</button>');
     expect(html).toContain('暂无采样点');
     expect(html).toContain('采样点仅在终端运行期间记录，曲线会在最初几天逐步填满。');
-    expect(html).toContain('曲线仅统计 CrossEx 账户保证金余额，不含 Gate 现货余额。');
+    expect(html).toContain('曲线统计总权益：各交易所稳定币现金加上持仓浮动盈亏；2026-10-26 之前为 Gate 保证金余额口径。');
   });
 
   it('renders the chart with live data and keeps the empty state for a lone point', () => {

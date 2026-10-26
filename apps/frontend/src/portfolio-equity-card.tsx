@@ -98,7 +98,7 @@ export function EquityCardBody({
       <strong>{changeValue >= 0 ? '+' : '-'}${formatAmount(Math.abs(changeValue))}</strong>
       {' '}({changeValue >= 0 ? '+' : '-'}{formatAmount(Math.abs(changePercent))}%)
     </p>}
-    <p className="equity-note">{t('Curve covers the CrossEx account margin balance; Gate spot balances are not included.')}</p>
+    <p className="equity-note">{t('Curve tracks total equity: stablecoin cash on every CrossEx venue plus open-position PnL. Before 2026-10-26 the series recorded the Gate margin balance.')}</p>
   </article>;
 }
 

@@ -48,6 +48,11 @@ function autoView() {
   return <StrategyView {...SHARED_PROPS} mode="auto" fees={[]} />;
 }
 
+/** The position page is the same component in its other mode, exactly as `strategy-route.tsx` wires it. */
+function positionView() {
+  return <StrategyView {...SHARED_PROPS} mode="position" fees={[]} />;
+}
+
 /** The premium page needs its own candle/watch props; everything else it shares with the others. */
 function premiumView() {
   return <PremiumStrategyView {...SHARED_PROPS} candleSeries={{}} watchKlines={vi.fn()} />;
@@ -87,6 +92,46 @@ function premiumRecord(): StrategyRecord {
     filledRight: '0.1',
     openPosition: '0',
     realizedPnl: '3.5',
+    createdAt: '2026-08-14T00:00:00.000Z',
+    updatedAt: '2026-08-14T01:00:00.000Z',
+    stoppedAt: '2026-08-14T01:00:00.000Z',
+  };
+}
+
+/** A stopped position (cross-exchange hedge) strategy, shaped like the record the backend returns. */
+function positionRecord(): StrategyRecord {
+  const config: StrategyConfig = {
+    kind: 'position',
+    asset: 'ETH',
+    leftVenue: 'GATE',
+    rightVenue: 'KRAKEN',
+    leftSide: 'BUY',
+    rightSide: 'SELL',
+    entryBps: '-50',
+    takeProfitBps: '20',
+    stopLossBps: 80,
+    maxPosition: '250',
+    totalAmount: '400',
+    perOrderQuantity: '250',
+    reduceOnly: false,
+    executionMethod: 'MAKER_TAKER',
+    makerLeg: 'right',
+    leftLeverage: '3',
+    rightLeverage: '2',
+  };
+  return {
+    id: 'PAIR-791A421C',
+    kind: 'position',
+    status: 'STOPPED',
+    accountProfileId: 'gate-crossex-default',
+    accountLabel: 'Gate CrossEx',
+    config,
+    progress: 100,
+    filledQuantity: '0',
+    filledLeft: '0',
+    filledRight: '0',
+    openPosition: '0',
+    realizedPnl: '0',
     createdAt: '2026-08-14T00:00:00.000Z',
     updatedAt: '2026-08-14T01:00:00.000Z',
     stoppedAt: '2026-08-14T01:00:00.000Z',
@@ -190,6 +235,76 @@ describe('auto form one-click copy prefill', () => {
     expect(html).not.toContain('Choose maker leg'); // `MAKER` (uppercase) is not `maker`
     // The notice still names the strategy, even though nothing usable was prefilled.
     expect(html).toContain('<strong>AUTO-COPY02</strong>');
+  });
+});
+
+/**
+ * The position page is where a copied `position` strategy lands (`kind: 'position'` →
+ * `/strategies/paired-position`). It shares the auto form's query channel, so these cases guard the
+ * regression where the prefill was gated on `mode === 'auto'` and a copy of a hedge strategy came
+ * back as an empty default form — "clicking 复制 did nothing".
+ */
+describe('position form one-click copy prefill', () => {
+  /** Exactly what `strategyCopyQuery()` emits for a stopped position strategy. */
+  const COPY_QUERY = '?asset=ETH&left=gate&right=kraken&entryBps=-50&takeProfitBps=20'
+    + '&stopLossBps=80&maxPosition=250&perOrderQuantity=250&leftSide=BUY'
+    + '&executionMethod=maker&makerLeg=right&copyStrategyId=PAIR-791A421C';
+
+  it('prefills the asset, both venues, the entry threshold, and the per-order quantity', () => {
+    const html = renderWithQuery(COPY_QUERY, positionView());
+    expect(html).toContain('<b>ETH</b>'); // asset, not the BTC default
+    expect(html).toContain('aria-label="Exchange A: Gate.io"'); // sell leg venue, not Binance
+    expect(html).toContain('aria-label="Exchange B: Kraken"'); // buy leg venue, not OKX
+    expect(html).toContain('<input value="-50"'); // entry threshold keeps its sign
+    expect(html).toContain('<input placeholder="e.g. 0.10" value="250"'); // per-order quantity
+    expect(html).toContain('aria-label="Choose maker leg"'); // Maker–Taker switched on
+  });
+
+  it('restores the opening direction of a copied position strategy', () => {
+    // `leftSide=BUY` means the stored strategy bought venue A; landing with the standard sell-A
+    // default would silently reverse the trade.
+    const html = renderWithQuery(COPY_QUERY, positionView());
+    expect(html).toContain('strategy-layout revised direction-flipped');
+    expect(html).toContain('<em>Buy <span>'); // leg A relabelled as the buy leg
+    expect(html).toContain('<em>Sell <span>'); // leg B relabelled as the sell leg
+  });
+
+  it('keeps the standard sell-A direction when the copy carries no side', () => {
+    const html = renderWithQuery('?asset=ETH&copyStrategyId=PAIR-NOSIDE', positionView());
+    expect(html).not.toContain('direction-flipped');
+    expect(html).toContain('<em>Sell <span>');
+  });
+
+  it('announces which position strategy the form was prefilled from', () => {
+    const html = renderWithQuery(COPY_QUERY, positionView());
+    expect(html).toContain('class="strategy-copy-notice"');
+    expect(html).toContain('<strong>PAIR-791A421C</strong>');
+    expect(html).toContain('Dismiss prefill notice');
+  });
+
+  it('keeps the documented defaults when the page is opened without a copy query', () => {
+    const html = renderWithQuery('', positionView());
+    expect(html).toContain('<b>BTC</b>');
+    expect(html).toContain('aria-label="Exchange A: Binance"');
+    expect(html).toContain('aria-label="Exchange B: OKX"');
+    expect(html).toContain('<input placeholder="e.g. 0.10" value=""'); // blank per-order quantity
+    expect(html).not.toContain('direction-flipped');
+    expect(html).not.toContain('strategy-copy-notice');
+  });
+
+  it('reads back exactly the query strategyCopyQuery emits for a stored position record', () => {
+    // Round trip through the single producer, so the copy mapping and the form can never drift.
+    const search = `?${new URLSearchParams(strategyCopyQuery(positionRecord())).toString()}`;
+    const html = renderWithQuery(search, positionView());
+    expect(html).toContain('<b>ETH</b>');
+    expect(html).toContain('aria-label="Exchange A: Gate.io"');
+    expect(html).toContain('aria-label="Exchange B: Kraken"');
+    expect(html).toContain('<input value="-50"'); // entry threshold
+    expect(html).toContain('<input placeholder="e.g. 0.10" value="250"'); // per-order quantity
+    expect(html).toContain('<input placeholder="e.g. 1.00" value="400"'); // total amount
+    expect(html).toContain('aria-label="Choose maker leg"');
+    expect(html).toContain('strategy-layout revised direction-flipped'); // leftSide=BUY
+    expect(html).toContain('<strong>PAIR-791A421C</strong>');
   });
 });
 

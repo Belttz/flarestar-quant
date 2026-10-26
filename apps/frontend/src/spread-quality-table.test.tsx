@@ -21,6 +21,9 @@ function qualityRow(overrides: Partial<SpreadQualityRow> = {}): SpreadQualityRow
     ar1Coefficient: 0.82, halfLifeHours: 3.5, holdingCostBps: 1.25,
     bookDepthUsdt: 250000, score: 87.5, sampleCount: 288, source: 'candles',
     updatedAt: '2026-08-01T00:00:00.000Z',
+    // The legs' current funding rate is its own column with its own dash rule; the fixtures here
+    // pin the *statistics* dash counts, so they carry published rates.
+    leftFundingRate8h: '0.0001', rightFundingRate8h: '0.0002', fundingRateDiffBps: -1,
     assetClass: 'TOKEN', assetSuperClass: 'CRYPTO', variantSuffix: null, isPreIpo: false,
     ...overrides,
   };
