@@ -2797,3 +2797,40 @@ html[data-theme='light'] .close-plan-status.pending { color: #7a5c00; background
   .strategy-config-detail-modal .strategy-detail-actions .strategy-detail-secondary { flex: 1 1 calc(50% - 4px); min-width: 0; min-height: 44px; }
   .strategy-config-detail-modal .strategy-detail-actions .confirm-submit { flex: 1 1 100%; min-height: 46px; }
 }
+
+/* US-stock spread page: the two legs are editable markets, which the SK hynix layout never needed.
+ * Only the pieces that page has no equivalent for live here; everything else reuses the shared
+ * `.strategy-*` / `.premium-history-*` classes. */
+.us-leg-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 10px; }
+.us-leg-head em { padding: 3px 7px; border-radius: 3px; font-size: var(--text-small); font-style: normal; font-weight: 700; white-space: nowrap; }
+.sell-leg .us-leg-head em { color: var(--red); background: #351821; }
+.buy-leg .us-leg-head em { color: var(--green); background: #0f352c; }
+.us-leg-ticker { display: grid; gap: 5px; margin-top: 10px; }
+.us-leg-ticker span { color: #5f6d80; font-size: var(--text-caption); font-weight: 600; }
+.us-leg-ticker input { height: 34px; padding: 0 10px; border: 1px solid #283543; border-radius: 4px; color: #e0e6ec; background: #0a1118; font: 700 var(--text-body) var(--font-sans); letter-spacing: .05em; text-transform: uppercase; }
+.us-leg-state { font-weight: 700; }
+.us-leg-state.live { color: var(--green); }
+.us-leg-state.stale { color: #d0a04b; }
+.us-leg-state.missing { color: #7f8da0; }
+.us-leg-symbol { overflow: hidden; max-width: 190px; text-overflow: ellipsis; white-space: nowrap; }
+.us-ratio-hint { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; margin: 0 16px 12px; padding: 9px 10px; border: 1px solid #283442; border-radius: 4px; background: #0a1118; }
+.us-ratio-hint span { color: #687588; font-size: var(--text-small); font-weight: 600; }
+.us-ratio-hint strong { color: #cbd4d0; font-family: var(--font-sans); font-size: var(--text-small); }
+.us-ratio-hint small { grid-column: 1 / -1; color: #5e6c7f; font-size: var(--text-micro); }
+.us-pair-name { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.us-pair-name input { min-width: 0; height: 34px; padding: 0 10px; border: 1px solid #2b3949; border-radius: 5px; color: #e4eaf1; background: #0d151e; font: var(--text-body) var(--font-sans); }
+.us-pair-save { height: 34px; padding: 0 12px; border: 1px solid #35675c; border-radius: 5px; color: #cfe0db; background: #0e1c19; font: 700 var(--text-small) var(--font-sans); cursor: pointer; }
+.us-pair-save:disabled { border-color: #24413b; color: #6c8f85; background: #16211f; cursor: not-allowed; }
+.us-pair-error { margin: 0; padding: 10px 16px; color: #ef91a0; font-size: var(--text-small); }
+.us-pair-saved .us-pair-notice { padding: 10px 16px; font-size: var(--text-small); }
+html[data-theme='light'] .us-leg-ticker input, html[data-theme='light'] .us-pair-name input { border-color: #d5dee5; color: #1f2b36; background: #f8fafb; }
+html[data-theme='light'] .us-ratio-hint { border-color: #d3dde4; background: #f5f8fa; }
+html[data-theme='light'] .us-ratio-hint strong { color: #33414e; }
+html[data-theme='light'] .us-pair-save { border-color: #b3ddd1; color: #1d7a63; background: #e9f7f2; }
+html[data-theme='light'] .sell-leg .us-leg-head em { color: var(--red); background: #fdebef; }
+html[data-theme='light'] .buy-leg .us-leg-head em { color: #00866d; background: #e4f6f1; }
+@media (max-width: 860px) {
+  .us-leg-head { flex-wrap: wrap; }
+  /* The resolved symbol is long and has no spaces: let it wrap instead of overflowing the row. */
+  .us-leg-symbol { max-width: none; white-space: normal; overflow-wrap: anywhere; text-align: right; }
+}
