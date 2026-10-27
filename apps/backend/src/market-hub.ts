@@ -293,6 +293,14 @@ interface BookState {
   seedAbandoned: boolean;
   /** Last `U`/`u` seen, for the per-venue sequence rules. Never bridged with the seed's own seq. */
   lastSeq: number | null;
+  /**
+   * Frames applied since the last full price-band sweep. This is the amortization counter: the
+   * per-frame path only inspects the levels its own frame wrote, and the whole-map sweep that
+   * removes legacy ghosts waits for {@link BOOK_PRICE_BAND_SWEEP_FRAMES} frames.
+   */
+  framesSinceBandSweep: number;
+  /** Local time of the last full price-band sweep, the wall-clock backstop for the same sweep. */
+  lastBandSweepAt: number;
 }
 
 /**
@@ -346,6 +354,32 @@ const BOOK_SEED_CUTOFF_MARGIN_MS = 200;
  * process. Trimming is amortized: it only runs when a side doubles the cap.
  */
 const BOOK_LEVEL_HARD_LIMIT = 100;
+
+/**
+ * Half-width of the price band a retained level must sit inside, measured against the book's own
+ * touch. Anything further away is a ghost and gets deleted.
+ *
+ * Why this exists: a level that emptied *before* we subscribed never receives a `quantity=0` delete
+ * frame — the venue has no such price in its book any more, so it never mentions it again. Such a
+ * row then sits in our map forever. Live capture of the Binance feed showed `price=1000.00 size=117.9`
+ * and `price=29344.00`/`price=71769.60` living in a BTC book trading near 79,700 — prices absent
+ * from the venue's first 500 levels — and the reported depth grew five-fold in 40 seconds purely
+ * from rows like those. The hourly REST re-seed was the only thing that ever removed them, so for
+ * up to an hour the depth figure was meaningless.
+ *
+ * 20% is deliberately generous: the observed junk is off by tens of times the touch (1000 vs
+ * 79,700), while a genuine book never publishes a level 20% away from its own mid — not even in a
+ * flash move, because the band is recomputed from the *current* touch on every frame. Levels inside
+ * the band are never touched, so ordinary volatility cannot trip this.
+ */
+const BOOK_PRICE_BAND_RATIO = 0.2;
+/**
+ * Full band sweep cadence, in frames. Only the sweep walks the retained maps; the per-frame path
+ * looks at nothing but the levels that frame wrote, so the common case stays O(frame).
+ */
+const BOOK_PRICE_BAND_SWEEP_FRAMES = 20;
+/** Wall-clock backstop for the same sweep, so a quiet book (few frames) is still cleaned. */
+const BOOK_PRICE_BAND_SWEEP_MS = 5_000;
 
 /** Structural type of a venue REST depth snapshot; keeps this module free of a package import. */
 export interface VenueBookSnapshot {
@@ -1351,6 +1385,10 @@ export class CrossExMarketHub {
       seedInFlight: false,
       seedAbandoned: false,
       lastSeq: null,
+      framesSinceBandSweep: 0,
+      // Anchored at the book's birth: the 5s backstop then measures "since this book existed"
+      // rather than "since the epoch", so a fresh book does not sweep on its very first frame.
+      lastBandSweepAt: receivedAt,
     };
   }
 
@@ -1374,6 +1412,115 @@ export class CrossExMarketHub {
     trim(book.asks, 'ask');
   }
 
+  /**
+   * Delete retained levels that sit outside the ±{@link BOOK_PRICE_BAND_RATIO} window around the
+   * touch. Called once per applied frame, right before {@link trimBookLevels} — the band removes
+   * prices that cannot belong to this market at all, then the trim keeps the nearest
+   * {@link BOOK_LEVEL_HARD_LIMIT} of what legitimately remains, so the two never fight.
+   *
+   * Two paths, so the cost stays amortized:
+   * 1. **Per frame**: only the prices *this frame wrote* are checked. A diff carries a handful of
+   *    rows, so this is O(frame) and needs no traversal of the retained maps.
+   * 2. **Full sweep**: every {@link BOOK_PRICE_BAND_SWEEP_FRAMES} frames or 5 seconds, whichever
+   *    comes first. This is what removes ghosts written before the book had a touch (or before
+   *    this filter existed) — rows no later diff will ever mention.
+   */
+  private enforcePriceBand(
+    book: BookState,
+    written: { bids: ReadonlyArray<[string, string]>; asks: ReadonlyArray<[string, string]> },
+    at: number,
+  ): void {
+    book.framesSinceBandSweep += 1;
+    const sweepDue = book.framesSinceBandSweep >= BOOK_PRICE_BAND_SWEEP_FRAMES
+      || at - book.lastBandSweepAt >= BOOK_PRICE_BAND_SWEEP_MS;
+    const band = this.priceBand(book);
+    if (band !== null) {
+      const dropBids: string[] = [];
+      for (const [price] of written.bids) {
+        if (book.bids.has(price) && this.outsidePriceBand(price, band)) dropBids.push(price);
+      }
+      const dropAsks: string[] = [];
+      for (const [price] of written.asks) {
+        if (book.asks.has(price) && this.outsidePriceBand(price, band)) dropAsks.push(price);
+      }
+      // Same "never empty the book" guard as the sweep, here in O(1): if this frame's own rows are
+      // the whole book and all of them look out of band, the band is wrong, not the rows — one
+      // stray row dragging the midpoint to nowhere must not blank a book that has real depth.
+      // Keeping them is self-healing: the next frame on either side moves the midpoint to the real
+      // touch and the next pass removes the stray row.
+      const wouldEmpty = dropBids.length + dropAsks.length === book.bids.size + book.asks.size
+        && book.bids.size + book.asks.size > 0;
+      if (!wouldEmpty) {
+        for (const price of dropBids) book.bids.delete(price);
+        for (const price of dropAsks) book.asks.delete(price);
+      }
+    }
+    if (!sweepDue) return;
+    book.framesSinceBandSweep = 0;
+    book.lastBandSweepAt = at;
+    this.sweepPriceBand(book);
+  }
+
+  /**
+   * The ±band window around the touch, or null when the book holds no usable reference price.
+   *
+   * One side empty (a very thin instrument, or a snapshot that only carried one side) falls back to
+   * the surviving touch; **both** sides empty yields null, and every caller must then skip the
+   * filter — with no reference price there is nothing to call a ghost.
+   */
+  private priceBand(book: BookState): { low: number; high: number } | null {
+    let bestBid = Number.NEGATIVE_INFINITY;
+    for (const price of book.bids.keys()) {
+      const value = Number(price);
+      if (Number.isFinite(value) && value > bestBid) bestBid = value;
+    }
+    let bestAsk = Number.POSITIVE_INFINITY;
+    for (const price of book.asks.keys()) {
+      const value = Number(price);
+      if (Number.isFinite(value) && value > 0 && value < bestAsk) bestAsk = value;
+    }
+    const hasBid = Number.isFinite(bestBid) && bestBid > 0;
+    const hasAsk = Number.isFinite(bestAsk) && bestAsk > 0;
+    const center = hasBid && hasAsk
+      ? (bestBid + bestAsk) / 2
+      : hasBid ? bestBid : hasAsk ? bestAsk : Number.NaN;
+    if (!Number.isFinite(center) || center <= 0) return null;
+    return { low: center * (1 - BOOK_PRICE_BAND_RATIO), high: center * (1 + BOOK_PRICE_BAND_RATIO) };
+  }
+
+  /** A price this book must not keep: unparsable, non-positive, or beyond the band in either direction. */
+  private outsidePriceBand(price: string, band: { low: number; high: number }): boolean {
+    const value = Number(price);
+    if (!Number.isFinite(value) || value <= 0) return true;
+    return value < band.low || value > band.high;
+  }
+
+  /** Full sweep of both sides; the amortized half of {@link enforcePriceBand}. */
+  private sweepPriceBand(book: BookState): void {
+    const band = this.priceBand(book);
+    if (band === null) return;
+    const survivors = this.countInsidePriceBand(book, band);
+    // A band that would empty the book is evidence the *touch* is corrupt (one stray ask far below
+    // the market moves the midpoint to nowhere), not evidence of fifty ghosts. Emptying the book
+    // would blank real depth and force a re-seed, so leave it: the hourly re-seed and the sequence
+    // gap rules remain the repair path for a genuinely broken book.
+    if (survivors === 0) return;
+    for (const price of [...book.bids.keys()]) {
+      if (this.outsidePriceBand(price, band)) book.bids.delete(price);
+    }
+    for (const price of [...book.asks.keys()]) {
+      if (this.outsidePriceBand(price, band)) book.asks.delete(price);
+    }
+  }
+
+  /** Levels the band would keep, both sides; backs the "never empty the book" guard above. */
+  private countInsidePriceBand(book: BookState, band: { low: number; high: number }): number {
+    let inside = 0;
+    for (const price of book.bids.keys()) if (!this.outsidePriceBand(price, band)) inside += 1;
+    for (const price of book.asks.keys()) if (!this.outsidePriceBand(price, band)) inside += 1;
+    return inside;
+  }
+
   /** Merge one frame's levels into the book and stamp the two clocks. */
   private applyBookFrame(book: BookState, result: z.infer<typeof OrderBookUpdatePushSchema>['result'], receivedAt: number): void {
     const apply = (levels: Map<string, string>, updates: Array<[string, string]>) => {
@@ -1384,6 +1531,8 @@ export class CrossExMarketHub {
     };
     apply(book.bids, result.b);
     apply(book.asks, result.a);
+    // Ghost filter first, trim second: see `enforcePriceBand`.
+    this.enforcePriceBand(book, { bids: result.b, asks: result.a }, receivedAt);
     this.trimBookLevels(book);
     book.updatedAt = new Date(result.ts).toISOString();
     // Local arrival time only moves with the frame that actually changed levels, so a quote built

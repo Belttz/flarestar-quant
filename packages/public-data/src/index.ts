@@ -463,7 +463,9 @@ export interface PublicMarketDataGateway {
   queryContractSizes?(venue: 'GATE' | 'OKX'): Promise<VenueContractSize[]>;
   /**
    * Optional full order-book snapshot for a CrossEx perpetual, used to seed a local book when the
-   * CrossEx feed sends no baseline for it. Returns base-coin sizes.
+   * CrossEx feed sends no baseline for it. Returns sizes in the venue's own feed unit — contract
+   * counts on GATE/OKX, base coins elsewhere — which is the unit the `order_book_update` diffs use,
+   * so the two can be merged without conversion. Coin conversion belongs to the depth consumer.
    */
   queryDepth?(crossExSymbol: string, limit: number): Promise<PublicBookSnapshot>;
   /** Optional bulk funding/open-interest stats for every perpetual a venue lists. */
@@ -493,9 +495,6 @@ export interface VenuePublicMarketDataClientOptions {
   /** Injectable so retry and pagination delays remain deterministic in tests. */
   sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
 }
-
-/** How long a venue's contract multiplier is reused before the instruments call is repeated. */
-const MULTIPLIER_CACHE_MS = 10 * 60_000;
 
 const GateCandleSchema = z.array(z.object({
   t: z.number(),
@@ -750,16 +749,6 @@ async function optionalPayload<T>(request: Promise<unknown>, schema: z.ZodType<T
 
 export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
   private readonly hyperliquidMetadataStore: HyperliquidPerpMetadataStore | undefined;
-  /**
-   * Whole instrument list per venue, not per symbol.
-   *
-   * The list is what carries every contract multiplier (Gate's is ~1.4 MB), so caching it per pair
-   * would refetch the entire payload once per symbol being seeded — with dozens of symbols that is
-   * the difference between one request an hour and dozens. Kept with the in-flight promise so
-   * concurrent seeds for the same venue share a single request.
-   */
-  private readonly venueSizeCache = new Map<'GATE' | 'OKX', { sizes: VenueContractSize[]; at: number }>();
-  private readonly venueSizeInFlight = new Map<'GATE' | 'OKX', Promise<VenueContractSize[]>>();
   private readonly hyperliquidMetadataFreshMs: number;
   private readonly hyperliquidForcedRefreshMinMs: number;
   private readonly sleep: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
@@ -913,7 +902,21 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
    * one, a local book accumulates only the price levels that happened to change after we
    * subscribed, so its depth and its top level describe a book that never existed. Seeding from the
    * venue's own REST endpoint gives the local book the missing baseline; CrossEx diffs then keep it
-   * current. Sizes are converted to base coins here so every caller sees one unit.
+   * current.
+   *
+   * **Sizes stay in the venue's own feed unit — GATE and OKX report contract counts, BINANCE and
+   * BYBIT report base coins — and this is deliberately *not* normalised here.** The snapshot is
+   * merged into one local book with the CrossEx `order_book_update` diffs, which carry exactly that
+   * same venue-native unit, so converting only one of the two sources creates a book that mixes
+   * contracts and coins level by level. That was a live bug: GATE levels seeded through a
+   * `quanto_multiplier` of 0.0001 landed 10,000× too small (measured depth of 129 USDT instead of
+   * ~700k), and the very next diff frame — which arrives in contracts — snapped the same book back
+   * to the right magnitude.
+   *
+   * The single conversion to coins happens downstream, where depth is turned into notional: see
+   * `unitFor()` on `/api/markets/books`, which multiplies GATE/OKX sizes by the contract multiplier
+   * exactly once. Any other consumer that needs coins must do the same, through
+   * {@link queryContractSizes}.
    */
   async queryDepth(crossExSymbol: string, limit: number): Promise<PublicBookSnapshot> {
     const bounded = Math.max(10, Math.min(1_000, Math.trunc(limit)));
@@ -925,48 +928,6 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
       case 'GATE': return await this.queryGateDepth(symbol, Math.min(100, bounded));
       default: throw new PublicMarketDataError('UNSUPPORTED_SYMBOL');
     }
-  }
-
-  /**
-   * The venue's instrument list, cached per venue and never per symbol: one payload answers every
-   * multiplier on that venue, and a failed lookup falls back to 1 elsewhere rather than retrying
-   * here (the next seed re-asks).
-   */
-  private async contractSizes(venue: 'GATE' | 'OKX'): Promise<VenueContractSize[]> {
-    const cached = this.venueSizeCache.get(venue);
-    const now = this.now();
-    if (cached && now - cached.at < MULTIPLIER_CACHE_MS) return cached.sizes;
-    const running = this.venueSizeInFlight.get(venue);
-    if (running) return await running;
-    const request = this.queryContractSizes(venue).then((sizes) => {
-      this.venueSizeCache.set(venue, { sizes, at: now });
-      return sizes;
-    }).finally(() => {
-      this.venueSizeInFlight.delete(venue);
-    });
-    this.venueSizeInFlight.set(venue, request);
-    return await request;
-  }
-
-  /** Multiplier that turns one venue contract into base coins, or 1 when the venue does not say. */
-  private async contractMultiplier(venue: 'GATE' | 'OKX', base: string, quote: string): Promise<number> {
-    try {
-      const sizes = await this.contractSizes(venue);
-      const hit = sizes.find((size) => size.base === base && size.quote === quote);
-      const value = hit === undefined ? Number.NaN : Number(hit.multiplier);
-      return Number.isFinite(value) && value > 0 ? value : 1;
-    } catch {
-      // A failed lookup must not block seeding: fall back to 1 and let the next seed refresh it.
-      return 1;
-    }
-  }
-
-  private static scaleLevels(levels: Array<[string, string]>, multiplier: number): Array<[string, string]> {
-    if (multiplier === 1) return levels;
-    return levels.map(([price, size]) => {
-      const scaled = Number(size) * multiplier;
-      return [price, Number.isFinite(scaled) ? String(scaled) : size] as [string, string];
-    });
   }
 
   private async queryBinanceDepth(symbol: ParsedSymbol, limit: number): Promise<PublicBookSnapshot> {
@@ -1000,14 +961,14 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
     const envelope = parsePayload(OkxDepthSchema, payload);
     const book = envelope.data[0];
     if (book === undefined) throw new PublicMarketDataError('INVALID_RESPONSE_SCHEMA');
-    const multiplier = await this.contractMultiplier('OKX', symbol.base, symbol.quote);
     const toLevels = (rows: Array<[string, string, string, string]>): Array<[string, string]> =>
       rows.map(([price, size]) => [price, size] as [string, string]);
     // `ts` is used as the ordering key for OKX instead of `seqId`: seqId is not comparable across
     // the venue's own channels, while the timestamp is monotonic and matches how we join by time.
     return {
-      bids: VenuePublicMarketDataClient.scaleLevels(toLevels(book.bids), multiplier),
-      asks: VenuePublicMarketDataClient.scaleLevels(toLevels(book.asks), multiplier),
+      // Contract counts, untouched: `ctVal` is applied once by the depth consumer, never here.
+      bids: toLevels(book.bids),
+      asks: toLevels(book.asks),
       ts: Number.isFinite(Number(book.ts)) ? Number(book.ts) : null,
       seq: null,
     };
@@ -1044,13 +1005,14 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
       4_000_000,
     );
     const parsed = parsePayload(GateDepthSchema, payload);
-    const multiplier = await this.contractMultiplier('GATE', symbol.base, symbol.quote);
-    // Gate returns `{p, s}` objects, and `s` counts contracts, not coins.
+    // Gate returns `{p, s}` objects, and `s` counts contracts, not coins. The count is kept as-is:
+    // the CrossEx diff stream for the same instrument is also in contracts, so scaling only this
+    // side mixes units inside one book (see `queryDepth`).
     const toLevels = (rows: Array<{ p: string; s: number }>): Array<[string, string]> =>
       rows.map((row) => [row.p, String(row.s)] as [string, string]);
     return {
-      bids: VenuePublicMarketDataClient.scaleLevels(toLevels(parsed.bids), multiplier),
-      asks: VenuePublicMarketDataClient.scaleLevels(toLevels(parsed.asks), multiplier),
+      bids: toLevels(parsed.bids),
+      asks: toLevels(parsed.asks),
       ts: Number.isFinite(Number(parsed.current)) && Number(parsed.current) > 0 ? Number(parsed.current) * 1_000 : null,
       seq: parsed.id === undefined ? null : String(parsed.id),
     };

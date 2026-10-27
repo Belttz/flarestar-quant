@@ -1115,12 +1115,12 @@ describe('venue depth snapshots', () => {
     expect(book.ts).toBe(1_783_703_477_100);
   });
 
-  it('converts OKX contract counts to coins through ct_val and keeps the venue timestamp', async () => {
+  it('keeps OKX contract counts untouched so a seeded book matches the diff stream', async () => {
     const fetchMock = vi.fn((url: string | URL | Request) => {
       const target = String(url);
-      if (target.includes('/public/instruments')) {
-        return response({ code: '0', msg: '', data: [{ instId: 'BTC-USDT-SWAP', ctVal: '0.01', ctValCcy: 'BTC' }] });
-      }
+      // No instrument lookup: converting here is what produced a book whose seeded levels were
+      // 100× smaller than the CrossEx diffs that replaced them.
+      expect(target).not.toContain('/public/instruments');
       expect(target).toContain('/api/v5/market/books');
       expect(target).toContain('sz=50');
       return response({
@@ -1136,9 +1136,9 @@ describe('venue depth snapshots', () => {
     const client = new VenuePublicMarketDataClient(fetchMock as unknown as typeof fetch, now);
 
     const book = await client.queryDepth('OKX_FUTURE_BTC_USDT', 50);
-    // 300 contracts × 0.01 BTC/contract = 3 coins.
-    expect(book.asks).toEqual([['63962.1', '3']]);
-    expect(book.bids).toEqual([['63962.0', '5']]);
+    // Contract counts, exactly as the venue reported them — `ctVal` is the consumer's job.
+    expect(book.asks).toEqual([['63962.1', '300']]);
+    expect(book.bids).toEqual([['63962.0', '500']]);
     expect(book.ts).toBe(1_783_703_477_021);
   });
 
@@ -1162,29 +1162,27 @@ describe('venue depth snapshots', () => {
     expect(book.seq).toBe('7654321');
   });
 
-  it('parses Gate {p,s} depth and scales contracts by quanto_multiplier', async () => {
+  it('parses Gate {p,s} depth and keeps the contract counts the feed itself uses', async () => {
     const fetchMock = vi.fn((url: string | URL | Request) => {
       const target = String(url);
-      if (target.includes('/contracts')) {
-        return response([{
-          name: 'BTC_USDT', quanto_multiplier: '0.0001', type: 'direct', leverage_min: '1', leverage_max: '100',
-        }]);
-      }
+      // Live magnitudes: CrossEx reports 20381 contracts for a level Gate's REST endpoint also
+      // reports as 20381. Multiplying by `quanto_multiplier` (0.0001) here is what made the seeded
+      // side of the book 10,000× smaller than the diffs on the same level.
+      expect(target).not.toContain('/contracts');
       expect(target).toContain('/futures/usdt/order_book');
       expect(target).toContain('with_id=true');
       return response({
         id: 987_654,
         current: 1_783_703_477,
-        bids: [{ p: '63962.0', s: 20_000 }],
+        bids: [{ p: '63962.0', s: 20_381 }],
         asks: [{ p: '63962.1', s: 10_000 }],
       });
     });
     const client = new VenuePublicMarketDataClient(fetchMock as unknown as typeof fetch, now);
 
     const book = await client.queryDepth('GATE_FUTURE_BTC_USDT', 50);
-    // 20,000 contracts × 0.0001 BTC = 2 coins; 10,000 × 0.0001 = 1 coin.
-    expect(book.bids).toEqual([['63962.0', '2']]);
-    expect(book.asks).toEqual([['63962.1', '1']]);
+    expect(book.bids).toEqual([['63962.0', '20381']]);
+    expect(book.asks).toEqual([['63962.1', '10000']]);
     expect(book.seq).toBe('987654');
     expect(book.ts).toBe(1_783_703_477_000);
   });
@@ -1195,48 +1193,41 @@ describe('venue depth snapshots', () => {
   });
 });
 
-describe('contract multiplier caching', () => {
-  it('fetches a venue\u2019s instrument list once for many symbols', async () => {
-    let instrumentsCalls = 0;
+describe('depth sizes stay in the venue feed unit', () => {
+  it('never looks up the instrument list while seeding, whatever the venue', async () => {
+    // The seeding path must not convert units at all, so the instruments endpoint (the only place
+    // a multiplier comes from) must stay untouched no matter how many symbols are seeded.
+    let instrumentCalls = 0;
     const fetchMock = vi.fn((url: string | URL | Request) => {
       const target = String(url);
-      if (target.includes('/contracts')) {
-        instrumentsCalls += 1;
-        return response([
-          { name: 'BTC_USDT', quanto_multiplier: '0.0001' },
-          { name: 'ETH_USDT', quanto_multiplier: '0.01' },
-        ]);
+      if (target.includes('/contracts') || target.includes('/public/instruments')) {
+        instrumentCalls += 1;
+        return response([]);
       }
-      const contract = /contract=([A-Z]+)_/.exec(target)?.[1] ?? 'BTC';
+      expect(target).toContain('/order_book');
       return response({ current: 1_783_703_477, bids: [{ p: '1', s: 10_000 }], asks: [{ p: '2', s: 10_000 }] });
     });
     const client = new VenuePublicMarketDataClient(fetchMock as unknown as typeof fetch, () => 1_783_703_500_000);
 
-    // Two symbols, one instrument payload: per-pair caching would have fetched it twice.
-    await client.queryDepth('GATE_FUTURE_BTC_USDT', 50);
+    const btc = await client.queryDepth('GATE_FUTURE_BTC_USDT', 50);
     await client.queryDepth('GATE_FUTURE_ETH_USDT', 50);
-    expect(instrumentsCalls).toBe(1);
+    expect(instrumentCalls).toBe(0);
+    // 10,000 contracts in, 10,000 contracts out: one unit, the one the diffs use.
+    expect(btc.bids).toEqual([['1', '10000']]);
+    expect(btc.asks).toEqual([['2', '10000']]);
   });
 
-  it('shares one in-flight instrument request between concurrent seeds', async () => {
-    let instrumentsCalls = 0;
-    const fetchMock = vi.fn((url: string | URL | Request) => {
-      const target = String(url);
-      if (target.includes('/contracts')) {
-        instrumentsCalls += 1;
-        // A slow payload: the second seed starts before this resolves.
-        return new Promise((resolve) => setTimeout(() => resolve(response([
-          { name: 'BTC_USDT', quanto_multiplier: '0.0001' },
-        ]).then((value) => value.json())), 5)) as unknown as Promise<Response>;
-      }
-      return response({ current: 1_783_703_477, bids: [{ p: '1', s: 10_000 }], asks: [{ p: '2', s: 10_000 }] });
-    });
+  it('still exposes the contract multipliers for consumers that need coins', async () => {
+    const fetchMock = vi.fn(() => response([
+      { name: 'BTC_USDT', quanto_multiplier: '0.0001' },
+      { name: 'ETH_USDT', quanto_multiplier: '0.01' },
+    ]));
     const client = new VenuePublicMarketDataClient(fetchMock as unknown as typeof fetch, () => 1_783_703_500_000);
 
-    await Promise.all([
-      client.queryDepth('GATE_FUTURE_BTC_USDT', 50),
-      client.queryDepth('GATE_FUTURE_BTC_USDT', 50),
+    // `/api/markets/books` multiplies by this once, and only once, when it builds notional depth.
+    await expect(client.queryContractSizes('GATE')).resolves.toEqual([
+      { base: 'BTC', quote: 'USDT', multiplier: '0.0001' },
+      { base: 'ETH', quote: 'USDT', multiplier: '0.01' },
     ]);
-    expect(instrumentsCalls).toBe(1);
   });
 });
