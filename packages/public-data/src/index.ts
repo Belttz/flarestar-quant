@@ -1558,14 +1558,34 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
   }
 
   async queryVenueFundingStats(venue: FundingStatVenue): Promise<VenueFundingStat[]> {
-    if (venue === 'GATE') return this.queryGateFundingStats();
-    if (venue === 'BINANCE') return this.queryBinanceFundingStats();
-    if (venue === 'OKX') return this.queryOkxFundingStats();
-    if (venue === 'BYBIT') return this.queryBybitFundingStats();
-    if (venue === 'KRAKEN') return this.queryKrakenFundingStats();
-    if (venue === 'HYPERLIQUID') return this.queryHyperliquidFundingStats();
-    if (venue === 'LIGHTER') return this.queryLighterFundingStats();
-    return this.queryDeribitFundingStats();
+    const stats = venue === 'GATE' ? await this.queryGateFundingStats()
+      : venue === 'BINANCE' ? await this.queryBinanceFundingStats()
+      : venue === 'OKX' ? await this.queryOkxFundingStats()
+      : venue === 'BYBIT' ? await this.queryBybitFundingStats()
+      : venue === 'KRAKEN' ? await this.queryKrakenFundingStats()
+      : venue === 'HYPERLIQUID' ? await this.queryHyperliquidFundingStats()
+      : venue === 'LIGHTER' ? await this.queryLighterFundingStats()
+      : await this.queryDeribitFundingStats();
+    return this.fillMissingSettlements(stats);
+  }
+
+  /**
+   * Every venue must expose a future settlement timestamp or the funding-arb runner's
+   * settlement-distance gate treats the pair as "settlement too close" and rejects it forever.
+   * Some venues omit the field (Deribit's continuous funding, Kraken's ticker) or return 0 / a
+   * stale current-settle value (Binance/Bybit/OKX edge rows). When the interval is known, derive
+   * the next interval boundary; a real future timestamp always wins.
+   */
+  private fillMissingSettlements(stats: VenueFundingStat[]): VenueFundingStat[] {
+    const now = this.now();
+    return stats.map((stat) => {
+      const scheduled = stat.nextFundingAt ? Date.parse(stat.nextFundingAt) : Number.NaN;
+      if (Number.isFinite(scheduled)) return stat;
+      const intervalHours = Math.max(1, stat.fundingIntervalHours ?? 8);
+      const period = intervalHours * 3_600_000;
+      const next = Math.ceil((now + 1) / period) * period;
+      return { ...stat, nextFundingAt: new Date(next).toISOString() };
+    });
   }
 
   async queryFundingHistory(crossExSymbol: string, startTime: number, endTime: number, signal?: AbortSignal): Promise<FundingRatePoint[]> {

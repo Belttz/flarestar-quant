@@ -576,13 +576,15 @@ describe('bulk venue funding stats', () => {
         { contract: 'BTC_USDT', funding_rate: '0.000015', mark_price: '50000', last: '50025', change_percentage: '1.25', total_size: '1000000', quanto_multiplier: '0.0001' },
       ]);
     });
-    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch);
+    const nowMs = 1_783_703_500_000;
+    const nextBoundary = new Date(Math.ceil((nowMs + 1) / (8 * 3_600_000)) * 8 * 3_600_000).toISOString();
+    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch, () => nowMs);
 
     const stats = await client.queryVenueFundingStats('GATE');
 
     expect(stats).toEqual([{
       venue: 'GATE', base: 'BTC', quote: 'USDT', fundingRate: '0.000015', fundingIntervalHours: 8, fundingRate8h: '0.000015',
-      nextFundingAt: null, openInterestValue: '5000000', lastPrice: '50025', change24h: '0.0125',
+      nextFundingAt: nextBoundary, openInterestValue: '5000000', lastPrice: '50025', change24h: '0.0125',
     }]);
   });
 
@@ -603,13 +605,15 @@ describe('bulk venue funding stats', () => {
         { symbol: 'ETHUSDC', lastFundingRate: '0.0001', nextFundingTime: 0, time: 1 },
       ]);
     });
-    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch);
+    const nowMs = 1_783_703_500_000;
+    const next4h = new Date(Math.ceil((nowMs + 1) / (4 * 3_600_000)) * 4 * 3_600_000).toISOString();
+    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch, () => nowMs);
 
     const stats = await client.queryVenueFundingStats('BINANCE');
 
     expect(stats).toEqual([
       { venue: 'BINANCE', base: 'BTC', quote: 'USDT', fundingRate: '0.00000219', fundingIntervalHours: 1, fundingRate8h: '0.00001752', nextFundingAt: '2026-07-23T08:00:00.000Z', openInterestValue: null, lastPrice: '50010', change24h: '-0.015' },
-      { venue: 'BINANCE', base: 'ETH', quote: 'USDC', fundingRate: '0.0001', fundingIntervalHours: 4, fundingRate8h: '0.0002', nextFundingAt: null, openInterestValue: null, lastPrice: '2500', change24h: '0.02' },
+      { venue: 'BINANCE', base: 'ETH', quote: 'USDC', fundingRate: '0.0001', fundingIntervalHours: 4, fundingRate8h: '0.0002', nextFundingAt: next4h, openInterestValue: null, lastPrice: '2500', change24h: '0.02' },
     ]);
   });
 
@@ -660,13 +664,15 @@ describe('bulk venue funding stats', () => {
       { symbol: 'ETHPERP', fundingRate: '0.00001', nextFundingTime: '0', openInterestValue: '1000000', fundingIntervalHour: '1', lastPrice: '2500', price24hPcnt: '0.02' },
       { symbol: 'BTC-26DEC25', fundingRate: '0', nextFundingTime: '0', openInterestValue: '5' },
     ] } }));
-    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch);
+    const nowMs = 1_783_703_500_000;
+    const nextHour = new Date(Math.ceil((nowMs + 1) / 3_600_000) * 3_600_000).toISOString();
+    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch, () => nowMs);
 
     const stats = await client.queryVenueFundingStats('BYBIT');
 
     expect(stats).toEqual([
       { venue: 'BYBIT', base: 'BTC', quote: 'USDT', fundingRate: '-0.0000323', fundingIntervalHours: 8, fundingRate8h: '-0.0000323', nextFundingAt: '2026-07-23T08:00:00.000Z', openInterestValue: '3517548021.69', lastPrice: '50000', change24h: '-0.01' },
-      { venue: 'BYBIT', base: 'ETH', quote: 'USDC', fundingRate: '0.00001', fundingIntervalHours: 1, fundingRate8h: '0.00008', nextFundingAt: null, openInterestValue: '1000000', lastPrice: '2500', change24h: '0.02' },
+      { venue: 'BYBIT', base: 'ETH', quote: 'USDC', fundingRate: '0.00001', fundingIntervalHours: 1, fundingRate8h: '0.00008', nextFundingAt: nextHour, openInterestValue: '1000000', lastPrice: '2500', change24h: '0.02' },
     ]);
   });
 
@@ -765,13 +771,15 @@ describe('bulk venue funding stats', () => {
       { instrument_name: 'SOL_USDC-PERPETUAL', open_interest: 200000, mark_price: 80, last: 81, price_change: 2.5, funding_8h: 0.000012 },
       { instrument_name: 'BTC_USDC-26DEC25', open_interest: 10, mark_price: 50000 },
     ] }));
-    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch);
+    const nowMs = 1_783_703_500_000;
+    const next8h = new Date(Math.ceil((nowMs + 1) / (8 * 3_600_000)) * 8 * 3_600_000).toISOString();
+    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch, () => nowMs);
 
     const stats = await client.queryVenueFundingStats('DERIBIT');
 
     expect(stats).toEqual([{
       venue: 'DERIBIT', base: 'SOL', quote: 'USDC', fundingRate: '0.000012', fundingIntervalHours: 8, fundingRate8h: '0.000012',
-      nextFundingAt: null, openInterestValue: '16000000', lastPrice: '81', change24h: '0.025',
+      nextFundingAt: next8h, openInterestValue: '16000000', lastPrice: '81', change24h: '0.025',
     }]);
   });
 
