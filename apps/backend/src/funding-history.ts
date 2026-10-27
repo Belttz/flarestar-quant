@@ -248,6 +248,27 @@ export class FundingHistoryService {
     };
   }
 
+  /**
+   * Read each symbol's trailing settlements straight out of SQLite, per settlement and in
+   * chronological order. Nothing here is a running total and nothing triggers an upstream
+   * request: a symbol with no cached rows yields `[]` so the caller can render "no settlements
+   * yet" instead of a fabricated flat history. Warming stays the job of `loadCachedMany` /
+   * the background refresher.
+   */
+  readRecentSettlements(symbols: readonly string[], limit: number): Map<string, FundingRatePoint[]> {
+    // A 1h venue settles 24× more often than an 8h one, so the lookback must scale with the
+    // requested depth: `limit` days always contains at least `limit` settlements at any interval
+    // up to 24h, and never reads a symbol's full retained year.
+    const windowMs = Math.max(3 * ONE_DAY_MS, Math.max(1, limit) * ONE_DAY_MS);
+    const endTime = this.now();
+    const startTime = endTime - windowMs;
+    const result = new Map<string, FundingRatePoint[]>();
+    for (const symbol of [...new Set(symbols)]) {
+      result.set(symbol, readFundingRateHistory(this.database, symbol, startTime, endTime));
+    }
+    return result;
+  }
+
   private pruneIfNeeded(): void {
     const now = this.now();
     if (this.lastPrunedAt !== null && now - this.lastPrunedAt < PRUNE_INTERVAL_MS) return;

@@ -16,6 +16,7 @@ import {
   FundingHistoryResponseSchema,
   FundingHistorySeriesResponseSchema,
   FundingOverviewResponseSchema,
+  FundingSettlementBoardResponseSchema,
   InstrumentsResponseSchema,
   LeverageResponseSchema,
   LeverageUpdateResponseSchema,
@@ -81,6 +82,9 @@ import {
   type FundingOverviewAsset,
   type FundingOverviewResponse,
   type FundingOverviewVenueEntry,
+  type FundingSettlementBoardResponse,
+  type FundingSettlementPoint,
+  type FundingSettlementSummary,
   type LiveBalance,
   type LiveMarket,
   type MarketBookDepth,
@@ -148,6 +152,9 @@ export type {
   FundingOverviewAsset,
   FundingOverviewResponse,
   FundingOverviewVenueEntry,
+  FundingSettlementBoardResponse,
+  FundingSettlementPoint,
+  FundingSettlementSummary,
   LiveBalance,
   LiveMarket,
   MarketBookDepth,
@@ -444,6 +451,16 @@ export const api = {
       method: 'POST',
       headers: { 'x-gct-read-intent': 'funding-history' },
       body: JSON.stringify({ symbols, durationDays }),
+    }),
+  /**
+   * Per-contract funding board: live rate + its annualized equivalent + the trailing N settled
+   * rates. Cache-only on the backend (no venue request), so polling it with the page is cheap.
+   */
+  fundingSettlements: (symbols: string[], limit = 8) =>
+    request(FundingSettlementBoardResponseSchema, '/api/markets/funding-settlements', {
+      method: 'POST',
+      headers: { 'x-gct-read-intent': 'funding-history' },
+      body: JSON.stringify({ symbols, limit }),
     }),
   tradingSnapshot: () => request(TradingSnapshotSchema, '/api/trading/snapshot'),
   positionsSnapshot: () => request(TradingSnapshotSchema, '/api/crossex/positions-snapshot', {

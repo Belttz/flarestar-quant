@@ -6,6 +6,7 @@ import {
   type FundingOverviewAsset,
   type FundingOverviewResponse,
   type FundingOverviewVenueEntry,
+  type FundingSettlementSummary,
   type LiveMarket,
   type MarketSnapshot,
 } from './api.js';
@@ -17,9 +18,19 @@ import {
   cumulativeFundingPercent,
   currentFundingComparisonRate,
   currentFundingMetricRate,
+  fundingFractionToPercent,
+  fundingPairAnnualizedPercent,
   fundingPercentScaledTo8h,
   fundingHistoryRequestKey,
+  pairFundingLegs,
+  sortFundingBoardRows,
 } from './funding-rates.js';
+import {
+  FundingSettlementBoard,
+  type FundingBoardSort,
+  type FundingPairBoardRow,
+  type FundingSettlementLeg,
+} from './funding-settlement-board.js';
 import type { ExchangeLogoId } from './exchange-logos.js';
 import {
   FUNDING_VENUE_COLORS,
@@ -153,6 +164,106 @@ const OI_FILTER_PRESETS = [
 const FUNDING_PAGE_SIZES = [25, 50, 100];
 const DEFAULT_MIN_AVG_OI_MILLIONS = '5';
 const FUNDING_OVERVIEW_POLL_MS = 30_000;
+/** One bar per settlement in the board's trailing strip. */
+const FUNDING_BOARD_SETTLEMENT_LIMIT = 8;
+/** The settlements endpoint accepts at most 120 symbols per call. */
+const FUNDING_SETTLEMENT_BATCH = 120;
+
+/**
+ * Project one funding-overview venue row plus its cached settlements into a pair leg.
+ *
+ * Live and settled figures stay in separate fields: `ratePercent` is what the venue will charge at
+ * the next settlement, `recentPercent` is what it already charged. `rate8hPercent` comes from the
+ * venue's own 8h-normalized rate when published, and is derived from the native rate and the
+ * venue's interval otherwise, so pairs with different intervals stay comparable.
+ */
+function legFromOverview(
+  asset: string,
+  entry: FundingOverviewVenueEntry,
+  settlement: FundingSettlementSummary | undefined,
+  status: FundingSettlementLeg['settlementStatus'],
+): FundingSettlementLeg | null {
+  const exchange = exchanges.find((item) => item.id === entry.venue.toLowerCase());
+  if (!exchange) return null;
+  const ratePercent = fundingFractionToPercent(entry.fundingRate);
+  const rate8hPercent = entry.fundingRate8h !== null
+    ? fundingFractionToPercent(entry.fundingRate8h)
+    : fundingPercentScaledTo8h(ratePercent, entry.fundingIntervalHours);
+  const recentPercent = (settlement?.recent ?? []).flatMap((point) => {
+    const percent = fundingFractionToPercent(point.rate);
+    return percent === null ? [] : [percent];
+  });
+  const openInterest = entry.openInterestValue === null ? Number.NaN : Number(entry.openInterestValue);
+  const lastPrice = entry.lastPrice === null ? Number.NaN : Number(entry.lastPrice);
+  return {
+    key: `${entry.venue}:${entry.symbol}`,
+    asset,
+    venue: exchange.id,
+    venueName: exchange.name,
+    venueShort: exchange.short,
+    symbol: entry.symbol,
+    ratePercent,
+    rate8hPercent,
+    intervalHours: entry.fundingIntervalHours,
+    nextFundingAt: entry.nextFundingAt,
+    recentPercent,
+    recentMeanPercent: fundingFractionToPercent(settlement?.recentMeanRate),
+    latestSettledPercent: fundingFractionToPercent(settlement?.latestRate),
+    latestSettledAt: settlement?.latestSettledAt ?? null,
+    settlementCount: settlement?.settlementCount ?? 0,
+    settlementStatus: status,
+    openInterest: Number.isFinite(openInterest) ? openInterest : 0,
+    lastPrice: Number.isFinite(lastPrice) ? lastPrice : null,
+    change24hPercent: fundingFractionToPercent(entry.change24h),
+  };
+}
+
+/**
+ * Fallback leg built from the streamed CrossEx market when the venue REST overview is unavailable.
+ * A streamed tick carries no settlement interval, so the leg cannot be normalized to 8h and is
+ * therefore never paired: the board shows an empty state instead of a spread built on a guess.
+ */
+function legFromLiveMarket(market: LiveMarket): FundingSettlementLeg | null {
+  const exchange = exchanges.find((item) => item.id === market.venue.toLowerCase());
+  if (!exchange) return null;
+  const openInterest = Number(market.openInterestValue);
+  const lastPrice = Number(market.lastPrice);
+  return {
+    key: `${market.venue}:${market.symbol}`,
+    asset: market.asset,
+    venue: exchange.id,
+    venueName: exchange.name,
+    venueShort: exchange.short,
+    symbol: market.symbol,
+    ratePercent: fundingFractionToPercent(market.fundingRate),
+    rate8hPercent: null,
+    intervalHours: null,
+    nextFundingAt: market.nextFundingAt,
+    recentPercent: [],
+    recentMeanPercent: null,
+    latestSettledPercent: null,
+    latestSettledAt: null,
+    settlementCount: 0,
+    settlementStatus: 'unavailable',
+    openInterest: Number.isFinite(openInterest) ? openInterest : 0,
+    lastPrice: Number.isFinite(lastPrice) ? lastPrice : null,
+    change24hPercent: null,
+  };
+}
+
+/** The earlier of two settlement times, or the one that exists; null when neither publishes one. */
+function earliestSettlement(left: string | null, right: string | null): string | null {
+  const leftAt = left ? Date.parse(left) : Number.NaN;
+  const rightAt = right ? Date.parse(right) : Number.NaN;
+  if (Number.isFinite(leftAt) && Number.isFinite(rightAt)) return leftAt <= rightAt ? left : right;
+  return Number.isFinite(leftAt) ? left : Number.isFinite(rightAt) ? right : null;
+}
+
+/** Binding liquidity of a pair: the smaller published leg OI, falling back to the known side. */
+function bindingOpenInterest(left: number, right: number): number {
+  if (left > 0 && right > 0) return Math.min(left, right);
+  return Math.max(left, right);
+}
 
 type FundingDetailDuration = 1 | 7 | 30;
 type FundingDetailMode = 'settlement' | 'cumulative';
@@ -368,6 +479,25 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
   const [minOiMillionsText, setMinOiMillionsText] = useState(DEFAULT_MIN_AVG_OI_MILLIONS);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
+  /**
+   * Which lens the page opens on. The settlement board is the default because the question
+   * "should I enter now" is answered by the live rate and its next settlement, not by a rolling
+   * total; the asset matrix stays one click away and keeps its own metric switch.
+   */
+  const [lens, setLens] = useState<'settlements' | 'matrix'>('settlements');
+  const [boardSortKey, setBoardSortKey] = useState<FundingBoardSort>('apr');
+  const [boardSortDirection, setBoardSortDirection] = useState<SortDirection>('desc');
+  /** One clock for every countdown on the board, so all rows tick together once a second. */
+  const [clockNow, setClockNow] = useState(() => Date.now());
+  const [settlementsBySymbol, setSettlementsBySymbol] = useState<Record<string, FundingSettlementSummary>>({});
+  const [settlementsLoading, setSettlementsLoading] = useState(false);
+  const settlementSymbolsRef = useRef<string[]>([]);
+
+  useEffect(() => {
+    if (lens !== 'settlements') return;
+    const timer = window.setInterval(() => setClockNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [lens]);
 
   // Poll the all-pairs overview while this page is mounted. Returning from a detail page can reuse
   // the parent cache until its normal refresh boundary instead of immediately requesting it again.
@@ -453,8 +583,74 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
     });
   }, [overview, overviewState, marketSnapshot]);
 
-  const parsedMinOi = Number(minOiMillionsText);
-  const minAvgOiUsd = Number.isFinite(parsedMinOi) && parsedMinOi > 0 ? parsedMinOi * 1_000_000 : 0;
+  /**
+   * Legs before pairing: one entry per venue contract from the REST overview, or the streamed
+   * markets when that overview is unavailable (those carry no interval and never pair).
+   */
+  const contractSources = useMemo(() => {
+    const sources: Array<{ asset: string; entry: FundingOverviewVenueEntry } | { market: LiveMarket }> = [];
+    for (const assetEntry of overview?.assets ?? []) {
+      for (const venueEntry of assetEntry.venues) sources.push({ asset: assetEntry.asset, entry: venueEntry });
+    }
+    if (sources.length === 0 && overviewState === 'failed') {
+      for (const market of marketSnapshot?.markets ?? []) sources.push({ market });
+    }
+    return sources;
+  }, [overview, overviewState, marketSnapshot]);
+
+  /**
+   * Every tradable venue pair of every asset. Funding arbitrage is a two-leg position, so the row
+   * model is the combination — one row per (asset, long venue, short venue). Combinations are
+   * confined to the same asset across distinct venues, and only legs that publish both a rate and
+   * an interval take part, which bounds the fan-out at C(venues, 2) per asset.
+   */
+  const boardRows = useMemo<FundingPairBoardRow[]>(() => {
+    const legsByAsset = new Map<string, FundingSettlementLeg[]>();
+    for (const source of contractSources) {
+      if ('market' in source) {
+        const leg = legFromLiveMarket(source.market);
+        if (!leg) continue;
+        const legs = legsByAsset.get(leg.asset) ?? [];
+        legs.push(leg);
+        legsByAsset.set(leg.asset, legs);
+        continue;
+      }
+      const settlement = settlementsBySymbol[source.entry.symbol];
+      const status: FundingSettlementLeg['settlementStatus'] = settlement
+        ? settlement.status
+        : settlementsLoading ? 'loading' : 'unavailable';
+      const leg = legFromOverview(source.asset, source.entry, settlement, status);
+      if (!leg) continue;
+      const legs = legsByAsset.get(leg.asset) ?? [];
+      legs.push(leg);
+      legsByAsset.set(leg.asset, legs);
+    }
+    const rows: FundingPairBoardRow[] = [];
+    for (const [asset, legs] of legsByAsset) {
+      for (const pair of pairFundingLegs(legs)) {
+        rows.push({
+          key: `${asset}:${pair.long.venue}:${pair.short.venue}`,
+          asset,
+          name: assetName(asset),
+          icon: assetIcon(asset),
+          symbol: `${pair.long.venue}:${pair.short.venue}`,
+          long: pair.long,
+          short: pair.short,
+          spreadPercent: pair.spread8hPercent,
+          annualizedPercent: fundingPairAnnualizedPercent(pair.spread8hPercent),
+          currentRatePercent: pair.long.ratePercent,
+          latestSettledPercent: pair.long.latestSettledPercent,
+          nextFundingAt: earliestSettlement(pair.long.nextFundingAt, pair.short.nextFundingAt),
+          openInterest: bindingOpenInterest(pair.long.openInterest, pair.short.openInterest),
+          change24hPercent: pair.long.change24hPercent,
+          lastPrice: pair.long.lastPrice,
+        });
+      }
+    }
+    return rows;
+  }, [contractSources, settlementsBySymbol, settlementsLoading]);
+
+  const parsedMinOi = Number(minOiMillionsText);  const minAvgOiUsd = Number.isFinite(parsedMinOi) && parsedMinOi > 0 ? parsedMinOi * 1_000_000 : 0;
   const visibleExchanges = useMemo(
     () => exchanges.map((venue, index) => ({ venue, index })).filter(({ venue }) => selectedExchanges.includes(venue.id)),
     [selectedExchanges],
@@ -499,6 +695,87 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
     [filteredMarkets, pageStart, pageSize],
   );
   const maxOi = Math.max(...filteredMarkets.map((item) => item.oi), 1);
+
+  /* ---------------------------------------------------------------------------------------------
+   * Settlement board (the default lens).
+   * ------------------------------------------------------------------------------------------- */
+  const boardFiltered = useMemo(() => boardRows.filter((row) => {
+    // Both legs must be tradable in the current exchange selection: a pair you can only open on
+    // one side is not an opportunity.
+    if (!selectedExchanges.some((id) => id === row.long.venue)) return false;
+    if (!selectedExchanges.some((id) => id === row.short.venue)) return false;
+    if (row.openInterest < minAvgOiUsd) return false;
+    if (query === '') return true;
+    return `${row.asset} ${row.name} ${row.long.symbol} ${row.short.symbol}`.toLowerCase().includes(query.toLowerCase());
+  }), [boardRows, minAvgOiUsd, query, selectedExchanges]);
+  const boardSorted = useMemo(
+    () => sortFundingBoardRows(boardFiltered, boardSortKey, boardSortDirection),
+    [boardFiltered, boardSortDirection, boardSortKey],
+  );
+  const boardTotalPages = Math.max(1, Math.ceil(boardSorted.length / pageSize));
+  const boardCurrentPage = Math.min(page, boardTotalPages);
+  const boardPageStart = (boardCurrentPage - 1) * pageSize;
+  const boardPageRows = useMemo(
+    () => boardSorted.slice(boardPageStart, boardPageStart + pageSize),
+    [boardSorted, boardPageStart, pageSize],
+  );
+  /**
+   * Settled rates are display-only (sorts use the live rates), so only the visible page's legs are
+   * requested: at 50 rows × 2 legs that is one batch per page instead of a page-wide sweep.
+   */
+  const boardSymbolKey = useMemo(() => {
+    const symbols = new Set<string>();
+    for (const row of boardPageRows) {
+      symbols.add(row.long.symbol);
+      symbols.add(row.short.symbol);
+    }
+    return [...symbols].sort().join('|');
+  }, [boardPageRows]);
+  settlementSymbolsRef.current = boardSymbolKey === '' ? [] : boardSymbolKey.split('|');
+
+  useEffect(() => {
+    if (lens !== 'settlements') return;
+    if (boardSymbolKey === '') {
+      setSettlementsLoading(false);
+      return;
+    }
+    const symbols = boardSymbolKey.split('|');
+    const batches: string[][] = [];
+    for (let offset = 0; offset < symbols.length; offset += FUNDING_SETTLEMENT_BATCH) {
+      batches.push(symbols.slice(offset, offset + FUNDING_SETTLEMENT_BATCH));
+    }
+    let cancelled = false;
+    setSettlementsLoading(true);
+    void Promise.all(batches.map(async (batch) => {
+      try {
+        return await api.fundingSettlements(batch, FUNDING_BOARD_SETTLEMENT_LIMIT);
+      } catch {
+        // A failed batch leaves those rows on their previous (or empty) settlements: the board
+        // renders "no settled rates yet" rather than inventing zeros.
+        return null;
+      }
+    })).then((responses) => {
+      if (cancelled) return;
+      setSettlementsBySymbol((current) => {
+        const next: Record<string, FundingSettlementSummary> = { ...current };
+        for (const response of responses) {
+          if (!response) continue;
+          for (const entry of response.entries) next[entry.symbol] = entry;
+        }
+        return next;
+      });
+    }).finally(() => {
+      if (!cancelled) setSettlementsLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [boardSymbolKey, lens]);
+
+  /** Pagination is shared by both lenses; only the unit of a row differs. */
+  const listTotal = lens === 'settlements' ? boardSorted.length : filteredMarkets.length;
+  const listTotalPages = lens === 'settlements' ? boardTotalPages : totalPages;
+  const listCurrentPage = lens === 'settlements' ? boardCurrentPage : currentPage;
+  const listPageStart = lens === 'settlements' ? boardPageStart : pageStart;
+  const listUnit = t('pairs');
   const historySymbols = useMemo(() => {
     if (metric !== '24h' && metric !== '7d' && metric !== '30d') return [];
     const symbols = new Set<string>();
@@ -690,7 +967,7 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
   if (!overview && overviewState === 'loading') {
     return <div className="alternate-view funding-view">
       <section className="view-heading funding-heading">
-        <div><p className="eyebrow">{t('Perpetual futures')}</p><h1>{t('Funding rate matrix.')}</h1><p>{t('Compare funding across exchanges, ranked by aggregate open interest.')}</p></div>
+        <div><p className="eyebrow">{t('Perpetual futures')}</p><h1>{t('Funding settlements.')}</h1><p>{t('Two-leg venue pairs ranked by their funding spread: each leg\'s live rate, its interval and countdown, and the settlements it already charged.')}</p></div>
       </section>
       <section className="funding-card funding-skeleton terminal-panel" role="status" aria-label={t('Loading all trading pairs…')}>
         <div className="funding-skeleton-filters"><i /><i /><i /><i /><i /></div>
@@ -706,7 +983,13 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
 
   return <div className="alternate-view funding-view">
     <section className="view-heading funding-heading">
-      <div><p className="eyebrow">{t('Perpetual futures')}</p><h1>{t('Funding rate matrix.')}</h1><p>{t('Compare funding across exchanges, ranked by aggregate open interest.')}</p></div>
+      <div>
+        <p className="eyebrow">{t('Perpetual futures')}</p>
+        <h1>{t(lens === 'settlements' ? 'Funding settlements.' : 'Funding rate matrix.')}</h1>
+        <p>{t(lens === 'settlements'
+          ? 'Two-leg venue pairs ranked by their funding spread: each leg\'s live rate, its interval and countdown, and the settlements it already charged.'
+          : 'Compare funding across exchanges, ranked by aggregate open interest.')}</p>
+      </div>
     </section>
 
     <section className="funding-card terminal-panel">
@@ -722,17 +1005,40 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
           return <button key={preset.label} role="radio" className={active ? 'selected' : ''} aria-checked={active} onClick={() => { cancelSortPreparation(); setPage(1); setMinOiMillionsText(preset.millions === 0 ? '' : String(preset.millions)); }}>{preset.label === 'Any' ? t('Any') : preset.label}</button>;
         })}
         <label className="oi-custom"><span>$</span><input inputMode="decimal" value={minOiMillionsText} onChange={(event) => { cancelSortPreparation(); setPage(1); setMinOiMillionsText(event.target.value.replace(/[^0-9.]/g, '')); }} placeholder="0" aria-label={t('Min average OI')} /><span>M</span></label>
-        <small>{overviewState === 'loading' && !overview ? t('Loading all trading pairs…') : `${filteredMarkets.length} / ${allPairs.length} ${t('pairs')}`}</small>
+        <small>{overviewState === 'loading' && !overview ? t('Loading all trading pairs…') : `${lens === 'settlements' ? boardFiltered.length : filteredMarkets.length} / ${lens === 'settlements' ? boardRows.length : allPairs.length} ${t('pairs')}`}</small>
       </div>
       <div className="funding-toolbar">
         <label className="funding-search"><span aria-hidden="true">⌕</span><input value={query} onChange={(event) => { cancelSortPreparation(); setPage(1); setQuery(event.target.value); }} placeholder={t('Search asset')} aria-label={t('Search asset')} /></label>
-        <div className="metric-switch" role="radiogroup" aria-label="Funding rate period">
+        {lens === 'matrix' && <div className="metric-switch" role="radiogroup" aria-label="Funding rate period">
           {(['Per interval', 'APR', '24h', '7d', '30d'] as FundingMetric[]).map((item) => <button key={item} role="radio" className={metric === item ? 'active' : ''} aria-checked={metric === item} onClick={() => changeMetric(item)}>{item === '24h' || item === '7d' || item === '30d' ? t(`Cumulative ${item}`) : t(item)}</button>)}
-        </div>
+        </div>}
         {preparingSort && <small className="funding-sort-status" role="status">{t('Preparing sort…')}</small>}
         <small className="funding-last-updated">{t('Last updated at')} <time dateTime={lastUpdatedIso}>{lastUpdatedText}</time></small>
       </div>
-      <div className="funding-table-wrap" aria-busy={preparingSort !== null}>
+      <div className="funding-lens-bar" role="radiogroup" aria-label={t('Funding view')}>
+        <button role="radio" aria-checked={lens === 'settlements'} className={lens === 'settlements' ? 'active' : ''} onClick={() => { setLens('settlements'); setPage(1); }}>{t('Per settlement')}</button>
+        <button role="radio" aria-checked={lens === 'matrix'} className={lens === 'matrix' ? 'active' : ''} onClick={() => { setLens('matrix'); setPage(1); }}>{t('Asset matrix')}</button>
+        <small>{lens === 'settlements'
+          ? t('Live rate is each leg next settlement. Bars are settlements already charged.')
+          : t('Rolling totals per asset across venues.')}</small>
+      </div>
+      {lens === 'settlements' && <FundingSettlementBoard
+        rows={boardPageRows}
+        now={clockNow}
+        sortKey={boardSortKey}
+        sortDirection={boardSortDirection}
+        onSort={(nextKey) => {
+          setPage(1);
+          if (nextKey === boardSortKey) {
+            setBoardSortDirection((current) => current === 'desc' ? 'asc' : 'desc');
+            return;
+          }
+          setBoardSortKey(nextKey);
+          setBoardSortDirection(nextKey === 'next' ? 'asc' : 'desc');
+        }}
+        settlementLimit={FUNDING_BOARD_SETTLEMENT_LIMIT}
+      />}
+      {lens === 'matrix' && <div className="funding-table-wrap" aria-busy={preparingSort !== null}>
         <table className="funding-table">
           <thead><tr>
             <th><button className="sort-header asset-sort" onClick={() => changeSort('asset')}>{t('Asset')} {sortMark('asset')}</button></th>
@@ -778,15 +1084,15 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
             : query ? <>{t('No perpetual markets match')} “{query}”.</>
               : <>{t('No pairs clear the average OI filter.')} {t('Lower the minimum to see more pairs.')}</>
         }</div>}
-      </div>
-      {filteredMarkets.length >= 10 && <div className="funding-pagination">
-        <span className="page-range">{filteredMarkets.length === 0 ? `0 ${t('pairs')}` : `${pageStart + 1}–${Math.min(pageStart + pageSize, filteredMarkets.length)} / ${filteredMarkets.length} ${t('pairs')}`}</span>
+      </div>}
+      {listTotal >= 10 && <div className="funding-pagination">
+        <span className="page-range">{listTotal === 0 ? `0 ${listUnit}` : `${listPageStart + 1}–${Math.min(listPageStart + pageSize, listTotal)} / ${listTotal} ${listUnit}`}</span>
         <div className="page-controls">
-          <button onClick={() => setPage(1)} disabled={currentPage <= 1} aria-label={t('First page')}>«</button>
-          <button onClick={() => setPage(currentPage - 1)} disabled={currentPage <= 1}>{t('Prev')}</button>
-          <span className="page-indicator">{t('Page')} {currentPage} / {totalPages}</span>
-          <button onClick={() => setPage(currentPage + 1)} disabled={currentPage >= totalPages}>{t('Next')}</button>
-          <button onClick={() => setPage(totalPages)} disabled={currentPage >= totalPages} aria-label={t('Last page')}>»</button>
+          <button onClick={() => setPage(1)} disabled={listCurrentPage <= 1} aria-label={t('First page')}>«</button>
+          <button onClick={() => setPage(listCurrentPage - 1)} disabled={listCurrentPage <= 1}>{t('Prev')}</button>
+          <span className="page-indicator">{t('Page')} {listCurrentPage} / {listTotalPages}</span>
+          <button onClick={() => setPage(listCurrentPage + 1)} disabled={listCurrentPage >= listTotalPages}>{t('Next')}</button>
+          <button onClick={() => setPage(listTotalPages)} disabled={listCurrentPage >= listTotalPages} aria-label={t('Last page')}>»</button>
         </div>
         <label className="page-size"><select value={pageSize} onChange={(event) => { setPage(1); setPageSize(Number(event.target.value)); }}>{FUNDING_PAGE_SIZES.map((size) => <option key={size} value={size}>{size}</option>)}</select><span>{t('per page')}</span></label>
       </div>}
@@ -798,7 +1104,10 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
             ? <> · {overview?.venueStatus.filter((status) => status.status === 'error').map((status) => exchanges.find((exchange) => exchange.id === status.venue.toLowerCase())?.name ?? status.venue).join(', ')} {t('unavailable')}</>
             : null}
         </span>
-        <span>{t('Click any row to inspect realized funding history.')} · {t('Historical settlements stored locally · latest tail refreshed ~15m')} · {t('OI averaged across venues reporting it')}</span>
+        <span>{lens === 'settlements'
+          ? <>{t('Annualized on each contract own settlement interval.')} · {t('Historical settlements stored locally · latest tail refreshed ~15m')}</>
+          : <>{t('Click any row to inspect realized funding history.')} · {t('Historical settlements stored locally · latest tail refreshed ~15m')} · {t('OI averaged across venues reporting it')}</>}
+        </span>
       </footer>
     </section>
   </div>;

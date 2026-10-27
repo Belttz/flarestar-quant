@@ -57,6 +57,7 @@ import type {
   FundingHistoryResponse,
   FundingHistorySeriesResponse,
   FundingOverviewResponse,
+  FundingSettlementBoardResponse,
   HealthResponse,
   MarketCatalogAsset,
   MarketCatalogResponse,
@@ -92,6 +93,11 @@ import { deleteStrategyPair, listStrategyPairs, saveStrategyPair } from './strat
 import { FundingHistoryService } from './funding-history.js';
 import { FundingOverviewService } from './funding-overview.js';
 import { TtlSingleFlightCache } from './funding-rankings-cache.js';
+import {
+  DEFAULT_RECENT_SETTLEMENT_LIMIT,
+  MAX_RECENT_SETTLEMENT_LIMIT,
+  buildFundingSettlementSummary,
+} from './funding-settlements.js';
 import { canonicalMarketAsset } from './market-asset-aliases.js';
 import { CrossExMarketHub, CANDLE_INTERVALS, type LiveMarket, type MarketDefinition, type MarketHubMessage } from './market-hub.js';
 import { OpportunityService, type SpreadPairType, type SpotSymbolEntry } from './opportunity-service.js';
@@ -197,6 +203,14 @@ const FundingRankingRequestSchema = z.object({
 const FundingHistorySeriesRequestSchema = z.object({
   symbols: z.array(z.string().regex(CROSSEX_FUTURE_SYMBOL)).min(1).max(7),
   durationDays: z.union([z.literal(1), z.literal(7), z.literal(30)]),
+});
+/**
+ * Per-contract settlement board. `limit` is how many trailing settlements each entry carries;
+ * the cap keeps one request from asking for a symbol's whole retained history.
+ */
+const FundingSettlementRequestSchema = z.object({
+  symbols: z.array(z.string().regex(CROSSEX_FUTURE_SYMBOL)).min(1).max(120),
+  limit: z.number().int().min(1).max(MAX_RECENT_SETTLEMENT_LIMIT).default(DEFAULT_RECENT_SETTLEMENT_LIMIT),
 });
 /** Hard cap on equity points per response so `all` cannot ship unbounded payloads. */
 const PORTFOLIO_EQUITY_MAX_POINTS = 720;
@@ -2919,8 +2933,41 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     ) satisfies FundingHistorySeriesResponse;
   });
 
-  app.get('/api/markets/:symbol/candles', async (request, reply) => {
-    const params = z.object({ symbol: z.string().regex(/^[A-Z0-9_]{3,120}$/) }).safeParse(request.params);
+  /**
+   * Trader-facing funding board: one row per venue contract, pairing the live rate the venue will
+   * charge at its next settlement (annualized on that contract's own interval) with the trailing
+   * per-settlement rates already charged. Both sides are read from local state — the overview
+   * cache and `funding_rate_history` — so the page can poll it without touching a venue, and a
+   * contract with no cached settlements comes back with `recent: []` rather than zeros.
+   *
+   * The market catalog is deliberately not required here: this is a cache read, and a catalog
+   * outage would otherwise blank the settlement strip. The body schema already pins each symbol
+   * to the `VENUE_FUTURE_ASSET_QUOTE` shape, and unknown symbols simply resolve to nulls.
+   */
+  app.post('/api/markets/funding-settlements', {
+    preHandler: async (request, reply) => {
+      if (request.headers['x-gct-read-intent'] !== 'funding-history') {
+        return reply.code(403).send({ error: 'missing_read_intent' });
+      }
+    },
+  }, async (request, reply) => {
+    const parsed = FundingSettlementRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_funding_settlement_request' });
+    const symbols = [...new Set(parsed.data.symbols)];
+    const history = fundingHistoryService.readRecentSettlements(symbols, parsed.data.limit);
+    return {
+      entries: symbols.map((symbol) => buildFundingSettlementSummary({
+        symbol,
+        points: history.get(symbol) ?? [],
+        limit: parsed.data.limit,
+        live: fundingOverviewService.currentFundingSnapshot(symbol),
+      })),
+      limit: parsed.data.limit,
+      fetchedAt: new Date().toISOString(),
+    } satisfies FundingSettlementBoardResponse;
+  });
+
+  app.get('/api/markets/:symbol/candles', async (request, reply) => {    const params = z.object({ symbol: z.string().regex(/^[A-Z0-9_]{3,120}$/) }).safeParse(request.params);
     const query = z.object({
       interval: z.enum(CANDLE_INTERVALS).default('1m'),
       before: z.coerce.number().int().positive().optional(),

@@ -120,6 +120,34 @@ export class FundingOverviewService {
    * carry strategy engine uses this to annualize funding and advance its accrual clock.
    */
   fundingIntervalFor(symbol: string): number | null {
+    return this.cachedStatFor(symbol)?.fundingIntervalHours ?? null;
+  }
+
+  /**
+   * Live (not yet settled) funding quote for one executable perpetual symbol: the native rate
+   * charged at the next settlement, its interval, when that settlement lands, and when the row
+   * was fetched. Read-only and cache-only — it never triggers an upstream request, so callers
+   * that join it with persisted history stay synchronous.
+   */
+  currentFundingSnapshot(symbol: string): {
+    currentRate: string | null;
+    intervalHours: number | null;
+    nextFundingAt: string | null;
+    fetchedAt: string | null;
+  } | null {
+    const stat = this.cachedStatFor(symbol);
+    if (!stat) return null;
+    const venue = symbol.split('_')[0] as FundingStatVenue;
+    return {
+      currentRate: stat.fundingRate ?? null,
+      intervalHours: stat.fundingIntervalHours ?? null,
+      nextFundingAt: stat.nextFundingAt ?? null,
+      fetchedAt: this.venues.get(venue)?.fetchedAt ?? null,
+    };
+  }
+
+  /** Resolve one executable `VENUE_FUTURE_ASSET_QUOTE` symbol against the venue cache. */
+  private cachedStatFor(symbol: string): VenueFundingStat | null {
     const match = CROSSEX_FUTURE_SYMBOL.exec(symbol);
     if (!match) return null;
     const nativeAsset = match[1];
@@ -127,7 +155,7 @@ export class FundingOverviewService {
     const parts = symbol.split('_');
     const venue = parts[0] as FundingStatVenue;
     const quote = parts[3] ?? '';
-    return this.venues.get(venue)?.rows.get(`${nativeAsset}:${quote}`)?.fundingIntervalHours ?? null;
+    return this.venues.get(venue)?.rows.get(`${nativeAsset}:${quote}`) ?? null;
   }
 
   buildResponse(catalog: FundingOverviewCatalogView): FundingOverviewResponse {

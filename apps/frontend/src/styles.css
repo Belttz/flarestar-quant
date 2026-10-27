@@ -2858,3 +2858,86 @@ html[data-theme='light'] .buy-leg .us-leg-head em { color: #00866d; background: 
    * the higher-specificity selector keeps the override local to this page. */
   .strategy-rules.compact .us-fields { grid-template-columns: 1fr; }
 }
+
+/* ------------------------------------------------------------------------------------------------
+ * Funding settlement board — one row per venue contract: live rate, its annualized equivalent on
+ * the contract's own settlement interval, the countdown to the next settlement and the trailing
+ * settled rates. Colour follows the Chinese terminal convention: a rate longs must pay reads red,
+ * a rate paid to longs reads green.
+ * ---------------------------------------------------------------------------------------------- */
+.funding-lens-bar { display: flex; align-items: center; gap: 8px; padding: 10px 18px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.funding-lens-bar button { padding: 5px 12px; border: 1px solid #263342; border-radius: 5px; color: #93a1b3; background: #0b121a; font-family: var(--font-sans); font-size: var(--text-small); cursor: pointer; transition: color .15s ease, border-color .15s ease, background .15s ease; }
+.funding-lens-bar button:hover { color: #d5dce4; border-color: #33526a; }
+.funding-lens-bar button.active { color: #062b24; border-color: var(--green); background: var(--green); font-weight: 700; }
+.funding-lens-bar button:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
+.funding-lens-bar > small { margin-left: auto; color: var(--muted); font-size: var(--text-caption); }
+.funding-settlement-board { display: grid; gap: 0; }
+.funding-settlement-table { min-width: 1180px; }
+.funding-settlement-table th:nth-child(1) { width: 210px; }
+.funding-settlement-table th:nth-child(2),
+.funding-settlement-table th:nth-child(3) { width: 130px; }
+.funding-settlement-table th:nth-child(4) { width: 140px; }
+.funding-settlement-table th:nth-child(5) { width: 250px; }
+.funding-settlement-table th:nth-child(6) { width: 150px; }
+.funding-settlement-table th:nth-child(7) { width: 110px; }
+.funding-settlement-contract { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.funding-settlement-contract > span { display: grid; min-width: 0; }
+.funding-settlement-contract strong { color: #dfe6ee; font-size: var(--text-body); }
+.funding-settlement-contract small { color: #5f6d80; font-size: var(--text-micro); font-family: var(--font-mono, var(--font-sans)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.funding-settlement-interval { display: block; color: #d5dce4; font-size: var(--text-body); }
+.funding-settle-countdown { display: block; margin-top: 3px; color: var(--green); font-family: var(--font-mono, var(--font-sans)); font-size: var(--text-caption); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.funding-tone-pay { color: var(--red); }
+.funding-tone-earn { color: var(--green); }
+.funding-tone-flat { color: #9aa7b6; }
+.funding-settlement-strip { display: flex; align-items: flex-end; gap: 3px; height: 30px; padding: 2px 0; }
+.funding-settlement-bar { flex: 1 1 0; min-width: 5px; display: block; border-radius: 2px; }
+.funding-settlement-bar.funding-tone-pay { background: var(--red); }
+.funding-settlement-bar.funding-tone-earn { background: var(--green); }
+.funding-settlement-bar.funding-tone-flat { background: #3a4757; }
+.funding-settlement-empty { display: block; color: #6b7a8d; font-size: var(--text-small); font-style: italic; }
+.funding-settlement-count { display: block; margin-top: 4px; color: #536073; font-size: var(--text-micro); }
+.funding-settlement-legend { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; padding: 9px 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: var(--text-caption); }
+.funding-settlement-legend > span { display: inline-flex; align-items: center; gap: 6px; }
+.funding-settlement-legend i { width: 10px; height: 10px; border-radius: 2px; }
+html[data-theme='light'] .funding-lens-bar button { border-color: #d5dee5; color: #46586b; background: #f8fafb; }
+html[data-theme='light'] .funding-lens-bar button.active { border-color: #1d7a63; color: #ffffff; background: #1d7a63; }
+html[data-theme='light'] .funding-tone-pay { color: #c02c45; }
+html[data-theme='light'] .funding-tone-earn { color: #0f7f66; }
+html[data-theme='light'] .funding-settlement-bar.funding-tone-pay { background: #c02c45; }
+html[data-theme='light'] .funding-settlement-bar.funding-tone-earn { background: #0f7f66; }
+html[data-theme='light'] .funding-settle-countdown { color: #0f7f66; }
+@media (max-width: 860px) {
+  .funding-lens-bar > small { margin-left: 0; }
+  .funding-settlement-legend { flex-direction: column; align-items: flex-start; gap: 6px; }
+}
+
+/* Funding board, two-leg pair model: one row = long venue ⇄ short venue on the same asset. */
+.funding-settlement-table { min-width: 1420px; }
+.funding-settlement-table th:nth-child(1) { width: 160px; }
+.funding-settlement-table th:nth-child(2),
+.funding-settlement-table th:nth-child(3) { width: 190px; }
+.funding-settlement-table th:nth-child(4),
+.funding-settlement-table th:nth-child(5) { width: 130px; }
+.funding-settlement-table th:nth-child(6) { width: 140px; }
+.funding-settlement-table th:nth-child(7) { width: 260px; }
+.funding-settlement-table th:nth-child(8) { width: 110px; }
+.funding-pair-asset { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.funding-pair-asset > span:last-child { display: grid; min-width: 0; }
+.funding-pair-asset strong { color: #dfe6ee; font-size: var(--text-body); }
+.funding-pair-asset small { color: #5f6d80; font-family: var(--font-mono, var(--font-sans)); font-size: var(--text-micro); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.funding-pair-leg { display: grid; gap: 3px; }
+.funding-pair-leg-head { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.funding-pair-leg-head > span { display: grid; min-width: 0; }
+.funding-pair-leg-head strong { color: #cfd8e3; font-size: var(--text-small); white-space: nowrap; }
+.funding-pair-leg-head small { color: #4f5d70; font-family: var(--font-mono, var(--font-sans)); font-size: var(--text-micro); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.funding-pair-leg-rate { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.funding-pair-leg-settle { display: flex; }
+.funding-pair-long { border-left: 2px solid rgba(24, 214, 173, .45); padding-left: 8px; }
+.funding-pair-short { border-left: 2px solid rgba(240, 91, 114, .45); padding-left: 8px; }
+.funding-pair-strips { display: grid; gap: 4px; }
+.funding-pair-strip-row { display: flex; align-items: center; gap: 6px; min-height: 24px; }
+.funding-pair-strip-row > em { flex: 0 0 34px; color: #5f6d80; font-size: var(--text-micro); font-style: normal; text-transform: uppercase; letter-spacing: .04em; }
+.funding-pair-strip-row .funding-settlement-strip { flex: 1 1 auto; height: 22px; }
+html[data-theme='light'] .funding-pair-leg-head strong { color: #33414e; }
+html[data-theme='light'] .funding-pair-long { border-left-color: rgba(15, 127, 102, .45); }
+html[data-theme='light'] .funding-pair-short { border-left-color: rgba(192, 44, 69, .45); }

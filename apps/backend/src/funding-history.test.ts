@@ -547,3 +547,31 @@ describe('funding history service', () => {
     `).get()).toEqual({ last_error_code: null });
   });
 });
+
+describe('per-settlement reads for the funding board', () => {
+  it('returns each cached settlement in order without starting a venue request', () => {
+    const database = testDatabase();
+    const queryFundingHistory = vi.fn(async () => []);
+    const symbol = 'BINANCE_FUTURE_BTC_USDT';
+    const insert = database.prepare(`
+      INSERT INTO funding_rate_history (symbol, funding_time, rate, fetched_at)
+      VALUES (?, ?, ?, ?)
+    `);
+    // Three 8h settlements plus one that falls outside the lookback window.
+    insert.run(symbol, NOW - (8 * 60 * 60_000), '0.0003', new Date(NOW).toISOString());
+    insert.run(symbol, NOW - (16 * 60 * 60_000), '-0.0002', new Date(NOW).toISOString());
+    insert.run(symbol, NOW - (24 * 60 * 60_000), '0.0001', new Date(NOW).toISOString());
+    insert.run(symbol, NOW - (200 * DAY), '9.9999', new Date(NOW).toISOString());
+    const service = new FundingHistoryService(database, gatewayWithHistory(queryFundingHistory), {
+      now: () => NOW,
+      venueSpacingMs: NO_SPACING,
+    });
+
+    const result = service.readRecentSettlements([symbol, 'OKX_FUTURE_NEVER_USDT'], 8);
+
+    expect(result.get(symbol)?.map((point) => point.rate)).toEqual(['0.0001', '-0.0002', '0.0003']);
+    // A symbol that was never cached reads as an empty array, not as a zero rate.
+    expect(result.get('OKX_FUTURE_NEVER_USDT')).toEqual([]);
+    expect(queryFundingHistory).not.toHaveBeenCalled();
+  });
+});

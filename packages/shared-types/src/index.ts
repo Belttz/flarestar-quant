@@ -1141,6 +1141,54 @@ export const FundingHistorySeriesResponseSchema = z.object({
 });
 export type FundingHistorySeriesResponse = z.infer<typeof FundingHistorySeriesResponseSchema>;
 
+/** One realized settlement: the native fraction charged once at `timestamp`. */
+export const FundingSettlementPointSchema = z.object({
+  timestamp: z.number().int().nonnegative(),
+  rate: z.string(),
+});
+export type FundingSettlementPoint = z.infer<typeof FundingSettlementPointSchema>;
+
+/**
+ * Trader-facing view of one venue contract: the live rate it will charge next
+ * (`currentRate`, annualized on the contract's own interval) side by side with the last
+ * `recent.length` settlements already charged. The two are deliberately separate fields — a
+ * rolling total answers a different question and is never substituted for either.
+ *
+ * Every derived number is nullable on purpose: a contract with no cached history reports
+ * `recent: []` and `null` aggregates, never `0`, so the UI can say "no settlements yet"
+ * instead of drawing a fake flat history.
+ */
+export const FundingSettlementSummarySchema = z.object({
+  symbol: z.string(),
+  status: z.enum(['ok', 'unavailable']),
+  /** Venue settlement interval in hours (8 / 4 / 1 …); null when the venue row is unavailable. */
+  intervalHours: z.number().positive().max(24).nullable(),
+  /** Live (not yet settled) rate for the next interval, as a native fraction. */
+  currentRate: z.string().nullable(),
+  /** `currentRate` scaled over its own interval — APR as a fraction (0.1 = +10% a year). */
+  currentAnnualizedRate: z.string().nullable(),
+  nextFundingAt: z.string().nullable(),
+  /** Last N settlements, oldest → newest. Empty when nothing is cached. */
+  recent: z.array(FundingSettlementPointSchema),
+  /** Mean of `recent`; null when `recent` is empty. */
+  recentMeanRate: z.string().nullable(),
+  /** Most recent settled rate; null when `recent` is empty. */
+  latestRate: z.string().nullable(),
+  latestSettledAt: z.string().nullable(),
+  /** Cached settlements inside the trailing lookback window (≥ `recent.length`). */
+  settlementCount: z.number().int().nonnegative(),
+  fetchedAt: z.string().nullable(),
+});
+export type FundingSettlementSummary = z.infer<typeof FundingSettlementSummarySchema>;
+
+export const FundingSettlementBoardResponseSchema = z.object({
+  entries: z.array(FundingSettlementSummarySchema),
+  /** Maximum length `recent` may reach for this response. */
+  limit: z.number().int().positive(),
+  fetchedAt: z.string(),
+});
+export type FundingSettlementBoardResponse = z.infer<typeof FundingSettlementBoardResponseSchema>;
+
 export const OrderBookLevelSchema = z.tuple([z.string(), z.string()]);
 export type OrderBookLevel = z.infer<typeof OrderBookLevelSchema>;
 
@@ -1627,6 +1675,9 @@ export const STRATEGY_LOG_EVENT_CATEGORY: Record<string, StrategyLogEventCategor
   'Stop-loss exit triggered': 'risk',
   'Stop-loss Executed': 'risk',
   'Basis take-profit triggered': 'risk',
+  // A position strategy's entry clip refused because it would breach the configured `maxPosition`
+  // ceiling. Risk control, not an execution failure: nothing was submitted and exposure is intact.
+  'Entry blocked by max position': 'risk',
   'Timed close triggered': 'risk',
   'Timed close slice executed': 'risk',
   'Timed close slice failed': 'risk',

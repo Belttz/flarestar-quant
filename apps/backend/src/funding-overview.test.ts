@@ -132,4 +132,22 @@ describe('funding overview service', () => {
     expect(response.assets[0]?.venues[0]).toMatchObject({ fundingRate: null });
     expect(response.venueStatus.every((status) => status.status === 'error')).toBe(true);
   });
+
+  it('exposes the live quote of one executable symbol for the settlement board', async () => {
+    let clock = Date.parse('2026-08-01T12:00:00.000Z');
+    const gateway = gatewayReturning((venue) => venue === 'GATE' ? [gateBtcStat] : []);
+    const service = new FundingOverviewService(gateway, { freshMs: 60_000, now: () => clock });
+    await service.ensureFresh();
+
+    expect(service.currentFundingSnapshot('GATE_FUTURE_BTC_USDT')).toEqual({
+      currentRate: '0.00005',
+      intervalHours: 4,
+      nextFundingAt: '2026-07-23T08:00:00.000Z',
+      fetchedAt: new Date(clock).toISOString(),
+    });
+    // Quote mismatch, spot symbol and unknown venue all resolve to null instead of a guess.
+    expect(service.currentFundingSnapshot('GATE_FUTURE_BTC_USDC')).toBeNull();
+    expect(service.currentFundingSnapshot('GATE_SPOT_BTC_USDT')).toBeNull();
+    expect(service.currentFundingSnapshot('OKX_FUTURE_NEVER_USDT')).toBeNull();
+  });
 });

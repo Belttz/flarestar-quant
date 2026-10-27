@@ -500,7 +500,7 @@ test.describe.serial('local trading terminal', () => {
 
     await page.getByRole('button', { name: 'Funding Rates', exact: true }).click();
     await expect(page).toHaveURL(/\/funding-rates$/);
-    await expect(page.getByRole('heading', { name: 'Funding rate matrix.' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Funding settlements.' })).toBeVisible();
     await expect.poll(loadedScripts).toEqual(expect.arrayContaining([expect.stringContaining('funding-route-')]));
 
     const results = await new AxeBuilder({ page })
@@ -638,6 +638,9 @@ test.describe.serial('local trading terminal', () => {
   test('places funding search and period controls below the filters', async ({ page }) => {
     await page.goto('/funding-rates');
     await clearDisclaimerIfPresent(page);
+    // The settlement board is the default lens; the toolbar layout under test belongs to the
+    // asset matrix, so switch to it first.
+    await page.getByRole('radio', { name: 'Asset matrix' }).click();
 
     const toolbarOrder = await page.locator('.funding-toolbar').evaluate((toolbar) =>
       [...toolbar.children].map((child) => child.className));
@@ -678,6 +681,8 @@ test.describe.serial('local trading terminal', () => {
       await riskDialog.getByRole('button', { name: /Continue in read-only mode/ }).click();
     }
 
+    // Cumulative periods live on the asset-matrix lens; the settlement board is the default.
+    await page.getByRole('radio', { name: 'Asset matrix' }).click();
     const thirtyDays = page.getByRole('button', { name: 'Cumulative 30d', exact: true });
     await thirtyDays.click();
     await expect(thirtyDays).toHaveAttribute('aria-pressed', 'true');
