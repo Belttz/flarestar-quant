@@ -1989,6 +1989,11 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
   private async queryKrakenFundingStats(): Promise<VenueFundingStat[]> {
     const payload = await this.sweepJson('https://futures.kraken.com/derivatives/api/v3/tickers', 4_000_000);
     const envelope = parsePayload(z.object({ tickers: z.array(z.unknown()) }), payload);
+    // Kraken perps accrue funding hourly on the hour, but its ticker payload does not publish the
+    // next timestamp. Derive the next hourly boundary so the settlement-distance gate (and the
+    // strategy's expected-wave calculation) can price Kraken legs instead of treating them as
+    // "unknown -> too close".
+    const nextHour = new Date(Math.ceil((this.now() + 1) / 3_600_000) * 3_600_000).toISOString();
     const stats: VenueFundingStat[] = [];
     for (const rawRow of envelope.tickers) {
       const row = KrakenFundingRowSchema.safeParse(rawRow);
@@ -2007,7 +2012,7 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
         fundingRate: mark !== null && mark > 0 && fundingAbsolute !== null ? String(fundingAbsolute / mark) : null,
         fundingIntervalHours: 1,
         fundingRate8h: rate8h,
-        nextFundingAt: null,
+        nextFundingAt: nextHour,
         openInterestValue: positiveProduct(finiteNumber(row.data.openInterest), mark),
         lastPrice: positiveNumberText(row.data.last) ?? positiveNumberText(row.data.markPrice),
         change24h: fractionFromPercent(row.data.change24h),

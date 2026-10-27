@@ -678,14 +678,17 @@ describe('bulk venue funding stats', () => {
       { symbol: 'PF_SOLUSD', pair: 'SOL:USD', tag: 'perpetual', markPrice: 80, fundingRate: 0.001, openInterest: 100, suspended: true },
       { symbol: 'FI_XBTUSD_260626', pair: 'XBT:USD', tag: 'quarter', markPrice: 51000 },
     ] }));
-    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch);
+    const nowMs = 1_783_703_500_000;
+    const nextHour = new Date(Math.ceil((nowMs + 1) / 3_600_000) * 3_600_000).toISOString();
+    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch, () => nowMs);
 
     const stats = await client.queryVenueFundingStats('KRAKEN');
 
-    // 0.5 USD per hour on a 50000 mark = 0.00001/h relative = 0.00008 per 8h.
+    // 0.5 USD per hour on a 50000 mark = 0.00001/h relative = 0.00008 per 8h; settlement is the
+    // next hourly boundary even though Kraken's ticker payload omits a timestamp.
     expect(stats).toEqual([
-      { venue: 'KRAKEN', base: 'BTC', quote: 'USD', fundingRate: '0.00001', fundingIntervalHours: 1, fundingRate8h: '0.00008', nextFundingAt: null, openInterestValue: '100000000', lastPrice: '50010', change24h: '-0.012' },
-      { venue: 'KRAKEN', base: 'DOGE', quote: 'USD', fundingRate: '0.000002', fundingIntervalHours: 1, fundingRate8h: '0.000016', nextFundingAt: null, openInterestValue: '1000000', lastPrice: '0.26', change24h: '0.04' },
+      { venue: 'KRAKEN', base: 'BTC', quote: 'USD', fundingRate: '0.00001', fundingIntervalHours: 1, fundingRate8h: '0.00008', nextFundingAt: nextHour, openInterestValue: '100000000', lastPrice: '50010', change24h: '-0.012' },
+      { venue: 'KRAKEN', base: 'DOGE', quote: 'USD', fundingRate: '0.000002', fundingIntervalHours: 1, fundingRate8h: '0.000016', nextFundingAt: nextHour, openInterestValue: '1000000', lastPrice: '0.26', change24h: '0.04' },
     ]);
   });
 
