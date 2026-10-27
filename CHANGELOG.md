@@ -17,6 +17,9 @@ All notable changes to Gate CrossEx are documented in this file.
 
 ### Fixed
 
+- **Funding-arb settings only save on the explicit Save button.** Editing a field no longer PUTs on every keystroke; the draft stays dirty while a save is in flight so the 20s status poll cannot overwrite it, and a failed save keeps the draft instead of silently reverting to defaults.
+- **Historical funding detail now batches venue symbol requests.** The series endpoint accepts at most 7 symbols; assets with eight venues (e.g. BTC) sent one oversized request, got a 400 and rendered an empty history for every venue. The detail page now splits into 7-symbol batches and merges the results.
+- **The funding-arb fee gate no longer charges the whole round trip against one settlement.** `minNetPerSettlementBps` is now the gross funding collected per settlement wave; a separate `minTradeNetBps` checks funding over the minimum holding window minus the one-off 27.2 bps round trip. This stops a 4000% 1h pair from failing the per-wave threshold by ~2 bps while still requiring fees to be covered.
 - **KRAKEN legs were permanently rejected by the settlement-distance gate.** Kraken's ticker payload does not publish a next-funding timestamp, so the adapter hard-coded `nextFundingAt: null`; the funding-arb monitor treats an unknown timestamp as "settlement too close" and rejected every candidate containing a KRAKEN leg (including the highest-APR LQTY/TREAD pairs). The adapter now derives the next hourly boundary, matching Kraken's hourly settlement cadence.
 
 ### Not implemented
