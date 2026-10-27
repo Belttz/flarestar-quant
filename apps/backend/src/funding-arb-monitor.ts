@@ -368,15 +368,21 @@ export class FundingArbMonitor {
     const fetchedAt = candidate.fetchedAt ? Date.parse(candidate.fetchedAt) : Number.NaN;
     if (!Number.isFinite(fetchedAt) || now - fetchedAt > DATA_STALE_MS) reasons.push('DATA_STALE');
     if (candidate.aprPercent < settings.minAprPercent) reasons.push('APR_BELOW');
-    if (settings.minNetPerSettlementBps > 0) {
-      // Expected funding actually collected in one "wave": the hold runs to the SLOWER leg's next
-      // settlement, so a 1h×8h pair is held 8h and collects eight hourly payments; a 1h×1h pair is
-      // held 1h and collects one. Comparing that cash against the round-trip cost is what keeps
-      // 1h legs (11 bps per settlement at 1000% APR) from being opened at all.
-      const windowHours = Math.max(candidate.shortIntervalHours ?? 8, candidate.longIntervalHours ?? 8, 1);
-      const expectedFundingBps = perSettlementFundingBps(candidate.aprPercent) * (windowHours / 8);
-      const netBps = expectedFundingBps - roundTripCostBps(DEFAULT_TAKER_FEE_BPS, DEFAULT_SLIPPAGE_BPS);
-      if (netBps < settings.minNetPerSettlementBps) reasons.push('NET_APR_BELOW');
+    // Per-wave funding is a gross number: the hold runs to the SLOWER leg's next settlement, so a
+    // 1h×8h pair collects eight hourly payments while a 1h×1h pair collects one. Fees are a single
+    // round trip for the whole trade, so they are checked separately over the minimum holding
+    // window instead of being charged against every settlement (that double-count made a 4000%
+    // 1h pair fail a 20 bps threshold by ~2 bps).
+    const windowHours = Math.max(candidate.shortIntervalHours ?? 8, candidate.longIntervalHours ?? 8, 1);
+    const expectedFundingBps = perSettlementFundingBps(candidate.aprPercent) * (windowHours / 8);
+    if (settings.minNetPerSettlementBps > 0 && expectedFundingBps < settings.minNetPerSettlementBps) {
+      reasons.push('NET_APR_BELOW');
+    }
+    if (settings.minTradeNetBps > 0) {
+      const minHoldWaves = Math.max(1, Math.ceil((settings.minHoldingHours || 1) / windowHours));
+      const expectedTradeNetBps = expectedFundingBps * minHoldWaves
+        - roundTripCostBps(DEFAULT_TAKER_FEE_BPS, DEFAULT_SLIPPAGE_BPS);
+      if (expectedTradeNetBps < settings.minTradeNetBps) reasons.push('COST_NOT_COVERED');
     }
     if (settings.fundingPersistenceMode !== 'off') {
       const short = context.persistence.get(candidate.shortSymbol);

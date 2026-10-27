@@ -60,7 +60,8 @@ const GROUPS: GroupDef[] = [
     }],
     fields: [
       { key: 'minAprPercent', label: 'Min funding APR', unit: '%', help: { en: 'Annualized funding-differential gate.', zh: '价差年化门槛，低于该值不开仓。' } },
-      { key: 'minNetPerSettlementBps', label: 'Min net per wave', unit: 'bps', help: { en: 'Expected funding in one hold wave minus the 27.2 bps round trip.', zh: '持有到较慢腿下一结算的预期资金费减去往返 27.2bps 后，至少还剩多少 bps。' } },
+      { key: 'minNetPerSettlementBps', label: 'Min funding per wave', unit: 'bps', help: { en: 'Gross funding collected in one settlement wave, before fees.', zh: '单次结算实际收到的资金费（未扣手续费），低于该值不开。' } },
+      { key: 'minTradeNetBps', label: 'Min net per trade', unit: 'bps', help: { en: 'Funding over the minimum holding window minus the 27.2 bps round trip.', zh: '按最短持有窗口估算的 funding 减去往返 27.2bps 手续费后，至少还剩多少 bps。' } },
       { key: 'maxCurrentTo24hRatio', label: 'Max current / 24h ratio', help: { en: 'Reject when the current APR is more than this multiple of the 24h average.', zh: '当前年化超过 24h 平均的倍数上限，防一期尖峰。' } },
       { key: 'max24hTo7dRatio', label: 'Max 24h / 7d ratio', help: { en: 'Reject when the last day is more than this multiple of the last week.', zh: '24h 平均超过 7d 平均的倍数上限。' } },
       { key: 'persistenceMinSamples24h', label: 'Min 24h samples', help: { en: 'Settlements required in the 24h window.', zh: '24h 窗口内至少需要的结算样本数。' } },
@@ -175,6 +176,7 @@ const REASON_TEXT: Record<string, string> = {
   FUNDING_PERSISTENCE: '费率持续性不足',
   FUNDING_SPIKE: '费率尖峰',
   DAILY_LOSS_LIMIT: '触发日亏熔断',
+  COST_NOT_COVERED: '净收益不足以覆盖手续费',
   AUTO_OPENED: '已自动开仓',
 };
 
@@ -255,13 +257,7 @@ export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () =>
     }
   }, []);
 
-  // Auto-save edited parameters after a short pause. The explicit button remains, but the panel no
-  // longer depends on it: a save that races a status poll or a rebuilt page still reaches SQLite.
-  useEffect(() => {
-    if (!draft || !draftDirty.current || busy || saveState === 'error' || saveState === 'saving') return;
-    const timer = window.setTimeout(() => { void save(draft); }, 700);
-    return () => window.clearTimeout(timer);
-  }, [draft, busy, saveState, save]);
+
 
   const updateDraft = (key: keyof FundingArbSettings, value: string) => {
     if (!draft) return;
@@ -477,7 +473,7 @@ export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () =>
           <div className="funding-arb-savebar">
             <button className="funding-arb-btn primary" disabled={busy} onClick={() => void save(draft)}>{t('Save parameters')}</button>
             <span className={`funding-arb-save-state ${saveState}`} role="status">
-              {saveState === 'saving' ? t('Saving…') : saveState === 'saved' ? t('Saved') : saveState === 'error' ? t('Save failed') : t('Auto-save is on')}
+              {saveState === 'saving' ? t('Saving…') : saveState === 'saved' ? t('Saved') : saveState === 'error' ? t('Save failed') : t('Click Save to apply')}
             </span>
             <button className="funding-arb-btn" disabled={busy} onClick={() => { draftDirty.current = false; setDraft(status?.settings ?? draft); }}>{t('Discard changes')}</button>
           </div>

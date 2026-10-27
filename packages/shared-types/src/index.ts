@@ -2000,6 +2000,13 @@ export const FundingArbSettingsSchema = z.object({
    * dominant source of losing trades, so the default requires a positive per-wave edge.
    */
   minNetPerSettlementBps: z.number().finite().min(0).max(100_000).default(20),
+  /**
+   * Minimum net edge after the one-off round-trip cost, measured over the *minimum holding
+   * window* (funding collected across that window minus the 27.2 bps round trip). Kept separate
+   * from the per-wave threshold so a 4000% 1h pair is not rejected just because one settlement's
+   * gross funding is smaller than the whole round trip.
+   */
+  minTradeNetBps: z.number().finite().min(0).max(100_000).default(20),
   maxCandidates: z.number().int().min(1).max(50).default(10),
   maxConcurrent: z.number().int().min(1).max(10).default(3),
   maxPerTradeUsd: z.number().finite().positive().default(200),

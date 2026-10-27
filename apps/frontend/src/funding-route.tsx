@@ -337,13 +337,37 @@ export function FundingDetailView({ asset, onBack, fundingOverview, onFundingOve
     setPending(venues.length);
     setFailed(false);
     const symbols = [...new Set(venues.map((venue) => venue.symbol))];
-    void api.fundingHistorySeries(symbols, duration)
-      .then((response) => {
+    // The series endpoint caps one request at 7 symbols. Assets such as BTC list 8 venues, so the
+    // detail page must batch: sending all symbols at once returned 400 and the page rendered
+    // "Funding history unavailable" for every venue.
+    const batches: string[][] = [];
+    for (let offset = 0; offset < symbols.length; offset += 7) batches.push(symbols.slice(offset, offset + 7));
+    setPending(batches.length);
+    void Promise.all(batches.map(async (batch) => {
+      try {
+        return await api.fundingHistorySeries(batch, duration);
+      } catch {
+        return null;
+      }
+    }))
+      .then((responses) => {
         if (cancelled) return;
-        setSeriesBySymbol(Object.fromEntries(response.entries.map((entry) => [entry.symbol, entry])));
-        setRangeFrom(response.from);
+        const entries: Record<string, FundingHistorySeriesEntry> = {};
+        let from = Number.POSITIVE_INFINITY;
+        for (const response of responses) {
+          if (!response) continue;
+          if (Number.isFinite(response.from)) from = Math.min(from, response.from);
+          for (const entry of response.entries) entries[entry.symbol] = entry;
+        }
+        if (Object.keys(entries).length === 0) {
+          setFailed(true);
+          setSeriesBySymbol({});
+        } else {
+          setSeriesBySymbol(entries);
+          setRangeFrom(Number.isFinite(from) ? from : null);
+          setFailed(false);
+        }
       })
-      .catch(() => { if (!cancelled) setFailed(true); })
       .finally(() => { if (!cancelled) setPending(0); });
     return () => { cancelled = true; };
   }, [duration, venues]);
