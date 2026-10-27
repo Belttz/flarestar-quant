@@ -3030,3 +3030,8 @@ html[data-theme='light'] .funding-pair-short { border-left-color: rgba(192, 44, 
   .funding-arb-switch { flex: 1 1 100%; justify-content: flex-start; }
   .funding-arb-modal { padding: 16px; }
 }
+
+.funding-arb-save-state { align-self: center; font-size: var(--text-small); color: var(--muted); }
+.funding-arb-save-state.saving { color: #e6b450; }
+.funding-arb-save-state.saved { color: var(--green); }
+.funding-arb-save-state.error { color: var(--red); }

@@ -197,6 +197,7 @@ export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () =>
   const [trades, setTrades] = useState<FundingArbDryRunTrade[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [candidateFilter, setCandidateFilter] = useState<'all' | 'PASS' | 'REJECT'>('all');
   const [pendingConfirm, setPendingConfirm] = useState<null | {
     title: string;
@@ -233,23 +234,39 @@ export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () =>
   }, [refresh]);
 
   const save = useCallback(async (patch: Partial<FundingArbSettings>) => {
-    draftDirty.current = false;
+    // Keep the draft marked dirty while the write is in flight: a concurrent 20s status poll must
+    // not overwrite the operator's edits with the pre-save row. It only becomes clean once the
+    // backend has acknowledged the write.
+    draftDirty.current = true;
     setBusy(true);
+    setSaveState('saving');
     try {
       const next = await api.saveFundingArbSettings(patch);
+      draftDirty.current = false;
       setStatus(next);
       setDraft(next.settings);
       setError(null);
+      setSaveState('saved');
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
+      setSaveState('error');
     } finally {
       setBusy(false);
     }
   }, []);
 
+  // Auto-save edited parameters after a short pause. The explicit button remains, but the panel no
+  // longer depends on it: a save that races a status poll or a rebuilt page still reaches SQLite.
+  useEffect(() => {
+    if (!draft || !draftDirty.current || busy || saveState === 'error' || saveState === 'saving') return;
+    const timer = window.setTimeout(() => { void save(draft); }, 700);
+    return () => window.clearTimeout(timer);
+  }, [draft, busy, saveState, save]);
+
   const updateDraft = (key: keyof FundingArbSettings, value: string) => {
     if (!draft) return;
     draftDirty.current = true;
+    setSaveState('idle');
     if (typeof draft[key] === 'number') {
       const parsed = Number(value);
       if (!Number.isFinite(parsed)) return;
@@ -431,6 +448,7 @@ export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () =>
                     <select value={String(draft[select.key] ?? '')} disabled={busy}
                       onChange={(event) => {
                         draftDirty.current = true;
+                        setSaveState('idle');
                         setDraft({ ...draft, [select.key]: event.target.value } as FundingArbSettings);
                       }}>
                       {select.options.map((option) => <option key={option.value} value={option.value}>{t(option.label)}</option>)}
@@ -458,6 +476,9 @@ export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () =>
           ))}
           <div className="funding-arb-savebar">
             <button className="funding-arb-btn primary" disabled={busy} onClick={() => void save(draft)}>{t('Save parameters')}</button>
+            <span className={`funding-arb-save-state ${saveState}`} role="status">
+              {saveState === 'saving' ? t('Saving…') : saveState === 'saved' ? t('Saved') : saveState === 'error' ? t('Save failed') : t('Auto-save is on')}
+            </span>
             <button className="funding-arb-btn" disabled={busy} onClick={() => { draftDirty.current = false; setDraft(status?.settings ?? draft); }}>{t('Discard changes')}</button>
           </div>
         </div>
