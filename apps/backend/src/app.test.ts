@@ -553,7 +553,7 @@ describe('local backend', () => {
       authenticatedTradingEnabled: false,
       tradingMode: 'unset',
       mode: 'live',
-      database: { migrationCount: 25, currentMigration: '0025_saved_strategy_pairs.sql' },
+      database: { migrationCount: 26, currentMigration: '0026_funding_arb.sql' },
       security: {
         credentialStorage: 'memory_test_only',
         credentialEntryPath: '/secure/credentials',

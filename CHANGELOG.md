@@ -2,6 +2,23 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [5.0.0] - 2026-10-27
+
+### Added
+
+- **Automatic perp ⇄ perp funding-rate arbitrage runner.** It mirrors the Funding page hedge board server-side, scans every 60 minutes (configurable), and applies the full gate stack: funding-differential APR, per-wave net edge after the 27.2 bps round-trip cost, trailing 24h/7d persistence with ratio caps, one-scan confirmation (history-replayed after a restart), duplicate/cooldown/day-loss limits, instrument/margin checks and a dynamic maker-vs-taker leg split. A `dryRun` mode records decisions and virtual trades without submitting orders; a live mode launches paired `position` strategies through the engine. Panel on the Funding page, six `/api/funding-arb/*` endpoints, decision/trade audit tables and a three-tier risk governor (ADL rank 4 partial reduce, rank 5 close, half-leg/orphan guard with order de-dup).
+- **Funding-driven exits for position strategies**: funding-decay exit with dwell debounce, flip exit, smart-decline exit, minimum and maximum holding time. Engine entry quotes gain a configurable maker offset and a timeout that only cancels (never converts to market).
+- **Historical replay tooling** (`sim/funding_arb_decay_sim.py`) for the hold-until-decay strategy, including persistence/confirmation/per-wave gates and both stale- and forward-signal boundaries.
+
+### Changed
+
+- Settings persistence/validation extended with confirmation, persistence, margin-headroom, ADL and maker-leg controls; decision reason codes now include `CONFIRMATION_PENDING`, `PAIR_COOLDOWN`, `DAILY_LOSS_LIMIT`, `FUNDING_PERSISTENCE`, `FUNDING_SPIKE`.
+- Dry-run open positions now rehydrate from SQLite on restart; history-replayed confirmation removes the two-scan wait after a restart.
+
+### Not implemented
+
+- **Exchange-side stop/TP brackets.** The Gate CrossEx SDK (`gate-api` `CrossexOrderRequest.Type`) exposes only `LIMIT` and `MARKET`; there is no conditional/stop order type to place venue-side protection. The engine keeps its bot-side stop-loss and the ADL/orphan guardian instead.
+
 ## [0.4.1] - 2026-10-24
 
 ### Added

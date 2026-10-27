@@ -22,6 +22,7 @@ import {
   CrossExTransferAccountSchema,
   CrossExTransferRequestSchema,
   canonicalizeCrossExTransfer,
+  FundingArbSettingsSchema,
   crossExTransferRouteError,
   downsampleEquityPoints,
   equityGranularityForRange,
@@ -92,6 +93,14 @@ import { deficitsOf, planDeficitSettlements } from './deficit-settlement.js';
 import { deleteStrategyPair, listStrategyPairs, saveStrategyPair } from './strategy-pairs.js';
 import { FundingHistoryService } from './funding-history.js';
 import { FundingOverviewService } from './funding-overview.js';
+import { FundingArbMonitor } from './funding-arb-monitor.js';
+import { mergeFundingArbSettings } from './funding-arb-settings.js';
+import {
+  listFundingArbDecisions,
+  listFundingArbDryRunTrades,
+  readFundingArbSettings,
+  writeFundingArbSettings,
+} from './funding-arb-repository.js';
 import { TtlSingleFlightCache } from './funding-rankings-cache.js';
 import {
   DEFAULT_RECENT_SETTLEMENT_LIMIT,
@@ -105,7 +114,7 @@ import { SpreadSampler } from './spread-sampler.js';
 import { SpreadQualityService, SPREAD_BOARD_FETCH_LIMIT, SPREAD_QUALITY_CANDLE_PAGE_LIMIT, SPREAD_QUALITY_INTERVAL } from './spread-quality.js';
 import { StrategyEngine, StrategyEngineError, type StrategyEngineOptions } from './strategy-engine.js';
 import { TradingSession } from './trading-session.js';
-import { TradingRuntime, TradingRuntimeError, unresolvedOrderDetails } from './trading-runtime.js';
+import { TradingRuntime, TradingRuntimeError, isTerminalOrderState, unresolvedOrderDetails } from './trading-runtime.js';
 import { CrossExPrivateStream } from './private-stream.js';
 import { LivePortfolioStore, type LivePortfolioSnapshot } from './live-portfolio.js';
 import { readDatabaseStatus } from './database.js';
@@ -1478,6 +1487,44 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     },
   });
 
+  // Automatic perp ⇄ perp funding-rate arbitrage runner. It reuses the Funding page's hedge model
+  // server-side (short the higher-funding venue, long the lower-funding one), sizes the hedge from
+  // available margin × leverage, and in auto mode launches the paired position strategy through the
+  // same engine the UI uses. The scan loop is clock-aligned (:30) and idle while the switch is off.
+  const fundingArbMonitor = new FundingArbMonitor({
+    database,
+    fundingOverview: fundingOverviewService,
+    catalog: derivedMarketCatalog,
+    market: (symbol) => marketHub.market(symbol),
+    orderBook: (symbol) => marketHub.orderBook(symbol),
+    balances: () => tradingRuntime.listBalances(),
+    instruments: () => new Map((readInstrumentCatalog(database)?.items ?? []).map((item) => [item.symbol, item])),
+    leverageMax: (symbol) => {
+      const limit = readRiskLimit(database, symbol);
+      let max = 0;
+      for (const tier of limit?.item.tiers ?? []) {
+        const value = Number(tier.leverageMax);
+        if (Number.isFinite(value) && value > max) max = value;
+      }
+      return max > 0 ? max : null;
+    },
+    strategies: () => tradingRuntime.listStrategies(),
+    startStrategy: (input, account) => strategyEngine.startStrategy(input, account),
+    stopStrategy: (id) => strategyEngine.stopStrategy(id),
+    positions: () => tradingRuntime.reconcilePositionsFromRemote(),
+    openOrders: (strategyId) => tradingRuntime.listOrders(500)
+      .filter((order) => order.strategyId === strategyId && !isTerminalOrderState(order.state)).length,
+    closePosition: (input) => tradingRuntime.createOrder(input),
+    account: () => {
+      if (!activeCredentialProfileId) return null;
+      const metadata = getCredentialMetadata(database, activeCredentialProfileId);
+      return { profileId: activeCredentialProfileId, label: metadata?.label ?? 'Gate CrossEx' };
+    },
+    liveTradingEnabled: () => tradingSession.liveTradingEnabled,
+    connectionState: options.startMarketStream ? () => marketHub.connectionState() : undefined,
+    warn: (message, detail) => app.log.warn(detail ?? {}, message),
+  });
+
   // R5: TTL + single-flight caches for the remaining per-request upstream endpoints, sharing
   // the opportunity board's cache discipline (30s for rankings, 60s for series; failures are
   // never cached). Keys include the full request body so distinct symbol sets never collide.
@@ -1508,6 +1555,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     strategyEngine.start();
     fundingHistoryService.startBackground();
     spreadSampler.startBackground();
+    fundingArbMonitor.startBackground();
     databaseMaintenanceTimer = setInterval(() => {
       runMaintenancePass();
     }, 24 * 60 * 60_000);
@@ -1518,6 +1566,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     triggerPortfolioRefresh();
   }
   app.addHook('onClose', async () => {
+    fundingArbMonitor.stopBackground();
     await fundingHistoryService.stopBackground();
     await spreadSampler.stopBackground();
     await strategyEngine.stop();
@@ -2637,6 +2686,53 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     await fundingOverviewService.ensureFresh();
     return fundingOverviewService.buildResponse(catalog) satisfies FundingOverviewResponse;
   });
+
+  // ---------------------------------------------------------------------------------------------
+  // Automatic perp ⇄ perp funding arbitrage (Funding page hedge board made automatic).
+  // The scan decisions come from a clock-aligned background loop (`fundingArbMonitor`); these
+  // routes only expose the switch, the settings, a manual scan and the audit trail.
+  // ---------------------------------------------------------------------------------------------
+  app.get('/api/funding-arb/status', async () => fundingArbMonitor.status());
+
+  app.put('/api/funding-arb/settings', {
+    config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+  }, async (request, reply) => {
+    const parsed = FundingArbSettingsSchema.partial().safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: 'invalid_funding_arb_settings',
+        issues: parsed.error.issues.map((issue) => ({ path: issue.path.join('.'), message: issue.message })),
+      });
+    }
+    const next = mergeFundingArbSettings(readFundingArbSettings(database), parsed.data);
+    writeFundingArbSettings(database, next);
+    if (next.enabled) fundingArbMonitor.startBackground();
+    else fundingArbMonitor.stopBackground();
+    return fundingArbMonitor.status();
+  });
+
+  app.post('/api/funding-arb/scan', {
+    config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+  }, async () => {
+    await fundingArbMonitor.runOnce({ manual: true });
+    return fundingArbMonitor.status();
+  });
+
+  // Emergency stop: turns the runner off without touching already-open strategies. Closing those
+  // is deliberately a separate, explicit action.
+  app.post('/api/funding-arb/stop', async () => {
+    const next = mergeFundingArbSettings(readFundingArbSettings(database), { enabled: false, autoExecute: false });
+    writeFundingArbSettings(database, next);
+    fundingArbMonitor.stopBackground();
+    return fundingArbMonitor.status();
+  });
+
+  app.get('/api/funding-arb/decisions', async (request) => {
+    const limit = Number((request.query as { limit?: string }).limit ?? 200);
+    return { decisions: listFundingArbDecisions(database, Number.isFinite(limit) ? limit : 200) };
+  });
+
+  app.get('/api/funding-arb/trades', async () => ({ trades: listFundingArbDryRunTrades(database, 200) }));
 
   // Comma-separated spread-board filters: `venues` holds uppercase venue ids (GATE,BINANCE) and
   // `markets` holds `spot`/`perp`. Blank and whitespace-only items read as "not supplied", which

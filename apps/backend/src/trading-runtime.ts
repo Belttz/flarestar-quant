@@ -136,6 +136,33 @@ export const CreateStrategyInputSchema = z.object({
   reduceOnly: z.boolean().default(false),
   executionMethod: z.enum(['TAKER_TAKER', 'MAKER_TAKER']),
   makerLeg: z.enum(['left', 'right']).optional(),
+  /**
+   * position: settlement-based exit. After N settlements of the slower leg (plus the delay) the
+   * engine closes both legs instead of waiting for a price take-profit. Used by the automatic
+   * perp⇄perp funding runner; omitted for every other strategy kind.
+   */
+  exitAfterSettlements: z.number().int().min(1).max(10).optional(),
+  exitSettlementDelaySeconds: z.number().int().min(0).max(3600).optional(),
+  /** position: close once the live annualized funding differential falls below this percent. */
+  exitFundingAprFloorPercent: z.number().finite().min(0).max(1_000_000).optional(),
+  /** position: close when the funding differential flips negative. */
+  exitOnFundingFlip: z.boolean().optional(),
+  /** position: force-close after this many hours (safety cap). */
+  maxHoldingHours: z.number().int().min(1).max(8760).optional(),
+  /** position: soft exits are disabled before this many hours of holding. */
+  minHoldingHours: z.number().int().min(0).max(8760).optional(),
+  /** position: dwell time below the funding floor before the soft exit fires. */
+  exitFundingDecayDwellSeconds: z.number().int().min(0).max(86_400).optional(),
+
+  /** position: smart-decline exit after this many strictly declining APR readings. */
+  exitFundingDeclineReadings: z.number().int().min(0).max(20).optional(),
+  /** position: signed offset applied to the maker entry quote, in bps. */
+  makerEntryOffsetBps: z.number().finite().min(-500).max(500).optional(),
+  /** position: cancel + pause when an unfilled entry quote rested this long (0 disables). */
+  makerEntryTimeoutSeconds: z.number().int().min(0).max(86_400).optional(),  /** position: marks a strategy created by the automatic funding arbitrage runner. */
+  autoFundingArb: z.boolean().optional(),
+  /** Maker entry proximity band around the trigger, in bps. Defaults to the engine constant. */
+  makerEntryProximityBps: z.number().int().min(1).max(5000).optional(),
   closePlan: z.object({
     // Mirrors the shared schema: a single slice (1) is a legitimate timed close; the split UI
     // keeps its own >=2 requirement.
@@ -169,6 +196,18 @@ export const CreateStrategyInputSchema = z.object({
     }
   }
   if (value.leftSide === value.rightSide) context.addIssue({ code: 'custom', path: ['rightSide'], message: 'legs must have opposing sides' });
+  // The settlement exit only makes sense for a paired position strategy. Rejecting it elsewhere
+  // (instead of silently ignoring it) keeps a misconfigured caller from believing the exit exists.
+  if (value.kind !== 'position' && (value.exitAfterSettlements !== undefined
+    || value.exitSettlementDelaySeconds !== undefined
+    || value.exitFundingAprFloorPercent !== undefined
+    || value.exitOnFundingFlip !== undefined
+    || value.maxHoldingHours !== undefined
+    || value.minHoldingHours !== undefined
+    || value.exitFundingDecayDwellSeconds !== undefined
+    || value.exitFundingDeclineReadings !== undefined)) {
+    context.addIssue({ code: 'custom', path: ['exitAfterSettlements'], message: 'settlement exits are a position-strategy option' });
+  }
   if (value.kind !== 'premium' && value.kind !== 'carry' && !value.entryBps) context.addIssue({ code: 'custom', path: ['entryBps'], message: 'entry threshold is required' });
   // Auto thresholds are signed: a positive entry sells the rich leg when the spread is wide, a
   // negative entry accepts a bounded opening cost to buy the rich leg (spread ≤ entryBps).

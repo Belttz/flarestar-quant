@@ -155,6 +155,21 @@ interface StrategyActor {
    */
   makerEntryParked: boolean;
   /**
+   * position: wall-clock deadline (ms) of the settlement-based exit, computed once the position is
+   * open from the slower leg's next settlement plus the configured delay. Null until armed and
+   * while no position is held.
+   */
+  settlementExitAt: number | null;
+  /**
+   * position: wall-clock ms of the first tick where both legs were held. Basis for the
+   * `maxHoldingHours` safety cap, and null while flat.
+   */
+  positionOpenedAt: number | null;
+  /** position: first tick the funding reading sat below the decay floor, for the dwell debounce. */
+  fundingDecaySince: number | null;
+  /** position: rolling APR readings for the smart-decline exit. */
+  fundingAprReadings: number[];
+  /**
    * auto MAKER_TAKER only: latched once the live exit spread reached the take-profit level. While
    * set, the maker exit quote is never withdrawn, the hedge leg is unwound (never topped up), and
    * no new entry quote is rested. Retired once both legs are flat — restarting recomputes from the
@@ -193,7 +208,7 @@ interface StrategyActor {
    */
   positionExitArmed: boolean;
   /** position: which threshold armed {@link positionExitArmed}; drives event names and the status. */
-  positionExitReason: 'take-profit' | 'stop-loss' | null;
+  positionExitReason: 'take-profit' | 'stop-loss' | 'settlement' | 'funding-decay' | 'max-hold' | null;
   /**
    * True while an entry clip is withheld because it would push exposure past `maxPosition`; gates
    * the one-shot `Entry blocked by max position` row so a capped strategy does not write a row on
@@ -1092,6 +1107,10 @@ export class StrategyEngine {
       venueExitQuantitySymbol: null,
       closePlanSatisfied: new Set<number>(),
       makerEntryParked: false,
+      settlementExitAt: null,
+      positionOpenedAt: null,
+      fundingDecaySince: null,
+      fundingAprReadings: [],
       makerExitArmed: false,
       makerExitStartedAt: null,
       makerExitFallbackLogged: false,
@@ -2228,6 +2247,18 @@ export class StrategyEngine {
         await this.checkCompletion(actor);
         return;
       }
+      // Funding-decay exit: hold the hedge while the pair's funding differential still clears
+      // `exitFundingAprFloorPercent`, close when it decays (or flips negative), and force-close at
+      // the `maxHoldingHours` cap. This is the automatic runner's primary exit.
+      if (await this.maybeTriggerFundingExit(actor)) {
+        await this.checkCompletion(actor);
+        return;
+      }
+      // Settlement cap (optional): hold through N settlements at most, independent of the rate read.
+      if (await this.maybeTriggerSettlementExit(actor)) {
+        await this.checkCompletion(actor);
+        return;
+      }
       if (actor.config.executionMethod === 'MAKER_TAKER') await this.evaluateMakerQuotes(actor);
       else await this.evaluateTakerClip(actor);
     } else if (actor.config.executionMethod === 'MAKER_TAKER') {
@@ -2410,6 +2441,141 @@ export class StrategyEngine {
   }
 
   /**
+   * Funding-decay exit for the automatic perp⇄perp runner.
+   *
+   * The trade is held while the pair's live funding differential keeps paying: on every tick the
+   * engine reads both legs' current funding rates, normalizes them to an 8h-equivalent and closes
+   * the pair once the annualized differential drops below `exitFundingAprFloorPercent` or flips
+   * negative (`exitOnFundingFlip`). `maxHoldingHours` is a separate safety cap that fires even while
+   * the rate is still paying. Missing quotes or rates abstain — the exit only fires on a complete
+   * reading, never on a fabricated zero.
+   */
+  private async maybeTriggerFundingExit(actor: StrategyActor): Promise<boolean> {
+    const config = actor.config;
+    if (config.kind !== 'position' || config.closePlan || actor.positionExitArmed) return false;
+    const exposure = this.legExposures(actor.id, config);
+    if (!this.matchedQuantity(exposure).gt(QUANTITY_EPSILON)) return false;
+    const now = this.options.now();
+    if (actor.positionOpenedAt === null) {
+      actor.positionOpenedAt = now;
+      return false;
+    }
+    const legs = legsOf(config);
+    const maxHours = config.maxHoldingHours;
+    if (maxHours !== undefined && maxHours > 0 && now - actor.positionOpenedAt >= maxHours * 3_600_000) {
+      actor.positionExitArmed = true;
+      actor.positionExitReason = 'max-hold';
+      this.runtime.addStrategyLog(actor.id, 'info', 'Max holding exit triggered',
+        `Held ${((now - actor.positionOpenedAt) / 3_600_000).toFixed(1)}h · cap ${maxHours}h`,
+        config.asset, 'Closing both legs at market');
+      await this.continuePositionExit(actor);
+      return true;
+    }
+    const minHoldHours = config.minHoldingHours;
+    if (minHoldHours !== undefined && minHoldHours > 0
+      && now - actor.positionOpenedAt < minHoldHours * 3_600_000) return false;
+    const floor = config.exitFundingAprFloorPercent;
+    const flip = config.exitOnFundingFlip ?? false;
+    if ((floor === undefined || floor <= 0) && !flip) return false;
+    const leftMarket = this.markets.market(legs.left.symbol);
+    const rightMarket = this.markets.market(legs.right.symbol);
+    if (!leftMarket || !rightMarket) return false;
+    const leftRate = Number(leftMarket.fundingRate);
+    const rightRate = Number(rightMarket.fundingRate);
+    if (!Number.isFinite(leftRate) || !Number.isFinite(rightRate)) return false;
+    const leftInterval = this.options.fundingIntervalHours?.(legs.left.symbol) ?? 8;
+    const rightInterval = this.options.fundingIntervalHours?.(legs.right.symbol) ?? 8;
+    const left8h = leftInterval > 0 ? leftRate * 8 / leftInterval : leftRate;
+    const right8h = rightInterval > 0 ? rightRate * 8 / rightInterval : rightRate;
+    const short8h = legs.left.side === 'SELL' ? left8h : right8h;
+    const long8h = legs.left.side === 'SELL' ? right8h : left8h;
+    const net8h = short8h - long8h;
+    const apr = net8h * 3 * 365 * 100;
+    const decayed = floor !== undefined && floor > 0 && apr < floor;
+    const flipped = flip && net8h <= 0;
+    // Smart-decline: a run of strictly falling readings below the floor is an exit even before the
+    // floor itself is breached again next tick (vooi's `smart_decl`). Rolling window, bounded size.
+    const declineN = config.exitFundingDeclineReadings ?? 0;
+    let declined = false;
+    if (declineN > 0) {
+      actor.fundingAprReadings.push(apr);
+      if (actor.fundingAprReadings.length > declineN + 1) actor.fundingAprReadings.shift();
+      declined = floor !== undefined && floor > 0 && apr < floor
+        && actor.fundingAprReadings.length >= declineN + 1
+        && actor.fundingAprReadings.every((value, index, all) => index === 0 || all[index - 1]! > value);
+    } else {
+      actor.fundingAprReadings = [];
+    }
+    const triggered = decayed || flipped || declined;
+    if (!triggered) {
+      actor.fundingDecaySince = null;
+      return false;
+    }
+    // Dwell debounce: one bad reading is not an exit. The pair has to stay at/below the floor for
+    // the configured window first, so a transient print cannot cut a position that is still paying.
+    if (actor.fundingDecaySince === null) actor.fundingDecaySince = now;
+    const dwellMs = Math.max(0, config.exitFundingDecayDwellSeconds ?? 0) * 1000;
+    if (now - actor.fundingDecaySince < dwellMs) return false;
+    actor.positionExitArmed = true;
+    actor.positionExitReason = 'funding-decay';
+    this.runtime.addStrategyLog(actor.id, 'info', 'Funding decay exit triggered',
+      `Pair APR ${apr.toFixed(1)}%${flipped ? ' · differential flipped' : declined ? ` · declining ${declineN} readings` : ` · floor ${floor}%`}`
+      + ` · held ${((now - actor.positionOpenedAt) / 3_600_000).toFixed(1)}h`,
+      `${config.asset}`, 'Closing both legs at market');
+    await this.continuePositionExit(actor);
+    return true;
+  }
+
+  /**
+   * Settlement-based exit for a position strategy (automatic perp⇄perp funding runner).
+   *
+   * The funding edge is captured by *holding through a settlement*, not by a price convergence:
+   * once both legs are open the engine computes one deadline — the later of the two legs' next
+   * settlement, advanced by the configured number of settlements, plus the configured delay — and
+   * closes both legs when it passes. The deadline lives in memory, so a restart recomputes it from
+   * the live funding clock; the fail-safe is that auto-execution stays paused after a restart.
+   */
+  private async maybeTriggerSettlementExit(actor: StrategyActor): Promise<boolean> {
+    const config = actor.config;
+    const settlementCount = config.exitAfterSettlements;
+    if (config.kind !== 'position' || config.closePlan || !settlementCount || actor.positionExitArmed) return false;
+    const exposure = this.legExposures(actor.id, config);
+    if (!this.matchedQuantity(exposure).gt(QUANTITY_EPSILON)) return false;
+    if (actor.settlementExitAt === null) {
+      actor.settlementExitAt = this.settlementExitDeadline(config);
+    }
+    if (this.options.now() < actor.settlementExitAt) return false;
+    actor.positionExitArmed = true;
+    actor.positionExitReason = 'settlement';
+    this.runtime.addStrategyLog(actor.id, 'info', 'Settlement exit triggered',
+      `Held through ${settlementCount} funding settlement${settlementCount === 1 ? '' : 's'} · deadline ${new Date(actor.settlementExitAt).toISOString()}`,
+      `${config.asset}`, 'Closing both legs at market');
+    await this.continuePositionExit(actor);
+    return true;
+  }
+
+  /**
+   * Deadline (wall-clock ms) of the settlement exit: the slower leg's next settlement, advanced by
+   * `exitAfterSettlements - 1` of its own intervals, plus the configured delay. Unknown interval
+   * falls back to the 8h cadence the rest of the engine already uses for funding math.
+   */
+  private settlementExitDeadline(config: CreateStrategyInput): number {
+    const count = Math.max(1, config.exitAfterSettlements ?? 1);
+    const delayMs = Math.max(0, config.exitSettlementDelaySeconds ?? 0) * 1000;
+    const now = this.options.now();
+    const legs = legsOf(config);
+    const deadlineFor = (symbol: string): number => {
+      const market = this.markets.market(symbol);
+      const next = market?.nextFundingAt ? Date.parse(market.nextFundingAt) : Number.NaN;
+      const reported = this.options.fundingIntervalHours?.(symbol) ?? null;
+      const interval = typeof reported === 'number' && Number.isFinite(reported) && reported > 0 ? reported : 8;
+      const first = Number.isFinite(next) && next > now ? next : now + interval * 3_600_000;
+      return first + interval * 3_600_000 * (count - 1);
+    };
+    return Math.max(deadlineFor(legs.left.symbol), deadlineFor(legs.right.symbol)) + delayMs;
+  }
+
+  /**
    * Position take-profit / stop-loss trigger.
    *
    * Semantics are deliberately identical to the auto spread bot:
@@ -2494,7 +2660,11 @@ export class StrategyEngine {
     const perOrder = new Decimal(actor.config.perOrderQuantity);
     const quantity = perOrder.gt(QUANTITY_EPSILON) ? Decimal.min(perOrder, matched) : matched;
     await this.executeTakerClip(actor, 'exit', quantity,
-      actor.positionExitReason === 'stop-loss' ? 'Stop-loss exit in progress' : 'Take-profit exit in progress');
+      actor.positionExitReason === 'stop-loss' ? 'Stop-loss exit in progress'
+        : actor.positionExitReason === 'settlement' ? 'Settlement exit in progress'
+          : actor.positionExitReason === 'funding-decay' ? 'Funding decay exit in progress'
+            : actor.positionExitReason === 'max-hold' ? 'Max holding exit in progress'
+              : 'Take-profit exit in progress');
   }
 
   /**
@@ -3162,7 +3332,11 @@ export class StrategyEngine {
       // stop-loss unwinds. Otherwise the event names are unchanged (C2). A latched `position`
       // stop-loss is the same hazard and is judged by the same helper.
       const stopLossExit = this.isStopLossExit(actor, intent);
+      const settlementExit = intent === 'exit' && actor.positionExitReason === 'settlement';
       const triggeredEvent = stopLossExit ? 'Stop-loss exit triggered'
+        : actor.positionExitReason === 'funding-decay' ? 'Funding decay exit triggered'
+        : actor.positionExitReason === 'max-hold' ? 'Max holding exit triggered'
+        : settlementExit ? 'Settlement exit triggered'
         : intent === 'exit' ? 'Take-profit triggered'
         : actor.config.reduceOnly ? 'Reduce-only triggered' : 'Entry triggered';
       this.runtime.addStrategyLog(actor.id, 'info', triggeredEvent, condition,
@@ -3224,7 +3398,11 @@ export class StrategyEngine {
       const right = settled.find((order) => order.strategyLeg === 'right');
       if (left?.state === 'FILLED' && right?.state === 'FILLED') {
         const stopLossExit = this.isStopLossExit(actor, intent);
+        const settlementExecuted = intent === 'exit' && actor.positionExitReason === 'settlement';
         const executedEvent = stopLossExit ? 'Stop-loss Executed'
+          : actor.positionExitReason === 'funding-decay' ? 'Funding decay exit Executed'
+          : actor.positionExitReason === 'max-hold' ? 'Max holding exit Executed'
+          : settlementExecuted ? 'Settlement exit Executed'
           : intent === 'exit' ? 'Take-profit Executed'
           : actor.config.reduceOnly ? 'Reduce-only Executed' : 'Position open Executed';
         this.runtime.addStrategyLog(actor.id, 'info',
@@ -3280,9 +3458,17 @@ export class StrategyEngine {
     // price; a SELL never goes below its minimum acceptable price, so the POC order cannot cross
     // the maker book merely because the economic boundary lies through the best ask/bid.
     const makerTop = new Decimal(makerLeg.side === 'BUY' ? makerMarket.bidPrice : makerMarket.askPrice);
-    const price = makerLeg.side === 'BUY'
+    let price = makerLeg.side === 'BUY'
       ? Decimal.min(boundary, makerTop)
       : Decimal.max(boundary, makerTop);
+    // Signed offset: positive = more aggressive (toward the taker side), negative = more passive.
+    // The POC order still cannot cross the book — the venue rejects it if the offset would.
+    const offsetBps = intent === 'entry' ? (actor.config.makerEntryOffsetBps ?? 0) : 0;
+    if (offsetBps !== 0) {
+      const delta = price.mul(offsetBps).div(BPS);
+      const adjusted = makerLeg.side === 'BUY' ? price.plus(delta) : price.minus(delta);
+      if (adjusted.gt(0)) price = adjusted;
+    }
     if (!price.gt(0)) return null;
     return { price, makerLeg, takerLeg };
   }
@@ -3290,6 +3476,17 @@ export class StrategyEngine {
   private async evaluateMakerQuotes(actor: StrategyActor): Promise<void> {
     const exposure = this.legExposures(actor.id, actor.config);
     const matched = this.matchedQuantity(exposure);
+    // Entry-quote timeout: cancel only, never convert to a market order. High-APR microcaps have
+    // thin books, and a market fallback would hand the whole edge to slippage.
+    const timeoutSec = actor.config.makerEntryTimeoutSeconds ?? 0;
+    const entryQuote = actor.quotes.get('entry');
+    if (timeoutSec > 0 && entryQuote && !entryQuote.cancelling && !matched.gt(QUANTITY_EPSILON)
+      && this.options.now() - entryQuote.quotedAt >= timeoutSec * 1000) {
+      if (await this.cancelQuotes(actor)) {
+        await this.pause(actor, 'Maker entry quote timed out; strategy paused (no market fallback)');
+      }
+      return;
+    }
     const perOrder = new Decimal(actor.config.perOrderQuantity);
     const legs = legsOf(actor.config);
     const intents: Array<{ intent: QuoteIntent; quantity: Decimal; tier: number }> = [];
@@ -3406,23 +3603,26 @@ export class StrategyEngine {
     distance: Decimal,
     tier: number,
   ): boolean {
-    if (distance.gt(MAKER_ENTRY_PROXIMITY_BPS)) {
+    // Operator-tunable band (funding-arbitration settings write it per strategy); the constant is
+    // only the fallback for every strategy that never set the field.
+    const bandBps = actor.config.makerEntryProximityBps ?? MAKER_ENTRY_PROXIMITY_BPS;
+    if (distance.gt(bandBps)) {
       if (actor.makerEntryParked) return false;
       actor.makerEntryParked = true;
       const level = this.tierLevelBps(actor.config, tier);
       this.runtime.addStrategyLog(actor.id, 'info', 'Maker quoting parked',
         `Live spread ${spread.toFixed(2)} bps · ${distance.toFixed(2)} bps away from the ${level.toFixed(2)} bps entry trigger`,
         '—',
-        `No entry quote is rested while the live spread is more than ${MAKER_ENTRY_PROXIMITY_BPS} bps from the trigger`);
+        `No entry quote is rested while the live spread is more than ${bandBps} bps from the trigger`);
       return false;
     }
     if (actor.makerEntryParked) {
       actor.makerEntryParked = false;
       const level = this.tierLevelBps(actor.config, tier);
       this.runtime.addStrategyLog(actor.id, 'info', 'Maker quoting resumed',
-        `Live spread ${spread.toFixed(2)} bps · inside the ${MAKER_ENTRY_PROXIMITY_BPS} bps band around the ${level.toFixed(2)} bps entry trigger`,
+        `Live spread ${spread.toFixed(2)} bps · inside the ${bandBps} bps band around the ${level.toFixed(2)} bps entry trigger`,
         '—',
-        `Entry quoting resumes now that the live spread is within ${MAKER_ENTRY_PROXIMITY_BPS} bps of the trigger`);
+        `Entry quoting resumes now that the live spread is within ${bandBps} bps of the trigger`);
     }
     return true;
   }

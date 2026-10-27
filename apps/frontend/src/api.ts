@@ -17,6 +17,9 @@ import {
   FundingHistorySeriesResponseSchema,
   FundingOverviewResponseSchema,
   FundingSettlementBoardResponseSchema,
+  FundingArbStatusResponseSchema,
+  FundingArbDecisionsResponseSchema,
+  FundingArbTradesResponseSchema,
   InstrumentsResponseSchema,
   LeverageResponseSchema,
   LeverageUpdateResponseSchema,
@@ -117,6 +120,12 @@ import {
   type VenueFeeRate,
   UnresolvedOrderSchema,
   type UnresolvedOrder,
+  type FundingArbCandidate,
+  type FundingArbDecision,
+  type FundingArbDryRunTrade,
+  type FundingArbScanResponse,
+  type FundingArbSettings,
+  type FundingArbStatusResponse,
 } from '@gate-crossex/shared-types';
 
 export type {
@@ -152,6 +161,12 @@ export type {
   FundingOverviewAsset,
   FundingOverviewResponse,
   FundingOverviewVenueEntry,
+  FundingArbCandidate,
+  FundingArbDecision,
+  FundingArbDryRunTrade,
+  FundingArbScanResponse,
+  FundingArbSettings,
+  FundingArbStatusResponse,
   FundingSettlementBoardResponse,
   FundingSettlementPoint,
   FundingSettlementSummary,
@@ -671,6 +686,16 @@ export const api = {
     method: 'PUT',
     body: JSON.stringify(preferences),
   }),
+  // Automatic perp ⇄ perp funding arbitrage runner.
+  fundingArbStatus: () => request(FundingArbStatusResponseSchema, '/api/funding-arb/status'),
+  saveFundingArbSettings: (patch: Partial<FundingArbSettings>) => request(FundingArbStatusResponseSchema, '/api/funding-arb/settings', {
+    method: 'PUT',
+    body: JSON.stringify(patch),
+  }),
+  scanFundingArb: () => request(FundingArbStatusResponseSchema, '/api/funding-arb/scan', { method: 'POST' }),
+  stopFundingArb: () => request(FundingArbStatusResponseSchema, '/api/funding-arb/stop', { method: 'POST' }),
+  fundingArbDecisions: (limit = 200) => request(FundingArbDecisionsResponseSchema, `/api/funding-arb/decisions?limit=${limit}`),
+  fundingArbTrades: () => request(FundingArbTradesResponseSchema, '/api/funding-arb/trades'),
 };
 
 export interface TerminalStreamHandle {

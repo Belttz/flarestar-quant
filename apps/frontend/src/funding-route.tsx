@@ -46,6 +46,7 @@ import {
   type SortDirection,
 } from './route-shared.js';
 import { useLanguage } from './i18n.js';
+import { FundingArbPanel } from './funding-arb-panel.js';
 
 const FundingHistoryChart = lazy(() => import('./charts.js').then((module) => ({ default: module.FundingHistoryChart })));
 
@@ -991,6 +992,8 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
           : 'Compare funding across exchanges, ranked by aggregate open interest.')}</p>
       </div>
     </section>
+
+    <FundingArbPanel />
 
     <section className="funding-card terminal-panel">
       <div className="exchange-filter" role="group" aria-label="Filter exchanges">

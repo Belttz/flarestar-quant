@@ -1545,6 +1545,42 @@ export const StrategyConfigSchema = z.object({
       positionSide: z.enum(['NONE', 'LONG', 'SHORT']),
     })).min(1).max(20),
   }).optional(),
+  /**
+   * position: optional settlement-based exit. When set, the engine closes both legs after N funding
+   * settlements of the *slower* leg have passed (plus `exitSettlementDelaySeconds`), instead of
+   * waiting for a price take-profit. Used by the automatic perp⇄perp funding-arbitrage runner.
+   */
+  exitAfterSettlements: z.number().int().min(1).max(10).optional(),
+  /** position: delay after the target settlement before the settlement exit is armed, in seconds. */
+  exitSettlementDelaySeconds: z.number().int().min(0).max(3600).optional(),
+  /**
+   * position: funding-decay exit. While the position is open the engine reads both legs' live
+   * funding rates and closes the pair once the annualized differential falls below this floor —
+   * the "hold until the rate stops paying" exit the funding runner actually uses. 0 disables it.
+   */
+  exitFundingAprFloorPercent: z.number().finite().min(0).max(1_000_000).optional(),
+  /** position: close immediately when the differential flips negative (the short leg stops earning). */
+  exitOnFundingFlip: z.boolean().optional(),
+  /** position: safety cap — force-close after this many hours regardless of the funding reading. */
+  maxHoldingHours: z.number().int().min(1).max(8760).optional(),
+  /** position: do not run soft exits before this many hours of holding (hard stop still applies). */
+  minHoldingHours: z.number().int().min(0).max(8760).optional(),
+  /** position: how long the pair must stay below the decay floor before the soft exit fires. */
+  exitFundingDecayDwellSeconds: z.number().int().min(0).max(86_400).optional(),
+
+  /** position: smart-decline exit after this many strictly declining APR readings. */
+  exitFundingDeclineReadings: z.number().int().min(0).max(20).optional(),
+  /** position: signed offset applied to the maker entry quote, in bps. */
+  makerEntryOffsetBps: z.number().finite().min(-500).max(500).optional(),
+  /** position: cancel + pause when an unfilled entry quote rested this long (0 disables). */
+  makerEntryTimeoutSeconds: z.number().int().min(0).max(86_400).optional(),  /** position: true when the strategy was created by the automatic funding runner (dedupe/limits). */
+  autoFundingArb: z.boolean().optional(),
+  /**
+   * position/auto: distance from the entry trigger within which a MAKER_TAKER entry quote is
+   * allowed to rest. Outside the band the strategy parks (no quote) instead of chasing the price.
+   * Absent keeps the engine default (25 bps).
+   */
+  makerEntryProximityBps: z.number().int().min(1).max(5000).optional(),
 });
 export type StrategyConfig = z.infer<typeof StrategyConfigSchema>;
 
@@ -1675,6 +1711,14 @@ export const STRATEGY_LOG_EVENT_CATEGORY: Record<string, StrategyLogEventCategor
   'Stop-loss exit triggered': 'risk',
   'Stop-loss Executed': 'risk',
   'Basis take-profit triggered': 'risk',
+  // Position settlement exit: the automatic perp⇄perp funding runner closes both legs after the
+  // configured number of funding settlements instead of waiting for a price take-profit.
+  'Settlement exit triggered': 'risk',
+  'Settlement exit Executed': 'risk',
+  'Funding decay exit triggered': 'risk',
+  'Funding decay exit Executed': 'risk',
+  'Max holding exit triggered': 'risk',
+  'Max holding exit Executed': 'risk',
   // A position strategy's entry clip refused because it would breach the configured `maxPosition`
   // ceiling. Risk control, not an execution failure: nothing was submitted and exposure is intact.
   'Entry blocked by max position': 'risk',
@@ -1869,3 +1913,231 @@ export type UserPreferences = z.infer<typeof UserPreferencesSchema>;
 
 export const UserPreferencesResponseSchema = z.object({ preferences: UserPreferencesSchema });
 export type UserPreferencesResponse = z.infer<typeof UserPreferencesResponseSchema>;
+
+// -------------------------------------------------------------------------------------------------
+// Perp ⇄ perp funding-rate arbitrage automation.
+//
+// The user-facing flow is the Funding page hedge board: short the higher-funding perpetual venue,
+// long the lower-funding one, and let the difference accrue. This automation scans that same
+// model on a schedule, sizes the hedge from available margin × leverage, opens it automatically
+// (one leg maker, one leg taker) when the funding differential clears the configured APR, and
+// closes both legs after the settled funding period. Everything here is a wire contract — the
+// backend owns the defaults and the decision logic.
+// -------------------------------------------------------------------------------------------------
+
+/** Why one candidate passed or was rejected. Rendered verbatim by the UI. */
+export const FUNDING_ARB_REASON_CODES = [
+  'DATA_STALE', 'NO_FUNDING', 'APR_BELOW', 'NET_APR_BELOW', 'LEG_UNAVAILABLE',
+  'SETTLEMENT_TOO_CLOSE', 'BALANCE_INSUFFICIENT', 'SLOT_LIMIT', 'DAILY_LIMIT',
+  'EXPOSURE_LIMIT', 'COOLDOWN', 'DUPLICATE_ASSET', 'BLACKLISTED', 'CONNECTION_UNHEALTHY',
+  'INSTRUMENT_MISSING', 'SIZE_TOO_SMALL', 'MAX_MARKET_SIZE', 'LIVE_LOCKED', 'ACCOUNT_MISSING',
+  'DATA_ANOMALY', 'CONFIRMATION_PENDING', 'PAIR_COOLDOWN', 'DAILY_LOSS_LIMIT',
+  'FUNDING_PERSISTENCE', 'FUNDING_SPIKE',
+] as const;
+export type FundingArbReasonCode = (typeof FUNDING_ARB_REASON_CODES)[number];
+
+/**
+ * One perp ⇄ perp funding candidate before/after gating. `short` is the higher-funding leg (the
+ * side that receives funding), `long` the lower-funding one; `aprPercent` is
+ * |rate8h(short) − rate8h(long)| × 1095 × 100 — the same normalization the Funding page uses.
+ */
+export const FundingArbCandidateSchema = z.object({
+  key: z.string(),
+  asset: z.string(),
+  shortVenue: z.string(),
+  shortSymbol: z.string(),
+  longVenue: z.string(),
+  longSymbol: z.string(),
+  shortRate8h: z.string(),
+  longRate8h: z.string(),
+  shortIntervalHours: z.number().nullable(),
+  longIntervalHours: z.number().nullable(),
+  shortNextFundingAt: z.string().nullable(),
+  longNextFundingAt: z.string().nullable(),
+  fetchedAt: z.string().nullable(),
+  /** |short − long| in 8h-equivalent fraction, as a decimal string. */
+  net8h: z.string(),
+  /** Annualized percentage of `net8h` (× 1095 × 100). */
+  aprPercent: z.number().finite(),
+  verdict: z.enum(['PASS', 'REJECT']),
+  reasons: z.array(z.string()).default([]),
+  /** Ranking key; higher first. Null on rejected rows is allowed but the backend fills it. */
+  score: z.number().finite().nullable().default(null),
+  /** Dynamic entry trigger computed from the live executable spread minus the slippage buffer. */
+  entryBps: z.string().nullable().default(null),
+  /** Sizing result for PASS rows; null when rejected. */
+  notionalUsd: z.number().finite().nullable().default(null),
+  quantity: z.string().nullable().default(null),
+  leverage: z.number().finite().nullable().default(null),
+  /** Milliseconds until the slower leg's next settlement at scan time. */
+  settlementInMs: z.number().int().nullable().default(null),
+});
+export type FundingArbCandidate = z.infer<typeof FundingArbCandidateSchema>;
+
+/**
+ * Persisted automation settings. All thresholds are operator-tunable; the defaults live in the
+ * backend module (`funding-arb-settings.ts`) and are re-validated here on every read/write.
+ */
+export const FundingArbSettingsSchema = z.object({
+  /** Master switch: off stops the scan loop entirely (open strategies are left untouched). */
+  enabled: z.boolean().default(false),
+  /** Simulation only — no orders are submitted, decisions and simulated trades are recorded. */
+  dryRun: z.boolean().default(true),
+  /** Create the position strategy automatically. Requires live trading mode. */
+  autoExecute: z.boolean().default(false),
+  scanIntervalMinutes: z.number().int().min(5).max(1440).default(60),
+  /**
+   * Funding differential annualized APR gate, in percent. The 30-day historical replay
+   * (`design/funding-arb-sim-30d.md`) puts the break-even a little above 1500% APR at the modelled
+   * 27.2 bps round-trip cost, and the best risk-adjusted band at 2000–4000%, so 2000% is the
+   * default; lower it deliberately, not by accident.
+   */
+  minAprPercent: z.number().finite().min(0).max(1_000_000).default(2000),
+  /**
+   * Additional gate: expected net bps collected in one "wave" (hold to the slower leg's next
+   * settlement) after round-trip costs. 0 disables it. The 30-day replay shows the 1h×1h pairs at
+   * 1000% APR collect only ~11 bps per settlement — below the 27.2 bps round trip — which is the
+   * dominant source of losing trades, so the default requires a positive per-wave edge.
+   */
+  minNetPerSettlementBps: z.number().finite().min(0).max(100_000).default(20),
+  maxCandidates: z.number().int().min(1).max(50).default(10),
+  maxConcurrent: z.number().int().min(1).max(10).default(3),
+  maxPerTradeUsd: z.number().finite().positive().default(200),
+  maxTotalExposureUsd: z.number().finite().positive().default(1000),
+  /** Share of available margin the sizing formula may use (keeps a fee/liquidation buffer). */
+  safetyFactor: z.number().finite().gt(0).lte(1).default(0.9),
+  /** `max` uses each leg's highest risk-tier leverage; `fixed` uses `fixedLeverage`. */
+  leverageMode: z.enum(['max', 'fixed']).default('max'),
+  fixedLeverage: z.number().finite().gt(0).max(200).default(5),
+  /** Hard ceiling on the per-leg leverage chosen in `max` mode (liquidation-buffer guard). */
+  maxLeverage: z.number().int().min(1).max(200).default(20),
+  /** Slippage buffer subtracted from the live spread when computing `entryBps`. */
+  entrySlipBufferBps: z.number().finite().min(0).max(500).default(5),
+  /** How far the spread may drift from the trigger before maker quoting parks (engine field). */
+  makerEntryProximityBps: z.number().int().min(1).max(5000).default(25),
+  /** Number of funding settlements to hold before the settlement exit fires. */
+  exitAfterSettlements: z.number().int().min(1).max(10).default(1),
+  /** Close the pair once the live annualized differential falls below this percent (0 disables). */
+  exitFundingAprFloorPercent: z.number().finite().min(0).max(1_000_000).default(500),
+  /** Close the pair when the differential flips negative (the short leg stops earning). */
+  exitOnFundingFlip: z.boolean().default(true),
+  /** Safety cap: force-close a position after this many hours even if the rate stays high. */
+  maxHoldingHours: z.number().int().min(1).max(8760).default(168),
+  /** Do not run the funding-decay soft exit before this many hours of holding (hard stop still fires). */
+  minHoldingHours: z.number().int().min(0).max(8760).default(2),
+  /** The pair must stay below the decay floor for this long before the soft exit fires. */
+  exitFundingDecayDwellSeconds: z.number().int().min(0).max(86_400).default(180),
+  /** Require the same candidate to pass every gate on this many consecutive scans before opening. */
+  confirmScans: z.number().int().min(1).max(10).default(2),
+  /** After this many losing closes of the same asset within the cooldown window, pause that asset. */
+  pairLossThreshold: z.number().int().min(1).max(10).default(2),
+  pairLossCooldownHours: z.number().int().min(0).max(720).default(48),
+  /** Halt new entries once today's realized loss reaches this share of account equity (0 disables). */
+  dailyLossLimitFraction: z.number().finite().min(0).max(1).default(0.03),
+
+  /**
+   * Persistence gate strength: `off` trades the current snapshot only; `24h` requires the trailing
+   * day's realised differential to be positive and the current reading not to be a spike over it;
+   * `24h7d` additionally requires a positive, non-spiking week (strictest, fewest trades).
+   */
+  fundingPersistenceMode: z.enum(['off', '24h', '24h7d']).default('24h'),
+  maxCurrentTo24hRatio: z.number().finite().min(1).max(100).default(3),
+  max24hTo7dRatio: z.number().finite().min(1).max(100).default(3),
+  persistenceMinSamples24h: z.number().int().min(1).max(100).default(1),
+  persistenceMinSamples7d: z.number().int().min(1).max(1000).default(3),
+  /** Share of available margin reserved for fees/slippage. */
+  marginHeadroomPct: z.number().finite().min(0).max(1).default(0.05),
+  /** Optional per-venue margin cap (0 disables the explicit cap). */
+  maxMarginPerVenueUsd: z.number().finite().min(0).default(0),
+  /** `left`/`right` pins the maker leg; `auto` picks it from the two books' top depth. */
+  makerLegMode: z.enum(['left', 'right', 'auto']).default('auto'),
+  /** How many declining APR readings arm the smart-decline exit (0 disables). */
+  exitFundingDeclineReadings: z.number().int().min(0).max(20).default(3),
+  /** Signed offset applied to the maker entry quote, in bps (positive = more aggressive). */
+  makerEntryOffsetBps: z.number().finite().min(-500).max(500).default(0),
+  /** Cancel + pause an unfilled entry quote after this many seconds (0 disables; never market). */
+  makerEntryTimeoutSeconds: z.number().int().min(0).max(86_400).default(300),
+  /** Watch for half-leg / orphan exposure and auto-close the surviving leg. */
+  orphanWatchEnabled: z.boolean().default(true),
+  /** How long a one-leg exposure must persist before the guardian acts. */
+  orphanGraceSeconds: z.number().int().min(10).max(3600).default(120),
+  /** Poll ADL ranks from the position snapshot and unwind a position at the exit rank. */
+  adlWatchEnabled: z.boolean().default(true),
+  /** ADL rank that forces a close of both legs. */
+  adlExitRank: z.number().int().min(1).max(5).default(5),
+  /** ADL rank at which both legs are reduced by `adlReduceFraction`. */
+  adlReduceRank: z.number().int().min(1).max(5).default(4),
+  /** Share of each leg closed at the warning rank (0 disables the partial reduce). */
+  adlReduceFraction: z.number().finite().min(0).max(1).default(0.5),
+  exitSettlementDelaySeconds: z.number().int().min(0).max(3600).default(60),
+  /** Exit order preference: `auto` picks the thinner top-of-book leg first in future phases. */
+  closeLegMode: z.enum(['auto', 'left', 'right']).default('auto'),
+  /** A leg whose top-of-book depth is below this is "thin" (exit falls back to a limit leg). */
+  thinBookTopDepthUsd: z.number().finite().positive().default(200),
+  exitLimitTimeoutSeconds: z.number().int().min(1).max(300).default(5),
+  /** position stop-loss in bps on the executable spread; 0 disables it. */
+  hardStopLossBps: z.number().finite().min(0).max(10_000).default(0),
+  cooldownMinutes: z.number().int().min(0).max(1440).default(60),
+  maxEntriesPerDay: z.number().int().min(1).max(100).default(20),
+  venueWhitelist: z.array(z.string().min(1).max(20)).max(8).default([]),
+  assetBlacklist: z.array(z.string().min(1).max(20)).max(200).default([]),
+});
+export type FundingArbSettings = z.infer<typeof FundingArbSettingsSchema>;
+
+export const FundingArbScanResponseSchema = z.object({
+  settings: FundingArbSettingsSchema,
+  scannedAt: z.string(),
+  dataFresh: z.boolean(),
+  candidates: z.array(FundingArbCandidateSchema),
+});
+export type FundingArbScanResponse = z.infer<typeof FundingArbScanResponseSchema>;
+
+/** Live run state plus the most recent scan, so one request can paint the whole panel. */
+export const FundingArbStatusResponseSchema = z.object({
+  settings: FundingArbSettingsSchema,
+  running: z.boolean(),
+  liveTradingEnabled: z.boolean(),
+  lastScanAt: z.string().nullable(),
+  nextScanAt: z.string().nullable(),
+  scans: z.number().int().nonnegative(),
+  lastError: z.string().nullable(),
+  lastResult: FundingArbScanResponseSchema.nullable(),
+});
+export type FundingArbStatusResponse = z.infer<typeof FundingArbStatusResponseSchema>;
+
+/** One audited decision row (candidate key + why it did/did not become a strategy). */
+export const FundingArbDecisionSchema = z.object({
+  id: z.string(),
+  scannedAt: z.string(),
+  candidateKey: z.string(),
+  verdict: z.enum(['PASS', 'REJECT']),
+  reasons: z.array(z.string()),
+  strategyId: z.string().nullable(),
+  createdAt: z.string(),
+});
+export type FundingArbDecision = z.infer<typeof FundingArbDecisionSchema>;
+
+export const FundingArbDecisionsResponseSchema = z.object({ decisions: z.array(FundingArbDecisionSchema) });
+export type FundingArbDecisionsResponse = z.infer<typeof FundingArbDecisionsResponseSchema>;
+
+/** A simulated (dry-run) trade: what the runner would have opened, held, and closed. */
+export const FundingArbDryRunTradeSchema = z.object({
+  id: z.string(),
+  asset: z.string(),
+  shortVenue: z.string(),
+  longVenue: z.string(),
+  quantity: z.string(),
+  notionalUsd: z.number().finite(),
+  entryBps: z.string(),
+  enteredAt: z.string(),
+  exitAt: z.string().nullable(),
+  fundingUsd: z.number().finite(),
+  feesUsd: z.number().finite(),
+  pnlUsd: z.number().finite(),
+  aprPercent: z.number().finite(),
+  status: z.enum(['OPEN', 'CLOSED']),
+});
+export type FundingArbDryRunTrade = z.infer<typeof FundingArbDryRunTradeSchema>;
+
+export const FundingArbTradesResponseSchema = z.object({ trades: z.array(FundingArbDryRunTradeSchema) });
+export type FundingArbTradesResponse = z.infer<typeof FundingArbTradesResponseSchema>;
