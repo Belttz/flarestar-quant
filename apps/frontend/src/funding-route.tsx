@@ -452,7 +452,7 @@ export function FundingDetailView({ asset, onBack, fundingOverview, onFundingOve
     </section>
   </div>;
 }
-export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset, onOpenStrategy, metric, onMetricChange, fundingOverview, onFundingOverview, fundingHistoryCache, onFundingHistoryEntries }: {
+export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset, onOpenStrategy, metric, onMetricChange, fundingOverview, onFundingOverview, fundingHistoryCache, onFundingHistoryEntries, onOpenModeDialog }: {
   marketSnapshot: MarketSnapshot | null;
   onMarketFallback: () => Promise<void>;
   onOpenAsset: (asset: string) => void;
@@ -463,6 +463,7 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
   onFundingOverview: (overview: FundingOverviewResponse) => void;
   fundingHistoryCache: FundingHistoryCache;
   onFundingHistoryEntries: (duration: FundingHistoryDuration, entries: FundingHistoryEntry[]) => void;
+  onOpenModeDialog: () => void;
 }) {
   const { t, language } = useLanguage();
   const [query, setQuery] = useState('');
@@ -993,7 +994,7 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
       </div>
     </section>
 
-    <FundingArbPanel />
+    <FundingArbPanel onOpenModeDialog={onOpenModeDialog} />
 
     <section className="funding-card terminal-panel">
       <div className="exchange-filter" role="group" aria-label="Filter exchanges">

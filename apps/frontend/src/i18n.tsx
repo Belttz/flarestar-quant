@@ -749,6 +749,22 @@ const chinese: Record<string, string> = {
   'Min net per wave': '单次净收益下限', 'Pass': '通过', 'PnL': '盈亏', 'Reject': '拒绝',
   'Right (long)': '右腿（多）', 'Risk & guards': '风控与守护', 'Runner controls': '执行器控制', 'Save parameters': '保存参数',
   'Scan & confirmation': '扫描与确认', 'Sizing & leverage': '仓位与杠杆', 'Start monitoring': '开始监测', 'Stop monitoring': '停止监测',
+
+  'Auto opening positions': '自动开仓中', 'Auto-execute only places orders when the exchange is live. Switch the trading mode first?': '自动执行只会在交易所实盘时下单；是否先去切换交易模式？',
+  'Click to toggle auto-execute': '点击切换自动执行', 'Click to toggle dry run': '点击切换干跑',
+  'Disable auto-execute': '关闭自动执行', 'Disable auto-execute?': '关闭自动执行？',
+  'Disable dry run': '关闭干跑', 'Disable dry run?': '关闭干跑？',
+  'Dry run is still on, so auto-execute will not place real orders. Turn dry run off as well?': '干跑仍开启，自动执行不会真实下单；是否同时关闭干跑？',
+  'Dry run off': '干跑 · 关', 'Dry run on': '干跑 · 开',
+  'Dry run only records decisions and simulated trades. No real orders are submitted.': '干跑只记录决策和模拟成交，不提交真实订单。',
+  'Enable anyway': '仍然开启', 'Enable auto-execute': '开启自动执行', 'Enable auto-execute?': '开启自动执行？',
+  'Enable dry run': '开启干跑', 'Enable dry run?': '开启干跑？', 'Exchange is read-only': '交易所当前只读',
+  'Go to trading mode': '去切换交易模式', 'No real orders': '不下真实订单', 'Orders allowed': '允许下单',
+  'Orders blocked': '禁止下单', 'Real orders possible': '可能真实下单', 'Records only': '只记录',
+  'The runner will open paired positions automatically when a candidate passes every gate.': '候选通过全部门槛后，执行器会自动开出配对仓位。',
+  'The runner will stop opening positions automatically; existing strategies are not closed.': '执行器将不再自动开仓；已有策略不会被平仓。',
+  'Turn off dry run and enable': '关闭干跑并开启',
+  'With dry run off, the runner can submit real orders once auto-execute is on and the exchange is live.': '关闭干跑后，当自动执行开启且交易所实盘时会真实下单。',
   'To settlement': '距结算', 'pass': '通过',
 };
 

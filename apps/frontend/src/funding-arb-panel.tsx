@@ -189,7 +189,7 @@ function formatMs(ms: number | null): string {
   return minutes >= 60 ? `${Math.floor(minutes / 60)}h ${minutes % 60}m` : `${minutes}m`;
 }
 
-export function FundingArbPanel() {
+export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () => void }) {
   const { t, language } = useLanguage();
   const [status, setStatus] = useState<FundingArbStatusResponse | null>(null);
   const [draft, setDraft] = useState<FundingArbSettings | null>(null);
@@ -198,6 +198,15 @@ export function FundingArbPanel() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [candidateFilter, setCandidateFilter] = useState<'all' | 'PASS' | 'REJECT'>('all');
+  const [pendingConfirm, setPendingConfirm] = useState<null | {
+    title: string;
+    message: string;
+    confirmLabel: string;
+    tone?: 'primary' | 'danger';
+    onConfirm: () => void;
+    secondaryLabel?: string;
+    onSecondary?: () => void;
+  }>(null);
   const draftDirty = useRef(false);
 
   const refresh = useCallback(async () => {
@@ -260,6 +269,69 @@ export function FundingArbPanel() {
 
   const hint = (help: Help | undefined): string => (help ? (language === 'zh' ? help.zh : help.en) : '');
 
+  const dryRun = settings?.dryRun ?? true;
+  const autoExecute = settings?.autoExecute ?? false;
+  const exchangeLive = status?.liveTradingEnabled ?? false;
+
+  const askDryRun = () => {
+    if (dryRun) {
+      setPendingConfirm({
+        title: t('Disable dry run?'),
+        message: t('With dry run off, the runner can submit real orders once auto-execute is on and the exchange is live.'),
+        confirmLabel: t('Disable dry run'),
+        tone: 'danger',
+        onConfirm: () => { setPendingConfirm(null); void save({ dryRun: false }); },
+      });
+    } else {
+      setPendingConfirm({
+        title: t('Enable dry run?'),
+        message: t('Dry run only records decisions and simulated trades. No real orders are submitted.'),
+        confirmLabel: t('Enable dry run'),
+        onConfirm: () => { setPendingConfirm(null); void save({ dryRun: true }); },
+      });
+    }
+  };
+
+  const askAutoExecute = () => {
+    if (autoExecute) {
+      setPendingConfirm({
+        title: t('Disable auto-execute?'),
+        message: t('The runner will stop opening positions automatically; existing strategies are not closed.'),
+        confirmLabel: t('Disable auto-execute'),
+        onConfirm: () => { setPendingConfirm(null); void save({ autoExecute: false }); },
+      });
+      return;
+    }
+    if (!exchangeLive) {
+      setPendingConfirm({
+        title: t('Exchange is read-only'),
+        message: t('Auto-execute only places orders when the exchange is live. Switch the trading mode first?'),
+        confirmLabel: t('Go to trading mode'),
+        onConfirm: () => { setPendingConfirm(null); onOpenModeDialog?.(); },
+      });
+      return;
+    }
+    if (dryRun) {
+      setPendingConfirm({
+        title: t('Enable auto-execute?'),
+        message: t('Dry run is still on, so auto-execute will not place real orders. Turn dry run off as well?'),
+        confirmLabel: t('Turn off dry run and enable'),
+        tone: 'danger',
+        onConfirm: () => { setPendingConfirm(null); void save({ autoExecute: true, dryRun: false }); },
+        secondaryLabel: t('Enable anyway'),
+        onSecondary: () => { setPendingConfirm(null); void save({ autoExecute: true }); },
+      });
+      return;
+    }
+    setPendingConfirm({
+      title: t('Enable auto-execute?'),
+      message: t('The runner will open paired positions automatically when a candidate passes every gate.'),
+      confirmLabel: t('Enable auto-execute'),
+      tone: 'danger',
+      onConfirm: () => { setPendingConfirm(null); void save({ autoExecute: true }); },
+    });
+  };
+
   return (
     <section className="terminal-panel funding-arb-panel" aria-label={t('Automatic funding arbitrage')}>
       <header className="funding-arb-head">
@@ -300,15 +372,30 @@ export function FundingArbPanel() {
           }}>⛔ {t('Emergency stop')}</button>
         </div>
         <div className="funding-arb-badges">
-          <span className={settings?.dryRun ? 'funding-arb-badge warn' : 'funding-arb-badge ok'}>
-            {settings?.dryRun ? t('Dry run') : t('Live mode')}
-          </span>
-          <span className={settings?.autoExecute ? 'funding-arb-badge ok' : 'funding-arb-badge'}>
-            {settings?.autoExecute ? t('Auto-execute on') : t('Auto-execute off')}
-          </span>
-          <span className={status?.liveTradingEnabled ? 'funding-arb-badge ok' : 'funding-arb-badge'}>
-            {status?.liveTradingEnabled ? t('Exchange live') : t('Exchange readonly')}
-          </span>
+          <button type="button" className={`funding-arb-switch ${dryRun ? 'on' : 'off'}`} onClick={askDryRun}
+            title={t('Click to toggle dry run')}>
+            <span className="funding-arb-switch-dot" />
+            <span className="funding-arb-switch-text">
+              <strong>{dryRun ? t('Dry run on') : t('Dry run off')}</strong>
+              <small>{dryRun ? t('No real orders') : t('Real orders possible')}</small>
+            </span>
+          </button>
+          <button type="button" className={`funding-arb-switch ${autoExecute ? 'on' : 'off'}`} onClick={askAutoExecute}
+            title={t('Click to toggle auto-execute')}>
+            <span className="funding-arb-switch-dot" />
+            <span className="funding-arb-switch-text">
+              <strong>{autoExecute ? t('Auto-execute on') : t('Auto-execute off')}</strong>
+              <small>{autoExecute ? t('Auto opening positions') : t('Records only')}</small>
+            </span>
+          </button>
+          <button type="button" className={`funding-arb-switch ${exchangeLive ? 'on' : 'off'}`}
+            onClick={() => onOpenModeDialog?.()} title={t('Switch trading mode')}>
+            <span className="funding-arb-switch-dot" />
+            <span className="funding-arb-switch-text">
+              <strong>{exchangeLive ? t('Exchange live') : t('Exchange readonly')}</strong>
+              <small>{exchangeLive ? t('Orders allowed') : t('Orders blocked')}</small>
+            </span>
+          </button>
         </div>
       </div>
 
@@ -460,6 +547,23 @@ export function FundingArbPanel() {
           ))}
         </ul>
       </details>
+
+      {pendingConfirm && (
+        <div className="funding-arb-modal-backdrop" role="dialog" aria-modal="true" aria-label={pendingConfirm.title}>
+          <div className="funding-arb-modal">
+            <h3>{pendingConfirm.title}</h3>
+            <p>{pendingConfirm.message}</p>
+            <div className="funding-arb-modal-actions">
+              <button type="button" className="funding-arb-btn" onClick={() => setPendingConfirm(null)}>{t('Cancel')}</button>
+              {pendingConfirm.secondaryLabel && pendingConfirm.onSecondary && (
+                <button type="button" className="funding-arb-btn" onClick={pendingConfirm.onSecondary}>{pendingConfirm.secondaryLabel}</button>
+              )}
+              <button type="button" className={`funding-arb-btn ${pendingConfirm.tone === 'danger' ? 'danger' : 'primary'}`}
+                onClick={pendingConfirm.onConfirm}>{pendingConfirm.confirmLabel}</button>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   );
 }
