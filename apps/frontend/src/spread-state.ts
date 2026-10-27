@@ -167,7 +167,17 @@ export function resolveLegQuote(
   return { state: 'missing', price: null, bid: null, ask: null, quotedAtMs: null, ageMs: null, source: 'none' };
 }
 
-export type SpreadStatus = 'live' | 'unaligned' | 'stale' | 'waiting';
+/**
+ * Display state of a spread.
+ *
+ * - `live`        — both legs quoted, arrived within the skew budget.
+ * - `approximate` — both legs quoted, but they arrived `skewMs` apart (still shown, with a label).
+ * - `stale`       — a leg's quote exceeded the single-leg freshness budget; nothing to show.
+ * - `waiting`     — a leg never quoted at all; nothing to show.
+ * - `unaligned`   — retired predecessor of `approximate`, never emitted; kept only so any external
+ *                   reference still type-checks.
+ */
+export type SpreadStatus = 'live' | 'approximate' | 'stale' | 'waiting' | 'unaligned';
 
 export type SpreadReason =
   | 'ready'
@@ -180,9 +190,11 @@ export type SpreadReason =
 export interface SpreadReadout {
   status: SpreadStatus;
   reason: SpreadReason;
-  /** Basis points on the sell leg's price; `null` unless `status === 'live'`. */
+  /** True when the two legs were quoted `skewMs` apart and the value is therefore approximate. */
+  approximate: boolean;
+  /** Basis points on the sell leg's price; `null` only when a leg is missing or stale. */
   bps: number | null;
-  /** `sell − buy` in price units; `null` unless `status === 'live'`. */
+  /** `sell − buy` in price units; `null` only when a leg is missing or stale. */
   gap: number | null;
   /** Display price per leg: the live value, or the last known one while stale. */
   sellPrice: number | null;
@@ -202,13 +214,31 @@ export interface SpreadInput {
 }
 
 /**
- * Combine the two legs into one readout. The bps figure is produced **only** when both legs are
- * live and their local arrival times sit inside the shared skew budget. Anything else returns a
- * named non-live status so the UI can say *why* instead of printing a spread that never existed.
+ * Combine the two legs into one readout.
+ *
+ * Two legs that were quoted a moment apart still have a spread worth showing: hiding it produced a
+ * number that flickered in and out of existence as the two venues' push cadences drifted past each
+ * other, which is worse than a number with a caveat. So the leg-to-leg gap is now a **label**, not
+ * a gate:
+ *
+ * - `missing` (a leg never quoted) and `stale` (a quote older than the single-leg freshness budget)
+ *   still suppress the number — there is nothing to show.
+ * - Everything else always produces `bps`. When the two legs arrived more than `maxSkewMs` apart the
+ *   status is `approximate` and `skewMs` carries the measured gap, so the UI can print the spread
+ *   *and* say how far apart the two inputs were.
+ *
+ * The reasoning: what a user does with this number is decide whether the pair is worth opening. A
+ * spread labelled "3.2s apart" answers that; a blank cell does not. Actually preventing a stale pair
+ * from being *traded* belongs at execution, where the engine already enforces its own gates
+ * (single-leg freshness, transport lag, leg skew) — not in the display layer.
  *
  * The skew is measured on our clock (`LegQuote.quotedAtMs` is a local arrival time), never by
- * subtracting two venues' own timestamps: an exchange clock a few seconds off would otherwise put
- * every pair it trades into the "unaligned" bucket permanently.
+ * subtracting two venues' own timestamps: an exchange clock a few seconds off would otherwise make
+ * every pair it trades look permanently out of sync.
+ *
+ * `'unaligned'` was the old name of `'approximate'`; it was retired because it described a state
+ * that suppressed the value, and is kept in the union below only so external references still
+ * type-check. Nothing emits it any more.
  */
 export function buildSpreadReadout(input: SpreadInput): SpreadReadout {
   const maxSkewMs = input.maxSkewMs ?? SPREAD_QUOTE_MAX_SKEW_MS;
@@ -222,39 +252,38 @@ export function buildSpreadReadout(input: SpreadInput): SpreadReadout {
     : null;
 
   if (sell.state === 'missing' && buy.state === 'missing') {
-    return { status: 'waiting', reason: 'missing_both_legs', bps: null, gap: null, sellPrice, buyPrice, skewMs, messageKey: 'Waiting for both leg prices' };
+    return { status: 'waiting', reason: 'missing_both_legs', approximate: false, bps: null, gap: null, sellPrice, buyPrice, skewMs, messageKey: 'Waiting for both leg prices' };
   }
   if (sell.state === 'missing') {
-    return { status: 'waiting', reason: 'missing_sell_leg', bps: null, gap: null, sellPrice, buyPrice, skewMs, messageKey: 'Waiting for the missing leg quote' };
+    return { status: 'waiting', reason: 'missing_sell_leg', approximate: false, bps: null, gap: null, sellPrice, buyPrice, skewMs, messageKey: 'Waiting for the missing leg quote' };
   }
   if (buy.state === 'missing') {
-    return { status: 'waiting', reason: 'missing_buy_leg', bps: null, gap: null, sellPrice, buyPrice, skewMs, messageKey: 'Waiting for the missing leg quote' };
+    return { status: 'waiting', reason: 'missing_buy_leg', approximate: false, bps: null, gap: null, sellPrice, buyPrice, skewMs, messageKey: 'Waiting for the missing leg quote' };
   }
   if (sell.state === 'stale' || buy.state === 'stale') {
-    return { status: 'stale', reason: 'stale', bps: null, gap: null, sellPrice, buyPrice, skewMs, messageKey: 'A leg quote is stale; waiting for its next update.' };
+    return { status: 'stale', reason: 'stale', approximate: false, bps: null, gap: null, sellPrice, buyPrice, skewMs, messageKey: 'A leg quote is stale; waiting for its next update.' };
   }
   if (sellPrice === null || buyPrice === null || sellPrice <= 0 || buyPrice <= 0) {
     // Defensive: a `live` leg always carries a positive price, so this only fires on a malformed
     // record. Treat it as "waiting" rather than dividing by zero.
-    return { status: 'waiting', reason: 'missing_both_legs', bps: null, gap: null, sellPrice, buyPrice, skewMs, messageKey: 'Waiting for both leg prices' };
+    return { status: 'waiting', reason: 'missing_both_legs', approximate: false, bps: null, gap: null, sellPrice, buyPrice, skewMs, messageKey: 'Waiting for both leg prices' };
   }
-  if (skewMs === null) {
-    // Both legs claim to be live but one carries no timestamp, which the state machine above
-    // cannot produce; keep the conservative verdict instead of inventing alignment.
-    return { status: 'unaligned', reason: 'skew_exceeded', bps: null, gap: null, sellPrice, buyPrice, skewMs: null, messageKey: 'Leg quotes are not time-aligned' };
-  }
-  if (skewMs > maxSkewMs) {
-    return { status: 'unaligned', reason: 'skew_exceeded', bps: null, gap: null, sellPrice, buyPrice, skewMs, messageKey: 'Leg quotes are not time-aligned' };
-  }
+
+  const bps = ((sellPrice - buyPrice) / buyPrice) * 10_000;
+  const gap = sellPrice - buyPrice;
+  // A missing timestamp cannot happen for two `live` legs, but if it ever did the pair is still
+  // worth showing: an unknown gap is annotated as "not measured", never used to blank the value.
+  const approximate = skewMs === null || skewMs > maxSkewMs;
   return {
-    status: 'live',
-    reason: 'ready',
-    bps: ((sellPrice - buyPrice) / buyPrice) * 10_000,
-    gap: sellPrice - buyPrice,
+    status: approximate ? 'approximate' : 'live',
+    reason: approximate ? 'skew_exceeded' : 'ready',
+    approximate,
+    bps,
+    gap,
     sellPrice,
     buyPrice,
     skewMs,
-    messageKey: 'Switch direction',
+    messageKey: approximate ? 'Legs out of sync' : 'Switch direction',
   };
 }
 

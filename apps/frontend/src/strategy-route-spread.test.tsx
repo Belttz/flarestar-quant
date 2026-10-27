@@ -102,17 +102,19 @@ describe('price-difference bot live spread states', () => {
     expect(html).toContain('Stale quote');
   });
 
-  it('explains a pair whose quotes reached us seconds apart', () => {
+  it('still shows the spread when the two legs arrive seconds apart, labelled out of sync', () => {
     // 5s apart locally: inside the 15s freshness budget, well outside the 2s skew budget. The
     // venues' own clocks are made to agree, so only the local arrival gap can be the reason.
     const html = render(snapshot([
       market({ symbol: 'BINANCE_FUTURE_BTC_USDT', venue: 'BINANCE', asset: 'BTC' }),
       market({ symbol: 'OKX_FUTURE_BTC_USDT', venue: 'OKX', asset: 'BTC', localAgeMs: 5_000, eventAgeMs: 0 }),
     ]));
-    expect(html).toContain('data-spread-status="unaligned"');
-    expect(html).toContain('Leg quotes are not time-aligned');
-    // The caption carries the measured gap, so "no spread" is explainable at a glance.
-    expect(html).toContain('Leg quotes are not time-aligned · 5.0s');
+    // The number stays on screen — blanking it made the panel flicker between value and nothing.
+    expect(html).toContain('data-spread-status="approximate"');
+    expect(html).not.toContain('data-spread-status="unaligned"');
+    expect(html).toMatch(/-?\d+\.\d bps/);
+    // …with the measured gap named, so a wide skew is explainable at a glance.
+    expect(html).toContain('Legs out of sync');
   });
 
   it('ignores venue clock drift when both legs reached us together', () => {

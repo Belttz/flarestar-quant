@@ -184,6 +184,22 @@ interface StrategyActor {
   makerExitHedgeFailures: number;
   /** Earliest wall-clock ms the hedge submit may be attempted again after a failure (backoff gate). */
   makerExitHedgeRetryAt: number;
+  /**
+   * position only: latched once a configured `takeProfitBps` / `stopLossBps` threshold was reached
+   * and the exit clip submitted. While set no new entry clip may be placed and every later tick
+   * only unwinds what is still open — the same one-way lifecycle the auto stop-loss latch and the
+   * premium take-profit latch use. Never retired: a position strategy exits at most once, and a
+   * restart re-derives the latch from the ledger (`positionExitStarted`).
+   */
+  positionExitArmed: boolean;
+  /** position: which threshold armed {@link positionExitArmed}; drives event names and the status. */
+  positionExitReason: 'take-profit' | 'stop-loss' | null;
+  /**
+   * True while an entry clip is withheld because it would push exposure past `maxPosition`; gates
+   * the one-shot `Entry blocked by max position` row so a capped strategy does not write a row on
+   * every tick.
+   */
+  positionCapBlocked: boolean;
   /** carry: in-memory accounting state; reset when the backend restarts (re-estimated from fills). */
   carry: CarryRuntimeState | null;
   /** Serialized metrics of the last write, so unchanged snapshots do not touch the database. */
@@ -270,6 +286,28 @@ const MAKER_EXIT_HEDGE_FALLBACK_SLIPPAGE_BPS = 10;
 
 function isSpotSymbol(symbol: string): boolean {
   return /^[A-Z0-9]+_SPOT_/.test(symbol);
+}
+
+/**
+ * Parse an optional numeric strategy field into a finite Decimal.
+ *
+ * Strategy fields arrive in two shapes — `stopLossBps`/`addOnStepBps` are numbers, `takeProfitBps`/
+ * `maxPosition` are decimal *text* — and the text form may be absent, blank, or (in a legacy row
+ * written before the schema tightened) unparseable. `new Decimal('')` throws, so every optional
+ * threshold is funnelled through this one helper: null means "not configured", and a caller must
+ * then treat that threshold as disabled rather than defaulting it to zero. Defaulting to zero is
+ * how a missing stop-loss would silently become a stop at 0 bps.
+ */
+function optionalDecimal(value: string | number | undefined | null): Decimal | null {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  if (text === '') return null;
+  try {
+    const parsed = new Decimal(text);
+    return parsed.isFinite() ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -361,6 +399,7 @@ interface StrategyLedgerCache {
   exposure?: { left: Decimal; right: Decimal; rightShares: Decimal };
   shortfalls?: Array<{ clip: string | null; k: Decimal; lagging: 'left' | 'right'; delta: Decimal }>;
   premiumExitStarted?: boolean;
+  positionExitStarted?: boolean;
   openOrderIds?: string[];
 }
 
@@ -754,7 +793,12 @@ export class StrategyEngine {
           ? `Enter ${input.entryBps && new Decimal(input.entryBps).lt(0) ? '≤' : '≥'} ${input.entryBps} bps · exit ${input.takeProfitBps ? `≤ ${input.takeProfitBps} bps` : 'on take profit'}${input.stopLossBps ? ` · stop-loss ${input.stopLossBps} bps` : ''}`
           : input.kind === 'carry'
             ? `${input.fundingDirection} funding carry · APR ≥ ${input.fundingAprMin}% · basis take-profit ${input.basisTakeProfitBps} bps`
-            : `Enter ≥ ${input.entryBps} bps`;
+            // A position strategy now carries the same exit thresholds the engine executes, so the
+            // launch row states them explicitly instead of implying the fields are decorative.
+            : `Enter ${input.entryBps && new Decimal(input.entryBps).lt(0) ? '≤' : '≥'} ${input.entryBps} bps`
+              + `${input.takeProfitBps ? ` · take-profit ${input.takeProfitBps} bps` : ''}`
+              + `${input.stopLossBps ? ` · stop-loss ${input.stopLossBps} bps` : ''}`
+              + `${input.maxPosition ? ` · max ${input.maxPosition} ${input.asset}` : ''}`;
       this.runtime.addStrategyLog(id, 'info', 'Strategy started', startCondition,
         input.closePlan ? `${input.closePlan.targets.length} position${input.closePlan.targets.length === 1 ? '' : 's'}` : `${input.perOrderQuantity} ${input.asset}`,
         input.closePlan
@@ -1055,6 +1099,9 @@ export class StrategyEngine {
       makerExitHedgeRequotes: 0,
       makerExitHedgeFailures: 0,
       makerExitHedgeRetryAt: 0,
+      positionExitArmed: false,
+      positionExitReason: null,
+      positionCapBlocked: false,
       carry: record.kind === 'carry' ? emptyCarryState() : null,
       lastCarryMetricsJson: null,
       quoteWatchRelease: null,
@@ -1244,6 +1291,34 @@ export class StrategyEngine {
     ));
     ledger.configKey = configKey;
     ledger.premiumExitStarted = started;
+    return started;
+  }
+
+  /**
+   * True when the ledger already holds a reduce-only order on the *closing* side of either leg —
+   * the durable trace of a take-profit / stop-loss unwind for a monitored position strategy.
+   *
+   * `positionExitArmed` lives in memory only, so a backend restart between an armed trigger and the
+   * exit's fill would otherwise leave a finished strategy looking like an untouched one: flat
+   * exposure, `RUNNING`, and no completion possible. This mirrors `premiumExitStarted`, which
+   * solves the same problem for the ADR bot. It is only consulted for strategies that actually
+   * monitor a spread (`positionMonitoringEnabled`), so a reduce-only position strategy — whose whole
+   * purpose is reduce-only orders on the entry sides — can never be mistaken for an exited one.
+   */
+  private positionExitStarted(actor: StrategyActor): boolean {
+    if (actor.kind !== 'position') return false;
+    const ledger = this.strategyLedger(actor.id);
+    const configKey = JSON.stringify(actor.config);
+    if (ledger.configKey === configKey && ledger.positionExitStarted !== undefined) {
+      return ledger.positionExitStarted;
+    }
+    const legs = legsOf(actor.config);
+    const started = ledger.rows.some((row) => row.reduce_only === 1 && (
+      (row.leg === 'left' && row.side === oppositeSide(legs.left.side))
+      || (row.leg === 'right' && row.side === oppositeSide(legs.right.side))
+    ));
+    ledger.configKey = configKey;
+    ledger.positionExitStarted = started;
     return started;
   }
 
@@ -1858,7 +1933,39 @@ export class StrategyEngine {
     let condition: string | null = null;
     let result = '';
     let details = '';
-    if (actor.kind === 'position') {
+    if (actor.kind === 'position' && this.positionMonitoringEnabled(actor.config)
+      && (actor.positionExitArmed || this.positionExitStarted(actor))) {
+      // A latched position exit is a one-way lifecycle: once the take-profit / stop-loss exit has
+      // been submitted the strategy never opens again, it only converges to flat. A stop-loss ends
+      // STOPPED (manual restart, exactly like the auto stop-loss) and a take-profit ends COMPLETED
+      // (the premium take-profit lifecycle), mirroring how each of those already behaves.
+      const quoteOrderIds = new Set([...actor.quotes.values()].map((quote) => quote.orderId));
+      const noOpenOrders = this.openStrategyOrders(actor.id, quoteOrderIds).length === 0;
+      const flat = exposure.left.abs().lte(QUANTITY_EPSILON)
+        && exposure.right.abs().lte(QUANTITY_EPSILON);
+      if (noOpenOrders && flat) {
+        if (actor.positionExitReason === 'stop-loss') {
+          if (!(await this.cancelQuotes(actor))) return;
+          actor.status = 'STOPPED';
+          const now = new Date().toISOString();
+          this.database.prepare(`UPDATE execution_strategies SET status = 'STOPPED', open_position = '0',
+            stopped_at = ?, updated_at = ? WHERE id = ?`).run(now, now, actor.id);
+          this.runtime.addStrategyLog(actor.id, 'info', 'Strategy stopped', 'Stop-loss exit complete',
+            `0 ${actor.config.asset} remaining`, 'Both legs closed after the stop-loss triggered; manual restart required');
+          this.releaseQuoteWatch(actor);
+          this.actors.delete(actor.id);
+          this.runtime.emitStrategyUpdate(this.runtime.getStrategy(actor.id));
+          return;
+        }
+        condition = 'Take-profit lifecycle';
+        result = `0 ${actor.config.asset} remaining`;
+        details = 'Both legs closed at the take-profit threshold; this strategy will not re-enter';
+      }
+    } else if (actor.kind === 'position' && !this.positionMonitoringEnabled(actor.config)) {
+      // Without take-profit / stop-loss thresholds a position strategy keeps the original open-only
+      // lifecycle: it completes as soon as the target quantity is filled and hedged. Configuring
+      // either threshold keeps it RUNNING past that point so the exit can actually be evaluated —
+      // the whole point of the feature, and the reason this branch is skipped for those strategies.
       const total = new Decimal(actor.config.totalAmount ?? '0');
       const imbalance = exposure.left.plus(exposure.right);
       if (total.gt(0) && matched.gte(total.minus(QUANTITY_EPSILON)) && imbalance.abs().lte(QUANTITY_EPSILON)) {
@@ -2100,6 +2207,29 @@ export class StrategyEngine {
     if (actor.kind === 'auto' && actor.stopLossArmed) {
       // A latched stop-loss exit only unwinds; no new entries, no maker quotes.
       await this.continueAutoStopLossExit(actor);
+    } else if (actor.kind === 'position') {
+      // A position strategy carries its own take-profit / stop-loss lifecycle. The trigger is
+      // evaluated on every tick *before* the entry routing, so an adverse move can never be
+      // re-entered into on the same tick it fires (the auto stop-loss takes the same position).
+      if (!actor.positionExitArmed && this.positionMonitoringEnabled(actor.config)
+        && this.positionExitStarted(actor)) {
+        // The ledger already holds the exit's reduce-only order, so a previous process began the
+        // unwind. Re-arm without re-deciding: entering again here would reopen the very position
+        // that is being closed. The original reason is not persisted, so it stays unknown and the
+        // resumed unwind is reported as a take-profit lifecycle.
+        actor.positionExitArmed = true;
+      }
+      if (actor.positionExitArmed) {
+        await this.continuePositionExit(actor);
+        await this.checkCompletion(actor);
+        return;
+      }
+      if (await this.maybeTriggerPositionExit(actor)) {
+        await this.checkCompletion(actor);
+        return;
+      }
+      if (actor.config.executionMethod === 'MAKER_TAKER') await this.evaluateMakerQuotes(actor);
+      else await this.evaluateTakerClip(actor);
     } else if (actor.config.executionMethod === 'MAKER_TAKER') {
       await this.evaluateMakerQuotes(actor);
     } else if (actor.kind === 'premium') {
@@ -2217,6 +2347,18 @@ export class StrategyEngine {
   }
 
   /**
+   * True when this exit clip is a stop-loss unwind, which must be labelled `Stop-loss …` instead of
+   * `Take-profit …`. One helper for the trigger row and the fill row so the two can never disagree:
+   * an `auto` strategy uses its latched stop, a `position` strategy uses the reason its latch
+   * recorded. Everything else (take-profit, reduce-only, carry) is not a stop and stays unlabelled.
+   */
+  private isStopLossExit(actor: StrategyActor, intent: QuoteIntent): boolean {
+    if (intent !== 'exit') return false;
+    if (actor.kind === 'auto') return actor.stopLossArmed;
+    return actor.kind === 'position' && actor.positionExitReason === 'stop-loss';
+  }
+
+  /**
    * Auto stop-loss: when the live spread has moved past the configured bps in the adverse
    * direction relative to the signed entry threshold, close the entire open position with one
    * reduce-only taker clip. The strategy itself stops once that exit has fully filled.
@@ -2247,6 +2389,161 @@ export class StrategyEngine {
     if (!matched.gt(QUANTITY_EPSILON)) return;
     await this.executeTakerClip(actor, 'exit',
       Decimal.min(new Decimal(actor.config.perOrderQuantity), matched), 'Stop-loss exit in progress');
+  }
+
+  /**
+   * Whether a position strategy monitors its spread for an exit at all. True only when the strategy
+   * is a plain `position` (never a close plan) **and** at least one of `takeProfitBps` /
+   * `stopLossBps` carries a usable value.
+   *
+   * This predicate is the compatibility switch for the whole feature: a position strategy without
+   * either threshold keeps the original open-only lifecycle — it completes the moment its target
+   * quantity is filled (`checkCompletion`) and never evaluates a spread afterwards. A configured
+   * threshold is the user asking for a monitored position, so completion is deferred and both
+   * thresholds are evaluated every tick.
+   */
+  private positionMonitoringEnabled(config: CreateStrategyInput): boolean {
+    if (config.kind !== 'position' || config.closePlan) return false;
+    const takeProfit = optionalDecimal(config.takeProfitBps);
+    const stopLoss = optionalDecimal(config.stopLossBps);
+    return takeProfit !== null || (stopLoss !== null && stopLoss.gt(0));
+  }
+
+  /**
+   * Position take-profit / stop-loss trigger.
+   *
+   * Semantics are deliberately identical to the auto spread bot:
+   * - take-profit fires when the **executable exit spread** (`exitSpreadBps`: the leg that must be
+   *   sold hits its bid, the leg that must be bought pays its ask) is at or below `takeProfitBps`;
+   * - stop-loss fires when the **live spread** (`entrySpreadBps`) is at or beyond the signed stop
+   *   line, judged by {@link adverseBreached} — the very predicate the auto entry gate and the auto
+   *   stop share, so "breached" can never mean two different things in one engine.
+   *
+   * Both readings come from `freshMarketPair`, so they inherit the existing freshness gate (15 s
+   * per leg, 3 s transport, 2 s cross-leg skew). No looser path is introduced: an exit is never
+   * triggered off a quote the entry path would have refused.
+   *
+   * A missing field disables exactly that one threshold — never both, and never a default of 0 — so
+   * a strategy that configures only a stop-loss cannot accidentally take profit at 0 bps.
+   *
+   * The latch (`positionExitArmed`) is set *before* the clip is submitted, so a rejected or
+   * partially filled exit is retried by {@link continuePositionExit} on later ticks instead of being
+   * re-decided (and re-logged) on every tick. The stop-loss is checked first: an adverse move must
+   * never be masked by a same-tick take-profit reading.
+   */
+  private async maybeTriggerPositionExit(actor: StrategyActor): Promise<boolean> {
+    if (actor.positionExitArmed) return false;
+    if (!this.positionMonitoringEnabled(actor.config)) return false;
+    const takeProfit = optionalDecimal(actor.config.takeProfitBps);
+    const stopLoss = optionalDecimal(actor.config.stopLossBps);
+    const stopActive = stopLoss !== null && stopLoss.gt(0);
+    if (!stopActive && takeProfit === null) return false;
+    // Thresholds are parsed before the ledger is read: an unconfigured strategy must cost nothing.
+    const exposure = this.legExposures(actor.id, actor.config);
+    const matched = this.matchedQuantity(exposure);
+    if (!matched.gt(QUANTITY_EPSILON)) return false;
+
+    if (stopActive) {
+      const entry = this.entrySpreadBps(actor.config);
+      if (entry && this.adverseBreached(actor.config, entry.spread)) {
+        actor.positionExitArmed = true;
+        actor.positionExitReason = 'stop-loss';
+        this.runtime.addStrategyLog(actor.id, 'warning', 'Stop-loss triggered',
+          `Spread ${entry.spread.toFixed(2)} bps hit the ${stopLoss.toString()} bps stop-loss`,
+          matched.toString(), 'Closing both legs with market orders; the strategy stops when flat');
+        // A resting entry quote must not survive the stop: it would re-open the leg being closed.
+        await this.cancelQuotes(actor);
+        await this.executeTakerClip(actor, 'exit', matched,
+          `Spread ${entry.spread.toFixed(2)} bps hit the ${stopLoss.toString()} bps stop-loss`);
+        return true;
+      }
+    }
+
+    if (takeProfit !== null) {
+      const exitSpread = this.exitSpreadBps(actor.config);
+      if (exitSpread && exitSpread.lte(takeProfit)) {
+        actor.positionExitArmed = true;
+        actor.positionExitReason = 'take-profit';
+        await this.cancelQuotes(actor);
+        // `executeTakerClip` writes the `Take-profit triggered` / `Take-profit Executed` pair with
+        // this condition, so the bps reading and the fill result are already in the log — a second
+        // decision row under the same event name would only duplicate it.
+        await this.executeTakerClip(actor, 'exit', matched,
+          `Exit spread ${exitSpread.toFixed(2)} bps ≤ ${takeProfit.toString()} bps take-profit`);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Unwind the remainder of a latched position exit in configured per-order clips. Idempotent: a
+   * zero remaining quantity is a no-op, and an exit clip that is still open blocks a second one, so
+   * two consecutive ticks that both satisfy the threshold submit exactly one exit per clip.
+   */
+  private async continuePositionExit(actor: StrategyActor): Promise<void> {
+    if (actor.busy) return;
+    // Never stack a second exit clip on an exit that is still open. The ledger only moves on fills,
+    // so without this an exit order that outlives its `awaitTerminalOrder` budget would be
+    // resubmitted on every following tick — the "two consecutive frames both satisfied the
+    // threshold" duplication. `ensureHedged` guards its repair the same way.
+    if (this.openStrategyOrders(actor.id, new Set()).length > 0) return;
+    const exposure = this.legExposures(actor.id, actor.config);
+    const matched = this.matchedQuantity(exposure);
+    if (!matched.gt(QUANTITY_EPSILON)) return;
+    const perOrder = new Decimal(actor.config.perOrderQuantity);
+    const quantity = perOrder.gt(QUANTITY_EPSILON) ? Decimal.min(perOrder, matched) : matched;
+    await this.executeTakerClip(actor, 'exit', quantity,
+      actor.positionExitReason === 'stop-loss' ? 'Stop-loss exit in progress' : 'Take-profit exit in progress');
+  }
+
+  /**
+   * Exposure ceiling configured for a position strategy, or null when `maxPosition` is absent.
+   * `maxPosition` is a left-leg quantity ceiling (the same unit as `totalAmount`), so it bounds the
+   * *whole* position — filled quantity plus anything still in flight.
+   */
+  private positionExposureLimit(config: CreateStrategyInput): Decimal | null {
+    if (config.kind !== 'position') return null;
+    const limit = optionalDecimal(config.maxPosition);
+    return limit !== null && limit.gt(0) ? limit : null;
+  }
+
+  /**
+   * Admission check for a position entry / add-on clip: would placing `clip` push committed
+   * exposure past `maxPosition`?
+   *
+   * Deliberately a hard refusal rather than a silent resize. Quietly shrinking the clip to the
+   * remaining room would hide a misconfigured ceiling (a `maxPosition` that is not a multiple of
+   * `perOrderQuantity`) behind orders that look normal in the log, and the operator would never
+   * learn that the strategy never reached its `totalAmount`. Returns the human-readable reason, or
+   * null when the clip is admitted.
+   */
+  private positionCapRejection(
+    actor: StrategyActor,
+    exposure: { left: Decimal; right: Decimal },
+    clip: Decimal,
+  ): string | null {
+    const limit = this.positionExposureLimit(actor.config);
+    if (limit === null) return null;
+    const committed = this.placedQuantity(actor, exposure);
+    const projected = committed.plus(clip);
+    if (projected.lte(limit.plus(QUANTITY_EPSILON))) return null;
+    const asset = actor.config.asset;
+    return `${projected.toString()} ${asset} would exceed the ${limit.toString()} ${asset} max position`
+      + ` (${committed.toString()} committed + ${clip.toString()} requested)`;
+  }
+
+  /**
+   * Report a refused clip once per blocked episode. Logging every tick would flood the execution log
+   * for a strategy that structurally cannot grow; the state transition is what matters, and the flag
+   * is cleared as soon as a clip is admitted again.
+   */
+  private reportPositionCapBlocked(actor: StrategyActor, reason: string): void {
+    if (actor.positionCapBlocked) return;
+    actor.positionCapBlocked = true;
+    this.runtime.addStrategyLog(actor.id, 'warning', 'Entry blocked by max position',
+      reason, `${actor.config.maxPosition ?? '—'} ${actor.config.asset}`,
+      'No order was submitted; exposure stays at the configured max position');
   }
 
   /**
@@ -2664,6 +2961,15 @@ export class StrategyEngine {
       const capacity = this.remainingEntryCapacity(actor, exposure);
       const quantity = Decimal.min(perOrder, capacity);
       if (quantity.gt(QUANTITY_EPSILON)) {
+        // `maxPosition` is a hard ceiling on total exposure, checked before anything is submitted.
+        // A clip that would breach it is refused outright (never quietly resized) and the reason is
+        // reported once — see `positionCapRejection`.
+        const capRejection = this.positionCapRejection(actor, exposure, quantity);
+        if (capRejection !== null) {
+          this.reportPositionCapBlocked(actor, capRejection);
+          return;
+        }
+        actor.positionCapBlocked = false;
         // An add-on clip *is* an entry clip, so it reuses the existing events and carries its tier
         // in the condition instead of inventing a new event name (§8.8). Tier 0 is the opening
         // clip rather than an add-on, so it keeps the original wording — only the clips the ladder
@@ -2853,8 +3159,9 @@ export class StrategyEngine {
       const reduceOnly = intent === 'exit' || actor.config.reduceOnly;
       // An exit driven by a latched auto stop-loss must not be labelled "Take-profit" — this is the
       // C2 mislabelling: with a position open, `intent === 'exit'` covered both take-profit and
-      // stop-loss unwinds. Otherwise the event names are unchanged (C2).
-      const stopLossExit = actor.kind === 'auto' && actor.stopLossArmed && intent === 'exit';
+      // stop-loss unwinds. Otherwise the event names are unchanged (C2). A latched `position`
+      // stop-loss is the same hazard and is judged by the same helper.
+      const stopLossExit = this.isStopLossExit(actor, intent);
       const triggeredEvent = stopLossExit ? 'Stop-loss exit triggered'
         : intent === 'exit' ? 'Take-profit triggered'
         : actor.config.reduceOnly ? 'Reduce-only triggered' : 'Entry triggered';
@@ -2916,7 +3223,7 @@ export class StrategyEngine {
       const left = settled.find((order) => order.strategyLeg === 'left');
       const right = settled.find((order) => order.strategyLeg === 'right');
       if (left?.state === 'FILLED' && right?.state === 'FILLED') {
-        const stopLossExit = actor.kind === 'auto' && actor.stopLossArmed && intent === 'exit';
+        const stopLossExit = this.isStopLossExit(actor, intent);
         const executedEvent = stopLossExit ? 'Stop-loss Executed'
           : intent === 'exit' ? 'Take-profit Executed'
           : actor.config.reduceOnly ? 'Reduce-only Executed' : 'Position open Executed';
@@ -3016,7 +3323,16 @@ export class StrategyEngine {
         || this.applyMakerEntryProximity(actor, liveSpread, distance, nextTier);
       if (gateOk && tierOk && withinProximity) {
         const entryQuantity = this.carryAdjustedMakerQuantity(actor, exposure, Decimal.min(perOrder, entryCapacity));
-        if (entryQuantity.gt(QUANTITY_EPSILON)) intents.push({ intent: 'entry', quantity: entryQuantity, tier: nextTier });
+        if (entryQuantity.gt(QUANTITY_EPSILON)) {
+          // Same `maxPosition` ceiling as the taker path: a resting entry quote is exposure too, so
+          // it is judged before it is placed rather than after it fills.
+          const capRejection = this.positionCapRejection(actor, exposure, entryQuantity);
+          if (capRejection !== null) this.reportPositionCapBlocked(actor, capRejection);
+          else {
+            actor.positionCapBlocked = false;
+            intents.push({ intent: 'entry', quantity: entryQuantity, tier: nextTier });
+          }
+        }
       }
     }
     if (actor.kind === 'auto' && actor.config.takeProfitBps) {

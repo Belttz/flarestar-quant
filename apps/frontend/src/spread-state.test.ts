@@ -148,10 +148,14 @@ describe('buildSpreadReadout', () => {
     expect(readout.buyPrice).toBe(100);
   });
 
-  it('refuses a spread whose legs quote seconds apart', () => {
+  it('still shows the spread when the legs quote seconds apart, labelled as out of sync', () => {
     const readout = buildSpreadReadout({ sell: leg(101, NOW), buy: leg(100, NOW - 30_000) });
-    expect(readout).toMatchObject({ status: 'unaligned', reason: 'skew_exceeded', bps: null, gap: null, skewMs: 30_000 });
-    expect(readout.messageKey).toBe('Leg quotes are not time-aligned');
+    // Hiding the number was the bug: a 30s gap is annotated, not blanked.
+    expect(readout).toMatchObject({
+      status: 'approximate', reason: 'skew_exceeded', approximate: true, bps: 100, skewMs: 30_000,
+    });
+    expect(readout.gap).toBeCloseTo(1);
+    expect(readout.messageKey).toBe('Legs out of sync');
   });
 
   it('accepts a pair exactly at the skew budget', () => {
