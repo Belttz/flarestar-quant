@@ -15,6 +15,10 @@ All notable changes to Gate CrossEx are documented in this file.
 - Settings persistence/validation extended with confirmation, persistence, margin-headroom, ADL and maker-leg controls; decision reason codes now include `CONFIRMATION_PENDING`, `PAIR_COOLDOWN`, `DAILY_LOSS_LIMIT`, `FUNDING_PERSISTENCE`, `FUNDING_SPIKE`.
 - Dry-run open positions now rehydrate from SQLite on restart; history-replayed confirmation removes the two-scan wait after a restart.
 
+### Fixed
+
+- **KRAKEN legs were permanently rejected by the settlement-distance gate.** Kraken's ticker payload does not publish a next-funding timestamp, so the adapter hard-coded `nextFundingAt: null`; the funding-arb monitor treats an unknown timestamp as "settlement too close" and rejected every candidate containing a KRAKEN leg (including the highest-APR LQTY/TREAD pairs). The adapter now derives the next hourly boundary, matching Kraken's hourly settlement cadence.
+
 ### Not implemented
 
 - **Exchange-side stop/TP brackets.** The Gate CrossEx SDK (`gate-api` `CrossexOrderRequest.Type`) exposes only `LIMIT` and `MARKET`; there is no conditional/stop order type to place venue-side protection. The engine keeps its bot-side stop-loss and the ADL/orphan guardian instead.

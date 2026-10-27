@@ -58,6 +58,7 @@
 
 ## 7. 已知限制
 
+- KRAKEN 的 `nextFundingAt` 由适配器按整点推算（Kraken 不返回该字段）；DERIBIT 仍为 `null`，含 DERIBIT 腿的候选会被结算距离门槛拒绝，后续按同样方式补。
 - **交易所侧止损/止盈 bracket 未实现**：Gate CrossEx 官方 SDK 的 `CrossexOrderRequest.Type` 只有 `LIMIT` / `MARKET`，没有条件单类型；目前只有 bot 侧止损 + ADL/孤儿守护。
 - 无独立 paper-trading 环境：干跑是监控层模拟（成交按当时报价近似，不含真实滑点）。
 - 重启后 `lastPassKeys` 由历史回放重建；连亏计数从策略表读取，天然持久；干跑持仓从 DB 恢复。
