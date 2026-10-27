@@ -741,13 +741,20 @@ const chinese: Record<string, string> = {
   'Leverage must be between 1× and 200×.': '杠杆需在 1× 到 200× 之间。',
   'Take-profit is normally below the entry threshold.': '止盈通常应低于入场阈值。',
   'Stop-loss is normally wider than the entry threshold.': '止损通常应宽于入场阈值。',
+  'APR': '年化', 'Auto-execute off': '自动执行关', 'Auto-execute on': '自动执行开', 'Candidate filter': '候选筛选',
+  'Discard changes': '放弃修改', 'Dry run': '干跑', 'Emergency stop disables monitoring and auto-execute. Continue?': '紧急停止会同时关闭监测和自动执行，确定继续？', 'Entry execution': '入场执行',
+  'Entry gates': '入场门槛', 'Exchange live': '交易所实盘', 'Exchange readonly': '交易所只读', 'Exit rules': '出场规则',
+  'Fees': '手续费', 'Fixed': '固定', 'Fixed leverage': '固定杠杆', 'Funding': '资金费',
+  'How to use this panel': '使用说明', 'Left (short)': '左腿（空）', 'Live mode': '实盘模式', 'Min funding APR': '最低资金费率年化',
+  'Min net per wave': '单次净收益下限', 'Pass': '通过', 'PnL': '盈亏', 'Reject': '拒绝',
+  'Right (long)': '右腿（多）', 'Risk & guards': '风控与守护', 'Runner controls': '执行器控制', 'Save parameters': '保存参数',
+  'Scan & confirmation': '扫描与确认', 'Sizing & leverage': '仓位与杠杆', 'Start monitoring': '开始监测', 'Stop monitoring': '停止监测',
+  'To settlement': '距结算', 'pass': '通过',
 };
 
 /**
  * Leg diagnostics are persisted as `${Left|Right} leg ${order.state.toLowerCase()}`, so the state
- * tail is an open set: `filled` / `cancelled` / … but also gateway states such as
- * `remote_not_found`, `fail`, `new` or `open`, and anything a future venue adds. Enumerating them
- * in `chinese` is impossible, so these rows go through a template instead. A state the table does
+ * classifier and the fetch set share one template. A state the translation table does
  * not know keeps its raw English tail (`左腿 remote_not_found`) — a half-translated row is useful
  * and greppable, while an empty cell or `undefined` would be a silent data loss.
  */
