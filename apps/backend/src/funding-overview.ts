@@ -64,9 +64,18 @@ export class FundingOverviewService {
     this.warn = options.warn ?? (() => undefined);
   }
 
-  /** Cold call awaits the first sweep; warm calls serve cached rows and revalidate in the background. */
-  async ensureFresh(): Promise<void> {
+  /**
+   * Cold call awaits the first sweep; warm calls serve cached rows and revalidate in the background.
+   * A manual funding-arb scan passes `force: true` so "Scan now" really waits for the venue sweep —
+   * otherwise a warm-but-old cache returns instantly, `cacheStatus` stays `stale`, and every
+   * candidate is rejected with DATA_STALE even though the operator just asked for fresh data.
+   */
+  async ensureFresh(force = false): Promise<void> {
     if (typeof this.gateway.queryVenueFundingStats !== 'function') return;
+    if (force) {
+      await this.refresh();
+      return;
+    }
     const last = this.lastRefreshCompletedAt;
     const now = this.now();
     if (last !== null && now - last <= this.currentFreshMs(now)) return;

@@ -57,7 +57,7 @@ export interface FundingArbMonitorDeps {
   database: Database.Database;
   now?: () => number;
   fundingOverview: {
-    ensureFresh(): Promise<void>;
+    ensureFresh(force?: boolean): Promise<void>;
     buildResponse(catalog: { assets: ReadonlyMap<string, MarketCatalogVenue[]> }): FundingOverviewResponse;
   };
   catalog: () => { assets: ReadonlyMap<string, MarketCatalogVenue[]> } | null;
@@ -170,7 +170,7 @@ export class FundingArbMonitor {
     this.scans += 1;
     this.lastScanAt = new Date(now).toISOString();
     try {
-      const result = await this.scan(settings, now);
+      const result = await this.scan(settings, now, options.manual === true);
       this.lastResult = result;
       this.lastError = null;
       this.updateDryRunTrades(now);
@@ -223,10 +223,10 @@ export class FundingArbMonitor {
     return base % SETTLEMENT_QUANTUM_MS === anchor ? base : base;
   }
 
-  private async scan(settings: FundingArbSettings, now: number): Promise<FundingArbScanResponse> {
+  private async scan(settings: FundingArbSettings, now: number, forceRefresh = false): Promise<FundingArbScanResponse> {
     const catalog = this.deps.catalog();
     if (!catalog) throw new Error('market catalog unavailable');
-    await this.deps.fundingOverview.ensureFresh();
+    await this.deps.fundingOverview.ensureFresh(forceRefresh);
     const overview = this.deps.fundingOverview.buildResponse(catalog);
     const dataFresh = overview.cacheStatus === 'fresh';
     const candidates = buildFundingArbCandidates(overview, settings.venueWhitelist);
