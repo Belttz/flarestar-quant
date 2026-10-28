@@ -714,6 +714,7 @@ export class StrategyEngine {
   async startStrategy(
     raw: unknown,
     account: { profileId: string; label: string } | null = null,
+    options: { allowStaleQuote?: boolean } = {},
   ): Promise<StrategyRecord> {
     const input = CreateStrategyInputSchema.parse(raw);
     // Grid strategies remain readable/resumable for historical compatibility, but the product no
@@ -759,6 +760,7 @@ export class StrategyEngine {
     // symbol. The subscription lives from here until the runtime actor takes ownership; any
     // failure in between (validation, margin preflight, persistence) releases it in `finally`.
     let launchQuoteWatchRelease: (() => void) | null = null;
+    let staleQuoteFallback = false;
     try {
       if (input.closePlan) {
         for (const target of input.closePlan.targets) {
@@ -781,8 +783,10 @@ export class StrategyEngine {
         }
         launchQuoteWatchRelease = this.openLegWatch([legs.left.symbol, legs.right.symbol]);
         // Dynamic symbols may still be waiting for their first ticker frame; wait for live prices
-        // instead of rejecting a tradable strategy at the first size/price check below.
-        await this.awaitFreshMarketPair(legs);
+        // instead of rejecting a tradable strategy at the first size/price check below. A manual
+        // launch (the operator already decided from historical data) may fall back to the latest
+        // non-zero quote after the fresh-price wait expires instead of refusing to open at all.
+        staleQuoteFallback = await this.awaitFreshMarketPair(legs, options.allowStaleQuote === true);
         this.validateStrategyOrderSizes(input, legs);
         marginPreflight = await this.prepareStrategy(input, legs);
       }
@@ -814,6 +818,10 @@ export class StrategyEngine {
               + `${input.takeProfitBps ? ` · take-profit ${input.takeProfitBps} bps` : ''}`
               + `${input.stopLossBps ? ` · stop-loss ${input.stopLossBps} bps` : ''}`
               + `${input.maxPosition ? ` · max ${input.maxPosition} ${input.asset}` : ''}`;
+      if (staleQuoteFallback) {
+        this.runtime.addStrategyLog(id, 'warning', 'Started on latest available quote', '—',
+          '—', 'Fresh WebSocket quote unavailable; using the most recent non-zero market quote for entry sizing');
+      }
       this.runtime.addStrategyLog(id, 'info', 'Strategy started', startCondition,
         input.closePlan ? `${input.closePlan.targets.length} position${input.closePlan.targets.length === 1 ? '' : 's'}` : `${input.perOrderQuantity} ${input.asset}`,
         input.closePlan
@@ -1252,7 +1260,8 @@ export class StrategyEngine {
    */
   private async awaitFreshMarketPair(
     legs: { left: LegDefinition; right: LegDefinition },
-  ): Promise<void> {
+    allowStaleFallback = false,
+  ): Promise<boolean> {
     const deadline = this.options.now() + this.options.marketDataWaitTimeoutMs;
     const executablePrice = (market: LiveMarket, side: 'BUY' | 'SELL') =>
       new Decimal(side === 'BUY' ? market.askPrice : market.bidPrice);
@@ -1260,8 +1269,14 @@ export class StrategyEngine {
       const pair = this.freshMarketPair(legs.left.symbol, legs.right.symbol);
       if (pair
         && executablePrice(pair.left, legs.left.side).gt(0)
-        && executablePrice(pair.right, legs.right.side).gt(0)) return;
+        && executablePrice(pair.right, legs.right.side).gt(0)) return false;
       if (this.options.now() >= deadline) {
+        if (allowStaleFallback) {
+          const latest = this.latestMarketPair(legs.left.symbol, legs.right.symbol);
+          if (latest
+            && executablePrice(latest.left, legs.left.side).gt(0)
+            && executablePrice(latest.right, legs.right.side).gt(0)) return true;
+        }
         throw new StrategyEngineError('strategy_market_data_unavailable', 409,
           `${legs.left.symbol}, ${legs.right.symbol}`);
       }
@@ -1272,6 +1287,23 @@ export class StrategyEngine {
       }
       await new Promise((resolveWait) => setTimeout(resolveWait, MARKET_WAIT_POLL_MS));
     }
+  }
+
+  /**
+   * Latest executable pair ignoring freshness/skew. Manual launches are decided from historical
+   * data; after the fresh-price wait they may proceed on the most recent non-zero quote and let
+   * the continuous watchers upgrade it to live prices once the strategy is running.
+   */
+  private latestMarketPair(
+    leftSymbol: string,
+    rightSymbol: string,
+  ): { left: LiveMarket; right: LiveMarket } | null {
+    const left = this.markets.market(leftSymbol);
+    const right = this.markets.market(rightSymbol);
+    if (!left || !right) return null;
+    if (Number(left.bidPrice) <= 0 || Number(left.askPrice) <= 0) return null;
+    if (Number(right.bidPrice) <= 0 || Number(right.askPrice) <= 0) return null;
+    return { left, right };
   }
 
   private strategyLedger(strategyId: string): StrategyLedgerCache {

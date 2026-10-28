@@ -2317,7 +2317,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         return strategyEngine.startStrategy(request.body, {
           profileId,
           label: profile?.label ?? (provider === 'env_file' ? 'Gate CrossEx (.env)' : 'Gate CrossEx'),
-        });
+        }, { allowStaleQuote: true });
       });
     }
     catch (error) {

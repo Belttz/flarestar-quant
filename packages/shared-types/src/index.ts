@@ -1755,6 +1755,8 @@ export const STRATEGY_LOG_EVENT_CATEGORY: Record<string, StrategyLogEventCategor
   'Maker exit fallback': 'risk',
   // System lifecycle.
   'Strategy started': 'system',
+  // Manual launch accepted the latest non-zero quote after the fresh-ticker wait expired.
+  'Started on latest available quote': 'system',
   'Strategy resumed': 'system',
   'Strategy paused': 'system',
   'Strategy stopped': 'system',
