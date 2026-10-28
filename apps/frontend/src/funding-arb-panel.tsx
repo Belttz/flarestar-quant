@@ -201,6 +201,8 @@ export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () =>
   const [busy, setBusy] = useState(false);
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [candidateFilter, setCandidateFilter] = useState<'all' | 'PASS' | 'REJECT'>('all');
+  const [tab, setTab] = useState<'candidates' | 'trades' | 'audit'>('candidates');
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [pendingConfirm, setPendingConfirm] = useState<null | {
     title: string;
     message: string;
@@ -275,8 +277,9 @@ export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () =>
   const candidates = useMemo(() => status?.lastResult?.candidates ?? [], [status]);
   const filteredCandidates = useMemo(() => candidates
     .filter((candidate) => candidateFilter === 'all' || candidate.verdict === candidateFilter)
-    .slice(0, 20), [candidates, candidateFilter]);
-  const passCount = candidates.filter((candidate) => candidate.verdict === 'PASS').length;
+    .slice(0, 60), [candidates, candidateFilter]);
+  const totalCandidates = status?.lastResult?.candidateCount ?? candidates.length;
+  const passCount = status?.lastResult?.passCount ?? candidates.filter((candidate) => candidate.verdict === 'PASS').length;
   const settings = status?.settings;
   const running = status?.running ?? false;
 
@@ -346,63 +349,81 @@ export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () =>
   };
 
   return (
-    <section className="terminal-panel funding-arb-panel" aria-label={t('Automatic funding arbitrage')}>
-      <header className="funding-arb-head">
-        <div>
+    <section className="funding-arb-panel terminal-panel" aria-label={t('Automatic funding arbitrage')}>
+      <header className="fa-head">
+        <div className="fa-title">
           <p className="eyebrow">{t('Perp ⇄ perp · automatic')}</p>
           <h2>{t('Funding arbitrage runner')}</h2>
-          <p>{t('Scans the funding hedge board on a clock-aligned cadence, sizes the hedge from available margin × leverage and opens the paired position strategy.')}</p>
         </div>
-        <div className="funding-arb-state" role="status">
-          <span className={running ? 'funding-arb-dot live' : 'funding-arb-dot'} />
-          <strong>{running ? t('Running') : t('Stopped')}</strong>
-          <small>
-            {status?.lastScanAt ? `${t('Last scan')} ${new Date(status.lastScanAt).toLocaleTimeString()}` : t('Never scanned')}
-            {status?.lastResult ? ` · ${passCount}/${candidates.length} ${t('pass')}` : ''}
-            {status?.lastResult && !status.lastResult.dataFresh ? ` · ${t('data stale')}` : ''}
-          </small>
+        <div className="fa-head-actions">
+          <span className={`fa-state ${running ? 'on' : ''}`} role="status">
+            <i />{running ? t('Running') : t('Stopped')}
+          </span>
+          <button type="button" className="funding-arb-btn primary" disabled={busy || running} onClick={() => void save({ enabled: true })}>
+            ▶ {t('Start monitoring')}
+          </button>
+          <button type="button" className="funding-arb-btn" disabled={busy || !running} onClick={() => void save({ enabled: false })}>
+            ■ {t('Stop monitoring')}
+          </button>
+          <button type="button" className="funding-arb-btn" disabled={busy} onClick={() => {
+            setBusy(true);
+            void api.scanFundingArb().then((next) => { setStatus(next); setBusy(false); })
+              .catch((caught: unknown) => { setBusy(false); setError(caught instanceof Error ? caught.message : String(caught)); });
+          }}>⟳ {t('Scan now')}</button>
+          <button type="button" className="funding-arb-btn" onClick={() => setSettingsOpen(true)}>
+            ⚙ {t('Settings')}
+          </button>
+          <button type="button" className="funding-arb-btn danger" disabled={busy} onClick={() => {
+            if (!window.confirm(t('Emergency stop disables monitoring and auto-execute. Continue?'))) return;
+            void save({ enabled: false, autoExecute: false });
+          }}>⛔ {t('Emergency stop')}</button>
         </div>
       </header>
 
       {error && <p className="funding-arb-error" role="alert">{error}</p>}
 
-      <div className="funding-arb-actionbar" role="group" aria-label={t('Runner controls')}>
-        <div className="funding-arb-actions">
-          <button className="funding-arb-btn primary" disabled={busy || running} onClick={() => void save({ enabled: true })}>
-            ▶ {t('Start monitoring')}
-          </button>
-          <button className="funding-arb-btn" disabled={busy || !running} onClick={() => void save({ enabled: false })}>
-            ■ {t('Stop monitoring')}
-          </button>
-          <button className="funding-arb-btn" disabled={busy} onClick={() => {
-            setBusy(true);
-            void api.scanFundingArb().then((next) => { setStatus(next); setBusy(false); })
-              .catch((caught: unknown) => { setBusy(false); setError(caught instanceof Error ? caught.message : String(caught)); });
-          }}>⟳ {t('Scan now')}</button>
-          <button className="funding-arb-btn danger" disabled={busy} onClick={() => {
-            if (!window.confirm(t('Emergency stop disables monitoring and auto-execute. Continue?'))) return;
-            void save({ enabled: false, autoExecute: false });
-          }}>⛔ {t('Emergency stop')}</button>
+      <div className="fa-overview">
+        <div className="fa-stats">
+          <div className="fa-stat">
+            <span>{t('Last scan')}</span>
+            <strong>{status?.lastScanAt ? new Date(status.lastScanAt).toLocaleTimeString() : t('Never scanned')}</strong>
+            <small>{status?.nextScanAt ? `${t('Next scan')} ${new Date(status.nextScanAt).toLocaleTimeString()}` : '—'}</small>
+          </div>
+          <div className="fa-stat">
+            <span>{t('Pass / candidates')}</span>
+            <strong>{passCount}<em> / {totalCandidates}</em></strong>
+            <small className={status?.lastResult && !status.lastResult.dataFresh ? 'warn' : ''}>
+              {status?.lastResult ? (status.lastResult.dataFresh ? t('Data fresh') : t('Data stale')) : t('No scan yet')}
+            </small>
+          </div>
+          <div className="fa-stat">
+            <span>{t('Mode')}</span>
+            <strong className={dryRun ? 'ok' : 'warn'}>{dryRun ? t('Dry run') : t('Live mode')}</strong>
+            <small>{autoExecute ? t('Auto-execute on') : t('Auto-execute off')}</small>
+          </div>
+          <div className="fa-stat">
+            <span>{t('Key thresholds')}</span>
+            <strong>{settings?.minAprPercent ?? '—'}<em>%</em></strong>
+            <small>{t('Min wave')} {settings?.minNetPerSettlementBps ?? '—'} bps · {t('Net / trade')} {settings?.minTradeNetBps ?? '—'} bps</small>
+          </div>
         </div>
-        <div className="funding-arb-badges">
-          <button type="button" className={`funding-arb-switch ${dryRun ? 'on' : 'off'}`} onClick={askDryRun}
-            title={t('Click to toggle dry run')}>
+
+        <div className="fa-switches" role="group" aria-label={t('Runner switches')}>
+          <button type="button" className={`funding-arb-switch ${dryRun ? 'on' : 'off'}`} onClick={askDryRun} title={t('Click to toggle dry run')}>
             <span className="funding-arb-switch-dot" />
             <span className="funding-arb-switch-text">
               <strong>{dryRun ? t('Dry run on') : t('Dry run off')}</strong>
               <small>{dryRun ? t('No real orders') : t('Real orders possible')}</small>
             </span>
           </button>
-          <button type="button" className={`funding-arb-switch ${autoExecute ? 'on' : 'off'}`} onClick={askAutoExecute}
-            title={t('Click to toggle auto-execute')}>
+          <button type="button" className={`funding-arb-switch ${autoExecute ? 'on' : 'off'}`} onClick={askAutoExecute} title={t('Click to toggle auto-execute')}>
             <span className="funding-arb-switch-dot" />
             <span className="funding-arb-switch-text">
               <strong>{autoExecute ? t('Auto-execute on') : t('Auto-execute off')}</strong>
               <small>{autoExecute ? t('Auto opening positions') : t('Records only')}</small>
             </span>
           </button>
-          <button type="button" className={`funding-arb-switch ${exchangeLive ? 'on' : 'off'}`}
-            onClick={() => onOpenModeDialog?.()} title={t('Switch trading mode')}>
+          <button type="button" className={`funding-arb-switch ${exchangeLive ? 'on' : 'off'}`} onClick={() => onOpenModeDialog?.()} title={t('Switch trading mode')}>
             <span className="funding-arb-switch-dot" />
             <span className="funding-arb-switch-text">
               <strong>{exchangeLive ? t('Exchange live') : t('Exchange readonly')}</strong>
@@ -412,158 +433,188 @@ export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () =>
         </div>
       </div>
 
-      <details className="funding-arb-guide">
-        <summary>{t('How to use this panel')}</summary>
-        <ol>
-          {(language === 'zh' ? [
-            '1. 点「开始监测」：执行器按设定间隔扫描；默认「干跑」只记决策与虚拟成交，不下单。',
-            '2. 看下方候选：通过=所有门槛都过了；原因列会逐条说明为什么被拒。',
-            '3. 干跑成交是“本来会开的单”。准备实盘时：交易所切到 live 模式 → 取消勾选「干跑」→ 再打开「自动执行」并确认。',
-            '4. 「停止监测」只停新的扫描/开仓，已有策略不动；「紧急停止」还会同时关掉自动执行。',
-          ] : [
-            '1. Click “Start monitoring”: the runner scans on its schedule and only records decisions while dry run is on.',
-            '2. Review the candidates below: PASS means every gate cleared; the reasons column explains every rejection.',
-            '3. Dry-run trades show what would have been opened. For real orders: switch live mode on the exchange → uncheck “Dry run” → enable “Auto-execute” and confirm.',
-            '4. “Stop monitoring” stops new scans/entries but leaves open strategies alone; “Emergency stop” also disables auto-execute.',
-          ]).map((step) => <li key={step}>{step}</li>)}
-        </ol>
-      </details>
+      <div className="fa-workspace">
+        <div className="fa-tabs" role="tablist" aria-label={t('Funding arbitrage views')}>
+          <button role="tab" aria-selected={tab === 'candidates'} className={tab === 'candidates' ? 'active' : ''} onClick={() => setTab('candidates')}>
+            {t('Candidates')} <span>{totalCandidates}</span>
+          </button>
+          <button role="tab" aria-selected={tab === 'trades'} className={tab === 'trades' ? 'active' : ''} onClick={() => setTab('trades')}>
+            {t('Dry-run trades')} <span>{trades.length}</span>
+          </button>
+          <button role="tab" aria-selected={tab === 'audit'} className={tab === 'audit' ? 'active' : ''} onClick={() => setTab('audit')}>
+            {t('Audit trail')} <span>{decisions.length}</span>
+          </button>
+        </div>
 
-      {draft && (
-        <div className="funding-arb-settings">
-          {GROUPS.map((group, index) => (
-            <details key={group.title} className="funding-arb-group" open={index === 0}>
-              <summary>
-                <span>{t(group.title)}</span>
-                <small>{hint(group.hint)}</small>
-              </summary>
-              <div className="funding-arb-group-body">
-                {group.selects?.map((select) => (
-                  <label key={String(select.key)} className="funding-arb-field" title={hint(select.help)}>
-                    <span>{t(select.label)}</span>
-                    <select value={String(draft[select.key] ?? '')} disabled={busy}
-                      onChange={(event) => {
-                        draftDirty.current = true;
-                        setSaveState('idle');
-                        setDraft({ ...draft, [select.key]: event.target.value } as FundingArbSettings);
-                      }}>
-                      {select.options.map((option) => <option key={option.value} value={option.value}>{t(option.label)}</option>)}
-                    </select>
-                    <small>{hint(select.help)}</small>
-                  </label>
-                ))}
-                {group.fields.map((field) => field.kind === 'toggle' ? (
-                  <label key={String(field.key)} className="funding-arb-field toggle" title={hint(field.help)}>
-                    <span>{t(field.label)}</span>
-                    <input type="checkbox" checked={Boolean(draft[field.key])} disabled={busy}
-                      onChange={(event) => void save({ [field.key]: event.target.checked } as Partial<FundingArbSettings>)} />
-                    <small>{hint(field.help)}</small>
-                  </label>
-                ) : (
-                  <label key={String(field.key)} className="funding-arb-field" title={hint(field.help)}>
-                    <span>{t(field.label)}{field.unit ? ` (${field.unit})` : ''}</span>
-                    <input inputMode="decimal" value={String(draft[field.key] ?? '')} disabled={busy}
-                      onChange={(event) => updateDraft(field.key, event.target.value)} />
-                    <small>{hint(field.help)}</small>
-                  </label>
+        {tab === 'candidates' && (
+          <div className="fa-tabbody">
+            <div className="fa-toolbar">
+              <div className="funding-arb-filter" role="group" aria-label={t('Candidate filter')}>
+                {(['all', 'PASS', 'REJECT'] as const).map((filter) => (
+                  <button key={filter} className={candidateFilter === filter ? 'active' : ''} onClick={() => setCandidateFilter(filter)}>
+                    {filter === 'all' ? t('All') : filter === 'PASS' ? t('Pass') : t('Reject')}
+                  </button>
                 ))}
               </div>
-            </details>
-          ))}
-          <div className="funding-arb-savebar">
-            <button className="funding-arb-btn primary" disabled={busy} onClick={() => void save(draft)}>{t('Save parameters')}</button>
-            <span className={`funding-arb-save-state ${saveState}`} role="status">
-              {saveState === 'saving' ? t('Saving…') : saveState === 'saved' ? t('Saved') : saveState === 'error' ? t('Save failed') : t('Click Save to apply')}
-            </span>
-            <button className="funding-arb-btn" disabled={busy} onClick={() => { draftDirty.current = false; setDraft(status?.settings ?? draft); }}>{t('Discard changes')}</button>
-          </div>
-        </div>
-      )}
-
-      <div className="funding-arb-tables">
-        <div>
-          <div className="funding-arb-tablehead">
-            <h3>{t('Latest scan')} <small>{candidates.length} {t('candidates')}</small></h3>
-            <div className="funding-arb-filter" role="group" aria-label={t('Candidate filter')}>
-              {(['all', 'PASS', 'REJECT'] as const).map((filter) => (
-                <button key={filter} className={candidateFilter === filter ? 'active' : ''}
-                  onClick={() => setCandidateFilter(filter)}>
-                  {filter === 'all' ? t('All') : filter === 'PASS' ? t('Pass') : t('Reject')}
-                </button>
-              ))}
+              <small className="fa-muted">{t('Showing top')} {filteredCandidates.length} / {totalCandidates}</small>
+            </div>
+            <div className="funding-arb-table-wrap">
+              <table className="funding-arb-table">
+                <thead>
+                  <tr>
+                    <th>{t('Asset')}</th><th>{t('Short / long')}</th><th>{t('APR')}</th>
+                    <th>{t('Entry bps')}</th><th>{t('Notional')}</th><th>{t('To settlement')}</th>
+                    <th>{t('Verdict')}</th><th>{t('Reasons')}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredCandidates.map((candidate) => (
+                    <tr key={candidate.key}>
+                      <td><strong>{candidate.asset}</strong></td>
+                      <td>{candidate.shortVenue} / {candidate.longVenue}</td>
+                      <td>{candidate.aprPercent.toFixed(0)}%</td>
+                      <td>{candidate.entryBps ?? '—'}</td>
+                      <td>{candidate.notionalUsd === null ? '—' : `$${candidate.notionalUsd.toFixed(0)}`}</td>
+                      <td>{formatMs(candidate.settlementInMs)}</td>
+                      <td><span className={candidate.verdict === 'PASS' ? 'funding-arb-pass' : 'funding-arb-reject'}>{t(candidate.verdict === 'PASS' ? 'Pass' : 'Reject')}</span></td>
+                      <td className="funding-arb-reasons">{candidate.reasons.length === 0 ? '—' : candidate.reasons.map((reason) => reasonLabel(reason, language)).join('、')}</td>
+                    </tr>
+                  ))}
+                  {filteredCandidates.length === 0 && <tr><td colSpan={8} className="funding-arb-empty">{t('No scan yet — press “Scan now”.')}</td></tr>}
+                </tbody>
+              </table>
             </div>
           </div>
-          <div className="funding-arb-table-wrap">
-            <table className="funding-arb-table">
-              <thead>
-                <tr>
-                  <th>{t('Asset')}</th><th>{t('Short / long')}</th><th>{t('APR')}</th>
-                  <th>{t('Entry bps')}</th><th>{t('Notional')}</th><th>{t('To settlement')}</th>
-                  <th>{t('Verdict')}</th><th>{t('Reasons')}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredCandidates.map((candidate) => (
-                  <tr key={candidate.key}>
-                    <td>{candidate.asset}</td>
-                    <td>{candidate.shortVenue} / {candidate.longVenue}</td>
-                    <td>{candidate.aprPercent.toFixed(0)}%</td>
-                    <td>{candidate.entryBps ?? '—'}</td>
-                    <td>{candidate.notionalUsd === null ? '—' : `$${candidate.notionalUsd.toFixed(2)}`}</td>
-                    <td>{formatMs(candidate.settlementInMs)}</td>
-                    <td><span className={candidate.verdict === 'PASS' ? 'funding-arb-pass' : 'funding-arb-reject'}>{t(candidate.verdict === 'PASS' ? 'Pass' : 'Reject')}</span></td>
-                    <td className="funding-arb-reasons">{candidate.reasons.length === 0 ? '—' : candidate.reasons.map((reason) => reasonLabel(reason, language)).join('、')}</td>
-                  </tr>
-                ))}
-                {filteredCandidates.length === 0 && <tr><td colSpan={8} className="funding-arb-empty">{t('No scan yet — press “Scan now”.')}</td></tr>}
-              </tbody>
-            </table>
-          </div>
-        </div>
+        )}
 
-        <div>
-          <h3>{t('Dry-run trades')} <small>{trades.length}</small></h3>
-          <div className="funding-arb-table-wrap">
-            <table className="funding-arb-table">
-              <thead>
-                <tr>
-                  <th>{t('Asset')}</th><th>{t('Venues')}</th><th>{t('Notional')}</th>
-                  <th>{t('Funding')}</th><th>{t('Fees')}</th><th>{t('PnL')}</th><th>{t('Status')}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {trades.map((trade) => (
-                  <tr key={trade.id}>
-                    <td>{trade.asset}</td>
-                    <td>{trade.shortVenue} / {trade.longVenue}</td>
-                    <td>${trade.notionalUsd.toFixed(2)}</td>
-                    <td className="funding-arb-pos">${trade.fundingUsd.toFixed(2)}</td>
-                    <td>${trade.feesUsd.toFixed(2)}</td>
-                    <td className={trade.pnlUsd >= 0 ? 'funding-arb-pos' : 'funding-arb-neg'}>${trade.pnlUsd.toFixed(2)}</td>
-                    <td>{t(trade.status === 'OPEN' ? 'Open' : 'Closed')}</td>
+        {tab === 'trades' && (
+          <div className="fa-tabbody">
+            <div className="funding-arb-table-wrap">
+              <table className="funding-arb-table">
+                <thead>
+                  <tr>
+                    <th>{t('Asset')}</th><th>{t('Venues')}</th><th>{t('Notional')}</th>
+                    <th>{t('Funding')}</th><th>{t('Fees')}</th><th>{t('PnL')}</th><th>{t('Status')}</th>
                   </tr>
-                ))}
-                {trades.length === 0 && <tr><td colSpan={7} className="funding-arb-empty">{t('No dry-run trades yet.')}</td></tr>}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {trades.map((trade) => (
+                    <tr key={trade.id}>
+                      <td><strong>{trade.asset}</strong></td>
+                      <td>{trade.shortVenue} / {trade.longVenue}</td>
+                      <td>${trade.notionalUsd.toFixed(0)}</td>
+                      <td className="funding-arb-pos">${trade.fundingUsd.toFixed(2)}</td>
+                      <td>${trade.feesUsd.toFixed(2)}</td>
+                      <td className={trade.pnlUsd >= 0 ? 'funding-arb-pos' : 'funding-arb-neg'}>${trade.pnlUsd.toFixed(2)}</td>
+                      <td>{t(trade.status === 'OPEN' ? 'Open' : 'Closed')}</td>
+                    </tr>
+                  ))}
+                  {trades.length === 0 && <tr><td colSpan={7} className="funding-arb-empty">{t('No dry-run trades yet.')}</td></tr>}
+                </tbody>
+              </table>
+            </div>
           </div>
-        </div>
+        )}
+
+        {tab === 'audit' && (
+          <div className="fa-tabbody">
+            <ul className="fa-audit">
+              {decisions.slice(0, 40).map((decision) => (
+                <li key={decision.id}>
+                  <time dateTime={decision.scannedAt}>{new Date(decision.scannedAt).toLocaleTimeString()}</time>
+                  <strong>{decision.candidateKey}</strong>
+                  <span className={decision.verdict === 'PASS' ? 'funding-arb-pass' : 'funding-arb-reject'}>{t(decision.verdict === 'PASS' ? 'Pass' : 'Reject')}</span>
+                  <span>{decision.reasons.map((reason) => reasonLabel(reason, language)).join('、')}</span>
+                  {decision.strategyId && <code>{decision.strategyId}</code>}
+                </li>
+              ))}
+              {decisions.length === 0 && <li className="funding-arb-empty">{t('No decisions yet.')}</li>}
+            </ul>
+          </div>
+        )}
       </div>
 
-      <details className="funding-arb-audit">
-        <summary>{t('Audit trail')} <small>{decisions.length}</small></summary>
-        <ul>
-          {decisions.slice(0, 20).map((decision) => (
-            <li key={decision.id}>
-              <time dateTime={decision.scannedAt}>{new Date(decision.scannedAt).toLocaleTimeString()}</time>
-              <strong>{decision.candidateKey}</strong>
-              <span className={decision.verdict === 'PASS' ? 'funding-arb-pass' : 'funding-arb-reject'}>{t(decision.verdict === 'PASS' ? 'Pass' : 'Reject')}</span>
-              <span>{decision.reasons.map((reason) => reasonLabel(reason, language)).join('、')}</span>
-              {decision.strategyId && <code>{decision.strategyId}</code>}
-            </li>
-          ))}
-        </ul>
-      </details>
+      {settingsOpen && (
+        <div className="fa-drawer-backdrop" onClick={() => setSettingsOpen(false)}>
+          <aside className="fa-drawer" role="dialog" aria-modal="true" aria-label={t('Settings')} onClick={(event) => event.stopPropagation()}>
+            <header className="fa-drawer-head">
+              <div><p className="eyebrow">{t('Funding arbitrage runner')}</p><h3>{t('Settings')}</h3></div>
+              <button type="button" className="fa-icon-btn" aria-label={t('Close')} onClick={() => setSettingsOpen(false)}>✕</button>
+            </header>
+            <div className="fa-drawer-body">
+              <details className="funding-arb-guide">
+                <summary>{t('How to use this panel')}</summary>
+                <ol>
+                  {(language === 'zh' ? [
+                    '1. 点「开始监测」：执行器按设定间隔扫描；默认「干跑」只记决策与虚拟成交，不下单。',
+                    '2. 「立即扫描」会强制拉取一轮最新行情；候选表只显示前 60 条，完整审计在「审计」页。',
+                    '3. 实盘：交易所切 live → 关闭干跑 → 打开自动执行并确认。',
+                    '4. 参数改完点底部「保存参数」；只有点保存才会落库。',
+                  ] : [
+                    '1. Start monitoring: the runner scans on schedule; dry run records decisions only.',
+                    '2. Scan now forces a fresh venue sweep; the table shows the top 60, the Audit tab has the rest.',
+                    '3. For live orders: exchange live → dry run off → auto-execute on and confirm.',
+                    '4. Edit parameters, then press Save at the bottom; only Save persists them.',
+                  ]).map((step) => <li key={step}>{step}</li>)}
+                </ol>
+              </details>
+
+              {draft && GROUPS.map((group, index) => (
+                <details key={group.title} className="funding-arb-group" open={index === 0}>
+                  <summary>
+                    <span>{t(group.title)}</span>
+                    <small>{hint(group.hint)}</small>
+                  </summary>
+                  <div className="funding-arb-group-body">
+                    {group.selects?.map((select) => (
+                      <label key={String(select.key)} className="funding-arb-field" title={hint(select.help)}>
+                        <span>{t(select.label)}</span>
+                        <select value={String(draft[select.key] ?? '')} disabled={busy}
+                          onChange={(event) => {
+                            draftDirty.current = true;
+                            setSaveState('idle');
+                            setDraft({ ...draft, [select.key]: event.target.value } as FundingArbSettings);
+                          }}>
+                          {select.options.map((option) => <option key={option.value} value={option.value}>{t(option.label)}</option>)}
+                        </select>
+                        <small>{hint(select.help)}</small>
+                      </label>
+                    ))}
+                    {group.fields.map((field) => field.kind === 'toggle' ? (
+                      <label key={String(field.key)} className="funding-arb-field toggle" title={hint(field.help)}>
+                        <span>{t(field.label)}</span>
+                        <input type="checkbox" checked={Boolean(draft[field.key])} disabled={busy}
+                          onChange={(event) => {
+                            draftDirty.current = true;
+                            setSaveState('idle');
+                            setDraft({ ...draft, [field.key]: event.target.checked } as FundingArbSettings);
+                          }} />
+                        <small>{hint(field.help)}</small>
+                      </label>
+                    ) : (
+                      <label key={String(field.key)} className="funding-arb-field" title={hint(field.help)}>
+                        <span>{t(field.label)}{field.unit ? ` (${field.unit})` : ''}</span>
+                        <input inputMode="decimal" value={String(draft[field.key] ?? '')} disabled={busy}
+                          onChange={(event) => updateDraft(field.key, event.target.value)} />
+                        <small>{hint(field.help)}</small>
+                      </label>
+                    ))}
+                  </div>
+                </details>
+              ))}
+            </div>
+            <footer className="fa-drawer-foot">
+              <span className={`funding-arb-save-state ${saveState}`} role="status">
+                {saveState === 'saving' ? t('Saving…') : saveState === 'saved' ? t('Saved') : saveState === 'error' ? t('Save failed') : t('Click Save to apply')}
+              </span>
+              <div>
+                <button type="button" className="funding-arb-btn" disabled={busy} onClick={() => { draftDirty.current = false; setDraft(status?.settings ?? draft ?? null); setSaveState('idle'); }}>{t('Discard changes')}</button>
+                <button type="button" className="funding-arb-btn primary" disabled={busy} onClick={() => draft && void save(draft)}>{t('Save parameters')}</button>
+              </div>
+            </footer>
+          </aside>
+        </div>
+      )}
 
       {pendingConfirm && (
         <div className="funding-arb-modal-backdrop" role="dialog" aria-modal="true" aria-label={pendingConfirm.title}>

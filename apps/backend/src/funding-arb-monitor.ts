@@ -49,6 +49,8 @@ import {
 const DEFAULT_TAKER_FEE_BPS = 4.8;
 const DEFAULT_SLIPPAGE_BPS = 2;
 const SETTLEMENT_TOO_CLOSE_MS = 2 * 60_000;
+/** Rows included in the polled status payload; full scan stays in memory and /decisions. */
+const STATUS_CANDIDATE_LIMIT = 60;
 const DATA_STALE_MS = 90_000;
 const SETTLEMENT_QUANTUM_MS = 30 * 60_000;
 const SETTLEMENT_OFFSET_MS = 30 * 60_000;
@@ -186,6 +188,17 @@ export class FundingArbMonitor {
 
   status(): FundingArbStatusResponse {
     const settings = readFundingArbSettings(this.deps.database);
+    // The scan keeps every candidate in memory for auditing, but the status payload is fetched
+    // every 20s by the panel: serialising all ~7k rows made each poll multiple megabytes. Return
+    // the head of the ranked list plus the true totals; the audit tab reads /decisions.
+    const lastResult = this.lastResult
+      ? {
+          ...this.lastResult,
+          candidates: this.lastResult.candidates.slice(0, STATUS_CANDIDATE_LIMIT),
+          candidateCount: this.lastResult.candidates.length,
+          passCount: this.lastResult.candidates.filter((candidate) => candidate.verdict === 'PASS').length,
+        }
+      : null;
     return {
       settings,
       running: this.runningLoop,
@@ -194,7 +207,7 @@ export class FundingArbMonitor {
       nextScanAt: this.nextScanAt,
       scans: this.scans,
       lastError: this.lastError,
-      lastResult: this.lastResult,
+      lastResult,
     };
   }
 

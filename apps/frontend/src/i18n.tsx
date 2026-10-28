@@ -766,6 +766,10 @@ const chinese: Record<string, string> = {
   'Turn off dry run and enable': '关闭干跑并开启',
   'With dry run off, the runner can submit real orders once auto-execute is on and the exchange is live.': '关闭干跑后，当自动执行开启且交易所实盘时会真实下单。',
 
+  'Data fresh': '数据新鲜', 'Data stale': '数据已过期', 'Funding arbitrage views': '套利视图',
+  'Key thresholds': '关键门槛', 'Min wave': '单次下限', 'Mode': '模式', 'Net / trade': '单笔净收益',
+  'Next scan': '下次扫描', 'No decisions yet.': '暂无判定记录', 'No scan yet': '尚未扫描',
+  'Pass / candidates': '通过 / 候选', 'Showing top': '显示前',
   'Click Save to apply': '修改后点保存生效', 'Saved': '已保存', 'Save failed': '保存失败',
   'To settlement': '距结算', 'pass': '通过',
 };

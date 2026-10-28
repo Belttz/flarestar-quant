@@ -2096,6 +2096,10 @@ export const FundingArbScanResponseSchema = z.object({
   scannedAt: z.string(),
   dataFresh: z.boolean(),
   candidates: z.array(FundingArbCandidateSchema),
+  /** Full candidate count before the status response trims the table payload. */
+  candidateCount: z.number().int().nonnegative().optional(),
+  /** PASS count in the full scan (the trimmed array may not contain every PASS). */
+  passCount: z.number().int().nonnegative().optional(),
 });
 export type FundingArbScanResponse = z.infer<typeof FundingArbScanResponseSchema>;
 
