@@ -1572,7 +1572,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     strategyEngine.start();
     fundingHistoryService.startBackground();
     spreadSampler.startBackground();
-    fundingArbMonitor.startBackground();
+    // Respect the persisted master switch: an enabled=false row means the operator stopped the
+    // runner, so booting the background loop would report running=true while every tick returns
+    // at the enabled guard — a state that looks live but never scans.
+    if (readFundingArbSettings(database).enabled) fundingArbMonitor.startBackground();
     databaseMaintenanceTimer = setInterval(() => {
       runMaintenancePass();
     }, 24 * 60 * 60_000);
