@@ -1185,14 +1185,23 @@ function App() {
     navigate({ workspace: 'Funding Rates', asset });
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }, [navigate]);
+  // A prefill is set immediately before navigating; the route effect below must not clear it in
+  // the render where `route` is still the old workspace (React commits the prefill state first,
+  // the router state second), otherwise the strategy page opens with defaults and no leg symbols.
+  const positionPrefillPendingRef = useRef(false);
   const openFundingStrategy = useCallback((prefill: PairedPositionPrefill) => {
+    positionPrefillPendingRef.current = true;
     setPositionPrefill(prefill);
     navigate({ workspace: 'Strategy', strategyKind: 'position' });
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }, [navigate]);
 
   useEffect(() => {
-    if (route.workspace !== 'Strategy' || route.strategyKind !== 'position') setPositionPrefill(null);
+    if (route.workspace === 'Strategy' && route.strategyKind === 'position') {
+      positionPrefillPendingRef.current = false;
+      return;
+    }
+    if (!positionPrefillPendingRef.current) setPositionPrefill(null);
   }, [route]);
   const availableCatalog = useMemo(
     () => catalog ?? fallbackCatalogFromSnapshot(marketSnapshot),
