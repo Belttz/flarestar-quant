@@ -1540,6 +1540,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
 
   let portfolioReconcileTimer: ReturnType<typeof setTimeout> | null = null;
   let databaseMaintenanceTimer: ReturnType<typeof setInterval> | null = null;
+  let spreadQualityWarmTimer: ReturnType<typeof setInterval> | null = null;
   const schedulePortfolioReconciliation = () => {
     if (!options.startMarketStream) return;
     const interval = Math.round(5 * 60_000 * (0.9 + Math.random() * 0.2));
@@ -1565,6 +1566,21 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     // Bootstrap once per backend process. Concurrent UI tabs and a private-stream ready event
     // join the same single-flight request instead of multiplying five authenticated REST reads.
     triggerPortfolioRefresh();
+    // The spread-quality board computes candles for up to 50 pairs (first call measured ~2.3s in
+    // production). Warm the default board shortly after boot and keep it inside its 5-minute TTL so
+    // the first operator opening that tab gets the cached page instead of the blocking computation.
+    const warmSpreadQuality = () => {
+      const catalog = derivedMarketCatalog();
+      if (!catalog) return;
+      void spreadQualityService.list({ assets: catalog.assets }, { limit: 100 })
+        .catch((error: unknown) => {
+          app.log.warn({ reason: error instanceof Error ? error.message : String(error) }, 'spread quality warmup failed');
+        });
+    };
+    const warmTimer = setTimeout(warmSpreadQuality, 4_000);
+    warmTimer.unref?.();
+    spreadQualityWarmTimer = setInterval(warmSpreadQuality, 4 * 60_000);
+    spreadQualityWarmTimer.unref?.();
   }
   app.addHook('onClose', async () => {
     fundingArbMonitor.stopBackground();
@@ -1573,6 +1589,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     await strategyEngine.stop();
     if (portfolioReconcileTimer) clearTimeout(portfolioReconcileTimer);
     if (databaseMaintenanceTimer) clearInterval(databaseMaintenanceTimer);
+    if (spreadQualityWarmTimer) clearInterval(spreadQualityWarmTimer);
     livePortfolio.stop();
     marketHub.stop();
     privateStream.stop();

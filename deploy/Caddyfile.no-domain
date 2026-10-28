@@ -7,5 +7,6 @@
 #
 # 正式对外使用建议配好域名后改用 deploy/Caddyfile（自带 HTTPS 证书申请）。
 http://:80 {
+	encode zstd gzip
 	reverse_proxy gate-crossex:17840
 }
