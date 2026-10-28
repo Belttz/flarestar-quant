@@ -788,7 +788,7 @@ export class StrategyEngine {
         // non-zero quote after the fresh-price wait expires instead of refusing to open at all.
         staleQuoteFallback = await this.awaitFreshMarketPair(legs, options.allowStaleQuote === true);
         this.validateStrategyOrderSizes(input, legs);
-        marginPreflight = await this.prepareStrategy(input, legs);
+        marginPreflight = await this.prepareStrategy(input, legs, options.allowStaleQuote === true);
       }
       const prefix = input.closePlan ? 'CLOSE' : input.kind === 'auto' ? 'AUTO' : input.kind === 'premium' ? 'PREM' : input.kind === 'carry' ? 'CARRY' : 'PAIR';
       const id = `${prefix}-${randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase()}`;
@@ -1156,8 +1156,10 @@ export class StrategyEngine {
   private async prepareStrategy(
     config: CreateStrategyInput,
     legs: { left: LegDefinition; right: LegDefinition },
+    allowStaleQuote = false,
   ): Promise<{ requiredMargin: string; availableMargin: string }> {
-    const pair = this.freshMarketPair(legs.left.symbol, legs.right.symbol);
+    const pair = this.freshMarketPair(legs.left.symbol, legs.right.symbol)
+      ?? (allowStaleQuote ? this.latestMarketPair(legs.left.symbol, legs.right.symbol) : null);
     if (!pair) throw new StrategyEngineError('strategy_market_data_unavailable', 409);
     const { left: leftMarket, right: rightMarket } = pair;
     const executablePrice = (market: LiveMarket, side: 'BUY' | 'SELL') =>
