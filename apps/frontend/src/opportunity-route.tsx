@@ -886,6 +886,16 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
     navigate({ workspace: 'Strategy', strategyKind: 'carry', query: carryPrefillQuery(row) });
   };
 
+  const executeQuality = (row: SpreadQualityRow) => {
+    // The quality board ranks executable combinations; hand the paired-position form the same
+    // asset/venue prefill the spread board uses so the row is actionable instead of display-only.
+    if (!onOpenPairedPosition) return;
+    onOpenPairedPosition({
+      asset: row.asset,
+      longVenue: row.rightVenue.toLowerCase() as PairedPositionPrefill['longVenue'],
+      shortVenue: row.leftVenue.toLowerCase() as PairedPositionPrefill['shortVenue'],
+    });
+  };
   const executeSpread = (row: SpreadOpportunity) => {
     navigate({ workspace: 'Strategy', strategyKind: 'auto', query: spreadPrefillQuery(row) });
   };
@@ -1003,6 +1013,16 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
     () => (isSpreadQualityBoard ? spreadQualityData?.rows ?? [] : []),
     [isSpreadQualityBoard, spreadQualityData],
   );
+  // Asset super-class lookup for boards whose own payloads do not carry the classification.
+  const superClassByAsset = useMemo(() => {
+    const map = new Map<string, 'RWA' | 'CRYPTO'>();
+    for (const row of fundingRows as Array<{ asset: string; assetSuperClass?: string }>) {
+      if (row.assetSuperClass === 'RWA' || row.assetSuperClass === 'CRYPTO') map.set(row.asset, row.assetSuperClass);
+    }
+    for (const row of spreadQualityRows) map.set(row.asset, row.assetSuperClass);
+    return map;
+  }, [fundingRows, spreadQualityRows]);
+  const superClassFor = useCallback((asset: string): 'RWA' | 'CRYPTO' => superClassByAsset.get(asset) ?? 'CRYPTO', [superClassByAsset]);
   const qualityTotal = spreadQualityData?.total ?? spreadQualityRows.length;
   const qualityPageCount = Math.max(1, Math.ceil(qualityTotal / qualityPageSize));
   // A filter/sort change can shrink the board below the current offset — walk the page back in.
@@ -1137,7 +1157,7 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
         {hedgeMode === 'perp' ? <>
           {hedgeRows.length === 0 && !overviewFailed && <div className="empty-state"><span>◎</span>
             <strong>{overviewLoading ? t('Loading…') : t('No opportunities match the current filters.')}</strong></div>}
-          {hedgeRows.length > 0 && <FundingHedgeTable rows={hedgeRowsVisible} history24h={history24h} nowMs={nowMs} onExecute={executeHedge} />}
+          {hedgeRows.length > 0 && <FundingHedgeTable rows={hedgeRowsVisible} history24h={history24h} nowMs={nowMs} onExecute={executeHedge} superClassFor={superClassFor} />}
         </> : <>
           {fundingRows.length === 0 && !failed && <div className="empty-state"><span>◎</span><strong>{t('No opportunities match the current filters.')}</strong></div>}
           {fundingRows.length > 0 && <div className="opportunity-table table-wrap"><table>
@@ -1214,7 +1234,8 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
           <strong>{overviewLoading ? t('Loading…') : t('No perpetual markets match')}</strong></div>}
         {rankingRows.length > 0 && <>
           <FundingRankingTable rows={rankingRows} venueCode={rankingVenue} nowMs={nowMs} locale={locale}
-            assetVenues={(asset) => buildAssetFundingVenues(fundingOverview?.assets ?? [], asset)} />
+            assetVenues={(asset) => buildAssetFundingVenues(fundingOverview?.assets ?? [], asset)}
+            superClassFor={superClassFor} />
           <p className="opportunity-hint">{t('Showing')} {rankingRows.length} / {rankingVenueTotal} {t('pairs')}</p>
         </>}
       </section>

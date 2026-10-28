@@ -76,6 +76,13 @@ export function SpreadQualitySourceBadge({ source }: { source: SpreadQualityRow[
   </span>;
 }
 
+/** RWA / crypto badge shared by the opportunity boards. */
+function QualityClassBadge({ superClass }: { superClass: SpreadQualityRow['assetSuperClass'] }) {
+  const { t } = useLanguage();
+  const isRwa = superClass === 'RWA';
+  return <span className={`opportunity-asset-class ${isRwa ? 'rwa' : 'crypto'}`}><b>{t(isRwa ? 'RWA' : 'Crypto')}</b></span>;
+}
+
 /** Sell-leg / buy-leg cell of the expanded detail table, mirroring the spread board's leg cell. */
 function QualityLegCell({ venue, symbol, leg }: { venue: string; symbol: string; leg: 'Sell leg' | 'Buy leg' }) {
   const { t } = useLanguage();
@@ -148,10 +155,11 @@ export function SpreadQualityStaleBadge() {
  * Expansion is controlled: the parent owns which asset is open (`expandedAsset`) and receives
  * toggles through `onToggleExpand`, the same pattern the spread board uses.
  */
-export function SpreadQualityTable({ rows, expandedAsset, onToggleExpand }: {
+export function SpreadQualityTable({ rows, expandedAsset, onToggleExpand, onExecute }: {
   rows: readonly SpreadQualityRow[];
   expandedAsset: string | null;
   onToggleExpand: (asset: string) => void;
+  onExecute?: (row: SpreadQualityRow) => void;
 }) {
   const { t } = useLanguage();
   const groups = groupSpreadQualityRows(rows);
@@ -172,6 +180,7 @@ export function SpreadQualityTable({ rows, expandedAsset, onToggleExpand }: {
       <th>{t('Holding cost')}</th>
       <th>{t('Book depth')}</th>
       <th>{t('Opportunity score')}</th>
+      {onExecute && <th />}
     </tr></thead>
     <tbody>{groups.map((group, index) => {
       const open = expandedAsset === group.asset;
@@ -188,6 +197,7 @@ export function SpreadQualityTable({ rows, expandedAsset, onToggleExpand }: {
               <strong>{group.asset}</strong>
               <small>{assetName(group.asset)}</small>
             </span>
+            <QualityClassBadge superClass={best.assetSuperClass} />
             <span className="quality-legs">
               <QualityLegCell venue={best.leftVenue} symbol={best.leftSymbol} leg="Sell leg" />
               <QualityLegCell venue={best.rightVenue} symbol={best.rightSymbol} leg="Buy leg" />
@@ -209,8 +219,9 @@ export function SpreadQualityTable({ rows, expandedAsset, onToggleExpand }: {
           <td className="mono">{formatSpreadQualityBps(best.holdingCostBps)}</td>
           <td className="mono" title={`${best.bookDepthUsdt} USDT`}>{formatOpportunityAmount(String(best.bookDepthUsdt))}</td>
           <td className="mono"><strong className="positive quality-score">{formatOpportunityScore(best.score)}</strong></td>
+          {onExecute && <td><button className="row-action execute-action" onClick={() => onExecute(best)}>{t('Execute')}</button></td>}
         </tr>
-        {open && <tr className="spread-quality-detail-row"><td colSpan={14}>
+        {open && <tr className="spread-quality-detail-row"><td colSpan={onExecute ? 15 : 14}>
           <table className="spread-quality-combination-table">
             <thead><tr>
               <th>{t('Pair')}</th>
@@ -221,6 +232,7 @@ export function SpreadQualityTable({ rows, expandedAsset, onToggleExpand }: {
               <th>{t('Opportunity score')}</th>
               <th>{t('Symmetric')}</th>
               <th>{t('Half-life')}</th>
+              {onExecute && <th />}
             </tr></thead>
             <tbody>{group.combinations.map((combination, combinationIndex) => <tr
               key={`${combination.leftSymbol}:${combination.rightSymbol}`}
@@ -237,6 +249,7 @@ export function SpreadQualityTable({ rows, expandedAsset, onToggleExpand }: {
               <td className="mono">{formatOpportunityScore(combination.score)}</td>
               <td><SpreadQualitySymmetryBadge symmetric={combination.symmetric} /></td>
               <td className="mono">{formatHalfLifeHours(combination.halfLifeHours)}</td>
+              {onExecute && <td><button className="row-action execute-action" onClick={() => onExecute(combination)}>{t('Execute')}</button></td>}
             </tr>)}</tbody>
           </table>
         </td></tr>}
