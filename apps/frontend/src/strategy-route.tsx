@@ -1160,7 +1160,11 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const priceDiffBps = spreadReadout.bps;
   // R1 (disabled-reason visibility): the launch button is disabled while the two legs do not form
   // an executable, time-aligned pair — surface that to the user instead of a silent grey button.
-  const marketQuotesReady = spreadReadout.status === 'live';
+  // Launch only requires an executable price on both legs, not a perfectly aligned live pair:
+  // the operator's entry decision comes from historical data and the backend accepts the latest
+  // available quote for a manual launch. `live`/`approximate`/`stale` all carry a price; only
+  // `waiting` (no quote at all) still blocks the launch hint.
+  const marketQuotesReady = leftQuote.price !== null && rightQuote.price !== null;
   const quoteTimestampText = (timestampMs: number | null): string => timestampMs === null
     ? '—'
     : new Date(timestampMs).toLocaleTimeString(language === 'zh' ? 'zh-CN' : 'en-US', { hour12: false });
