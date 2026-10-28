@@ -3093,3 +3093,34 @@ html[data-theme='light'] .funding-pair-short { border-left-color: rgba(192, 44, 
   .fa-drawer-foot { position: sticky; bottom: 0; }
   .funding-arb-table { min-width: 720px; }
 }
+
+/* Segmented runner controls + expandable candidate table */
+.fa-control { display: flex; flex-direction: column; gap: 6px; min-width: 250px; }
+.fa-segmented { display: flex; gap: 3px; padding: 3px; border: 1px solid var(--line); border-radius: 9px; background: rgba(255,255,255,0.02); }
+.fa-segmented .seg { flex: 1 1 0; border: 0; background: transparent; color: var(--muted); border-radius: 6px; padding: 6px 8px; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 1px; font-size: 10px; line-height: 1.2; }
+.fa-segmented .seg span { font-size: 10px; color: var(--muted); }
+.fa-segmented .seg em { font-style: normal; font-weight: 700; font-size: 12px; color: var(--muted); }
+.fa-segmented .seg.on { background: rgba(24,214,173,0.14); }
+.fa-segmented .seg.on span, .fa-segmented .seg.on em { color: var(--green); }
+.fa-segmented .seg.off em { color: #e6b450; }
+.fa-badges { display: flex; gap: 6px; flex-wrap: wrap; }
+.fa-badges .badge { border: 1px solid var(--line); border-radius: 999px; padding: 3px 8px; font-size: 10px; color: var(--muted); white-space: nowrap; }
+.fa-badges .badge.safe { color: var(--green); border-color: rgba(24,214,173,0.4); }
+.fa-badges .badge.risk { color: #e6b450; border-color: rgba(230,180,80,0.4); }
+.fa-candidate-row { cursor: pointer; }
+.fa-candidate-row:hover { background: rgba(255,255,255,0.03); }
+.fa-candidate-row.expanded { background: rgba(24,214,173,0.06); }
+.fa-caret { display: inline-block; width: 12px; color: var(--muted); font-size: 10px; }
+.fa-candidate-detail > td { background: rgba(255,255,255,0.025); border-top: 1px solid var(--line); }
+.fa-detail-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 14px; padding: 10px 12px; }
+.fa-detail-grid > div { min-width: 0; }
+.fa-detail-grid > div > span { display: block; font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.fa-detail-grid > div > strong { display: block; margin-top: 2px; font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
+.fa-detail-grid > div > small { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; overflow-wrap: anywhere; }
+.fa-detail-grid .wide { grid-column: 1 / -1; }
+.fa-loadmore { display: flex; justify-content: center; padding: 10px 0 2px; }
+@media (max-width: 720px) {
+  .fa-control { min-width: 0; width: 100%; }
+  .fa-detail-grid { grid-template-columns: 1fr; }
+  .fa-segmented .seg { padding: 7px 6px; }
+}

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
+  type FundingArbCandidate,
   type FundingArbDecision,
   type FundingArbDryRunTrade,
   type FundingArbSettings,
@@ -203,6 +204,9 @@ export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () =>
   const [candidateFilter, setCandidateFilter] = useState<'all' | 'PASS' | 'REJECT'>('all');
   const [tab, setTab] = useState<'candidates' | 'trades' | 'audit'>('candidates');
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [selectedCandidate, setSelectedCandidate] = useState<FundingArbCandidate | null>(null);
+  const [visibleLimit, setVisibleLimit] = useState(20);
+  const refreshing = useRef(false);
   const [pendingConfirm, setPendingConfirm] = useState<null | {
     title: string;
     message: string;
@@ -215,6 +219,8 @@ export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () =>
   const draftDirty = useRef(false);
 
   const refresh = useCallback(async () => {
+    if (refreshing.current) return;
+    refreshing.current = true;
     try {
       const next = await api.fundingArbStatus();
       setStatus(next);
@@ -228,13 +234,23 @@ export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () =>
       setError(null);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      refreshing.current = false;
     }
   }, []);
 
   useEffect(() => {
-    void refresh();
-    const timer = window.setInterval(() => { void refresh(); }, 20_000);
-    return () => window.clearInterval(timer);
+    const tick = () => {
+      if (document.visibilityState === 'visible') void refresh();
+    };
+    tick();
+    const timer = window.setInterval(tick, 30_000);
+    const onVisibility = () => { if (document.visibilityState === 'visible') void refresh(); };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
   }, [refresh]);
 
   const save = useCallback(async (patch: Partial<FundingArbSettings>) => {
@@ -277,7 +293,10 @@ export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () =>
   const candidates = useMemo(() => status?.lastResult?.candidates ?? [], [status]);
   const filteredCandidates = useMemo(() => candidates
     .filter((candidate) => candidateFilter === 'all' || candidate.verdict === candidateFilter)
-    .slice(0, 60), [candidates, candidateFilter]);
+    .slice(0, visibleLimit), [candidates, candidateFilter, visibleLimit]);
+  const filteredTotal = useMemo(() => candidates
+    .filter((candidate) => candidateFilter === 'all' || candidate.verdict === candidateFilter).length,
+  [candidates, candidateFilter]);
   const totalCandidates = status?.lastResult?.candidateCount ?? candidates.length;
   const passCount = status?.lastResult?.passCount ?? candidates.filter((candidate) => candidate.verdict === 'PASS').length;
   const settings = status?.settings;
@@ -408,28 +427,23 @@ export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () =>
           </div>
         </div>
 
-        <div className="fa-switches" role="group" aria-label={t('Runner switches')}>
-          <button type="button" className={`funding-arb-switch ${dryRun ? 'on' : 'off'}`} onClick={askDryRun} title={t('Click to toggle dry run')}>
-            <span className="funding-arb-switch-dot" />
-            <span className="funding-arb-switch-text">
-              <strong>{dryRun ? t('Dry run on') : t('Dry run off')}</strong>
-              <small>{dryRun ? t('No real orders') : t('Real orders possible')}</small>
-            </span>
-          </button>
-          <button type="button" className={`funding-arb-switch ${autoExecute ? 'on' : 'off'}`} onClick={askAutoExecute} title={t('Click to toggle auto-execute')}>
-            <span className="funding-arb-switch-dot" />
-            <span className="funding-arb-switch-text">
-              <strong>{autoExecute ? t('Auto-execute on') : t('Auto-execute off')}</strong>
-              <small>{autoExecute ? t('Auto opening positions') : t('Records only')}</small>
-            </span>
-          </button>
-          <button type="button" className={`funding-arb-switch ${exchangeLive ? 'on' : 'off'}`} onClick={() => onOpenModeDialog?.()} title={t('Switch trading mode')}>
-            <span className="funding-arb-switch-dot" />
-            <span className="funding-arb-switch-text">
-              <strong>{exchangeLive ? t('Exchange live') : t('Exchange readonly')}</strong>
-              <small>{exchangeLive ? t('Orders allowed') : t('Orders blocked')}</small>
-            </span>
-          </button>
+        <div className="fa-control" role="group" aria-label={t('Runner switches')}>
+          <div className="fa-segmented">
+            <button type="button" className={dryRun ? 'seg on' : 'seg off'} onClick={askDryRun} title={t('Click to toggle dry run')}>
+              <span>{t('Dry run')}</span><em>{dryRun ? t('On') : t('Off')}</em>
+            </button>
+            <button type="button" className={autoExecute ? 'seg on' : 'seg off'} onClick={askAutoExecute} title={t('Click to toggle auto-execute')}>
+              <span>{t('Auto-execute')}</span><em>{autoExecute ? t('On') : t('Off')}</em>
+            </button>
+            <button type="button" className={exchangeLive ? 'seg on' : 'seg off'} onClick={() => onOpenModeDialog?.()} title={t('Switch trading mode')}>
+              <span>{t('Exchange')}</span><em>{exchangeLive ? t('Live') : t('Read-only')}</em>
+            </button>
+          </div>
+          <div className="fa-badges">
+            <span className={dryRun ? 'badge safe' : 'badge risk'}>{dryRun ? t('No real orders') : t('Real orders possible')}</span>
+            <span className={autoExecute ? 'badge safe' : 'badge'}>{autoExecute ? t('Auto opening positions') : t('Records only')}</span>
+            <span className={exchangeLive ? 'badge safe' : 'badge risk'}>{exchangeLive ? t('Orders allowed') : t('Orders blocked')}</span>
+          </div>
         </div>
       </div>
 
@@ -451,15 +465,15 @@ export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () =>
             <div className="fa-toolbar">
               <div className="funding-arb-filter" role="group" aria-label={t('Candidate filter')}>
                 {(['all', 'PASS', 'REJECT'] as const).map((filter) => (
-                  <button key={filter} className={candidateFilter === filter ? 'active' : ''} onClick={() => setCandidateFilter(filter)}>
+                  <button key={filter} className={candidateFilter === filter ? 'active' : ''} onClick={() => { setCandidateFilter(filter); setVisibleLimit(20); }}>
                     {filter === 'all' ? t('All') : filter === 'PASS' ? t('Pass') : t('Reject')}
                   </button>
                 ))}
               </div>
-              <small className="fa-muted">{t('Showing top')} {filteredCandidates.length} / {totalCandidates}</small>
+              <small className="fa-muted">{t('Showing top')} {filteredCandidates.length} / {filteredTotal}</small>
             </div>
             <div className="funding-arb-table-wrap">
-              <table className="funding-arb-table">
+              <table className="funding-arb-table fa-candidate-table">
                 <thead>
                   <tr>
                     <th>{t('Asset')}</th><th>{t('Short / long')}</th><th>{t('APR')}</th>
@@ -468,24 +482,50 @@ export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () =>
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredCandidates.map((candidate) => (
-                    <tr key={candidate.key}>
-                      <td><strong>{candidate.asset}</strong></td>
-                      <td>{candidate.shortVenue} / {candidate.longVenue}</td>
-                      <td>{candidate.aprPercent.toFixed(0)}%</td>
-                      <td>{candidate.entryBps ?? '—'}</td>
-                      <td>{candidate.notionalUsd === null ? '—' : `$${candidate.notionalUsd.toFixed(0)}`}</td>
-                      <td>{formatMs(candidate.settlementInMs)}</td>
-                      <td><span className={candidate.verdict === 'PASS' ? 'funding-arb-pass' : 'funding-arb-reject'}>{t(candidate.verdict === 'PASS' ? 'Pass' : 'Reject')}</span></td>
-                      <td className="funding-arb-reasons">{candidate.reasons.length === 0 ? '—' : candidate.reasons.map((reason) => reasonLabel(reason, language)).join('、')}</td>
-                    </tr>
-                  ))}
+                  {filteredCandidates.map((candidate) => {
+                    const expanded = selectedCandidate?.key === candidate.key;
+                    return [
+                      <tr key={candidate.key}
+                        className={`fa-candidate-row${expanded ? ' expanded' : ''}`}
+                        onClick={() => setSelectedCandidate(expanded ? null : candidate)}>
+                        <td><span className="fa-caret">{expanded ? '▾' : '▸'}</span><strong>{candidate.asset}</strong></td>
+                        <td>{candidate.shortVenue} / {candidate.longVenue}</td>
+                        <td>{candidate.aprPercent.toFixed(0)}%</td>
+                        <td>{candidate.entryBps ?? '—'}</td>
+                        <td>{candidate.notionalUsd === null ? '—' : `$${candidate.notionalUsd.toFixed(0)}`}</td>
+                        <td>{formatMs(candidate.settlementInMs)}</td>
+                        <td><span className={candidate.verdict === 'PASS' ? 'funding-arb-pass' : 'funding-arb-reject'}>{t(candidate.verdict === 'PASS' ? 'Pass' : 'Reject')}</span></td>
+                        <td className="funding-arb-reasons">{candidate.reasons.length === 0 ? '—' : candidate.reasons.map((reason) => reasonLabel(reason, language)).join('、')}</td>
+                      </tr>,
+                      expanded ? (
+                        <tr key={`${candidate.key}-detail`} className="fa-candidate-detail">
+                          <td colSpan={8}>
+                            <div className="fa-detail-grid">
+                              <div><span>{t('Candidate')}</span><strong>{candidate.key}</strong></div>
+                              <div><span>{t('Short leg')}</span><strong>{candidate.shortVenue} · {candidate.shortSymbol}</strong><small>{candidate.shortIntervalHours ?? '—'}h · rate8h {candidate.shortRate8h}</small></div>
+                              <div><span>{t('Long leg')}</span><strong>{candidate.longVenue} · {candidate.longSymbol}</strong><small>{candidate.longIntervalHours ?? '—'}h · rate8h {candidate.longRate8h}</small></div>
+                              <div><span>{t('Net 8h')}</span><strong>{candidate.net8h}</strong><small>{t('APR')} {candidate.aprPercent.toFixed(1)}%</small></div>
+                              <div><span>{t('Sizing')}</span><strong>{candidate.notionalUsd === null ? '—' : `$${candidate.notionalUsd.toFixed(2)}`}</strong><small>{t('Qty')} {candidate.quantity ?? '—'} · {t('Leverage')} {candidate.leverage ?? '—'}x</small></div>
+                              <div><span>{t('Settlement')}</span><strong>{formatMs(candidate.settlementInMs)}</strong><small>{candidate.shortNextFundingAt ?? '—'} / {candidate.longNextFundingAt ?? '—'}</small></div>
+                              <div className="wide"><span>{t('Reasons')}</span><strong>{candidate.reasons.length === 0 ? '—' : candidate.reasons.map((reason) => reasonLabel(reason, language)).join('、')}</strong></div>
+                            </div>
+                          </td>
+                        </tr>
+                      ) : null,
+                    ];
+                  })}
                   {filteredCandidates.length === 0 && <tr><td colSpan={8} className="funding-arb-empty">{t('No scan yet — press “Scan now”.')}</td></tr>}
                 </tbody>
               </table>
             </div>
+            {filteredCandidates.length < filteredTotal && (
+              <div className="fa-loadmore">
+                <button type="button" className="funding-arb-btn" onClick={() => setVisibleLimit((value) => value + 40)}>{t('Load more')}</button>
+              </div>
+            )}
           </div>
         )}
+
 
         {tab === 'trades' && (
           <div className="fa-tabbody">
