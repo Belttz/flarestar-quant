@@ -787,6 +787,15 @@ export class CrossExMarketHub {
       this.quoteWatchers.set(symbol, (this.quoteWatchers.get(symbol) ?? 0) + 1);
       if (this.dynamicMarkets.has(symbol)) this.dynamicMarkets.set(symbol, Date.now());
     }
+    // A registered placeholder is not the same as a live subscription: dynamic symbols can be
+    // inserted by a path that never sent the ticker subscribe frame (DOOD sat on a zero-priced
+    // demo_seed row while CrossEx WS was streaming it). Watch = subscribe here; subscribeSymbols
+    // is idempotent, so strategies sharing a leg do not duplicate frames.
+    if (watched.length > 0) {
+      for (const channel of ['ticker', 'funding_rate', 'open_interest']) {
+        this.subscribeSymbols(channel, watched);
+      }
+    }
     let released = false;
     return () => {
       if (released) return;
