@@ -963,8 +963,21 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
 
   // Strategies may trade catalog-only tickers (e.g. stock perps) that nothing has watched yet, so
   // the engine's market source can register them on demand at launch.
+  /** REST book-ticker fallback, refreshed in the background; used when a hub quote is absent/stale. */
+  const restQuoteCache = new Map<string, LiveMarket>();
   const strategyEngine = new StrategyEngine(database, tradingSession, tradingRuntime, {
-    market: (symbol) => marketHub.market(symbol),
+    market: (symbol) => {
+      const hub = marketHub.market(symbol);
+      const hubQuote = Date.parse(hub?.quoteUpdatedAt ?? '');
+      const hubUsable = hub !== null && Number(hub.bidPrice) > 0 && Number(hub.askPrice) > 0
+        && Number.isFinite(hubQuote) && Date.now() - hubQuote <= 15_000;
+      if (hubUsable) return hub;
+      // A venue WebSocket that never ticks this symbol (DOOD is one) leaves a zero-priced
+      // demo_seed row. The REST book-ticker sweep still has an executable top of book, and the
+      // entry decision came from funding history, so the launch must not be rejected solely
+      // because the millisecond feed is missing.
+      return restQuoteCache.get(symbol) ?? hub;
+    },
     ensureMarket: ensureMarketKnown,
     // The engine holds one ticker subscription per running strategy so its legs keep streaming
     // even when no browser page is watching them; releases are ref-counted in the hub.
@@ -1211,7 +1224,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   // contribute no REST rows and stay hub-driven. KRAKEN joined for v0.3.1: it quotes every
   // perpetual in USD, so without this sweep it was invisible to the spread board — its rows could
   // only appear if someone happened to have its symbol subscribed on the hub.
-  const REST_SPREAD_VIEW_TTL_MS = 30_000;
+  const REST_SPREAD_VIEW_TTL_MS = 8_000;
   const REST_SPREAD_VENUES = ['GATE', 'BINANCE', 'OKX', 'BYBIT', 'KRAKEN'] as const;
   let restSpreadCache: { fetchedAt: number; markets: Map<string, LiveMarket> } | null = null;
   let restSpreadInFlight: Promise<Map<string, LiveMarket>> | null = null;
@@ -1272,6 +1285,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       // A total upstream outage must not blank the board for a whole TTL cycle: keep the last
       // good sweep, and when there is none, leave the cache unset so the next request retries.
       if (succeeded > 0 || !restSpreadCache) restSpreadCache = { fetchedAt: Date.now(), markets };
+      restQuoteCache.clear();
+      for (const [symbol, market] of restSpreadCache.markets) restQuoteCache.set(symbol, market);
       return restSpreadCache.markets;
     })().finally(() => {
       restSpreadInFlight = null;
@@ -1566,6 +1581,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     // Bootstrap once per backend process. Concurrent UI tabs and a private-stream ready event
     // join the same single-flight request instead of multiplying five authenticated REST reads.
     triggerPortfolioRefresh();
+    // Keep the REST fallback quotes warm for venues whose WS ticker is missing a symbol (DOOD).
+    const restQuoteTimer = setInterval(() => { void restSpreadMarkets().catch(() => undefined); }, 8_000);
+    restQuoteTimer.unref?.();
+    void restSpreadMarkets().catch(() => undefined);
     // The spread-quality board computes candles for up to 50 pairs (first call measured ~2.3s in
     // production). Warm the default board shortly after boot and keep it inside its 5-minute TTL so
     // the first operator opening that tab gets the cached page instead of the blocking computation.
