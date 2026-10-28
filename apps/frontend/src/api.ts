@@ -678,7 +678,13 @@ export const api = {
     }),
   // The instrument catalog is thousands of rows and changes on the backend's 5-minute cadence;
   // reusing it across route mounts avoids a large download + schema validation per tab switch.
-  instruments: cachedRead(5 * 60_000, () => request(InstrumentsResponseSchema, '/api/crossex/instruments')),
+  // Never cache an empty catalog: a transient empty/partial response used to stick for five
+  // minutes and left every strategy launch disabled with "Enter valid strategy amounts".
+  instruments: cachedRead(5 * 60_000, async () => {
+    const response = await request(InstrumentsResponseSchema, '/api/crossex/instruments');
+    if (response.items.length === 0) throw new ApiError(0, 'instrument_catalog_empty');
+    return response;
+  }),
   riskLimits: (symbol: string) =>
     request(CrossExRiskLimitResponseSchema, `/api/crossex/instruments/${encodeURIComponent(symbol)}/risk-limits`),
   preferences: () => request(UserPreferencesResponseSchema, '/api/preferences'),

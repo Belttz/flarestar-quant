@@ -163,10 +163,28 @@ function useInstrumentCatalog(): CrossExInstrument[] | null {
 
   useEffect(() => {
     let cancelled = false;
-    void api.instruments()
-      .then((response) => { if (!cancelled) setInstruments(response.items); })
-      .catch(() => undefined);
-    return () => { cancelled = true; };
+    let attempt = 0;
+    let timer: number | undefined;
+    const load = () => {
+      void api.instruments()
+        .then((response) => {
+          if (cancelled) return;
+          // A suspiciously small catalog is a partial sweep, not the real 12k-row list; retry.
+          if (response.items.length < 100 && attempt < 3) {
+            attempt += 1;
+            timer = window.setTimeout(load, 1_500);
+            return;
+          }
+          setInstruments(response.items);
+        })
+        .catch(() => {
+          if (cancelled || attempt >= 3) return;
+          attempt += 1;
+          timer = window.setTimeout(load, 1_500);
+        });
+    };
+    load();
+    return () => { cancelled = true; if (timer !== undefined) window.clearTimeout(timer); };
   }, []);
 
   return instruments;
