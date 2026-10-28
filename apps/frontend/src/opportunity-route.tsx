@@ -664,6 +664,7 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
   const [hedgeVenues, setHedgeVenues] = useState<string[]>(() => [...ALL_SPREAD_VENUES]);
   const [hedgeSort, setHedgeSort] = useState<FundingHedgeSortKey>(DEFAULT_HEDGE_SORT);
   const [fundingOverview, setFundingOverview] = useState<FundingOverviewResponse | null>(null);
+  const [executableSymbols, setExecutableSymbols] = useState<ReadonlySet<string> | null>(null);
   const [overviewLoading, setOverviewLoading] = useState(false);
   const [overviewFailed, setOverviewFailed] = useState(false);
   const [rankingVenue, setRankingVenue] = useState('GATE');
@@ -810,6 +811,15 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
 
   // The funding hedge board in perpetual mode and the ranking board read the venue funding
   // overview instead; the opportunity endpoint is not fetched for them at all.
+  // CrossEx instrument catalog: a funding pair whose leg is absent here has public rates but
+  // cannot be launched through CrossEx (Binance BLUR was the production case).
+  useEffect(() => {
+    let cancelled = false;
+    void api.instruments().then((response) => {
+      if (!cancelled) setExecutableSymbols(new Set(response.items.map((item) => item.symbol)));
+    }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, []);
   const needsFundingOverview = isFundingTopBoard || (isFundingBoard && hedgeMode === 'perp');
   const loadOverview = useCallback(() => {
     setOverviewLoading(true);
@@ -1157,7 +1167,7 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
         {hedgeMode === 'perp' ? <>
           {hedgeRows.length === 0 && !overviewFailed && <div className="empty-state"><span>◎</span>
             <strong>{overviewLoading ? t('Loading…') : t('No opportunities match the current filters.')}</strong></div>}
-          {hedgeRows.length > 0 && <FundingHedgeTable rows={hedgeRowsVisible} history24h={history24h} nowMs={nowMs} onExecute={executeHedge} superClassFor={superClassFor} />}
+          {hedgeRows.length > 0 && <FundingHedgeTable rows={hedgeRowsVisible} history24h={history24h} nowMs={nowMs} onExecute={executeHedge} superClassFor={superClassFor} executableSymbols={executableSymbols} />}
         </> : <>
           {fundingRows.length === 0 && !failed && <div className="empty-state"><span>◎</span><strong>{t('No opportunities match the current filters.')}</strong></div>}
           {fundingRows.length > 0 && <div className="opportunity-table table-wrap"><table>

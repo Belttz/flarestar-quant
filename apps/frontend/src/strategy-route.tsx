@@ -1157,7 +1157,14 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
     buy: directionFlipped ? leftQuote : rightQuote,
   });
   // `null` unless both legs are live *and* contemporaneous — never `0`, never a candle value.
-  const priceDiffBps = spreadReadout.bps;
+  // A stale pair still has two last prices; keep the amount visible (the caption flags it) instead
+  // of blanking the spread the moment one leg misses the 15 s budget.
+  const stalePriceGapBps = spreadReadout.status === 'stale'
+    && spreadReadout.sellPrice !== null && spreadReadout.buyPrice !== null
+    && spreadReadout.buyPrice > 0
+    ? ((spreadReadout.sellPrice - spreadReadout.buyPrice) / spreadReadout.buyPrice) * 10_000
+    : null;
+  const priceDiffBps = spreadReadout.bps ?? stalePriceGapBps;
   // R1 (disabled-reason visibility): the launch button is disabled while the two legs do not form
   // an executable, time-aligned pair — surface that to the user instead of a silent grey button.
   // Launch only requires an executable price on both legs, not a perfectly aligned live pair:
@@ -1781,6 +1788,9 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
           {positionRiskLimitExceeded && <div className="launch-warning"><span>!</span><p>{t('Configured position exceeds the maximum at selected leverage')}</p></div>}
           <button className={tradingEnabled ? 'start-strategy' : 'start-strategy locked'} onClick={requestStrategyLaunch} disabled={launching || (tradingEnabled && !strategyInputsValid)}>{launching ? t('Launching…') : tradingEnabled ? marginInsufficient ? t('Insufficient margin') : positionRiskLimitExceeded ? t('Position exceeds leverage limit') : positionRiskReviewUnavailable ? t('Loading position limits…') : !strategyInputsValid ? t('Enter valid strategy amounts') : t(mode === 'position' ? 'Execute strategy' : 'Launch strategy') : t('Live trading locked')}</button>
           {tradingEnabled && !marketQuotesReady && <p className="launch-disabled-reason">{t('Live quotes for both legs are missing or not time-aligned — entry estimates may be stale.')}</p>}
+          {tradingEnabled && !instrumentsReady && <p className="launch-disabled-reason">
+            {t('Not tradable through CrossEx')}: {!leftInstrument ? leftHistorySymbol : rightHistorySymbol}
+          </p>}
           {launchNotice && <div className={`launch-notice ${launchNotice.kind}`}>{launchNotice.text}</div>}
           {mode === 'position' && <p className="background-strategy-note">{t('Runs in background; manage active strategies below.')}</p>}
           {mode === 'position' && <div className="launch-warning"><span>ⓘ</span><p>{tradingEnabled

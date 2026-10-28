@@ -53,17 +53,22 @@ function FundingLegCell({ leg }: { leg: FundingHedgeLeg }) {
  * the net the pair collects every 8h, its settlement countdown, and the realized 24h equivalent.
  * Every value is already computed by the pure funding-hedge model — this only renders.
  */
-export function FundingHedgeTable({ rows, history24h, nowMs, onExecute, superClassFor }: {
+export function FundingHedgeTable({ rows, history24h, nowMs, onExecute, superClassFor, executableSymbols }: {
   rows: FundingHedgeRow[];
   history24h: Readonly<Record<string, FundingHistoryEntry>>;
   nowMs: number;
   onExecute: (row: FundingHedgeRow) => void;
   superClassFor?: (asset: string) => 'RWA' | 'CRYPTO';
+  /** CrossEx instrument symbols; a pair with a leg outside this set cannot be launched. */
+  executableSymbols?: ReadonlySet<string> | null;
 }) {
   const { t } = useLanguage();
   const [expanded, setExpanded] = useState<string | null>(null);
-  // One parent row per asset, best net funding first. The detail rows are the same asset's other
-  // venue pairs, so a long board collapses to one line per coin like the spread board.
+  const supported = (row: FundingHedgeRow): boolean => executableSymbols === undefined || executableSymbols === null
+    || row.legs.every((leg) => executableSymbols.has(leg.symbol));
+  // One parent row per asset, best *executable* net funding first. Binance BLUR has public funding
+  // but no CrossEx instrument, so the parent must fall through to OKX/GATE instead of offering a
+  // launch that the instrument preflight can never pass.
   const groups = useMemo(() => {
     const byAsset = new Map<string, FundingHedgeRow[]>();
     for (const row of rows) {
@@ -71,12 +76,15 @@ export function FundingHedgeTable({ rows, history24h, nowMs, onExecute, superCla
       if (bucket === undefined) byAsset.set(row.asset, [row]);
       else bucket.push(row);
     }
-    return [...byAsset].map(([asset, pairs]) => ({ asset, best: pairs[0], pairs }));
-  }, [rows]);
+    return [...byAsset].map(([asset, pairs]) => {
+      const executable = pairs.filter((row) => supported(row));
+      return { asset, best: executable[0] ?? pairs[0], pairs, hasExecutable: executable.length > 0 };
+    });
+  }, [rows, executableSymbols]);
   const rowCells = (row: FundingHedgeRow, compact: boolean) => {
     const fundingLeg = hedgeFundingLeg(row);
     const net24h = hedgeNet24hPercent(row, history24h);
-    const blocked = row.carry !== null && !row.carry.executable;
+    const blocked = (row.carry !== null && !row.carry.executable) || !supported(row);
     return <tr key={row.key} className={blocked ? 'not-executable' : ''}>
       <td><span className="hedge-pair"><b>{hedgePairLabel(row)}</b>
         <small>{row.short.kind === 'spot' || row.long.kind === 'spot' ? t('Spot ⇄ perpetual') : t('Perpetual ⇄ perpetual')}</small>
@@ -94,7 +102,7 @@ export function FundingHedgeTable({ rows, history24h, nowMs, onExecute, superCla
       <td><strong className={net24h === null ? 'funding-missing' : net24h >= 0 ? 'positive' : 'negative'}>{formatFundingPercent(net24h)}</strong></td>
       <td className="mono">{net24h === null ? '—' : formatFundingPercent(fundingApyPercent(net24h, 365), 2)}</td>
       <td><button className="row-action execute-action" onClick={() => onExecute(row)} disabled={blocked}>
-        {blocked ? t('Not connected') : t('Execute')}
+        {blocked ? t('Not supported') : t('Execute')}
       </button></td>
     </tr>;
   };
@@ -136,8 +144,8 @@ export function FundingHedgeTable({ rows, history24h, nowMs, onExecute, superCla
           <td><strong className={group.best.net24hPercent === null ? 'funding-missing' : group.best.net24hPercent >= 0 ? 'positive' : 'negative'}>{formatFundingPercent(group.best.net24hPercent)}</strong></td>
           <td className="mono">{group.best.net24hPercent === null ? '—' : formatFundingPercent(fundingApyPercent(group.best.net24hPercent, 365), 2)}</td>
           <td><button className="row-action execute-action" onClick={() => onExecute(group.best)}
-            disabled={group.best.carry !== null && !group.best.carry.executable}>
-            {group.best.carry !== null && !group.best.carry.executable ? t('Not connected') : t('Execute')}
+            disabled={!group.hasExecutable}>
+            {group.hasExecutable ? t('Execute') : t('Not supported')}
           </button></td>
         </tr>
         {open && group.pairs.map((row) => <tr key={`${row.key}:detail`} className="hedge-detail-row">
