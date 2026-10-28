@@ -23,6 +23,7 @@ import {
   CrossExTransferRequestSchema,
   canonicalizeCrossExTransfer,
   FundingArbSettingsSchema,
+  type FundingArbSettings,
   crossExTransferRouteError,
   downsampleEquityPoints,
   equityGranularityForRange,
@@ -2697,14 +2698,21 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   app.put('/api/funding-arb/settings', {
     config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
   }, async (request, reply) => {
-    const parsed = FundingArbSettingsSchema.partial().safeParse(request.body ?? {});
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const parsed = FundingArbSettingsSchema.partial().safeParse(body);
     if (!parsed.success) {
       return reply.code(400).send({
         error: 'invalid_funding_arb_settings',
         issues: parsed.error.issues.map((issue) => ({ path: issue.path.join('.'), message: issue.message })),
       });
     }
-    const next = mergeFundingArbSettings(readFundingArbSettings(database), parsed.data);
+    // `.partial()` can still materialise schema defaults for keys the caller did not send. If those
+    // defaults are merged over the stored row, saving one field silently resets every other
+    // customisation (the "settings revert after refresh" bug). Keep only fields present in the
+    // request body.
+    const patch = Object.fromEntries(Object.entries(parsed.data)
+      .filter(([key]) => Object.prototype.hasOwnProperty.call(body, key))) as Partial<FundingArbSettings>;
+    const next = mergeFundingArbSettings(readFundingArbSettings(database), patch);
     writeFundingArbSettings(database, next);
     if (next.enabled) fundingArbMonitor.startBackground();
     else fundingArbMonitor.stopBackground();
