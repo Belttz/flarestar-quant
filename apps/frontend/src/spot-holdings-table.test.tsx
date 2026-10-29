@@ -19,7 +19,7 @@ function render(ui: React.ReactNode): string {
 const baseProps = { page: 1, onPageChange: vi.fn() };
 
 describe('SpotHoldingsTable', () => {
-  it('renders the balance columns with the asset icon on the coin cell', () => {
+  it('renders the balance columns with the full coin name on the coin cell', () => {
     const html = render(<SpotHoldingsTable {...baseProps} rows={[row()]} />);
     expect(html).toContain('>Market</th>');
     expect(html).toContain('>Coin</th>');
@@ -28,7 +28,7 @@ describe('SpotHoldingsTable', () => {
     expect(html).toContain('>Available</th>');
     expect(html).toContain('>Locked</th>');
     expect(html).toContain('>Valuation (USDT)</th>');
-    expect(html).toContain('₿ BTC');
+    expect(html).toContain('title="BTC">BTC</strong>');
   });
 
   it('labels a held balance as a long position', () => {
@@ -70,7 +70,7 @@ describe('SpotHoldingsTable', () => {
 
   it('renders the venue per row so the same coin can appear on two exchanges', () => {
     const html = render(<SpotHoldingsTable {...baseProps} rows={[row(), row({ venue: 'BINANCE', coin: 'BTC' })]} />);
-    expect((html.match(/₿ BTC/g) ?? []).length).toBe(2);
+    expect((html.match(/title="BTC">BTC<\/strong>/g) ?? []).length).toBe(2);
   });
 
   it('prefixes valuations with $ and renders — for rows without a market quote', () => {

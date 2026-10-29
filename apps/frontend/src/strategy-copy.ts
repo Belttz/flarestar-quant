@@ -63,6 +63,15 @@ export function strategyPrefillKey(query?: FrontendQuery | null): string {
 }
 
 /**
+ * Remount key for a strategy view. A copy launched from the open config dialog keeps the same
+ * `strategyId`/`copyStrategyId`, so the id alone is not enough to remount the form; the caller
+ * bumps `copyRevision` for every copy action to make the prefill initializers run again.
+ */
+export function strategyRemountKey(query?: FrontendQuery | null, copyRevision = 0): string {
+  return `${strategyPrefillKey(query)}:${copyRevision}`;
+}
+
+/**
  * Build the prefill query for a copy of `strategy`.
  *
  * Keys are emitted for every form family at once — the auto/position form reads `left`/`right`,

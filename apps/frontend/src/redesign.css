@@ -1,0 +1,2204 @@
+/* 2026-10 visual refresh: Based-inspired black / deep-purple / blue / gold.
+ *
+ * This layer is intentionally loaded after styles.css and only overrides the
+ * presentation. Trading semantics, state and routes stay in the existing DOM.
+ * Keep PnL and side colours on --green / --red; brand accents live on
+ * --brand / --brand-2 / --brand-blue / --gold. */
+
+:root {
+  --brand: #7c3aed;
+  --brand-2: #8b5cf6;
+  --brand-blue: #3b82f6;
+  --brand-blue-2: #60a5fa;
+  --brand-soft: rgba(124, 58, 237, .16);
+  --brand-line: rgba(139, 92, 246, .34);
+  --gold: #f5c451;
+  --gold-soft: rgba(245, 196, 81, .12);
+  --bg: #050509;
+  --surface: #0d0d16;
+  --surface-2: #12121d;
+  --surface-3: #181826;
+  --line: #242438;
+  --line-soft: #1b1b2b;
+  --muted: #8b8fa8;
+  --text: #f4f5f6;
+  --panel: #0d0d16;
+  --panel-radius: 18px;
+  --text-page-title: 36px;
+  --text-description: 13px;
+  --text-section-title: 16px;
+}
+
+html,
+body,
+#root {
+  background: var(--bg);
+}
+
+body {
+  color: var(--text);
+  background:
+    radial-gradient(1100px 520px at 8% -10%, rgba(124, 58, 237, .16), transparent 62%),
+    radial-gradient(900px 420px at 100% 0%, rgba(59, 130, 246, .10), transparent 58%),
+    var(--bg);
+}
+
+.app-shell {
+  position: relative;
+  min-height: 100vh;
+  padding-top: 66px;
+  padding-bottom: 34px;
+}
+
+/* ---------------------------------------------------------------- topbar */
+
+.app-shell .topbar {
+  height: 66px;
+  gap: 14px;
+  padding: 0 18px;
+  border-bottom: 1px solid var(--line-soft);
+  background: rgba(5, 5, 9, .88);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, .015);
+  backdrop-filter: blur(24px);
+}
+
+.app-shell .brand {
+  width: 232px;
+  padding: 0 16px 0 2px;
+  border-right: 0;
+}
+
+.app-shell .brand-symbol {
+  width: 32px;
+  height: 32px;
+  filter: drop-shadow(0 0 14px rgba(124, 58, 237, .38));
+}
+
+.app-shell .brand-title strong {
+  color: #fff;
+  font-size: 15px;
+  font-weight: 750;
+  letter-spacing: .045em;
+}
+
+.app-shell .brand-title small {
+  color: #8f92a8;
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+}
+
+.app-shell .brand-edition {
+  color: var(--gold);
+  font-size: 8px;
+  letter-spacing: .18em;
+}
+
+.app-shell .brand-edition::before {
+  width: 16px;
+  background: linear-gradient(90deg, var(--gold), rgba(245, 196, 81, .18));
+}
+
+.app-shell .topbar nav {
+  gap: 4px;
+  padding: 0 6px;
+}
+
+.app-shell .topbar nav button {
+  height: 36px;
+  align-self: center;
+  padding: 0 14px;
+  border-radius: 11px;
+  color: #9598ae;
+  font-size: 12px;
+  font-weight: 650;
+  transition: color .15s ease, background .15s ease;
+}
+
+.app-shell .topbar nav button:hover {
+  color: #f4f5f6;
+  background: var(--surface-2);
+}
+
+.app-shell .topbar nav button.active {
+  color: #fff;
+  background: linear-gradient(135deg, rgba(124, 58, 237, .92), rgba(59, 130, 246, .78));
+  box-shadow: 0 8px 22px rgba(124, 58, 237, .20);
+}
+
+.app-shell .topbar nav button.active::after {
+  display: none;
+}
+
+.app-shell .topbar nav button .topbar-nav-glyph {
+  color: #777b93;
+  font-size: 15px;
+}
+
+.app-shell .topbar nav button.active .topbar-nav-glyph {
+  color: var(--gold);
+}
+
+.app-shell .topbar .nav-strategy-menu {
+  margin-top: 6px;
+  padding: 7px;
+  border-color: var(--line);
+  border-radius: 14px;
+  background: #11111b;
+  box-shadow: 0 22px 60px #000b;
+}
+
+.app-shell .topbar .nav-strategy-menu button {
+  height: auto;
+  align-self: auto;
+  padding: 10px 11px;
+  border-radius: 9px;
+}
+
+.app-shell .top-actions {
+  gap: 6px;
+  padding-right: 0;
+}
+
+.app-shell .utility,
+.app-shell .settings-button {
+  width: 34px;
+  height: 34px;
+  border-color: transparent;
+  border-radius: 11px;
+  color: #989bb0;
+}
+
+.app-shell .utility:hover,
+.app-shell .utility[aria-expanded='true'],
+.app-shell .settings-button:hover,
+.app-shell .settings-button[aria-expanded='true'] {
+  border-color: var(--line);
+  color: #fff;
+  background: var(--surface-2);
+}
+
+.app-shell .mode-badge {
+  height: 30px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: #c9cbd8;
+  background: var(--surface);
+  font-size: 10px;
+}
+
+.app-shell .mode-badge i {
+  background: var(--brand-2);
+  box-shadow: 0 0 9px rgba(139, 92, 246, .8);
+}
+
+.app-shell .mode-badge.live i {
+  background: var(--green);
+  box-shadow: 0 0 9px rgba(24, 214, 173, .7);
+}
+
+.app-shell .profile-menu {
+  border-color: var(--line);
+  border-radius: 14px;
+  background: #11111b;
+  box-shadow: 0 22px 60px #000b;
+}
+
+.app-shell .statusbar {
+  height: 30px;
+  border-top-color: var(--line-soft);
+  color: #6f7288;
+  background: #08080e;
+}
+
+.app-shell .statusbar :is(button, .footer-brand b) {
+  color: #9295a9;
+}
+
+.app-shell .statusbar .connected,
+.app-shell .statusbar div > span.connected > i {
+  color: #7fcfb5;
+}
+
+.app-shell .statusbar div > span.connected > i {
+  background: var(--green);
+  box-shadow: 0 0 8px rgba(24, 214, 173, .45);
+}
+
+/* ------------------------------------------------------- page and cards */
+
+.app-shell .workspace {
+  width: 100%;
+}
+
+.app-shell .alternate-view {
+  width: 100%;
+  max-width: 1560px;
+  padding: 34px 32px 70px;
+}
+
+.app-shell .view-heading {
+  align-items: flex-end;
+  gap: 24px;
+  margin-bottom: 26px;
+}
+
+.app-shell .view-heading h1 {
+  margin: 2px 0 9px;
+  color: #fff;
+  font-size: clamp(30px, 2.55vw, 38px);
+  font-weight: 780;
+  line-height: 1.07;
+  letter-spacing: -.045em;
+}
+
+.app-shell .view-heading p:not(.eyebrow) {
+  max-width: 720px;
+  color: #8f92a8;
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.app-shell .eyebrow {
+  margin-bottom: 7px;
+  color: var(--gold);
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: .18em;
+}
+
+.app-shell .alternate-view :is(
+  .terminal-panel,
+  .strategy-panel,
+  .strategy-launch,
+  .running-strategies,
+  .allocation-card,
+  .balance-card,
+  .transfer-card,
+  .activity-card,
+  .opportunity-filters,
+  .opportunity-board,
+  .funding-detail-card,
+  .funding-panel,
+  .fee-comparison-card
+) {
+  border-color: var(--line);
+  border-radius: var(--panel-radius);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, .018), transparent 34%),
+    var(--surface);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .02);
+}
+
+.app-shell .section-title {
+  min-height: 64px;
+}
+
+.app-shell .section-title h2 {
+  color: #f1f2f7;
+  font-size: 15px;
+  font-weight: 720;
+  letter-spacing: -.015em;
+}
+
+.app-shell .section-title .eyebrow {
+  color: #8a7cb8;
+  letter-spacing: .14em;
+}
+
+.app-shell .section-title > span,
+.app-shell .section-title button {
+  color: #7e8198;
+  font-size: 10px;
+}
+
+/* ------------------------------------------------------------- portfolio */
+
+.app-shell .portfolio-summary {
+  display: grid;
+  grid-template-columns: 1.45fr repeat(6, minmax(0, 1fr));
+  gap: 10px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.app-shell .portfolio-summary article {
+  min-height: 122px;
+  padding: 17px 17px 15px;
+  border: 1px solid var(--line);
+  border-radius: 17px;
+  background:
+    radial-gradient(90% 120% at 100% 0%, rgba(124, 58, 237, .07), transparent 58%),
+    var(--surface);
+}
+
+.app-shell .portfolio-summary article:first-child {
+  border-color: rgba(124, 58, 237, .42);
+  background:
+    radial-gradient(120% 150% at 8% 0%, rgba(124, 58, 237, .25), transparent 58%),
+    radial-gradient(120% 140% at 100% 100%, rgba(59, 130, 246, .13), transparent 55%),
+    var(--surface-2);
+  box-shadow: inset 0 1px 0 rgba(196, 181, 253, .10);
+}
+
+.app-shell .portfolio-summary article > span:first-child {
+  color: #9598ae;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: .02em;
+}
+
+.app-shell .portfolio-summary strong {
+  color: #fff;
+  font-size: 25px;
+  font-weight: 760;
+  letter-spacing: -.045em;
+}
+
+.app-shell .portfolio-summary article:first-child strong {
+  font-size: 34px;
+}
+
+.app-shell .portfolio-summary em {
+  color: #777b92;
+  font-size: 10px;
+}
+
+.app-shell .portfolio-summary .margin-meter {
+  background: #242334;
+}
+
+.app-shell .portfolio-summary .margin-meter i {
+  background: linear-gradient(90deg, var(--brand), var(--brand-blue));
+}
+
+.app-shell .portfolio-content,
+.app-shell .portfolio-operations {
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.app-shell .portfolio-status {
+  color: #8d90a6;
+}
+
+.app-shell .portfolio-refresh {
+  height: 34px;
+  padding: 0 14px;
+  border-color: var(--line);
+  border-radius: 999px;
+  color: #c7c9d8;
+  background: var(--surface-2);
+  font-size: 11px;
+}
+
+.app-shell .portfolio-refresh:hover:not(:disabled) {
+  border-color: var(--brand-line);
+  color: #fff;
+  background: #181626;
+}
+
+.app-shell .portfolio-operations > article {
+  border-color: var(--line);
+  border-radius: var(--panel-radius);
+}
+
+.app-shell .portfolio-operations .section-title {
+  min-height: 64px;
+  border-bottom-color: var(--line-soft);
+}
+
+.app-shell .asset-row {
+  border-bottom-color: var(--line-soft);
+}
+
+.app-shell .asset-row > strong,
+.app-shell .asset-row > span:last-child b {
+  color: #f2f3f7;
+}
+
+.app-shell .donut {
+  filter: drop-shadow(0 0 30px rgba(124, 58, 237, .14));
+}
+
+/* -------------------------------------------------------------- controls */
+
+.app-shell .alternate-view :is(input, select, textarea) {
+  border-color: var(--line);
+  border-radius: 10px;
+  color: var(--text);
+  background-color: #0a0a12;
+}
+
+.app-shell .alternate-view :is(input, select, textarea):focus {
+  border-color: var(--brand-line);
+  outline: 0;
+  box-shadow: 0 0 0 3px rgba(124, 58, 237, .13);
+}
+
+.app-shell .transfer-submit {
+  height: 40px;
+  border: 0;
+  border-radius: 11px;
+  color: #fff;
+  background: linear-gradient(135deg, var(--brand), var(--brand-blue));
+  box-shadow: 0 12px 26px rgba(124, 58, 237, .22);
+}
+
+.app-shell .transfer-submit:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.app-shell .start-strategy {
+  border: 0;
+  border-radius: 11px;
+  color: #fff;
+  background: linear-gradient(135deg, var(--brand), var(--brand-blue));
+  box-shadow: 0 12px 26px rgba(124, 58, 237, .20);
+}
+
+.app-shell .start-strategy:disabled {
+  color: #7d8095;
+  background: #242333;
+  box-shadow: none;
+}
+
+.app-shell .start-strategy.locked {
+  border: 1px solid rgba(245, 196, 81, .28);
+  color: var(--gold);
+  background: var(--gold-soft);
+}
+
+.app-shell .opportunity-board-tabs button,
+.app-shell .activity-tabs button,
+.app-shell .metric-switch button,
+.app-shell .panel-tabs button {
+  border-radius: 999px;
+}
+
+.app-shell .opportunity-board-tabs button.active,
+.app-shell .activity-tabs button.active,
+.app-shell .metric-switch button.active,
+.app-shell .panel-tabs button.active {
+  border-color: transparent;
+  color: #fff;
+  background: linear-gradient(135deg, rgba(124, 58, 237, .9), rgba(59, 130, 246, .72));
+}
+
+.app-shell .opportunity-refresh {
+  border-color: var(--line);
+  border-radius: 999px;
+  color: #c9cbd8;
+  background: var(--surface-2);
+}
+
+.app-shell .opportunity-refresh:hover:not(:disabled) {
+  border-color: var(--brand-line);
+  color: #fff;
+}
+
+.app-shell .opportunity-filters {
+  padding: 14px 16px;
+}
+
+.app-shell .row-action {
+  border-color: var(--line);
+  border-radius: 9px;
+  color: #c9cbd8;
+  background: #11111b;
+}
+
+.app-shell .row-action.execute-action {
+  border-color: rgba(124, 58, 237, .38);
+  color: #e7e1ff;
+  background: rgba(124, 58, 237, .15);
+}
+
+.app-shell .row-action.execute-action:hover:not(:disabled) {
+  border-color: var(--brand-2);
+  color: #fff;
+  background: rgba(124, 58, 237, .28);
+}
+
+/* ---------------------------------------------------------------- tables */
+
+.app-shell .alternate-view :is(table) {
+  border-collapse: collapse;
+}
+
+.app-shell .alternate-view :is(table) th {
+  border-bottom-color: var(--line);
+  color: #7d8098;
+  background: #0a0a12;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .09em;
+}
+
+.app-shell .alternate-view :is(table) td {
+  border-bottom-color: var(--line-soft);
+}
+
+.app-shell .alternate-view :is(table) tbody tr:hover {
+  background: rgba(124, 58, 237, .045);
+}
+
+.app-shell .alternate-view :is(table) :is(td, th):first-child {
+  padding-left: 18px;
+}
+
+.app-shell .alternate-view :is(table) :is(td, th):last-child {
+  padding-right: 18px;
+}
+
+.app-shell .funding-pagination button,
+.app-shell .execution-pagination button {
+  border-color: var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+/* -------------------------------------------------------------- strategy */
+
+.app-shell .strategy-panel-head {
+  border-bottom-color: var(--line-soft);
+}
+
+.app-shell .strategy-panel-head h2 {
+  color: #f1f2f7;
+  font-weight: 720;
+  letter-spacing: -.015em;
+}
+
+.app-shell .strategy-leg {
+  border-color: var(--line);
+  border-radius: 13px;
+  background: #101019;
+}
+
+.app-shell .strategy-leg-head {
+  color: #9b9eb3;
+}
+
+.app-shell .strategy-setup-actions button,
+.app-shell .compact-trigger {
+  border-radius: 999px;
+}
+
+.app-shell .reduce-only-control,
+.app-shell .compact-field {
+  border-color: var(--line);
+  border-radius: 11px;
+  background: #0a0a12;
+}
+
+.app-shell .running-strategies {
+  border-color: var(--line);
+}
+
+.app-shell .running-head,
+.app-shell .running-row {
+  border-color: var(--line-soft);
+}
+
+.app-shell .running-row {
+  background: transparent;
+}
+
+.app-shell .running-row:hover {
+  background: rgba(124, 58, 237, .045);
+}
+
+.app-shell .strategy-launch {
+  border-color: var(--line);
+}
+
+.app-shell .strategy-launch.running {
+  border-color: rgba(24, 214, 173, .34);
+  box-shadow: inset 0 2px var(--green);
+}
+
+.app-shell .launch-status > span {
+  color: #cfd1df;
+}
+
+.app-shell .launch-intent strong {
+  color: #fff;
+}
+
+.app-shell .launch-summary dt {
+  color: #7d8098;
+}
+
+.app-shell .launch-summary dd {
+  color: #eef0f6;
+}
+
+/* ------------------------------------------------------ trade-page accents */
+
+.app-shell .trading-page .market-header,
+.app-shell .trading-page .terminal-panel {
+  border-color: var(--line);
+}
+
+.app-shell .trading-page .terminal-panel {
+  background: var(--surface);
+}
+
+.app-shell .trading-page .panel-tabs {
+  border-bottom-color: var(--line);
+}
+
+.app-shell .trading-page .trade-side-tabs button.active,
+.app-shell .trading-page .order-type-tabs button.active {
+  color: #fff;
+}
+
+.app-shell .trading-page .submit-order {
+  border-radius: 10px;
+}
+
+/* --------------------------------------------------- responsive: mobile */
+
+@media (max-width: 1180px) {
+  .app-shell .portfolio-summary {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .app-shell .portfolio-summary article:first-child {
+    grid-column: span 2;
+  }
+}
+
+@media (max-width: 920px) {
+  .app-shell {
+    padding-top: 58px;
+    padding-bottom: calc(78px + env(safe-area-inset-bottom));
+  }
+
+  .app-shell .topbar {
+    height: 58px;
+    flex-wrap: nowrap;
+    gap: 8px;
+    padding: 0 12px;
+  }
+
+  .app-shell .brand {
+    width: auto;
+    min-width: 0;
+    height: 58px;
+    padding: 0;
+    border: 0;
+  }
+
+  .app-shell .brand-symbol {
+    width: 29px;
+    height: 29px;
+  }
+
+  .app-shell .brand-copy {
+    gap: 2px;
+  }
+
+  .app-shell .brand-title strong {
+    font-size: 14px;
+  }
+
+  .app-shell .brand-title small {
+    font-size: 8px;
+  }
+
+  .app-shell .brand-edition {
+    display: none;
+  }
+
+  .app-shell .topbar > nav {
+    display: none;
+  }
+
+  .app-shell .top-actions {
+    height: 58px;
+    gap: 4px;
+  }
+
+  .app-shell .top-actions .mode-badge {
+    padding: 0 8px;
+    font-size: 9px;
+  }
+
+  .app-shell .utility,
+  .app-shell .settings-button {
+    width: 32px;
+    height: 32px;
+  }
+
+  .app-shell .workspace {
+    min-height: calc(100vh - 58px);
+  }
+
+  .app-shell .statusbar {
+    display: none;
+  }
+
+  .app-shell .alternate-view {
+    max-width: none;
+    padding: 22px 14px calc(86px + env(safe-area-inset-bottom));
+  }
+
+  .app-shell .view-heading {
+    align-items: flex-start;
+    gap: 14px;
+    margin-bottom: 20px;
+  }
+
+  .app-shell .view-heading h1 {
+    margin-bottom: 7px;
+    font-size: 28px;
+    letter-spacing: -.04em;
+  }
+
+  .app-shell .view-heading p:not(.eyebrow) {
+    font-size: 12px;
+  }
+
+  .app-shell .portfolio-summary {
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+
+  .app-shell .portfolio-summary article {
+    min-height: 96px;
+    padding: 13px 13px 12px;
+    border-radius: 15px;
+  }
+
+  .app-shell .portfolio-summary article:first-child {
+    grid-column: 1 / -1;
+    min-height: 108px;
+  }
+
+  .app-shell .portfolio-summary strong {
+    font-size: 21px;
+  }
+
+  .app-shell .portfolio-summary article:first-child strong {
+    font-size: 30px;
+  }
+
+  .app-shell .portfolio-content,
+  .app-shell .portfolio-operations {
+    grid-template-columns: 1fr;
+    gap: 10px;
+    margin-top: 10px;
+  }
+
+  .app-shell .section-title {
+    min-height: 58px;
+  }
+
+  .app-shell .portfolio-operations .section-title {
+    min-height: 58px;
+  }
+
+  .app-shell .alternate-view :is(table) {
+    font-size: 11px;
+  }
+
+  .app-shell .opportunity-view {
+    padding: 20px 14px 8px;
+    overflow: hidden;
+  }
+
+  .app-shell .opportunity-head-actions {
+    align-self: flex-start;
+    justify-content: flex-start;
+  }
+
+  .app-shell .opportunity-board-tabs {
+    width: 100%;
+    overflow-x: auto;
+    padding-bottom: 3px;
+    scrollbar-width: none;
+  }
+
+  .app-shell .opportunity-board-tabs::-webkit-scrollbar {
+    display: none;
+  }
+
+  .app-shell .opportunity-board-tabs button {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+
+  .app-shell .opportunity-filters {
+    padding: 12px;
+  }
+
+  .app-shell .opportunity-filter input {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .app-shell .opportunity-table {
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
+
+  .app-shell .opportunity-table table {
+    min-width: 760px;
+  }
+
+  .app-shell .opportunity-hint {
+    flex-basis: 100%;
+    text-align: left;
+  }
+
+  .app-shell .strategy-layout,
+  .app-shell .strategy-layout.revised {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .app-shell .strategy-layout.revised .strategy-sidebar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .app-shell .strategy-layout.revised .strategy-rules-sidebar {
+    width: 100%;
+  }
+
+  .app-shell .mobile-tabbar {
+    display: grid;
+  }
+}
+
+/* Bottom navigation only exists for the small-screen shell. */
+.app-shell .mobile-tabbar {
+  display: none;
+  position: fixed;
+  z-index: 60;
+  inset: auto 0 0;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 2px;
+  min-height: calc(66px + env(safe-area-inset-bottom));
+  padding: 7px 8px calc(7px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--line);
+  background: rgba(7, 7, 12, .94);
+  box-shadow: 0 -18px 44px rgba(0, 0, 0, .38);
+  backdrop-filter: blur(24px);
+}
+
+.app-shell .mobile-tabbar button {
+  min-width: 0;
+  display: grid;
+  justify-items: center;
+  align-content: center;
+  gap: 4px;
+  padding: 4px 2px;
+  border: 0;
+  border-radius: 12px;
+  color: #7f8299;
+  background: transparent;
+  font-size: 9px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.app-shell .mobile-tabbar button svg {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.app-shell .mobile-tabbar button.active {
+  color: #f0ecff;
+  background: rgba(124, 58, 237, .10);
+}
+
+.app-shell .mobile-tabbar button.active svg {
+  color: var(--gold);
+}
+
+.app-shell .mobile-tabbar button:focus-visible {
+  outline: 2px solid var(--brand-2) !important;
+  outline-offset: -2px !important;
+}
+
+/* Keep this after the base rule above: both selectors have the same specificity,
+ * so the small-screen override must be the last declaration. */
+@media (max-width: 920px) {
+  .app-shell .mobile-tabbar {
+    display: grid;
+  }
+}
+
+/* Mobile opportunity filters: wrap exchanges instead of clipping them, and make
+ * the wide hedge table visibly scrollable rather than looking cut off. */
+@media (max-width: 920px) {
+  .app-shell .exchange-filter {
+    flex-wrap: wrap;
+    height: auto;
+    overflow-x: visible;
+    padding: 10px 12px;
+  }
+
+  .app-shell .exchange-filter button {
+    flex: 0 1 auto;
+  }
+
+  .app-shell .opportunity-table {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(124, 58, 237, .75) transparent;
+    padding-bottom: 4px;
+  }
+
+  .app-shell .opportunity-table::-webkit-scrollbar {
+    height: 5px;
+  }
+
+  .app-shell .opportunity-table::-webkit-scrollbar-thumb {
+    background: rgba(124, 58, 237, .75);
+    border-radius: 999px;
+  }
+}
+
+/* The execution-method selector is a radio group; keep its selected state in
+ * the new brand palette instead of the legacy green action color. */
+.app-shell .compact-method button.active,
+.app-shell .compact-method button[aria-checked="true"] {
+  background: linear-gradient(135deg, var(--brand-2), var(--brand));
+  border-color: transparent;
+  color: #fff;
+  box-shadow: 0 6px 16px rgba(124, 58, 237, .22);
+}
+
+/* ------------------------------------------------------------------ */
+/* Funding page: keep the execution controls and status above the fold  */
+/* while leaving the dense settlement board to the lower section.       */
+/* ------------------------------------------------------------------ */
+.app-shell .funding-view.alternate-view {
+  padding-top: 24px;
+}
+
+.app-shell .funding-view .funding-heading {
+  margin-bottom: 14px;
+}
+
+.app-shell .funding-view .funding-heading h1 {
+  font-size: 32px;
+  line-height: 1.12;
+  letter-spacing: -.025em;
+}
+
+.app-shell .funding-view .funding-heading p {
+  max-width: 820px;
+  margin-top: 5px;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.app-shell .funding-arb-panel {
+  padding: 16px 18px 12px;
+}
+
+.app-shell .fa-head {
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.app-shell .fa-title .eyebrow {
+  margin-bottom: 3px;
+}
+
+.app-shell .fa-title h2 {
+  font-size: 18px;
+  line-height: 1.25;
+}
+
+.app-shell .fa-head-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.app-shell .funding-arb-panel .funding-arb-btn {
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 8px;
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.app-shell .funding-arb-panel .funding-arb-btn.primary {
+  background: linear-gradient(135deg, var(--brand-2), var(--brand));
+  border-color: transparent;
+  color: #fff;
+  box-shadow: 0 4px 12px rgba(124, 58, 237, .22);
+}
+
+.app-shell .funding-arb-panel .funding-arb-btn.danger {
+  border-color: rgba(245, 79, 74, .42);
+  color: #ff8b86;
+}
+
+.app-shell .fa-state {
+  height: 28px;
+  padding: 0 9px;
+  font-size: 10px;
+}
+
+.app-shell .fa-overview {
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.app-shell .fa-stats {
+  gap: 8px;
+}
+
+.app-shell .fa-stat {
+  min-height: 62px;
+  padding: 9px 10px;
+  border-radius: 10px;
+}
+
+.app-shell .fa-stat > span {
+  font-size: 10px;
+}
+
+.app-shell .fa-stat strong {
+  margin: 2px 0;
+  font-size: 18px;
+  line-height: 1.15;
+}
+
+.app-shell .fa-stat small {
+  font-size: 10px;
+  line-height: 1.3;
+}
+
+.app-shell .fa-control {
+  gap: 8px;
+}
+
+.app-shell .fa-segmented {
+  gap: 4px;
+  padding: 3px;
+  border-radius: 10px;
+}
+
+.app-shell .fa-segmented .seg {
+  min-height: 34px;
+  padding: 5px 8px;
+  border-radius: 7px;
+  font-size: 10px;
+}
+
+.app-shell .fa-badges {
+  gap: 4px;
+}
+
+.app-shell .fa-badges .badge {
+  padding: 3px 7px;
+  font-size: 9px;
+}
+
+.app-shell .fa-workspace {
+  margin-top: 10px;
+}
+
+.app-shell .fa-tabs {
+  gap: 2px;
+  padding-bottom: 0;
+}
+
+.app-shell .fa-tabs button {
+  height: 32px;
+  padding: 0 10px;
+  font-size: 11px;
+}
+
+.app-shell .fa-toolbar {
+  padding: 5px 0 6px;
+}
+
+.app-shell .funding-arb-table-wrap {
+  min-height: 0;
+  max-height: 360px;
+  overflow: auto;
+  border-radius: 10px;
+}
+
+.app-shell .funding-arb-table-wrap .funding-arb-table {
+  font-size: 11px;
+}
+
+.app-shell .funding-arb-table-wrap .funding-arb-table th {
+  padding: 8px 8px;
+  font-size: 9px;
+}
+
+.app-shell .funding-arb-table-wrap .funding-arb-table td {
+  padding: 8px 8px;
+}
+
+.app-shell .funding-arb-table-wrap .funding-arb-empty {
+  padding: 20px 12px;
+  font-size: 11px;
+}
+
+@media (max-width: 920px) {
+  .app-shell .funding-view.alternate-view {
+    padding: 16px 12px 84px;
+  }
+
+  .app-shell .funding-view .funding-heading {
+    margin-bottom: 10px;
+  }
+
+  .app-shell .funding-view .funding-heading h1 {
+    font-size: 26px;
+  }
+
+  .app-shell .funding-view .funding-heading p {
+    display: -webkit-box;
+    max-width: none;
+    overflow: hidden;
+    font-size: 12px;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+
+  .app-shell .funding-arb-panel {
+    padding: 13px 12px 10px;
+  }
+
+  .app-shell .fa-head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .app-shell .fa-title h2 {
+    font-size: 16px;
+  }
+
+  .app-shell .fa-head-actions {
+    display: grid;
+    grid-template-columns: minmax(0, 1.4fr) repeat(3, minmax(0, 1fr));
+    width: 100%;
+    margin-left: 0;
+    gap: 6px;
+  }
+
+  .app-shell .fa-state {
+    grid-column: 1 / -1;
+    justify-self: start;
+    height: 24px;
+    font-size: 9px;
+  }
+
+  .app-shell .funding-arb-panel .funding-arb-btn {
+    width: 100%;
+    height: 32px;
+    padding: 0 6px;
+    overflow: hidden;
+    font-size: 10px;
+    text-overflow: ellipsis;
+  }
+
+  .app-shell .fa-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  .app-shell .fa-stat {
+    min-height: 56px;
+    padding: 7px 8px;
+  }
+
+  .app-shell .fa-stat strong {
+    font-size: 16px;
+  }
+
+  .app-shell .fa-stat small {
+    font-size: 9px;
+  }
+
+  .app-shell .fa-overview {
+    gap: 8px;
+    margin-top: 9px;
+  }
+
+  .app-shell .fa-segmented .seg {
+    min-height: 30px;
+    padding: 4px 5px;
+    font-size: 9px;
+  }
+
+  .app-shell .fa-segmented .seg em {
+    font-size: 9px;
+  }
+
+  .app-shell .fa-badges {
+    display: none;
+  }
+
+  .app-shell .fa-workspace {
+    margin-top: 8px;
+  }
+
+  .app-shell .fa-tabs {
+    display: flex;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .app-shell .fa-tabs button {
+    flex: 0 0 auto;
+    height: 30px;
+    padding: 0 8px;
+    font-size: 10px;
+  }
+
+  .app-shell .fa-toolbar {
+    flex-wrap: wrap;
+    gap: 5px;
+    padding: 5px 0;
+  }
+
+  .app-shell .funding-arb-table-wrap {
+    max-height: 310px;
+  }
+
+  /* Candidates are a decision list on a phone, not a 9-column spreadsheet.
+   * Keep asset, pair, APR, verdict and the execute action; details remain
+   * available by opening the row. */
+  .app-shell .fa-candidate-table {
+    width: 100%;
+    min-width: 0;
+    table-layout: fixed;
+  }
+
+  .app-shell .fa-candidate-table th:nth-child(4),
+  .app-shell .fa-candidate-table td:nth-child(4),
+  .app-shell .fa-candidate-table th:nth-child(5),
+  .app-shell .fa-candidate-table td:nth-child(5),
+  .app-shell .fa-candidate-table th:nth-child(6),
+  .app-shell .fa-candidate-table td:nth-child(6),
+  .app-shell .fa-candidate-table th:nth-child(8),
+  .app-shell .fa-candidate-table td:nth-child(8) {
+    display: none;
+  }
+
+  .app-shell .fa-candidate-table th:nth-child(1) { width: 18%; }
+  .app-shell .fa-candidate-table th:nth-child(2) { width: 32%; }
+  .app-shell .fa-candidate-table th:nth-child(3) { width: 16%; }
+  .app-shell .fa-candidate-table th:nth-child(7) { width: 14%; }
+  .app-shell .fa-candidate-table th:nth-child(9) { width: 20%; }
+
+  .app-shell .fa-candidate-table th,
+  .app-shell .fa-candidate-table td {
+    padding: 7px 4px;
+    font-size: 9px;
+  }
+
+  .app-shell .fa-candidate-table .funding-arb-btn {
+    width: 100%;
+    height: 27px;
+    padding: 0 4px;
+    font-size: 9px;
+  }
+
+  .app-shell .fa-candidate-table .fa-caret {
+    display: none;
+  }
+}
+
+/* Empty candidate tables should collapse instead of reserving a third of the
+ * viewport; the min-height was inherited from the old always-visible board. */
+.app-shell .fa-workspace {
+  min-height: 0;
+}
+
+.app-shell .fa-tabbody {
+  min-height: 0;
+}
+
+/* The OI preset row is a single-line desktop control. On a phone, let the
+ * label and the preset chips wrap instead of squeezing the label vertically. */
+@media (max-width: 920px) {
+  .app-shell .funding-card .oi-filter {
+    flex-wrap: wrap;
+    height: auto;
+    gap: 6px;
+    padding: 10px 12px;
+  }
+
+  .app-shell .funding-card .oi-filter > span {
+    flex: 0 0 100%;
+  }
+
+  .app-shell .funding-card .oi-filter > button {
+    flex: 0 0 auto;
+  }
+
+  .app-shell .funding-card .oi-filter .oi-custom {
+    flex: 0 0 112px;
+  }
+
+  .app-shell .funding-card .oi-filter > small {
+    flex: 0 0 100%;
+    margin-left: 0;
+    text-align: left;
+  }
+}
+
+/* Funding settlement rows are an eight-column desktop table. On mobile the
+ * same data is rendered as compact pair cards by funding-settlement-board.tsx. */
+.app-shell .funding-mobile-cards {
+  display: none;
+}
+
+@media (max-width: 920px) {
+  .app-shell .funding-settlement-board .funding-table-wrap {
+    display: none;
+  }
+
+  .app-shell .funding-mobile-cards {
+    display: grid;
+    gap: 8px;
+    padding: 8px 12px 12px;
+  }
+
+  .app-shell .funding-mobile-card {
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: var(--surface-2);
+  }
+
+  .app-shell .funding-mobile-card > header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
+  .app-shell .funding-mobile-asset {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .app-shell .funding-mobile-asset > span:last-child {
+    display: grid;
+    min-width: 0;
+  }
+
+  .app-shell .funding-mobile-asset strong {
+    font-size: 14px;
+    line-height: 1.2;
+  }
+
+  .app-shell .funding-mobile-asset small {
+    overflow: hidden;
+    color: var(--muted);
+    font-size: 9px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .app-shell .funding-mobile-apr {
+    display: grid;
+    flex: 0 0 auto;
+    justify-items: end;
+  }
+
+  .app-shell .funding-mobile-apr strong {
+    font-size: 15px;
+  }
+
+  .app-shell .funding-mobile-apr small {
+    color: var(--muted);
+    font-size: 8px;
+  }
+
+  .app-shell .funding-mobile-legs {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--line);
+  }
+
+  .app-shell .funding-mobile-legs > div {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .app-shell .funding-mobile-legs small {
+    overflow: hidden;
+    color: var(--muted);
+    font-size: 8.5px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .app-shell .funding-mobile-legs strong {
+    font-size: 14px;
+  }
+
+  .app-shell .funding-mobile-card > footer {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--line);
+  }
+
+  .app-shell .funding-mobile-card > footer > span {
+    display: grid;
+    gap: 1px;
+    min-width: 0;
+  }
+
+  .app-shell .funding-mobile-card > footer small {
+    color: var(--muted);
+    font-size: 8px;
+  }
+
+  .app-shell .funding-mobile-card > footer strong {
+    font-size: 10.5px;
+  }
+}
+
+/* Funding page active states follow the purple brand instead of the legacy
+ * green action color. Green stays reserved for pass/safe semantics. */
+.app-shell .funding-lens-bar button.active,
+.app-shell .funding-arb-filter button.active {
+  border-color: transparent;
+  background: linear-gradient(135deg, var(--brand-2), var(--brand));
+  color: #fff;
+}
+
+.app-shell .fa-tabs button.active {
+  border-color: var(--brand-2);
+  color: #fff;
+}
+
+.app-shell .fa-segmented .seg.on {
+  border-color: rgba(124, 58, 237, .48);
+  background: rgba(124, 58, 237, .18);
+  color: #fff;
+}
+
+.app-shell .funding-card .exchange-filter button.selected,
+.app-shell .funding-card .oi-filter button.selected {
+  border-color: rgba(124, 58, 237, .58);
+  background: rgba(124, 58, 237, .12);
+  color: #eee9ff;
+}
+
+/* Positions: full instrument names on desktop, and a compact card list on phones.
+ * The merged table keeps its dense desktop layout; mobile no longer scrolls a 1000px table
+ * sideways just to read the market name or reach the close action. */
+.unified-positions-cards { display: none; }
+.spot-market-label { overflow-wrap: anywhere; }
+.app-shell .unified-positions-table td:nth-child(2) strong { white-space: nowrap; }
+
+@media (max-width: 920px) {
+  .app-shell .unified-positions-table { display: none; }
+  .unified-positions-cards {
+    display: grid;
+    gap: 8px;
+    padding: 10px 12px 4px;
+  }
+  .position-mobile-card {
+    min-width: 0;
+    padding: 11px 12px 10px;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: linear-gradient(180deg, var(--surface-2), var(--surface));
+  }
+  .position-mobile-head {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    min-width: 0;
+  }
+  .position-mobile-symbol {
+    min-width: 0;
+    max-width: 100%;
+    color: var(--text);
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    overflow-wrap: anywhere;
+  }
+  .position-mobile-side { margin-left: auto; }
+  .position-mobile-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 9px 12px;
+    margin: 10px 0 0;
+  }
+  .position-mobile-grid div { min-width: 0; }
+  .position-mobile-grid dt {
+    color: var(--muted, #8b8fa3);
+    font-size: 10px;
+    line-height: 1.3;
+  }
+  .position-mobile-grid dd {
+    margin: 2px 0 0;
+    color: var(--text);
+    font-size: 12px;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+  }
+  .position-mobile-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 10px;
+    padding-top: 9px;
+    border-top: 1px solid var(--line-soft);
+    color: var(--muted, #8b8fa3);
+    font-size: 11px;
+  }
+  .position-mobile-foot > span { min-width: 0; }
+  .position-mobile-foot strong { color: var(--text); }
+  .position-mobile-foot .row-action {
+    flex: 0 0 auto;
+    min-height: 30px;
+    padding: 0 10px;
+    border: 1px solid rgba(124, 58, 237, .5);
+    border-radius: 9px;
+    color: #c4b5fd;
+    background: rgba(124, 58, 237, .10);
+    font-size: 11px;
+  }
+}
+
+/* Exchange-style control geometry: mature venue UIs use compact rectangles,
+ * not large pills. Keep pill shapes only for status badges and tags. */
+.app-shell .topbar nav button,
+.app-shell .topbar nav button.active,
+.app-shell .mobile-tabbar button,
+.app-shell .mobile-tabbar button.active,
+.app-shell .portfolio-refresh,
+.app-shell .opportunity-refresh,
+.app-shell .row-action,
+.app-shell .funding-arb-panel .funding-arb-btn,
+.app-shell .funding-arb-panel .funding-arb-btn.primary,
+.app-shell .funding-arb-panel .funding-arb-btn.danger,
+.app-shell .transfer-submit,
+.app-shell .start-strategy,
+.app-shell .position-mobile-foot .row-action,
+.app-shell .funding-mobile-card,
+.app-shell .position-mobile-card,
+.app-shell .opportunity-board-tabs button,
+.app-shell .activity-tabs button,
+.app-shell .metric-switch button,
+.app-shell .panel-tabs button,
+.app-shell .funding-arb-filter button,
+.app-shell .fa-tabs button,
+.app-shell .fa-segmented .seg {
+  border-radius: 6px;
+}
+
+.app-shell .fa-segmented,
+.app-shell .funding-arb-filter,
+.app-shell .opportunity-board-tabs,
+.app-shell .activity-tabs,
+.app-shell .metric-switch {
+  border-radius: 7px;
+}
+
+.app-shell .portfolio-summary article,
+.app-shell .portfolio-operations > article,
+.app-shell .alternate-view :is(
+  .terminal-panel,
+  .strategy-panel,
+  .strategy-launch,
+  .running-strategies,
+  .allocation-card,
+  .balance-card,
+  .transfer-card,
+  .activity-card,
+  .opportunity-filters,
+  .opportunity-board,
+  .funding-arb-panel
+) {
+  border-radius: 10px;
+}
+
+.app-shell .funding-mobile-card,
+.app-shell .position-mobile-card {
+  border-radius: 9px;
+}
+
+.app-shell .panel-filter-chips button {
+  border-radius: 6px;
+}
+
+.app-shell .panel-filter-chips button.active {
+  border-color: var(--brand);
+  color: #fff;
+  background: var(--brand);
+}
+
+.app-shell .positions-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  margin: 0 0 8px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--line);
+}
+
+.app-shell .positions-summary > div {
+  display: grid;
+  gap: 3px;
+  padding: 9px 12px;
+  background: var(--surface);
+}
+
+.app-shell .positions-summary span {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.app-shell .positions-summary strong {
+  color: var(--text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 640px) {
+  .app-shell .positions-summary {
+    margin-inline: 10px;
+  }
+
+  .app-shell .positions-summary > div {
+    padding: 8px 9px;
+  }
+
+  .app-shell .positions-summary span {
+    font-size: 9px;
+  }
+
+  .app-shell .positions-summary strong {
+    font-size: 12px;
+  }
+}
+
+/* Desktop strategy workspace: keep the market/history column next to the
+ * configure/review rail so the page fits in roughly one and a half screens
+ * instead of stacking two full-width forms. The 1540px single-column rule
+ * above remains only for mid-size/tablet widths. */
+@media (min-width: 1180px) {
+  .app-shell .strategy-layout.revised {
+    grid-template-columns: minmax(0, 1fr) minmax(400px, 440px);
+    align-items: start;
+  }
+
+  .app-shell .strategy-layout.revised .strategy-main,
+  .app-shell .strategy-layout.revised .strategy-sidebar {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .app-shell .strategy-layout.revised .strategy-sidebar {
+    position: sticky;
+    top: 78px;
+  }
+
+  .app-shell .strategy-layout.revised .strategy-rules-sidebar,
+  .app-shell .strategy-layout.revised .strategy-launch {
+    width: 100%;
+  }
+}
+
+.app-shell .strategy-heading {
+  padding-bottom: 6px;
+}
+
+.app-shell .strategy-heading h1 {
+  font-size: clamp(28px, 2.2vw, 34px);
+}
+
+.app-shell .strategy-funding-history .funding-history-chart {
+  height: 210px;
+}
+
+.app-shell .strategy-funding-history .premium-history-head {
+  min-height: 54px;
+}
+
+.app-shell .strategy-market-panel .strategy-legs {
+  gap: 8px;
+}
+
+.app-shell .strategy-market-panel .strategy-leg {
+  padding: 10px 12px;
+}
+
+.app-shell .strategy-rules.compact .compact-fields {
+  gap: 6px;
+  padding: 10px 12px 8px;
+}
+
+.app-shell .strategy-rules.compact .compact-fields label > div {
+  height: 32px;
+}
+
+.app-shell .strategy-launch .review-grid {
+  gap: 0;
+}
+
+.app-shell .strategy-launch .review-grid > div {
+  padding-block: 3px;
+}
+
+.app-shell .strategy-funding-history .funding-history-chart {
+  height: 170px;
+}
+
+.app-shell .running-strategies {
+  margin-top: 10px;
+}
+
+.app-shell .running-strategies .strategy-panel-head {
+  min-height: 46px;
+}
+
+.app-shell .running-strategies .running-head {
+  height: 30px;
+}
+
+.app-shell .running-strategies .no-strategies {
+  min-height: 58px;
+  padding: 8px 12px;
+}
+
+.app-shell .strategy-heading {
+  margin-bottom: 0;
+  padding-bottom: 2px;
+}
+
+.app-shell .strategy-launch .launch-intent {
+  padding-block: 8px;
+}
+
+.app-shell .strategy-launch .launch-summary.review-grid {
+  gap: 0;
+}
+
+.app-shell .strategy-launch .launch-summary.review-grid > div {
+  min-height: 0;
+  padding: 2px 4px;
+}
+
+.app-shell .strategy-launch .launch-summary dt,
+.app-shell .strategy-launch .launch-summary dd {
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.app-shell .strategy-launch .start-strategy {
+  min-height: 36px;
+  margin-top: 8px;
+}
+
+.app-shell .strategy-launch .launch-warning {
+  margin-top: 6px;
+  padding: 6px 8px;
+}
+
+.app-shell .strategy-heading h1 {
+  font-size: clamp(26px, 2vw, 31px);
+}
+
+.app-shell .strategy-heading > div > p:last-child {
+  margin-top: 4px;
+  font-size: 11px;
+}
+
+.app-shell .running-strategies:has(.no-strategies) .running-head {
+  display: none;
+}
+
+.app-shell .running-strategies:has(.no-strategies) .no-strategies {
+  min-height: 46px;
+}
+
+/* ------------------------------------------------------------ final system pass
+ * One shared scale for every page. Page-specific CSS above may still position
+ * things, but typography, control geometry and surface radii come from here. */
+:root {
+  --panel-radius: 14px;
+  --control-radius: 8px;
+  --text-page-title: 32px;
+  --text-section-title: 16px;
+  --text-body: 12px;
+  --text-label: 11px;
+}
+
+.app-shell .alternate-view {
+  max-width: 1560px;
+  padding: 22px 24px 44px;
+}
+
+.app-shell .view-heading {
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.app-shell .view-heading h1 {
+  margin: 0 0 6px;
+  font-size: 32px;
+  font-weight: 760;
+  line-height: 1.14;
+  letter-spacing: -.035em;
+}
+
+.app-shell .view-heading p:not(.eyebrow) {
+  max-width: 760px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.app-shell .eyebrow {
+  margin-bottom: 5px;
+  font-size: 9px;
+  letter-spacing: .14em;
+}
+
+/* Boros uses the shared header, but its display wordmark was the one page still
+ * rendering at display-headline scale. */
+.app-shell .boros-heading h1 {
+  gap: 10px;
+  font-size: 32px !important;
+  line-height: 1.14;
+}
+
+.app-shell .boros-heading h1 > span,
+.app-shell .boros-heading h1 > svg,
+.app-shell .boros-heading h1 img {
+  width: 34px;
+  height: 34px;
+}
+
+/* One card geometry for every page family. */
+.app-shell .alternate-view :is(
+  .terminal-panel,
+  .strategy-panel,
+  .strategy-launch,
+  .running-strategies,
+  .allocation-card,
+  .balance-card,
+  .transfer-card,
+  .activity-card,
+  .opportunity-filters,
+  .opportunity-board,
+  .funding-detail-card,
+  .funding-panel,
+  .fee-query-card,
+  .fee-results-card,
+  .boros-controls,
+  .boros-opportunities,
+  .boros-workflow,
+  .boros-guide
+) {
+  border-radius: var(--panel-radius);
+}
+
+.app-shell .section-title,
+.app-shell .strategy-panel-head,
+.app-shell .funding-detail-card-head,
+.app-shell .premium-history-head {
+  min-height: 54px;
+}
+
+.app-shell :is(
+  .section-title,
+  .strategy-panel-head,
+  .funding-detail-card-head,
+  .premium-history-head,
+  .opportunity-board-head,
+  .fee-results-card > header,
+  .boros-controls h2,
+  .boros-opportunities h2,
+  .boros-workflow-head h2
+) h2 {
+  font-size: var(--text-section-title);
+}
+
+/* Shared control geometry. Keep compact table actions compact, but make the
+ * primary CTA and the navigation/tab bands use one height across all pages. */
+.app-shell button,
+.app-shell input,
+.app-shell select,
+.app-shell textarea {
+  font-family: var(--font-sans);
+}
+
+.app-shell .topbar-navigation-button {
+  min-height: 36px;
+  border-radius: var(--control-radius);
+  font-size: 12px;
+}
+
+.app-shell :is(
+  .panel-tabs,
+  .strategy-history-tabs,
+  .funding-lens-bar,
+  .opportunity-board-tabs,
+  .boros-tabs
+) button {
+  min-height: 34px;
+  border-radius: var(--control-radius);
+  padding-inline: 12px;
+  font-size: 12px;
+}
+
+.app-shell :is(
+  .submit-order,
+  .start-strategy,
+  .confirm-submit,
+  .fa-start,
+  .fa-scan,
+  .portfolio-refresh,
+  .fee-refresh,
+  .boros-preflight > button
+) {
+  min-height: 38px;
+  border-radius: var(--control-radius);
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.app-shell .alternate-view :is(input:not([type='checkbox']):not([type='radio']), select) {
+  min-height: 34px;
+  height: 34px;
+  border-radius: var(--control-radius);
+  font-size: 12px;
+}
+
+.app-shell .alternate-view :is(table) th {
+  font-size: 10px;
+  letter-spacing: .055em;
+}
+
+.app-shell .alternate-view :is(table) td {
+  font-size: 12px;
+}
+
+.app-shell .positions-table button,
+.app-shell .orders-table button,
+.app-shell .fee-results-card button {
+  min-height: 27px;
+  border-radius: 6px;
+  font-size: 11px;
+}
+
+/* Boros opportunity cards are large clickable surfaces, not pills. */
+.app-shell .boros-opportunity,
+.app-shell .boros-opportunity-card,
+.app-shell .boros-opportunity-list > button,
+.app-shell .boros-opportunity-list > li > button {
+  border-radius: 12px;
+}
+
+.app-shell .boros-controls button,
+.app-shell .boros-filters button {
+  min-height: 30px;
+  border-radius: var(--control-radius);
+  font-size: 12px;
+}
+
+.app-shell .opportunity-board-tabs button {
+  border-radius: var(--control-radius);
+}
+
+.app-shell .opportunity-board-tabs button.active,
+.app-shell .funding-lens-bar button.active {
+  background: linear-gradient(135deg, var(--brand), var(--brand-blue));
+  border-color: var(--brand-line);
+  color: #fff;
+}
+
+@media (max-width: 920px) {
+  .app-shell .alternate-view {
+    padding: 16px 14px 82px;
+  }
+
+  .app-shell .view-heading {
+    align-items: flex-start;
+    margin-bottom: 14px;
+  }
+
+  .app-shell .view-heading h1,
+  .app-shell .boros-heading h1 {
+    font-size: 26px !important;
+    margin-bottom: 5px;
+  }
+
+  .app-shell .view-heading p:not(.eyebrow) {
+    font-size: 11px;
+  }
+
+  .app-shell .section-title,
+  .app-shell .strategy-panel-head,
+  .app-shell .funding-detail-card-head,
+  .app-shell .premium-history-head {
+    min-height: 48px;
+  }
+
+  .app-shell :is(
+    .submit-order,
+    .start-strategy,
+    .confirm-submit,
+    .fa-start,
+    .fa-scan,
+    .portfolio-refresh,
+    .fee-refresh,
+    .boros-preflight > button
+  ) {
+    min-height: 40px;
+  }
+}
+
+/* Shared control radius. Page-level rules above intentionally used 5–6px
+ * in a few places; the final layer normalizes them to the 8px system value.
+ * Table row actions stay at 6px because they sit inside dense data rows. */
+.app-shell button:not(.brand):not(.icon-button):not(.star-button):not(.transfer-swap) {
+  border-radius: var(--control-radius);
+}
+
+.app-shell .funding-arb-btn {
+  min-height: 36px;
+  font-size: 12px;
+}
+
+.app-shell .funding-arb-btn.primary,
+.app-shell .fa-start {
+  min-height: 40px;
+}
+
+.app-shell .funding-arb-panel .seg {
+  min-height: 32px;
+  font-size: 11px;
+}
+
+.app-shell .portfolio-view .panel-tabs button,
+.app-shell .opportunity-view .panel-tabs button {
+  height: 34px;
+}
+
+.app-shell .portfolio-refresh,
+.app-shell .opportunity-refresh,
+.app-shell .fee-refresh,
+.app-shell .boros-controls button {
+  min-height: 34px;
+}
+
+.app-shell .transfer-submit {
+  min-height: 40px;
+}
+
+.app-shell .row-action,
+.app-shell .execute-action,
+.app-shell .positions-table button,
+.app-shell .orders-table button {
+  min-height: 28px;
+  border-radius: 6px;
+}
+
+.app-shell .mobile-tabbar button {
+  border-radius: 10px;
+}
+
+/* Compact toolbar rows: on desktop the opportunity filters read as one
+ * continuous band instead of four unrelated cards. */
+@media (min-width: 921px) {
+  .app-shell .opportunity-view > :is(
+    .asset-class-filters,
+    .hedge-mode-switch,
+    .opportunity-filters,
+    .exchange-filter
+  ) {
+    margin: 0;
+    padding: 9px 0;
+    border: 0;
+    border-bottom: 1px solid var(--line);
+    border-radius: 0;
+    background: transparent;
+  }
+
+  .app-shell .opportunity-view > .opportunity-filters {
+    padding-inline: 0;
+  }
+
+  .app-shell .opportunity-view > .exchange-filter {
+    margin-bottom: 2px;
+  }
+}
+
+/* One active-state language: brand gradient for selected tabs/filters. Green remains
+ * reserved for positive PnL and healthy/live indicators. */
+.app-shell :is(
+  .equity-range-tabs button.active,
+  .positions-head .panel-tabs button.active,
+  .portfolio-view .panel-tabs button.active,
+  .funding-settlement-board .lens-tabs button.active,
+  .funding-settlement-board .funding-lens-bar button.active,
+  .market-filter button.selected,
+  .exchange-filter button.selected,
+  .opportunity-board-tabs button.active,
+  .funding-lens-bar button.active
+) {
+  border-color: var(--brand-line);
+  color: #fff;
+  background: linear-gradient(135deg, var(--brand), var(--brand-blue));
+}
+
+.app-shell .exchange-filter button.selected em,
+.app-shell .market-filter button.selected em {
+  color: #fff;
+}
+
+.app-shell .fee-refresh {
+  border: 1px solid var(--brand-line);
+  color: #ddd6fe;
+  background: var(--brand-soft);
+}
+
+.app-shell .fee-refresh:hover {
+  border-color: var(--brand-2);
+  color: #fff;
+  background: rgba(124, 58, 237, .28);
+}

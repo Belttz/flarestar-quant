@@ -290,6 +290,45 @@ export function FundingSettlementBoard({
       </table>
       {rows.length === 0 && <div className="funding-empty">{t('No venue pair matches the current filters.')}</div>}
     </div>
+    {/* Phones get a decision card per pair instead of a horizontally clipped
+     * eight-column table. The desktop table remains the source of truth. */}
+    <div className="funding-mobile-cards">
+      {rows.map((row) => {
+        const countdown = formatFundingCountdown(fundingSettlementCountdown(row.nextFundingAt, now));
+        const longInterval = fundingIntervalLabel(row.long.intervalHours);
+        const shortInterval = fundingIntervalLabel(row.short.intervalHours);
+        return <article className="funding-mobile-card" key={row.key}>
+          <header>
+            <span className="funding-mobile-asset">
+              <span className="funding-asset">{row.icon}</span>
+              <span><strong>{row.asset}</strong><small>{row.long.venueShort} ⇄ {row.short.venueShort} · {row.name}</small></span>
+            </span>
+            <span className="funding-mobile-apr">
+              <strong className="funding-rate funding-tone-earn">{formatPercent(row.annualizedPercent, 1, emptyLabel)}</strong>
+              <small>{t('Annualized APR')}</small>
+            </span>
+          </header>
+          <div className="funding-mobile-legs">
+            <div>
+              <small>{t('Long')} · {row.long.venueName}</small>
+              <strong className={`funding-rate ${toneClass(row.long.ratePercent)}`}>{formatPercent(row.long.ratePercent, 4, emptyLabel)}</strong>
+              <small>{longInterval ? `${t('per interval')} · ${longInterval}` : t('interval unknown')}</small>
+            </div>
+            <div>
+              <small>{t('Short')} · {row.short.venueName}</small>
+              <strong className={`funding-rate ${toneClass(row.short.ratePercent)}`}>{formatPercent(row.short.ratePercent, 4, emptyLabel)}</strong>
+              <small>{shortInterval ? `${t('per interval')} · ${shortInterval}` : t('interval unknown')}</small>
+            </div>
+          </div>
+          <footer>
+            <span><small>{t('Funding spread')}</small><strong>{formatPercent(row.spreadPercent, 4, emptyLabel)}</strong></span>
+            <span><small>{t('Open interest')}</small><strong>{formatOpenInterest(row.openInterest, emptyLabel)}</strong></span>
+            <span><small>{t('Next settlement')}</small><strong>{countdown === null ? emptyLabel : `${t('in')} ${countdown}`}</strong></span>
+          </footer>
+        </article>;
+      })}
+      {rows.length === 0 && <div className="funding-empty">{t('No venue pair matches the current filters.')}</div>}
+    </div>
     <div className="funding-settlement-legend">
       <span><i className="funding-settlement-bar funding-tone-pay" />{t('Charged to longs — you pay')}</span>
       <span><i className="funding-settlement-bar funding-tone-earn" />{t('Paid to longs — you receive')}</span>

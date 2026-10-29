@@ -3,7 +3,6 @@ import { AdlIndicators } from './adl-indicator.js';
 import { ExecutionPagination } from './execution-pagination-control.js';
 import { executionPageWindow } from './execution-pagination.js';
 import { useLanguage } from './i18n.js';
-import { marketSymbol } from './market-symbol.js';
 import { compactPrice } from './number-format.js';
 import { formatAmount, signedAmount, VenueCell, exchanges } from './route-shared.js';
 import { groupPositionRows, type PositionTableRow } from './strategy-positions.js';
@@ -78,7 +77,7 @@ export function PositionsTable({ rows, onClose }: PositionsTableProps) {
           const position = group.legs[0];
           const ranks = [{ key: position.id, venue: position.venue, crossExRank: position.crossExAdlRank, exchangeRank: position.exchangeAdlRank }];
           return <tr key={group.key}>
-            <td><strong>{marketSymbol(position.asset, position.quote, 'perpetual')}</strong><small className={position.quantity >= 0 ? 'long-tag' : 'short-tag'}>{t(position.quantity >= 0 ? 'Long' : 'Short')}</small></td>
+            <td><strong>{position.asset}/{position.quote}</strong><small className={position.quantity >= 0 ? 'long-tag' : 'short-tag'}>{t(position.quantity >= 0 ? 'Long' : 'Short')}</small></td>
             <td><VenueFromCode code={position.venue} /></td>
             <td>{position.quantity.toFixed(4)} {position.asset}</td>
             <td>{valueUnknown(position) ? '—' : `${formatAmount(position.value)} ${position.quote}`}</td>
@@ -105,7 +104,7 @@ export function PositionsTable({ rows, onClose }: PositionsTableProps) {
         const groupPnlKnown = group.legs.every((leg) => !pnlUnknown(leg));
         return <Fragment key={group.key}>
           <tr className="aggregate-row">
-            <td><button type="button" className={expanded ? 'expand-position expanded' : 'expand-position'} aria-expanded={expanded} aria-label={`${t('Positions')} · ${group.label}`} onClick={() => setExpandedPosition(expanded ? null : group.key)}>›</button><strong>{group.label} PERP</strong><small className={group.fullyHedged ? 'hedged-tag' : group.quantity >= 0 ? 'long-tag' : 'short-tag'}>{t(group.fullyHedged ? 'Hedged' : group.quantity >= 0 ? 'Long' : 'Short')}</small></td>
+            <td><button type="button" className={expanded ? 'expand-position expanded' : 'expand-position'} aria-expanded={expanded} aria-label={`${t('Positions')} · ${group.label}`} onClick={() => setExpandedPosition(expanded ? null : group.key)}>›</button><strong>{group.mixedAssets ? group.label : `${group.label}/${aggregateQuote}`} PERP</strong><small className={group.fullyHedged ? 'hedged-tag' : group.quantity >= 0 ? 'long-tag' : 'short-tag'}>{t(group.fullyHedged ? 'Hedged' : group.quantity >= 0 ? 'Long' : 'Short')}</small></td>
             <td><span className="venue-group"><strong>{group.venueCount} {t(group.venueCount === 1 ? 'exchange' : 'exchanges')}</strong></span></td>
             <td>{group.mixedAssets ? '—' : `${group.quantity.toFixed(4)} ${group.asset}`}</td>
             <td>{group.mixedAssets || !groupValueKnown ? '—' : `$${formatAmount(group.grossNotional)}`}</td>
@@ -118,7 +117,7 @@ export function PositionsTable({ rows, onClose }: PositionsTableProps) {
             <td><button className="row-action close-position-action" onClick={() => onClose(group.legs)}>{t('Close all')}</button></td>
           </tr>
           {expanded && group.legs.map((position) => <tr className="position-leg" key={position.id}>
-            <td><span className="leg-branch">↳</span><strong>{marketSymbol(position.asset, position.quote, 'perpetual')}</strong><small>{t('Venue leg')}</small></td>
+            <td><span className="leg-branch">↳</span><strong>{position.asset}/{position.quote}</strong><small>{t('Venue leg')}</small></td>
             <td><VenueFromCode code={position.venue} /></td>
             <td>{position.quantity.toFixed(4)} {position.asset}</td>
             <td>{valueUnknown(position) ? '—' : `${formatAmount(position.value)} ${position.quote}`}</td>

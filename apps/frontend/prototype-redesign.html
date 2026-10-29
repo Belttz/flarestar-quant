@@ -1,0 +1,835 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%237c3aed'/%3E%3Cpath d='M16 6c.7 5.8 4.2 9.3 10 10-5.8.7-9.3 4.2-10 10-.7-5.8-4.2-9.3-10-10 5.8-.7 9.3-4.2 10-10Z' fill='%23101011'/%3E%3C/svg%3E" />
+<title>星闪量化 · UI 重构预览</title>
+<style>
+  @font-face {
+    font-family: 'Manrope';
+    src: url('./src/assets/fonts/Manrope-Variable.ttf') format('truetype');
+    font-weight: 200 800;
+    font-display: swap;
+  }
+
+  :root {
+    --bg: #050509;
+    --surface: #0d0d16;
+    --surface-2: #12121d;
+    --surface-3: #181826;
+    --line: #26263c;
+    --line-soft: #1c1c2c;
+    --text: #f4f5f6;
+    --muted: #9693ad;
+    --muted-2: #68657f;
+    --primary: #7c3aed;
+    --primary-2: #8b5cf6;
+    --primary-soft: rgba(124, 58, 237, .16);
+    --blue: #3b82f6;
+    --blue-2: #60a5fa;
+    --gold: #f5c451;
+    --gold-soft: rgba(245, 196, 81, .14);
+    --green: #29ab87;
+    --green-soft: rgba(41, 171, 135, .12);
+    --red: #f54f4a;
+    --radius: 20px;
+    --radius-sm: 14px;
+    --font: 'Manrope', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif;
+    --mono: 'SF Mono', 'Roboto Mono', ui-monospace, monospace;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; }
+  body {
+    color: var(--text);
+    background: var(--bg);
+    font-family: var(--font);
+    font-size: 14px;
+    -webkit-font-smoothing: antialiased;
+  }
+  button { font: inherit; color: inherit; }
+  button, a { -webkit-tap-highlight-color: transparent; }
+  button:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+  svg { display: block; }
+
+  /* ---------- preview chrome ---------- */
+  .preview-bar {
+    position: fixed;
+    z-index: 100;
+    inset: 0 0 auto;
+    height: 58px;
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    padding: 0 22px;
+    border-bottom: 1px solid #1a1a2a;
+    background: rgba(7, 7, 8, .92);
+    backdrop-filter: blur(18px);
+  }
+  .preview-brand { display: flex; align-items: center; gap: 9px; min-width: 0; }
+  .preview-mark {
+    width: 24px; height: 24px; display: grid; place-items: center; border-radius: 8px;
+    color: #fff; background: linear-gradient(135deg, var(--primary), var(--blue)); font-weight: 900; font-size: 13px;
+    box-shadow: 0 0 24px rgba(99,102,241,.38);
+  }
+  .preview-brand strong { font-size: 13px; letter-spacing: .02em; white-space: nowrap; }
+  .preview-brand span { color: var(--muted-2); font-size: 11px; white-space: nowrap; }
+  .preview-seg {
+    display: flex; gap: 2px; margin-left: auto; padding: 3px;
+    border: 1px solid var(--line); border-radius: 999px; background: var(--surface);
+  }
+  .preview-seg button {
+    height: 30px; padding: 0 16px; border: 0; border-radius: 999px;
+    color: var(--muted); background: transparent; font-size: 12px; font-weight: 700; cursor: pointer;
+    transition: color .15s ease, background .15s ease;
+  }
+  .preview-seg button.active { color: #fff; background: linear-gradient(135deg, var(--primary), var(--blue)); }
+  .preview-hint { color: var(--muted-2); font-size: 11px; white-space: nowrap; }
+  .preview-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
+
+  .stage {
+    min-height: 100vh;
+    padding: 86px 24px 40px;
+    display: grid;
+    place-items: start center;
+    background:
+      radial-gradient(720px 420px at 50% -12%, rgba(139,92,246,.14), transparent 68%),
+      radial-gradient(620px 380px at 94% 32%, rgba(59,130,246,.07), transparent 72%);
+  }
+  .view-panel[hidden] { display: none !important; }
+
+  /* ---------- desktop app ---------- */
+  .desktop-shell {
+    width: min(1440px, 100%);
+    overflow: hidden;
+    border: 1px solid #2a2a40;
+    border-radius: 24px;
+    background: #08080e;
+    box-shadow: 0 36px 110px rgba(0, 0, 0, .55), 0 0 0 1px rgba(255,255,255,.015) inset;
+  }
+  .d-topbar {
+    height: 66px;
+    display: flex;
+    align-items: center;
+    gap: 26px;
+    padding: 0 24px;
+    border-bottom: 1px solid var(--line-soft);
+    background: rgba(16, 16, 17, .78);
+  }
+  .d-brand { display: flex; align-items: center; gap: 10px; min-width: 178px; border: 0; padding: 0; background: transparent; cursor: pointer; text-align: left; }
+  .d-brand-mark { width: 30px; height: 30px; position: relative; display: grid; place-items: center; }
+  .d-brand-mark svg { width: 28px; height: 28px; overflow: visible; }
+  .d-brand-copy { display: grid; gap: 1px; }
+  .d-brand-copy strong { font-size: 14px; letter-spacing: .03em; }
+  .d-brand-copy small { color: var(--muted-2); font-size: 9px; letter-spacing: .13em; text-transform: uppercase; }
+  .d-nav { display: flex; align-items: center; gap: 3px; }
+  .d-nav button {
+    height: 34px; padding: 0 13px; border: 0; border-radius: 9px;
+    color: var(--muted); background: transparent; font-size: 12px; font-weight: 650;
+    cursor: pointer; transition: color .15s ease, background .15s ease;
+  }
+  .d-nav button:hover { color: var(--text); background: var(--surface-2); }
+  .d-nav button.active { color: var(--text); background: #1e1e30; }
+  .d-nav button.active::after {
+    content: ''; display: inline-block; width: 5px; height: 5px; margin-left: 7px;
+    border-radius: 50%; background: var(--gold); vertical-align: 2px;
+  }
+  .d-top-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+  .d-live {
+    display: flex; align-items: center; gap: 7px; height: 30px; padding: 0 11px;
+    border: 1px solid #2e312e; border-radius: 999px; color: #a9b2ad;
+    background: #121613; font-size: 10px; font-weight: 700; letter-spacing: .03em;
+  }
+  .d-icon-btn {
+    width: 34px; height: 34px; display: grid; place-items: center; padding: 0;
+    border: 1px solid var(--line); border-radius: 50%; color: var(--muted); background: var(--surface);
+    cursor: pointer; transition: border-color .15s ease, color .15s ease;
+  }
+  .d-icon-btn:hover { border-color: #3a3c40; color: var(--text); }
+  .d-avatar {
+    width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid #3a2d5a;
+    border-radius: 50%; color: #fff; background: linear-gradient(135deg, #4c1d95, #1e3a8a); font-size: 11px; font-weight: 800;
+  }
+
+  .d-main { padding: 26px 24px 20px; }
+  .d-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 22px; margin-bottom: 22px; }
+  .d-eyebrow { margin: 0 0 7px; color: var(--gold); font-size: 10px; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; }
+  .d-heading h1 { margin: 0; font-size: 34px; line-height: 1.08; letter-spacing: -.045em; font-weight: 700; }
+  .d-heading p { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
+  .d-heading-actions { display: flex; align-items: center; gap: 9px; padding-bottom: 2px; }
+  .d-ghost-btn, .d-primary-btn {
+    height: 38px; display: inline-flex; align-items: center; gap: 8px; padding: 0 15px;
+    border-radius: 11px; font-size: 12px; font-weight: 750; cursor: pointer;
+    transition: transform .15s ease, background .15s ease, border-color .15s ease;
+  }
+  .d-ghost-btn { border: 1px solid var(--line); color: #c7c9cd; background: var(--surface); }
+  .d-ghost-btn:hover { border-color: #3a3c40; background: var(--surface-2); }
+  .d-primary-btn { border: 1px solid rgba(139,92,246,.9); color: #fff; background: linear-gradient(135deg, var(--primary), var(--blue)); box-shadow: 0 8px 28px rgba(99,102,241,.28); }
+  .d-primary-btn:hover { background: linear-gradient(135deg, var(--primary-2), var(--blue-2)); transform: translateY(-1px); }
+
+  .d-stats { display: grid; grid-template-columns: 1.45fr 1fr 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+  .stat-card {
+    min-width: 0; padding: 17px 18px 16px;
+    border: 1px solid var(--line-soft); border-radius: var(--radius-sm); background: var(--surface);
+  }
+  .stat-card.hero {
+    border-color: #302a48;
+    background:
+      radial-gradient(260px 150px at 100% 0, rgba(139,92,246,.18), transparent 70%),
+      radial-gradient(220px 130px at 70% 0, rgba(59,130,246,.08), transparent 72%),
+      var(--surface);
+  }
+  .stat-label { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .055em; text-transform: uppercase; }
+  .stat-label i { width: 5px; height: 5px; border-radius: 50%; background: var(--primary); }
+  .stat-card.hero .stat-label i { background: var(--gold); box-shadow: 0 0 9px rgba(245,196,81,.55); }
+  .stat-value { margin-top: 9px; display: flex; align-items: baseline; gap: 7px; font-size: 24px; line-height: 1; letter-spacing: -.035em; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .stat-value small { color: var(--muted-2); font-size: 12px; letter-spacing: 0; font-weight: 600; }
+  .stat-sub { margin-top: 8px; display: flex; align-items: center; gap: 7px; color: var(--muted-2); font-size: 10px; }
+  .delta-up { color: var(--green); }
+  .delta-down { color: var(--red); }
+  .pill {
+    display: inline-flex; align-items: center; gap: 5px; height: 20px; padding: 0 8px;
+    border-radius: 999px; font-size: 9px; font-weight: 800; letter-spacing: .02em;
+  }
+  .pill.accent { color: var(--primary-2); background: var(--primary-soft); }
+  .pill.green { color: var(--green); background: var(--green-soft); }
+  .pill.neutral { color: var(--muted); background: var(--surface-3); }
+
+  .d-grid { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 14px; align-items: start; }
+  .d-left, .d-right { min-width: 0; display: grid; gap: 14px; align-content: start; }
+
+  .panel {
+    overflow: hidden; border: 1px solid var(--line-soft); border-radius: var(--radius); background: var(--surface);
+  }
+  .panel-head {
+    min-height: 56px; display: flex; align-items: center; justify-content: space-between; gap: 14px;
+    padding: 0 18px; border-bottom: 1px solid var(--line-soft);
+  }
+  .panel-title { display: flex; align-items: center; gap: 9px; }
+  .panel-title h2 { margin: 0; font-size: 13px; font-weight: 750; letter-spacing: -.01em; }
+  .count-badge {
+    min-width: 18px; height: 18px; display: grid; place-items: center; padding: 0 5px;
+    border: 1px solid #34363b; border-radius: 999px; color: var(--muted); background: var(--surface-2);
+    font-size: 9px; font-weight: 800;
+  }
+  .panel-tools { display: flex; align-items: center; gap: 6px; }
+  .seg {
+    display: flex; gap: 2px; padding: 3px; border: 1px solid var(--line); border-radius: 9px; background: #090910;
+  }
+  .seg button { height: 24px; padding: 0 9px; border: 0; border-radius: 6px; color: var(--muted-2); background: transparent; font-size: 10px; font-weight: 700; cursor: pointer; }
+  .seg button.active { color: #121212; background: #d7d8da; }
+  .seg.accent button.active { color: #fff; background: linear-gradient(135deg, var(--primary), var(--blue)); }
+  .tiny-link { border: 0; padding: 0; color: var(--primary-2); background: transparent; font-size: 10px; font-weight: 750; cursor: pointer; }
+
+  .opp-head, .opp-row {
+    display: grid;
+    grid-template-columns: minmax(160px, 1.35fr) 90px 96px 100px 80px 78px;
+    align-items: center; gap: 10px; padding: 0 18px;
+  }
+  .opp-head {
+    height: 34px; color: var(--muted-2); background: #0b0b14;
+    border-bottom: 1px solid var(--line-soft); font-size: 9px; font-weight: 750; letter-spacing: .055em; text-transform: uppercase;
+  }
+  .opp-head > span:nth-child(2), .opp-head > span:nth-child(3), .opp-head > span:nth-child(4), .opp-head > span:nth-child(5) { text-align: right; }
+  .opp-row {
+    min-height: 66px; border-bottom: 1px solid #1a1a2a; transition: background .14s ease;
+  }
+  .opp-row:last-child { border-bottom: 0; }
+  .opp-row:hover { background: rgba(139, 92, 246, .035); }
+  .asset-cell { min-width: 0; display: flex; align-items: center; gap: 10px; }
+  .asset-icon {
+    flex: 0 0 auto; width: 32px; height: 32px; display: grid; place-items: center; border-radius: 50%;
+    color: #0c0c0c; background: #d9dadd; font-size: 10px; font-weight: 850; letter-spacing: -.03em;
+  }
+  .asset-icon.eth { background: #b9c1d0; }
+  .asset-icon.sol { background: #b7a7ff; }
+  .asset-icon.hype { background: #9fe6d3; }
+  .asset-cell strong { display: block; overflow: hidden; font-size: 12px; font-weight: 750; text-overflow: ellipsis; white-space: nowrap; }
+  .asset-cell small { display: block; margin-top: 3px; overflow: hidden; color: var(--muted-2); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+  .venue-cell { display: flex; align-items: center; justify-content: flex-end; gap: 5px; color: #b9bdc3; font-size: 9px; font-weight: 650; white-space: nowrap; }
+  .venue-cell i {
+    width: 17px; height: 17px; display: grid; place-items: center; border-radius: 5px;
+    color: var(--muted); background: var(--surface-3); font-size: 8px; font-style: normal; font-weight: 800;
+  }
+  .venue-cell b { color: #4f5359; font-size: 9px; font-weight: 500; }
+  .apr-cell { text-align: right; }
+  .apr-cell strong { color: var(--gold); font-family: var(--mono); font-size: 14px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .apr-cell small { display: block; margin-top: 2px; color: var(--muted-2); font-size: 8px; }
+  .funding-cell { text-align: right; color: #c7cad0; font-family: var(--mono); font-size: 10px; font-variant-numeric: tabular-nums; }
+  .funding-cell small { display: block; margin-top: 3px; color: var(--muted-2); font-family: var(--font); font-size: 8px; }
+  .spread-cell { text-align: right; color: #b9bdc3; font-family: var(--mono); font-size: 10px; }
+  .risk-cell { text-align: right; }
+  .row-action {
+    height: 28px; padding: 0 11px; border: 1px solid #3a3d42; border-radius: 8px;
+    color: #d7d9dc; background: #1a1a2a; font-size: 10px; font-weight: 750; cursor: pointer;
+    transition: border-color .15s ease, color .15s ease, background .15s ease;
+  }
+  .row-action:hover { border-color: var(--primary); color: #fff; background: linear-gradient(135deg, var(--primary), var(--blue)); }
+  .opp-foot {
+    min-height: 42px; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 0 18px; border-top: 1px solid var(--line-soft); color: var(--muted-2); font-size: 9px;
+  }
+  .opp-foot span { display: flex; align-items: center; gap: 6px; }
+  .opp-foot i { width: 5px; height: 5px; border-radius: 50%; background: var(--green); }
+
+  .running-row {
+    display: grid; grid-template-columns: minmax(140px, 1.1fr) 1fr 90px 90px 52px;
+    align-items: center; gap: 12px; min-height: 64px; padding: 0 18px; border-bottom: 1px solid #1a1a2a;
+  }
+  .running-row:last-child { border-bottom: 0; }
+  .running-name { display: flex; align-items: center; gap: 9px; min-width: 0; }
+  .running-name .status-dot { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px rgba(41,171,135,.65); }
+  .running-name strong { display: block; overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+  .running-name small { display: block; margin-top: 3px; color: var(--muted-2); font-size: 8px; }
+  .legs { display: flex; gap: 5px; }
+  .leg { padding: 4px 7px; border-radius: 6px; font-size: 9px; font-weight: 650; white-space: nowrap; }
+  .leg.long { color: #77d8c1; background: rgba(41,171,135,.1); }
+  .leg.short { color: #f3a1a8; background: rgba(245,79,74,.1); }
+  .running-metric { text-align: right; }
+  .running-metric strong { font-family: var(--mono); font-size: 11px; font-weight: 700; }
+  .running-metric small { display: block; margin-top: 3px; color: var(--muted-2); font-size: 8px; }
+  .more-btn { width: 26px; height: 26px; display: grid; place-items: center; justify-self: end; border: 1px solid transparent; border-radius: 7px; color: var(--muted-2); background: transparent; cursor: pointer; }
+  .more-btn:hover { border-color: var(--line); color: var(--text); background: var(--surface-2); }
+
+  .budget-card {
+    position: relative; overflow: hidden; padding: 20px;
+    border: 1px solid #302a48; border-radius: var(--radius);
+    background:
+      radial-gradient(260px 180px at 100% 0, rgba(139, 92, 246, .21), transparent 72%),
+      radial-gradient(180px 140px at 0 100%, rgba(41,171,135,.055), transparent 74%),
+      #121111;
+  }
+  .budget-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+  .budget-top .stat-label { color: #bda99f; }
+  .auto-badge {
+    display: flex; align-items: center; gap: 6px; height: 24px; padding: 0 9px;
+    border: 1px solid rgba(139, 92, 246, .22); border-radius: 999px; color: var(--primary-2);
+    background: rgba(139, 92, 246, .09); font-size: 9px; font-weight: 800;
+  }
+  .auto-badge i { width: 5px; height: 5px; border-radius: 50%; background: var(--primary); box-shadow: 0 0 8px var(--primary); }
+  .budget-amount { margin-top: 17px; display: flex; align-items: baseline; gap: 7px; font-size: 34px; line-height: 1; letter-spacing: -.05em; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .budget-amount small { color: #8f8aa8; font-size: 12px; font-weight: 600; letter-spacing: 0; }
+  .budget-bar { height: 7px; margin: 15px 0 8px; overflow: hidden; border-radius: 999px; background: #242034; }
+  .budget-bar > i { display: block; width: 8%; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--primary), var(--blue) 72%, var(--gold)); box-shadow: 0 0 18px rgba(139, 92, 246, .34); }
+  .budget-meta { display: flex; justify-content: space-between; color: #81766f; font-size: 9px; }
+  .budget-rules { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0; margin-top: 16px; border: 1px solid #29243c; border-radius: 12px; overflow: hidden; background: rgba(10,10,11,.32); }
+  .budget-rules > div { min-width: 0; padding: 10px 11px; border-right: 1px solid #29243c; }
+  .budget-rules > div:last-child { border-right: 0; }
+  .budget-rules small { display: block; color: #7f746e; font-size: 8px; }
+  .budget-rules strong { display: block; margin-top: 4px; overflow: hidden; color: #e6d9d3; font-family: var(--mono); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+  .budget-cta {
+    width: 100%; height: 36px; margin-top: 14px; border: 1px solid #3b302b; border-radius: 10px;
+    color: #eeeaff; background: rgba(139, 92, 246, .1); font-size: 11px; font-weight: 750; cursor: pointer;
+  }
+  .budget-cta:hover { background: rgba(139, 92, 246, .16); }
+
+  .side-card { padding: 18px; border: 1px solid var(--line-soft); border-radius: var(--radius); background: var(--surface); }
+  .side-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .side-head h3 { margin: 0; font-size: 12px; font-weight: 750; }
+  .side-head span { color: var(--muted-2); font-size: 9px; }
+  .switch { width: 38px; height: 22px; padding: 2px; border: 1px solid #34363a; border-radius: 999px; background: #24252a; cursor: pointer; }
+  .switch i { display: block; width: 16px; height: 16px; border-radius: 50%; background: #7d8086; transition: transform .18s ease, background .18s ease; }
+  .switch.on { border-color: rgba(139, 92, 246, .38); background: rgba(139, 92, 246, .18); }
+  .switch.on i { background: var(--primary); transform: translateX(16px); }
+  .side-list { display: grid; gap: 0; margin-top: 14px; }
+  .side-list > div { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 33px; border-bottom: 1px solid #1a1a2a; color: var(--muted); font-size: 10px; }
+  .side-list > div:last-child { border-bottom: 0; }
+  .side-list b { color: #d4d6da; font-family: var(--mono); font-size: 10px; font-weight: 650; }
+  .risk-note { display: flex; gap: 9px; margin-top: 13px; padding: 10px; border: 1px solid #302a48; border-radius: 10px; background: rgba(139, 92, 246, .05); }
+  .risk-note i { flex: 0 0 auto; width: 5px; height: 5px; margin-top: 4px; border-radius: 50%; background: var(--primary); box-shadow: 0 0 8px rgba(139, 92, 246, .45); }
+  .risk-note p { margin: 0; color: #9b8d85; font-size: 9px; line-height: 1.55; }
+  .risk-note b { color: #e7d7cf; }
+
+  .d-statusbar {
+    min-height: 34px; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    margin-top: 2px; padding: 0 24px; border-top: 1px solid var(--line-soft);
+    color: var(--muted-2); font-size: 9px; background: #090910;
+  }
+  .d-statusbar > div { display: flex; align-items: center; gap: 14px; }
+  .d-statusbar span { display: flex; align-items: center; gap: 5px; }
+  .d-statusbar i { width: 4px; height: 4px; border-radius: 50%; background: var(--green); }
+
+  /* ---------- mobile app ---------- */
+  .mobile-stage { display: grid; place-items: start center; }
+  .phone {
+    position: relative; width: 390px; height: 844px; overflow: hidden;
+    border: 1px solid #333438; border-radius: 42px; background: #0c0c0d;
+    box-shadow: 0 40px 110px rgba(0,0,0,.65), 0 0 0 7px #17181b, 0 0 0 8px #2a2b2e;
+    display: flex; flex-direction: column;
+  }
+  .phone-status {
+    height: 44px; flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
+    padding: 0 22px; color: #e9eaeb; font-size: 10px; font-weight: 700;
+  }
+  .phone-status .island { position: absolute; top: 9px; left: 50%; width: 102px; height: 27px; border-radius: 999px; background: #000; transform: translateX(-50%); }
+  .phone-status .status-icons { display: flex; align-items: center; gap: 5px; }
+  .phone-status svg { width: 13px; height: 13px; }
+  .m-scroll { flex: 1; overflow-y: auto; padding: 5px 18px 12px; scrollbar-width: none; }
+  .m-scroll::-webkit-scrollbar { display: none; }
+  .m-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .m-profile { display: flex; align-items: center; gap: 9px; min-width: 0; }
+  .m-avatar { width: 34px; height: 34px; flex: 0 0 auto; display: grid; place-items: center; border-radius: 50%; color: #fff; background: linear-gradient(135deg, #6d28d9, #2563eb); font-size: 11px; font-weight: 850; }
+  .m-profile strong { display: block; font-size: 11px; letter-spacing: .01em; white-space: nowrap; }
+  .m-profile small { display: block; margin-top: 2px; color: var(--muted-2); font-size: 8px; }
+  .m-head-actions { display: flex; gap: 7px; }
+  .m-round-btn { width: 31px; height: 31px; display: grid; place-items: center; padding: 0; border: 1px solid #2a2b2f; border-radius: 50%; color: #b7b9bd; background: #171719; }
+  .m-round-btn svg { width: 14px; height: 14px; }
+
+  .m-account { margin-top: 22px; }
+  .m-account-label { color: var(--muted-2); font-size: 9px; }
+  .m-account-row { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; }
+  .m-account-value { margin-top: 5px; font-size: 38px; line-height: 1; letter-spacing: -.055em; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .m-add-btn { height: 34px; padding: 0 13px; border: 1px solid rgba(139,92,246,.9); border-radius: 999px; color: #fff; background: linear-gradient(135deg, var(--primary), var(--blue)); font-size: 10px; font-weight: 800; box-shadow: 0 8px 24px rgba(99,102,241,.26); }
+  .m-pnl { margin-top: 7px; display: flex; flex-wrap: wrap; align-items: center; gap: 7px; color: var(--muted); font-size: 9px; }
+  .m-pnl b { color: var(--green); font-family: var(--mono); font-weight: 650; }
+  .m-pnl span { color: #3e4146; }
+
+  .m-quick { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; margin-top: 20px; }
+  .m-tile {
+    min-height: 74px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px;
+    border: 1px solid #222326; border-radius: 14px; color: #c3c5c9; background: #151517; font-size: 9px; font-weight: 700;
+  }
+  .m-tile svg { width: 19px; height: 19px; color: var(--primary); }
+  .m-tile:nth-child(2n) svg { color: var(--blue-2); }
+  .m-tile.dim { color: #61646a; }
+  .m-tile.dim svg { color: #61554f; }
+  .m-coming { position: relative; }
+  .m-coming::after { content: 'Soon'; position: absolute; top: 7px; right: 7px; color: #8f8aa8; font-size: 6px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
+
+  .m-section-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 21px 0 10px; }
+  .m-section-head h2 { margin: 0; font-size: 14px; letter-spacing: -.02em; }
+  .m-tabs { display: flex; gap: 2px; margin-top: 2px; padding: 3px; border: 1px solid #2a2a40; border-radius: 10px; background: #151517; }
+  .m-tabs button { height: 25px; padding: 0 9px; border: 0; border-radius: 7px; color: var(--muted-2); background: transparent; font-size: 8px; font-weight: 750; }
+  .m-tabs button.active { color: #fff; background: linear-gradient(135deg, var(--primary), var(--blue)); }
+  .m-opp-list { display: grid; gap: 8px; }
+  .m-opp {
+    display: flex; align-items: center; gap: 10px; padding: 12px;
+    border: 1px solid #2a2a40; border-radius: 14px; background: #151517;
+  }
+  .m-opp-icon { width: 31px; height: 31px; flex: 0 0 auto; display: grid; place-items: center; border-radius: 50%; color: #111; background: #d9dadd; font-size: 9px; font-weight: 850; }
+  .m-opp-icon.eth { background: #b9c1d0; }
+  .m-opp-icon.sol { background: #b7a7ff; }
+  .m-opp-main { min-width: 0; flex: 1; }
+  .m-opp-main strong { display: block; font-size: 10px; white-space: nowrap; }
+  .m-opp-main small { display: block; margin-top: 3px; overflow: hidden; color: var(--muted-2); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+  .m-opp-apr { text-align: right; }
+  .m-opp-apr strong { display: block; color: var(--gold); font-family: var(--mono); font-size: 11px; }
+  .m-opp-apr small { display: block; margin-top: 3px; color: var(--muted-2); font-size: 7px; }
+  .m-go { width: 27px; height: 27px; flex: 0 0 auto; display: grid; place-items: center; border: 1px solid #34363b; border-radius: 8px; color: #d9dbde; background: #1c1d20; }
+  .m-go svg { width: 12px; height: 12px; }
+  .m-run-head { display: flex; align-items: center; justify-content: space-between; margin: 18px 0 9px; }
+  .m-run-head h2 { margin: 0; font-size: 14px; letter-spacing: -.02em; }
+  .m-run-head span { color: var(--muted-2); font-size: 8px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+  .m-run {
+    display: flex; align-items: center; gap: 10px; padding: 12px;
+    border: 1px solid #2a2a40; border-radius: 14px; background: #151517;
+  }
+  .m-run .status-dot { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px rgba(41,171,135,.65); }
+  .m-run-main { min-width: 0; flex: 1; }
+  .m-run-main strong { display: block; font-size: 10px; }
+  .m-run-main small { display: block; margin-top: 3px; overflow: hidden; color: var(--muted-2); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+  .m-run-pnl { text-align: right; }
+  .m-run-pnl strong { display: block; color: var(--green); font-family: var(--mono); font-size: 11px; }
+  .m-run-pnl small { display: block; margin-top: 3px; color: var(--muted-2); font-size: 7px; }
+  .m-budget {
+    display: flex; align-items: center; gap: 10px; height: 42px; margin-top: 7px; padding: 0 12px;
+    border: 1px solid rgba(245,196,81,.20); border-radius: 12px;
+    background: radial-gradient(190px 100px at 100% 0, rgba(139, 92, 246, .18), transparent 72%), #12111c;
+  }
+  .m-budget-main { min-width: 0; flex: 1; display: flex; align-items: baseline; gap: 6px; }
+  .m-budget-main small { color: var(--gold); font-size: 8px; }
+  .m-budget-main strong { font-family: var(--mono); font-size: 13px; letter-spacing: -.02em; }
+  .m-budget-bar { width: 58px; flex: 0 0 auto; }
+  .m-budget-bar i { display: block; width: 8%; height: 4px; border-radius: 999px; background: linear-gradient(90deg, var(--primary), var(--blue) 72%, var(--gold)); }
+  .m-budget-bar em { display: block; width: 100%; height: 4px; margin-top: -4px; border-radius: 999px; background: #242034; z-index: -1; }
+  .m-budget-tag { flex: 0 0 auto; color: var(--gold); font-size: 8px; font-weight: 800; }
+
+  .m-bottom {
+    flex: 0 0 auto; height: 66px; display: grid; grid-template-columns: repeat(4, 1fr);
+    border-top: 1px solid #1e1e30; background: rgba(12,12,13,.96); backdrop-filter: blur(16px);
+  }
+  .m-nav { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; padding: 0; border: 0; color: #666a71; background: transparent; font-size: 8px; font-weight: 650; }
+  .m-nav svg { width: 18px; height: 18px; }
+  .m-nav.active { color: var(--primary-2); }
+  .m-home-indicator { position: absolute; bottom: 6px; left: 50%; width: 116px; height: 4px; border-radius: 999px; background: #e6e7e9; transform: translateX(-50%); opacity: .9; }
+
+  @media (max-width: 1120px) {
+    .d-nav button { padding-inline: 9px; }
+    .d-brand { min-width: 150px; }
+    .d-grid { grid-template-columns: minmax(0, 1fr) 330px; }
+    .opp-head, .opp-row { grid-template-columns: minmax(140px, 1.2fr) 76px 82px 86px 66px 68px; gap: 7px; padding-inline: 14px; }
+  }
+  @media (max-width: 900px) {
+    .stage { padding: 80px 12px 24px; }
+    .desktop-shell { display: none; }
+    .preview-hint { display: none; }
+    .preview-brand span { display: none; }
+    .phone { transform: scale(.92); transform-origin: top center; }
+  }
+  @media (min-width: 901px) { .mobile-stage { display: none; } }
+</style>
+</head>
+<body>
+
+<div class="preview-bar">
+  <div class="preview-brand">
+    <span class="preview-mark">✦</span>
+    <div><strong>星闪量化 · UI 预览</strong><span> / Based 风格重构稿</span></div>
+  </div>
+  <div class="preview-seg" role="tablist" aria-label="预览设备">
+    <button type="button" class="active" data-view="desktop">Desktop</button>
+    <button type="button" data-view="mobile">Mobile</button>
+  </div>
+  <div class="preview-hint"><span class="preview-dot"></span> 演示数据 · 非实时</div>
+</div>
+
+<main class="stage">
+  <!-- ================= DESKTOP ================= -->
+  <section class="desktop-shell view-panel" data-panel="desktop" aria-label="桌面端预览">
+    <header class="d-topbar">
+      <button class="d-brand" type="button" aria-label="星闪量化">
+        <span class="d-brand-mark" aria-hidden="true">
+          <svg viewBox="-112 -112 224 224" fill="none">
+            <path d="M0 -80 C5.5 -31 31 -5.5 80 0 C31 5.5 5.5 31 0 80 C-5.5 31 -31 5.5 -80 0 C-31 -5.5 -5.5 -31 0 -80 Z" fill="#7c3aed"/>
+            <circle cx="40" cy="-40" r="11" fill="#f5c451"/>
+            <circle cx="40" cy="-40" r="4.5" fill="#101011"/>
+          </svg>
+        </span>
+        <span class="d-brand-copy"><strong>星闪量化</strong><small>FlareStar Quant</small></span>
+      </button>
+      <nav class="d-nav" aria-label="主导航">
+        <button class="active" type="button">总览</button>
+        <button type="button">机会</button>
+        <button type="button">策略</button>
+        <button type="button">资金费率</button>
+        <button type="button">账户</button>
+      </nav>
+      <div class="d-top-right">
+        <span class="d-live"><i class="preview-dot"></i> LIVE</span>
+        <button class="d-icon-btn" type="button" aria-label="搜索">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.8-3.8"/></svg>
+        </button>
+        <button class="d-icon-btn" type="button" aria-label="通知">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M10 21h4"/></svg>
+        </button>
+        <span class="d-avatar" aria-hidden="true">B</span>
+      </div>
+    </header>
+
+    <div class="d-main">
+      <div class="d-heading">
+        <div>
+          <p class="d-eyebrow">Portfolio / 总览</p>
+          <h1>资金费率套利</h1>
+          <p>跨交易所中性策略 · Gate CrossEx · 自动预算已开启</p>
+        </div>
+        <div class="d-heading-actions">
+          <button class="d-ghost-btn" type="button">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+            策略记录
+          </button>
+          <button class="d-primary-btn" type="button">＋ 新建策略</button>
+        </div>
+      </div>
+
+      <section class="d-stats" aria-label="账户概览">
+        <article class="stat-card hero">
+          <div class="stat-label"><i></i> 总权益</div>
+          <div class="stat-value">$92.21 <small>USDT</small></div>
+          <div class="stat-sub"><span class="delta-up">+$0.09</span><span>24h 已实现</span><span class="pill green">已对冲</span></div>
+        </article>
+        <article class="stat-card">
+          <div class="stat-label">可用保证金</div>
+          <div class="stat-value">$89.68</div>
+          <div class="stat-sub"><span>占用 $2.53</span><span class="pill neutral">2.7%</span></div>
+        </article>
+        <article class="stat-card">
+          <div class="stat-label">自动预算</div>
+          <div class="stat-value">90<small>%</small></div>
+          <div class="stat-sub"><span>目标占用 $82.99</span><span class="pill accent">缓冲 10%</span></div>
+        </article>
+        <article class="stat-card">
+          <div class="stat-label">运行中策略</div>
+          <div class="stat-value">1<small>/ 3</small></div>
+          <div class="stat-sub"><span>预计仓位 3</span><span class="pill green">自动执行</span></div>
+        </article>
+      </section>
+
+      <div class="d-grid">
+        <div class="d-left">
+          <section class="panel" aria-label="机会雷达">
+            <header class="panel-head">
+              <div class="panel-title"><h2>机会雷达</h2><span class="count-badge">4</span></div>
+              <div class="panel-tools">
+                <div class="seg"><button class="active" type="button">永续</button><button type="button">现货</button></div>
+                <div class="seg accent"><button class="active" type="button">全部</button><button type="button">高 APR</button></div>
+              </div>
+            </header>
+            <div class="opp-head" aria-hidden="true">
+              <span>资产 / 交易对</span><span>交易所</span><span>年化</span><span>下次结算</span><span>价差</span><span style="text-align:right">操作</span>
+            </div>
+            <div class="opp-row">
+              <div class="asset-cell"><span class="asset-icon">BTC</span><div><strong>BTC_USDT</strong><small>永续 · 跨交易所</small></div></div>
+              <div class="venue-cell"><i>BN</i><span>→</span><i>BY</i></div>
+              <div class="apr-cell"><strong>1,842%</strong><small>净年化</small></div>
+              <div class="funding-cell">02:14:09<small>8h 周期</small></div>
+              <div class="spread-cell">0.042%</div>
+              <div class="risk-cell"><button class="row-action" type="button">执行</button></div>
+            </div>
+            <div class="opp-row">
+              <div class="asset-cell"><span class="asset-icon eth">ETH</span><div><strong>ETH_USDT</strong><small>永续 · 跨交易所</small></div></div>
+              <div class="venue-cell"><i>OK</i><span>→</span><i>GT</i></div>
+              <div class="apr-cell"><strong>1,211%</strong><small>净年化</small></div>
+              <div class="funding-cell">02:14:09<small>8h 周期</small></div>
+              <div class="spread-cell">0.031%</div>
+              <div class="risk-cell"><button class="row-action" type="button">执行</button></div>
+            </div>
+            <div class="opp-row">
+              <div class="asset-cell"><span class="asset-icon sol">SOL</span><div><strong>SOL_USDT</strong><small>永续 · 跨交易所</small></div></div>
+              <div class="venue-cell"><i>BY</i><span>→</span><i>BN</i></div>
+              <div class="apr-cell"><strong>986%</strong><small>净年化</small></div>
+              <div class="funding-cell">01:46:32<small>4h 周期</small></div>
+              <div class="spread-cell">0.027%</div>
+              <div class="risk-cell"><button class="row-action" type="button">执行</button></div>
+            </div>
+            <div class="opp-row">
+              <div class="asset-cell"><span class="asset-icon hype">HYPE</span><div><strong>HYPE_USDT</strong><small>永续 · 跨交易所</small></div></div>
+              <div class="venue-cell"><i>HL</i><span>→</span><i>GT</i></div>
+              <div class="apr-cell"><strong>764%</strong><small>净年化</small></div>
+              <div class="funding-cell">03:02:55<small>1h 周期</small></div>
+              <div class="spread-cell">0.054%</div>
+              <div class="risk-cell"><button class="row-action" type="button">执行</button></div>
+            </div>
+            <footer class="opp-foot">
+              <span><i></i> 同资产只展示最优机会，避免同步反转集中风险</span>
+              <button class="tiny-link" type="button">查看全部机会 →</button>
+            </footer>
+          </section>
+
+          <section class="panel" aria-label="运行中策略">
+            <header class="panel-head">
+              <div class="panel-title"><h2>运行中策略</h2><span class="count-badge">1</span></div>
+              <div class="panel-tools"><button class="tiny-link" type="button">全部策略 →</button></div>
+            </header>
+            <div class="running-row">
+              <div class="running-name"><span class="status-dot"></span><div><strong>ETH_USDT · 自动套利</strong><small>PAIR-E5BAC53D · 第 3 轮</small></div></div>
+              <div class="legs"><span class="leg long">LONG OKX</span><span class="leg short">SHORT GATE</span></div>
+              <div class="running-metric"><strong class="delta-up">+$0.42</strong><small>净 PnL</small></div>
+              <div class="running-metric"><strong>$27.66</strong><small>每仓预算</small></div>
+              <button class="more-btn" type="button" aria-label="更多">···</button>
+            </div>
+            <div class="running-row">
+              <div class="running-name"><span class="status-dot" style="background:#5d6168;box-shadow:none"></span><div><strong>BTC_USDT · 手动</strong><small>PAIR-7EED248C · 等待成交</small></div></div>
+              <div class="legs"><span class="leg long">LONG BYBIT</span><span class="leg short">SHORT BINANCE</span></div>
+              <div class="running-metric"><strong style="color:#b8bcc2">$0.00</strong><small>净 PnL</small></div>
+              <div class="running-metric"><strong>$12.40</strong><small>剩余额度</small></div>
+              <button class="more-btn" type="button" aria-label="更多">···</button>
+            </div>
+          </section>
+        </div>
+
+        <aside class="d-right">
+          <section class="budget-card" aria-label="自动资金预算">
+            <div class="budget-top">
+              <div class="stat-label"><i></i> 自动资金预算</div>
+              <span class="auto-badge"><i></i> AUTO</span>
+            </div>
+            <div class="budget-amount">$82.99 <small>可用额度</small></div>
+            <div class="budget-bar"><i></i></div>
+            <div class="budget-meta"><span>已用 $0.00</span><span>90% 目标占用 · 10% 缓冲</span></div>
+            <div class="budget-rules">
+              <div><small>计划仓位</small><strong>3</strong></div>
+              <div><small>每仓预算</small><strong>$27.66</strong></div>
+              <div><small>单腿杠杆</small><strong>20×</strong></div>
+            </div>
+            <button class="budget-cta" type="button">调整自动预算 →</button>
+          </section>
+
+          <section class="side-card" aria-label="执行设置">
+            <div class="side-head"><h3>自动执行</h3><button class="switch on" type="button" aria-label="自动执行开关"><i></i></button></div>
+            <div class="side-list">
+              <div><span>冷却时间</span><b>10 min</b></div>
+              <div><span>最低净年化</span><b>2,000%</b></div>
+              <div><span>同资产保护</span><b style="color:var(--primary)">仅最优</b></div>
+              <div><span>当前环境</span><b style="color:var(--green)">LIVE</b></div>
+            </div>
+            <div class="risk-note"><i></i><p><b>风险提示</b> 90% 占用属于激进配置。10% 缓冲大约只能覆盖 1.1% 的不利基差波动，请持续监控保证金。</p></div>
+          </section>
+
+          <section class="side-card" aria-label="资金状态">
+            <div class="side-head"><h3>资金状态</h3><span>USDT</span></div>
+            <div class="side-list">
+              <div><span>账户权益</span><b>$92.21</b></div>
+              <div><span>可用保证金</span><b>$89.68</b></div>
+              <div><span>维持保证金</span><b>$2.53</b></div>
+              <div><span>保证金率</span><b class="delta-up">2.7%</b></div>
+            </div>
+          </section>
+        </aside>
+      </div>
+    </div>
+
+    <footer class="d-statusbar">
+      <div><span><i></i> Backend stream connected</span><span>LIVE</span><span><i></i> Market data healthy</span></div>
+      <div><span>演示数据 · 非实时</span><span>v5.2.2-preview</span></div>
+    </footer>
+  </section>
+
+  <!-- ================= MOBILE ================= -->
+  <section class="mobile-stage view-panel" data-panel="mobile" hidden aria-label="手机端预览">
+    <div class="phone">
+      <div class="phone-status">
+        <span>10:08</span>
+        <span class="island" aria-hidden="true"></span>
+        <span class="status-icons" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M2 20h3v-4H2v4Zm5 0h3v-8H7v8Zm5 0h3V8h-3v12Zm5 0h3V4h-3v16Z"/></svg>
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 20h.01M5 12.5a10 10 0 0 1 14 0M8 15.5a6 6 0 0 1 8 0M2 9.5a15 15 0 0 1 20 0" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/></svg>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="7" width="18" height="10" rx="2"/><path d="M22 10v4"/><rect x="4" y="9" width="12" height="6" rx="1" fill="currentColor" stroke="none"/></svg>
+        </span>
+      </div>
+
+      <div class="m-scroll">
+        <header class="m-header">
+          <div class="m-profile">
+            <span class="m-avatar">B</span>
+            <div><strong>0x744A…5e3A4D</strong><small>星闪量化 · LIVE</small></div>
+          </div>
+          <div class="m-head-actions">
+            <button class="m-round-btn" type="button" aria-label="设置">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21h-4v-.09A1.7 1.7 0 0 0 8.6 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H3v-4h.09A1.7 1.7 0 0 0 4.6 8.6a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1V3h4v.09A1.7 1.7 0 0 0 15.4 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9c.12.38.33.72.6 1 .3.29.68.43 1.1.4h.09v4h-.09a1.7 1.7 0 0 0-1.7.6Z"/></svg>
+            </button>
+            <button class="m-round-btn" type="button" aria-label="通知">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M10 21h4"/></svg>
+            </button>
+          </div>
+        </header>
+
+        <section class="m-account">
+          <div class="m-account-label">账户总值</div>
+          <div class="m-account-row">
+            <div class="m-account-value">$92.21</div>
+            <button class="m-add-btn" type="button">＋ 入金</button>
+          </div>
+          <div class="m-pnl"><span>未实现 PnL</span><b>+$0.00</b><span>·</span><span>占用 2.7%</span><span class="pill accent">自动预算 90%</span></div>
+        </section>
+
+        <section class="m-quick" aria-label="快捷入口">
+          <div class="m-tile">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9 21v-6h6v6"/></svg>
+            <span>资金</span>
+          </div>
+          <div class="m-tile">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4M5 5l2.8 2.8M16.2 16.2 19 19M19 5l-2.8 2.8M7.8 16.2 5 19"/></svg>
+            <span>机会</span>
+          </div>
+          <div class="m-tile">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 19V5M4 19h16"/><path d="m7 14 3-3 3 2 4-5"/></svg>
+            <span>策略</span>
+          </div>
+          <div class="m-tile">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3 4 7v5c0 5 3.4 7.8 8 9 4.6-1.2 8-4 8-9V7l-8-4Z"/><path d="m9 12 2 2 4-4"/></svg>
+            <span>风控</span>
+          </div>
+          <div class="m-tile dim">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/></svg>
+            <span>成交记录</span>
+          </div>
+          <div class="m-tile dim m-coming">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 19V5M4 19h16"/><path d="M8 15v-4M12 15V7M16 15v-6"/></svg>
+            <span>收益日历</span>
+          </div>
+        </section>
+
+        <div class="m-section-head">
+          <h2>机会</h2>
+          <div class="m-tabs"><button class="active" type="button">自选</button><button type="button">热门</button><button type="button">全部</button></div>
+        </div>
+        <div class="m-opp-list">
+          <article class="m-opp">
+            <span class="m-opp-icon">BTC</span>
+            <div class="m-opp-main"><strong>BTC_USDT</strong><small>BINANCE → BYBIT · 8h</small></div>
+            <div class="m-opp-apr"><strong>1,842%</strong><small>净年化</small></div>
+            <button class="m-go" type="button" aria-label="执行"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 5 7 7-7 7"/></svg></button>
+          </article>
+          <article class="m-opp">
+            <span class="m-opp-icon eth">ETH</span>
+            <div class="m-opp-main"><strong>ETH_USDT</strong><small>OKX → GATE · 8h</small></div>
+            <div class="m-opp-apr"><strong>1,211%</strong><small>净年化</small></div>
+            <button class="m-go" type="button" aria-label="执行"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 5 7 7-7 7"/></svg></button>
+          </article>
+          <article class="m-opp">
+            <span class="m-opp-icon sol">SOL</span>
+            <div class="m-opp-main"><strong>SOL_USDT</strong><small>BYBIT → BINANCE · 4h</small></div>
+            <div class="m-opp-apr"><strong>986%</strong><small>净年化</small></div>
+            <button class="m-go" type="button" aria-label="执行"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 5 7 7-7 7"/></svg></button>
+          </article>
+        </div>
+
+        <div class="m-run-head"><h2>运行中</h2><span>LIVE · 1 策略</span></div>
+        <div class="m-run">
+          <span class="status-dot"></span>
+          <div class="m-run-main"><strong>ETH_USDT · 自动套利</strong><small>LONG OKX · SHORT GATE · 第 3 轮</small></div>
+          <div class="m-run-pnl"><strong>+$0.42</strong><small>净 PnL</small></div>
+        </div>
+        <div class="m-budget">
+          <div class="m-budget-main"><small>自动预算</small><strong>$82.99</strong></div>
+          <div class="m-budget-bar"><em></em><i></i></div>
+          <div class="m-budget-tag">90%</div>
+        </div>
+      </div>
+
+      <nav class="m-bottom" aria-label="移动端导航">
+        <button class="m-nav active" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/></svg><span>首页</span>
+        </button>
+        <button class="m-nav" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 19V5M4 19h16"/><path d="m7 14 3-3 3 2 4-5"/></svg><span>机会</span>
+        </button>
+        <button class="m-nav" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3 4 7v5c0 5 3.4 7.8 8 9 4.6-1.2 8-4 8-9V7l-8-4Z"/><path d="m9 12 2 2 4-4"/></svg><span>策略</span>
+        </button>
+        <button class="m-nav" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="8" r="3.5"/><path d="M4.5 20c.8-4 3.6-6 7.5-6s6.7 2 7.5 6"/></svg><span>账户</span>
+        </button>
+      </nav>
+      <div class="m-home-indicator" aria-hidden="true"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+  const viewButtons = [...document.querySelectorAll('[data-view]')];
+  const panels = [...document.querySelectorAll('[data-panel]')];
+  function setView(view) {
+    viewButtons.forEach((button) => button.classList.toggle('active', button.dataset.view === view));
+    panels.forEach((panel) => { panel.hidden = panel.dataset.panel !== view; });
+  }
+  viewButtons.forEach((button) => button.addEventListener('click', () => setView(button.dataset.view)));
+
+  if (window.innerWidth <= 900) setView('mobile');
+
+  document.querySelectorAll('.seg, .m-tabs').forEach((group) => {
+    group.querySelectorAll('button').forEach((button) => {
+      button.addEventListener('click', () => {
+        group.querySelectorAll('button').forEach((item) => item.classList.remove('active'));
+        button.classList.add('active');
+      });
+    });
+  });
+
+  document.querySelectorAll('.d-nav, .m-bottom').forEach((nav) => {
+    nav.querySelectorAll('button').forEach((button) => {
+      button.addEventListener('click', () => {
+        nav.querySelectorAll('button').forEach((item) => item.classList.remove('active'));
+        button.classList.add('active');
+      });
+    });
+  });
+
+  document.querySelectorAll('.switch').forEach((toggle) => {
+    toggle.addEventListener('click', () => toggle.classList.toggle('on'));
+  });
+</script>
+</body>
+</html>

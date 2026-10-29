@@ -45,7 +45,7 @@ describe('shared positions table', () => {
     expect(html).toContain('ADL indicator');
     expect(html).toContain('Realized PnL');
     expect(html).toContain('Funding fee');
-    expect(html).toContain('HYPE PERP');
+    expect(html).toContain('HYPE/USDT PERP');
     expect(html).toContain('Close all');
     expect(html).not.toContain('<th>Leverage</th>');
   });

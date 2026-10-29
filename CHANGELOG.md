@@ -2,6 +2,27 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [5.3.0] - 2026-10-30
+
+### Added
+
+- **Unified black / deep-purple / blue / gold visual system** across Trade, Portfolio, Funding, Fees, all opportunity boards, all strategy views, Boros, and the mobile shell. Shared page-title, section-title, body and label scales replace the previous page-specific sizing.
+- **Mobile bottom navigation** for Trade, Opportunities, Strategy, Funding and Portfolio, with a compact top bar and safe-area-aware page padding.
+
+### Changed
+
+- Standardized controls to one exchange-style geometry: 8px control radius, 14px panels, 34px inputs/tabs, 38–40px primary actions and 28px row actions; active states use the purple/blue brand accent, while green/red remain reserved for PnL and side semantics.
+- All page content now uses the same maximum width and spacing rhythm; Opportunity filters collapse into a single desktop toolbar instead of four separate cards.
+- Funding page is compact: context-aware Start/Stop toolbar, 2×2 status cards, collapsed empty candidate state, pair cards on mobile.
+- Unified positions show complete market names (`IOTX/USDT`, `IOTX/USD`, `ADA`, `SUI`, `ONE`, `USDC`, `USD`), add a position-value/PnL/count summary, and render as full-width cards on mobile instead of a horizontally scrolling table.
+- Strategy page uses a two-column desktop workspace and a ~1.5-screen layout; detail-dialog copy now reliably remounts and prefills the form.
+
+### Fixed
+
+- Copying a strategy from the detail dialog of the same strategy kind no longer reuses the old form state (copy revision is now part of the remount key).
+- Empty funding-candidate tables no longer reserve a large blank area.
+- Mobile opportunity filters and exchange selectors wrap instead of clipping.
+
 ## [5.2.1] - 2026-10-29
 
 ### Fixed

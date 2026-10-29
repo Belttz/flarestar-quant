@@ -436,21 +436,24 @@ export function FundingArbPanel({ onOpenModeDialog, onOpenPairedPosition }: {
           <span className={`fa-state ${running ? 'on' : ''}`} role="status">
             <i />{running ? t('Running') : t('Stopped')}
           </span>
-          <button type="button" className="funding-arb-btn primary" disabled={busy || running} onClick={() => void save({ enabled: true })}>
-            ▶ {t('Start monitoring')}
-          </button>
-          <button type="button" className="funding-arb-btn" disabled={busy || !running} onClick={() => void save({ enabled: false })}>
-            ■ {t('Stop monitoring')}
-          </button>
-          <button type="button" className="funding-arb-btn" disabled={busy} onClick={() => {
+          {running ? (
+            <button type="button" className="funding-arb-btn compact" disabled={busy} onClick={() => void save({ enabled: false })}>
+              ■ {t('Stop monitoring')}
+            </button>
+          ) : (
+            <button type="button" className="funding-arb-btn primary compact" disabled={busy} onClick={() => void save({ enabled: true })}>
+              ▶ {t('Start monitoring')}
+            </button>
+          )}
+          <button type="button" className="funding-arb-btn compact" disabled={busy} onClick={() => {
             setBusy(true);
             void api.scanFundingArb().then((next) => { setStatus(next); setBusy(false); })
               .catch((caught: unknown) => { setBusy(false); setError(caught instanceof Error ? caught.message : String(caught)); });
           }}>⟳ {t('Scan now')}</button>
-          <button type="button" className="funding-arb-btn" onClick={() => setSettingsOpen(true)}>
+          <button type="button" className="funding-arb-btn compact" onClick={() => setSettingsOpen(true)}>
             ⚙ {t('Settings')}
           </button>
-          <button type="button" className="funding-arb-btn danger" disabled={busy} onClick={() => {
+          <button type="button" className="funding-arb-btn danger compact" disabled={busy} onClick={() => {
             if (!window.confirm(t('Emergency stop disables monitoring and auto-execute. Continue?'))) return;
             void save({ enabled: false, autoExecute: false });
           }}>⛔ {t('Emergency stop')}</button>

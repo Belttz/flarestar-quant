@@ -10,7 +10,7 @@ import { ExecutionPagination } from './execution-pagination-control.js';
 import { useLanguage } from './i18n.js';
 import { marketSymbol, type MarketProduct } from './market-symbol.js';
 import { orderDisplayPrice } from './order-display-price.js';
-import { assetIcon, exchanges, formatAmount, formatUsd, VenueCell, symbolParts } from './route-shared.js';
+import { exchanges, formatAmount, formatUsd, VenueCell, symbolParts } from './route-shared.js';
 import { marketTypeOfSymbol, type SpotHoldingsRow } from './execution-split.js';
 import type { PositionTableRow } from './strategy-positions.js';
 
@@ -105,7 +105,7 @@ export function SpotHoldingsTable({ rows, page, onPageChange, closeState = null 
     }
     return <button className="row-action close-position-action" disabled title={t(blocker)}>{t(label)}</button>;
   };
-  return <><div className="positions-table spot-holdings-table table-wrap"><table><thead><tr><th>{t('Market')}</th><th>{t('Coin')}</th><th>{t('Side')}</th><th>{t('Total')}</th><th>{t('Available')}</th><th>{t('Locked')}</th><th>{t('Valuation (USDT)')}</th>{closeState && <th>{t('Close position')}</th>}</tr></thead><tbody>{rows.slice(window.start, window.end).map((row) => { const short = row.total < 0; return <tr key={`${row.venue}:${row.coin}`}><td><VenueFromCode code={row.venue} /></td><td><strong>{assetIcon(row.coin)} {row.coin}</strong></td><td><small className={short ? 'short-tag' : 'long-tag'}>{t(short ? 'Short' : 'Long')}</small></td><td>{formatAmount(row.total)}</td><td>{formatAmount(row.available)}</td><td>{formatAmount(row.locked)}</td><td>{row.valuationUsd === null ? '—' : formatUsd(row.valuationUsd)}</td>{closeState && <td>{closeAction(row)}</td>}</tr>; })}</tbody></table></div><ExecutionPagination itemCount={rows.length} page={window.page} onPageChange={onPageChange} /></>;
+  return <><div className="positions-table spot-holdings-table table-wrap"><table><thead><tr><th>{t('Market')}</th><th>{t('Coin')}</th><th>{t('Side')}</th><th>{t('Total')}</th><th>{t('Available')}</th><th>{t('Locked')}</th><th>{t('Valuation (USDT)')}</th>{closeState && <th>{t('Close position')}</th>}</tr></thead><tbody>{rows.slice(window.start, window.end).map((row) => { const short = row.total < 0; return <tr key={`${row.venue}:${row.coin}`}><td><VenueFromCode code={row.venue} /></td><td><strong title={row.coin}>{row.coin}</strong></td><td><small className={short ? 'short-tag' : 'long-tag'}>{t(short ? 'Short' : 'Long')}</small></td><td>{formatAmount(row.total)}</td><td>{formatAmount(row.available)}</td><td>{formatAmount(row.locked)}</td><td>{row.valuationUsd === null ? '—' : formatUsd(row.valuationUsd)}</td>{closeState && <td>{closeAction(row)}</td>}</tr>; })}</tbody></table></div><ExecutionPagination itemCount={rows.length} page={window.page} onPageChange={onPageChange} /></>;
 }
 
 /** One merged positions-list row (R6/R7): either a contract position or a spot holding. */
@@ -150,6 +150,12 @@ export interface UnifiedPositionsTableProps {
 export function UnifiedPositionsTable({ rows, page, onPageChange, onClosePerp, spotCloseState }: UnifiedPositionsTableProps) {
   const { t } = useLanguage();
   const window = executionPageWindow(rows.length, page);
+  const visibleRows = rows.slice(window.start, window.end);
+  const perpRows = rows.filter((row): row is Extract<UnifiedPositionRow, { marketType: 'perp' }> => row.marketType === 'perp');
+  const spotRows = rows.filter((row): row is Extract<UnifiedPositionRow, { marketType: 'spot' }> => row.marketType === 'spot');
+  const grossValue = perpRows.reduce((sum, row) => sum + row.perp.value, 0)
+    + spotRows.reduce((sum, row) => sum + (row.spot.valuationUsd ?? 0), 0);
+  const unrealizedPnl = perpRows.reduce((sum, row) => sum + row.perp.unrealizedPnl, 0);
   const spotCloseAction = (row: SpotHoldingsRow) => {
     if (!spotCloseState) return null;
     const short = row.total < 0;
@@ -166,15 +172,63 @@ export function UnifiedPositionsTable({ rows, page, onPageChange, onClosePerp, s
     }
     return <button className="row-action close-position-action" disabled title={t(blocker)}>{t(label)}</button>;
   };
-  return <><div className="positions-table unified-positions-table table-wrap"><table><thead><tr>
+  const mobileCard = (row: UnifiedPositionRow) => {
+    if (row.marketType === 'perp') {
+      const perp = row.perp;
+      const short = perp.side === 'Short';
+      const symbol = `${perp.asset}/${perp.quote}`;
+      return <article className="position-mobile-card" key={`m-perp:${perp.id}`}>
+        <header className="position-mobile-head">
+          <span className="market-type-tag perp">{t('Perp')}</span>
+          <strong className="position-mobile-symbol" title={symbol}>{symbol}</strong>
+          {perp.leverage && <small className="long-tag">{perp.leverage}×</small>}
+          <small className={short ? 'short-tag position-mobile-side' : 'long-tag position-mobile-side'}>{t(short ? 'Short' : 'Long')}</small>
+        </header>
+        <dl className="position-mobile-grid">
+          <div><dt>{t('Exchange')}</dt><dd><VenueFromCode code={perp.venue} /></dd></div>
+          <div><dt>{t('Size')}</dt><dd>{formatAmount(Math.abs(perp.quantity))} {perp.asset}</dd></div>
+          <div><dt>{t('Entry')}</dt><dd>{formatAmount(perp.entryPrice)}</dd></div>
+          <div><dt>{t('PnL / Valuation')}</dt><dd className={perp.unrealizedPnl >= 0 ? 'positive' : 'negative'}>{perp.unrealizedPnl >= 0 ? '+' : ''}{formatAmount(perp.unrealizedPnl)}</dd></div>
+        </dl>
+        <footer className="position-mobile-foot">
+          <span>{t('Value')} <strong>{formatUsd(perp.value)}</strong></span>
+          <button className="row-action close-position-action" onClick={() => onClosePerp(perp)}>{t('Close position')}</button>
+        </footer>
+      </article>;
+    }
+    const spot = row.spot;
+    const short = spot.total < 0;
+    return <article className="position-mobile-card" key={`m-spot:${spot.venue}:${spot.coin}`}>
+      <header className="position-mobile-head">
+        <span className="market-type-tag spot">{t('Spot')}</span>
+        <strong className="position-mobile-symbol" title={spot.coin}>{spot.coin}</strong>
+        <small className={short ? 'short-tag position-mobile-side' : 'long-tag position-mobile-side'}>{t(short ? 'Short' : 'Long')}</small>
+      </header>
+      <dl className="position-mobile-grid">
+        <div><dt>{t('Exchange')}</dt><dd><VenueFromCode code={spot.venue} /></dd></div>
+        <div><dt>{t('Size')}</dt><dd>{formatAmount(spot.total)} {spot.coin}</dd></div>
+        <div><dt>{t('Available')}</dt><dd>{formatAmount(spot.available)}</dd></div>
+        <div><dt>{t('PnL / Valuation')}</dt><dd>{spot.valuationUsd === null ? '—' : formatUsd(spot.valuationUsd)}</dd></div>
+      </dl>
+      <footer className="position-mobile-foot">
+        <span>{spot.locked > 0 ? `${t('Locked')} ${formatAmount(spot.locked)}` : '—'}</span>
+        {spotCloseAction(spot)}
+      </footer>
+    </article>;
+  };
+  return <><div className="positions-summary">
+    <div><span>{t('Position notional')}</span><strong>{formatUsd(grossValue)}</strong></div>
+    <div><span>{t('Unrealized PnL')}</span><strong className={unrealizedPnl >= 0 ? 'positive' : 'negative'}>{unrealizedPnl >= 0 ? '+' : ''}{formatAmount(unrealizedPnl)}</strong></div>
+    <div><span>{t('Positions')}</span><strong>{perpRows.length} {t('Perp')} · {spotRows.length} {t('Spot')}</strong></div>
+  </div><div className="positions-table unified-positions-table table-wrap"><table><thead><tr>
     <th>{t('Type')}</th><th>{t('Market')}</th><th>{t('Exchange')}</th><th>{t('Side')}</th><th>{t('Size')}</th><th>{t('Entry / Available')}</th><th>{t('Value')}</th><th>{t('PnL / Valuation')}</th><th>{t('Action')}</th>
-  </tr></thead><tbody>{rows.slice(window.start, window.end).map((row) => {
+  </tr></thead><tbody>{visibleRows.map((row) => {
     if (row.marketType === 'perp') {
       const perp = row.perp;
       const short = perp.side === 'Short';
       return <tr key={`perp:${perp.id}`}>
         <td><span className="market-type-tag perp">{t('Perp')}</span></td>
-        <td><strong>{marketSymbol(perp.asset, perp.quote, 'perpetual')}</strong>{perp.leverage && <small className="long-tag">{perp.leverage}×</small>}</td>
+        <td><strong title={marketSymbol(perp.asset, perp.quote, 'perpetual')}>{perp.asset}/{perp.quote}</strong>{perp.leverage && <small className="long-tag">{perp.leverage}×</small>}</td>
         <td><VenueFromCode code={perp.venue} /></td>
         <td><small className={short ? 'short-tag' : 'long-tag'}>{t(short ? 'Short' : 'Long')}</small></td>
         <td>{formatAmount(Math.abs(perp.quantity))} {perp.asset}</td>
@@ -188,7 +242,7 @@ export function UnifiedPositionsTable({ rows, page, onPageChange, onClosePerp, s
     const short = spot.total < 0;
     return <tr key={`spot:${spot.venue}:${spot.coin}`}>
       <td><span className="market-type-tag spot">{t('Spot')}</span></td>
-      <td><strong>{assetIcon(spot.coin)} {spot.coin}</strong></td>
+      <td><strong title={spot.coin}>{spot.coin}</strong></td>
       <td><VenueFromCode code={spot.venue} /></td>
       <td><small className={short ? 'short-tag' : 'long-tag'}>{t(short ? 'Short' : 'Long')}</small></td>
       <td>{formatAmount(spot.total)} {spot.coin}</td>
@@ -197,5 +251,5 @@ export function UnifiedPositionsTable({ rows, page, onPageChange, onClosePerp, s
       <td>{spot.locked > 0 ? <small>{t('Locked')} {formatAmount(spot.locked)}</small> : '—'}</td>
       <td>{spotCloseAction(spot)}</td>
     </tr>;
-  })}</tbody></table></div><ExecutionPagination itemCount={rows.length} page={window.page} onPageChange={onPageChange} /></>;
+  })}</tbody></table></div><div className="unified-positions-cards">{visibleRows.map(mobileCard)}</div><ExecutionPagination itemCount={rows.length} page={window.page} onPageChange={onPageChange} /></>;
 }

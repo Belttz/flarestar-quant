@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { strategyPrefillKey } from './strategy-copy.js';
+import { strategyPrefillKey, strategyRemountKey } from './strategy-copy.js';
 
 /**
  * Remount key for the strategy views (0.3.3 需求 4).
@@ -40,5 +40,12 @@ describe('strategyPrefillKey', () => {
 
   it('gives a different key for a different copy target', () => {
     expect(strategyPrefillKey({ copyStrategyId: 'A' })).not.toBe(strategyPrefillKey({ copyStrategyId: 'B' }));
+  });
+});
+
+describe('strategyRemountKey', () => {
+  it('remounts the form when a copy bumps the revision even for the same strategy id', () => {
+    const query = { strategyId: 'PAIR-01', copyStrategyId: 'PAIR-01' };
+    expect(strategyRemountKey(query, 0)).not.toBe(strategyRemountKey(query, 1));
   });
 });

@@ -27,7 +27,7 @@ import {
 } from './api.js';
 import { parseStoredFavorites } from './local-preferences.js';
 import { scopeStrategiesToAccount, strategyBelongsToAccount } from './strategy-accounts.js';
-import { strategyCopyQuery, strategyPrefillKey, strategyRouteKind } from './strategy-copy.js';
+import { strategyCopyQuery, strategyRemountKey, strategyRouteKind } from './strategy-copy.js';
 import { DEFAULT_FRONTEND_ROUTE, frontendPath, frontendRoute, historyNeedsUpdate, type FrontendRoute, type OpportunityBoard, type StrategyRouteKind } from './frontend-routes.js';
 import { LanguageContext, translate, useLanguage, type Language, type Theme } from './i18n.js';
 import { LoginPage } from './login-page.js';
@@ -519,6 +519,10 @@ function App() {
   const [language, setLanguage] = useState<Language>(() => window.localStorage.getItem('crossex-language') === 'zh' ? 'zh' : 'en');
   const [theme, setTheme] = useState<Theme>(() => window.localStorage.getItem('crossex-theme') === 'light' ? 'light' : 'dark');
   const [route, setRoute] = useState<FrontendRoute>(() => frontendRoute(window.location.pathname) ?? DEFAULT_FRONTEND_ROUTE);
+  // Bumped on every copy action. A copy from the open strategy-detail dialog keeps both
+  // `strategyId` and `copyStrategyId` equal to the same record, so a key derived only from those
+  // values would not remount the form and the prefilled fields would silently stay stale.
+  const [copyRevision, setCopyRevision] = useState(0);
   const workspace: Workspace = route.workspace;
   const fundingDetailAsset = route.workspace === 'Funding Rates' ? route.asset : null;
   const strategyKind: StrategyKind = route.workspace === 'Strategy' ? route.strategyKind : 'position';
@@ -1227,11 +1231,12 @@ function App() {
   // same kind, so only the query changes. Keying the element on the prefill parameters forces the
   // remount that makes the prefill actually happen. Must stay in the `content` memo deps, or the
   // memo would bail out and hand React the old element with the old key.
-  const strategyPrefillKeyValue = route.workspace === 'Strategy' ? strategyPrefillKey(route.query) : 'default';
+  const strategyPrefillKeyValue = route.workspace === 'Strategy' ? strategyRemountKey(route.query, copyRevision) : 'default';
   const openStrategyConfig = useCallback((strategy: StrategyRecord) => {
     navigate({ workspace: 'Strategy', strategyKind: strategyRouteKind(strategy.kind), query: { strategyId: strategy.id } });
   }, [navigate]);
   const copyStrategy = useCallback((strategy: StrategyRecord) => {
+    setCopyRevision((value) => value + 1);
     navigate({ workspace: 'Strategy', strategyKind: strategyRouteKind(strategy.kind), query: strategyCopyQuery(strategy) });
     // The copy button lives in the historical table far down the page; without this the prefilled
     // form remounts above the fold and the operator can reasonably think nothing happened.
@@ -1255,7 +1260,7 @@ function App() {
     if (workspace === 'Trading Fees') return <FeeComparisonView catalog={availableCatalog} marketSnapshot={marketSnapshot} favorites={favorites} fees={fees} feesReady={feesReady} error={feesError} onRefresh={refreshFees} watchSelectorQuotes={watchSelectorQuotes} />;
     return null;
 
-  }, [workspace, strategyKind, positionPrefill, requestedStrategyId, strategyPrefillKeyValue, openStrategyConfig, copyStrategy, selectedAsset, fundingMetric, fundingOverview, fundingHistoryCache, availableCatalog, selectAsset, marketSnapshot, tradingSnapshot, authenticatedPortfolio, accountStream, activeAccountStrategies, balances, fees, feesReady, feesError, orderBook, publicTrades, candleSeries, candleBackfilling, tradingMode, openModeDialog, watchMarket, watchQuotes, watchSelectorQuotes, watchKlines, seedCandles, refreshTrading, refreshStrategies, refreshPositions, refreshMarketSnapshot, refreshFees, favorites, toggleFavorite, confirmOrders, fundingDetailAsset, openFundingDetail, openFundingStrategy, mergeFundingHistory, navigate, connection?.activeProfileId, opportunityBoard]);
+  }, [workspace, strategyKind, positionPrefill, requestedStrategyId, strategyPrefillKeyValue, copyRevision, openStrategyConfig, copyStrategy, selectedAsset, fundingMetric, fundingOverview, fundingHistoryCache, availableCatalog, selectAsset, marketSnapshot, tradingSnapshot, authenticatedPortfolio, accountStream, activeAccountStrategies, balances, fees, feesReady, feesError, orderBook, publicTrades, candleSeries, candleBackfilling, tradingMode, openModeDialog, watchMarket, watchQuotes, watchSelectorQuotes, watchKlines, seedCandles, refreshTrading, refreshStrategies, refreshPositions, refreshMarketSnapshot, refreshFees, favorites, toggleFavorite, confirmOrders, fundingDetailAsset, openFundingDetail, openFundingStrategy, mergeFundingHistory, navigate, connection?.activeProfileId, opportunityBoard]);
 
   const storageLabel = connection?.storage === 'os_keychain' ? t('OS keychain') : connection?.storage === 'env_file' ? t('Local .env file') : connection?.storage ?? '—';
   const accountStatusLabel = accountStream?.state === 'live' ? t('Account live')
@@ -1624,6 +1629,28 @@ function App() {
         {content}
       </Suspense>
     </main>
+    <nav className="mobile-tabbar" aria-label={t('Main navigation')}>
+      <button className={workspace === 'Trade' ? 'active' : ''} onClick={() => navigate({ workspace: 'Trade' })}>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V9M9 19V5M15 19v-7M20 19V8" /></svg>
+        <span>{t('Trade')}</span>
+      </button>
+      <button className={workspace === 'Opportunities' ? 'active' : ''} onClick={() => navigate({ workspace: 'Opportunities', board: opportunityBoard })}>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z" /><path d="m18.5 15 .8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2Z" /></svg>
+        <span>{t('Opportunities')}</span>
+      </button>
+      <button className={workspace === 'Strategy' ? 'active' : ''} onClick={() => navigate({ workspace: 'Strategy', strategyKind })}>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16M8 4v6M16 14v6" /></svg>
+        <span>{t('Strategy')}</span>
+      </button>
+      <button className={workspace === 'Funding Rates' ? 'active' : ''} onClick={() => navigate({ workspace: 'Funding Rates', asset: null })}>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 18 12-12M8.5 7.5a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0ZM18.5 16.5a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0Z" /></svg>
+        <span>{t('Funding Rates')}</span>
+      </button>
+      <button className={workspace === 'Portfolio' ? 'active' : ''} onClick={() => navigate({ workspace: 'Portfolio' })}>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10.5A8 8 0 1 1 13.5 20" /><path d="M4 10.5V20h9.5M12 12l4-4" /></svg>
+        <span>{t('Portfolio')}</span>
+      </button>
+    </nav>
     <footer className="statusbar"><div>{terminalStreamEnabled ? <><span className={streamState === 'connected' ? 'connected' : ''}><i /> {t(streamState === 'connected' ? 'Backend stream connected' : 'Reconnecting backend stream')}</span><span>LIVE {t('environment')}</span><span className={marketSnapshot?.connectionState === 'healthy' ? 'connected' : ''}><i /> {t('Market data')} {t(marketSnapshot?.connectionState ?? 'connecting')}</span><span className={accountStatusConnected ? 'connected' : ''}><i /> {accountStatusLabel}</span></> : <span className={fundingOverview ? 'connected' : ''}><i /> {fundingOverview ? t('Funding data source connected') : t('Funding data source loading')}</span>}</div><div><UtcClock /><span className="footer-brand" title="星闪量化 FlareStar Quant"><img src={brandMark} alt="" /><b>星闪量化</b></span><span title={`Release ${RELEASE_VERSION}`}>{RELEASE_VERSION}</span><button onClick={() => window.open('https://becod.eu.org/', '_blank', 'noopener')}>{t('Blog')}</button></div></footer>
     <AccountManagerDialog
       open={accountManagerOpen}
