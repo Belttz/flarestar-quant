@@ -28,6 +28,10 @@ interface FieldDef {
   unit?: string;
   help?: Help;
   kind?: 'number' | 'toggle';
+  /** Shown only when `autoSizing` is on. */
+  autoOnly?: boolean;
+  /** Shown only when `autoSizing` is off (legacy manual mode). */
+  manualOnly?: boolean;
 }
 
 interface SelectDef {
@@ -35,6 +39,7 @@ interface SelectDef {
   label: string;
   options: Array<{ value: string; label: string }>;
   help?: Help;
+  manualOnly?: boolean;
 }
 
 interface GroupDef {
@@ -81,26 +86,29 @@ const GROUPS: GroupDef[] = [
   },
   {
     title: 'Sizing & leverage',
-    hint: { en: 'Notional = available margin × (1 − headroom) × safety ÷ (1/L1 + 1/L2), capped by the limits below.', zh: '仓位公式：名义 = 可用保证金 × (1−安全垫) × 安全系数 ÷ (1/L1 + 1/L2)，并受下方上限约束。' },
+    hint: { en: 'Auto mode: enter only the planned position count. Equity × (1 − buffer) is split across the remaining slots, and each leg uses its own venue maximum leverage.', zh: '自动模式只需填预计开仓位数：账户权益 × (1 − 缓冲) 按剩余空位均分，两腿各自使用本交易所最大杠杆。' },
     selects: [{
       key: 'leverageMode',
       label: 'Leverage mode',
+      manualOnly: true,
       options: [
         { value: 'max', label: 'Max available' },
         { value: 'fixed', label: 'Fixed' },
       ],
-      help: { en: 'Max uses each leg risk-tier ceiling; fixed uses the value below.', zh: 'max=取两腿风险档最高杠杆；fixed=使用固定杠杆。' },
+      help: { en: 'Manual mode only; auto mode always uses each leg’s own maximum.', zh: '仅手动模式使用；自动模式固定为两腿各自最大杠杆。' },
     }],
     fields: [
-      { key: 'maxPerTradeUsd', label: 'Max per trade', unit: 'USD', help: { en: 'Hard per-position notional cap.', zh: '单笔名义本金硬上限。' } },
-      { key: 'maxTotalExposureUsd', label: 'Max total exposure', unit: 'USD', help: { en: 'Sum of all automatic positions.', zh: '所有自动仓位名义本金合计上限。' } },
-      { key: 'maxConcurrent', label: 'Max concurrent', help: { en: 'Concurrent auto positions (engine overall cap is 10).', zh: '同时持有的自动仓位数（引擎总上限 10）。' } },
-      { key: 'maxEntriesPerDay', label: 'Max entries / day', help: { en: 'New positions per UTC day.', zh: '每个 UTC 日最多新开仓次数。' } },
-      { key: 'maxLeverage', label: 'Max leverage', unit: 'x', help: { en: 'Ceiling applied in max mode.', zh: 'max 模式下的杠杆硬上限。' } },
-      { key: 'fixedLeverage', label: 'Fixed leverage', unit: 'x', help: { en: 'Used when leverage mode is fixed.', zh: 'fixed 模式下使用的杠杆。' } },
-      { key: 'safetyFactor', label: 'Safety factor', unit: '0-1', help: { en: 'Share of margin the sizing formula may use.', zh: '计算仓位时可用保证金的比例。' } },
-      { key: 'marginHeadroomPct', label: 'Margin headroom', unit: '0-1', help: { en: 'Extra margin kept aside for fees/slippage.', zh: '额外预留的保证金比例（手续费/滑点）。' } },
-      { key: 'maxMarginPerVenueUsd', label: 'Max margin per venue', unit: 'USD', help: { en: 'Optional per-leg venue margin cap (0 = off).', zh: '单交易所单腿保证金上限（0=关闭）。' } },
+      { key: 'autoSizing', label: 'Auto sizing', kind: 'toggle', help: { en: 'One input (planned positions); all caps and leverage are derived automatically.', zh: '只填预计开仓位数，其余上限和杠杆全部自动计算。' } },
+      { key: 'maxConcurrent', label: 'Planned positions', help: { en: 'Expected concurrent positions; the budget is divided by the remaining empty slots.', zh: '预计同时开仓位数；预算按剩余空位均分。' } },
+      { key: 'sizingBufferPct', label: 'Cash buffer', unit: '0-1', autoOnly: true, help: { en: '0.10 keeps 10% of equity unencumbered (default 90% usage).', zh: '0.10=保留 10% 权益做缓冲（默认 90% 资金占用）。' } },
+      { key: 'maxPerTradeUsd', label: 'Max per trade', unit: 'USD', manualOnly: true, help: { en: 'Manual mode hard per-position notional cap.', zh: '手动模式单笔名义本金硬上限。' } },
+      { key: 'maxTotalExposureUsd', label: 'Max total exposure', unit: 'USD', manualOnly: true, help: { en: 'Manual mode sum of all automatic positions.', zh: '手动模式所有自动仓位名义本金合计上限。' } },
+      { key: 'maxEntriesPerDay', label: 'Max entries / day', manualOnly: true, help: { en: 'Manual mode new positions per UTC day; auto uses 2 × planned positions.', zh: '手动模式每日新开仓上限；自动模式为预计开仓位数 × 2。' } },
+      { key: 'maxLeverage', label: 'Max leverage', unit: 'x', manualOnly: true, help: { en: 'Manual mode ceiling; auto uses each venue tier ceiling.', zh: '手动模式杠杆硬上限；自动模式使用各交易所品种上限。' } },
+      { key: 'fixedLeverage', label: 'Fixed leverage', unit: 'x', manualOnly: true, help: { en: 'Used when manual mode is fixed.', zh: '手动固定杠杆模式使用。' } },
+      { key: 'safetyFactor', label: 'Safety factor', unit: '0-1', manualOnly: true, help: { en: 'Manual mode share of margin the formula may use.', zh: '手动模式计算仓位时可用保证金比例。' } },
+      { key: 'marginHeadroomPct', label: 'Margin headroom', unit: '0-1', manualOnly: true, help: { en: 'Manual mode extra margin kept aside.', zh: '手动模式额外预留保证金。' } },
+      { key: 'maxMarginPerVenueUsd', label: 'Max margin per venue', unit: 'USD', manualOnly: true, help: { en: 'Manual mode optional per-leg venue cap (0 = off).', zh: '手动模式单腿交易所保证金上限（0=关闭）。' } },
     ],
   },
   {
@@ -693,7 +701,7 @@ export function FundingArbPanel({ onOpenModeDialog, onOpenPairedPosition }: {
                     <small>{hint(group.hint)}</small>
                   </summary>
                   <div className="funding-arb-group-body">
-                    {group.selects?.map((select) => (
+                    {group.selects?.filter((select) => !select.manualOnly || !draft.autoSizing).map((select) => (
                       <label key={String(select.key)} className="funding-arb-field" title={hint(select.help)}>
                         <span>{t(select.label)}</span>
                         <select value={String(draft[select.key] ?? '')} disabled={busy}
@@ -707,7 +715,8 @@ export function FundingArbPanel({ onOpenModeDialog, onOpenPairedPosition }: {
                         <small>{hint(select.help)}</small>
                       </label>
                     ))}
-                    {group.fields.map((field) => field.kind === 'toggle' ? (
+                    {group.fields.filter((field) => (field.autoOnly ? draft.autoSizing : true)
+                      && (field.manualOnly ? !draft.autoSizing : true)).map((field) => field.kind === 'toggle' ? (
                       <label key={String(field.key)} className="funding-arb-field toggle" title={hint(field.help)}>
                         <span>{t(field.label)}</span>
                         <input type="checkbox" checked={Boolean(draft[field.key])} disabled={busy}

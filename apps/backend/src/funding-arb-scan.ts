@@ -80,6 +80,8 @@ export function buildFundingArbCandidates(
           notionalUsd: null,
           quantity: null,
           leverage: null,
+          shortLeverage: null,
+          longLeverage: null,
           settlementInMs: null,
         });
       }
@@ -150,7 +152,8 @@ export function settlementInMs(
 export interface FundingArbHedgeSizeInput {
   availableMarginUsd: number;
   safetyFactor: number;
-  maxPerTradeUsd: number;
+  /** `null` disables the per-trade USD ceiling (auto sizing derives the slot budget instead). */
+  maxPerTradeUsd: number | null;
   leftLeverage: number;
   rightLeverage: number;
   price: number;
@@ -161,7 +164,17 @@ export interface FundingArbHedgeSizeInput {
 }
 
 export type FundingArbHedgeSize =
-  | { ok: true; quantity: string; notionalUsd: number; leverage: number }
+  | {
+    ok: true;
+    quantity: string;
+    notionalUsd: number;
+    /** Lower of the two per-leg leverages, for display/legacy callers. */
+    leverage: number;
+    leftLeverage: number;
+    rightLeverage: number;
+    leftMarginUsd: number;
+    rightMarginUsd: number;
+  }
   | { ok: false; reason: 'SIZE_TOO_SMALL' | 'MAX_MARKET_SIZE' | 'BALANCE_INSUFFICIENT'; detail: string };
 
 /**
@@ -184,7 +197,9 @@ export function sizePerpHedge(input: FundingArbHedgeSizeInput): FundingArbHedgeS
   const marginPerNotional = new Decimal(1).div(leftLeverage).plus(new Decimal(1).div(rightLeverage));
   if (marginPerNotional.lte(0)) return { ok: false, reason: 'BALANCE_INSUFFICIENT', detail: 'leverage is not positive' };
   let notional = available.mul(safety).div(marginPerNotional);
-  notional = Decimal.min(notional, new Decimal(Math.max(0, input.maxPerTradeUsd)));
+  if (input.maxPerTradeUsd !== null) {
+    notional = Decimal.min(notional, new Decimal(Math.max(0, input.maxPerTradeUsd)));
+  }
   if (input.maxMarketSize !== null) {
     const maxMarket = new Decimal(input.maxMarketSize);
     if (maxMarket.isFinite() && maxMarket.gt(0)) {
@@ -214,7 +229,63 @@ export function sizePerpHedge(input: FundingArbHedgeSizeInput): FundingArbHedgeS
     }
   }
   const leverage = Decimal.min(leftLeverage, rightLeverage).toNumber();
-  return { ok: true, quantity: quantity.toString(), notionalUsd: finalNotional.toNumber(), leverage };
+  return {
+    ok: true,
+    quantity: quantity.toString(),
+    notionalUsd: finalNotional.toNumber(),
+    leverage,
+    leftLeverage: leftLeverage.toNumber(),
+    rightLeverage: rightLeverage.toNumber(),
+    leftMarginUsd: finalNotional.div(leftLeverage).toNumber(),
+    rightMarginUsd: finalNotional.div(rightLeverage).toNumber(),
+  };
+}
+
+export interface FundingArbAutoBudgetInput {
+  /** Account equity (margin balance), not just the free balance. */
+  equityUsd: number;
+  availableMarginUsd: number;
+  usedMarginUsd: number;
+  plannedPositions: number;
+  openPositions: number;
+  /** 0.10 keeps 10% of equity unencumbered. */
+  bufferPct: number;
+}
+
+export interface FundingArbAutoBudget {
+  targetUsedUsd: number;
+  bufferUsd: number;
+  remainingSlots: number;
+  remainingBudgetUsd: number;
+  budgetPerSlotUsd: number;
+}
+
+/**
+ * Auto-sizing budget. The operator supplies only the planned position count; the runner reserves
+ * `equity × bufferPct` for fees/basis moves and divides what is left across the still-empty slots.
+ * `availableMarginUsd` caps the result because locked margin cannot be spent even if the equity
+ * target still has room.
+ */
+export function autoSizingBudget(input: FundingArbAutoBudgetInput): FundingArbAutoBudget {
+  const equity = Math.max(0, Number.isFinite(input.equityUsd) ? input.equityUsd : 0);
+  const available = Math.max(0, Number.isFinite(input.availableMarginUsd) ? input.availableMarginUsd : 0);
+  const used = Math.max(0, Math.min(equity || available, Number.isFinite(input.usedMarginUsd) ? input.usedMarginUsd : 0));
+  const bufferPct = Math.max(0, Math.min(0.5, Number.isFinite(input.bufferPct) ? input.bufferPct : 0.1));
+  const planned = Math.max(0, Math.trunc(input.plannedPositions));
+  const open = Math.max(0, Math.trunc(input.openPositions));
+  const remainingSlots = Math.max(0, planned - open);
+  const targetUsedUsd = equity * (1 - bufferPct);
+  const remainingBudgetUsd = Math.max(0, targetUsedUsd - used);
+  const budgetPerSlotUsd = remainingSlots > 0
+    ? Math.max(0, Math.min(available, remainingBudgetUsd / remainingSlots))
+    : 0;
+  return {
+    targetUsedUsd,
+    bufferUsd: Math.max(0, equity - targetUsedUsd),
+    remainingSlots,
+    remainingBudgetUsd,
+    budgetPerSlotUsd,
+  };
 }
 
 /**

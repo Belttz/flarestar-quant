@@ -13,6 +13,7 @@ import type {
   StrategyRecord,
 } from '@gate-crossex/shared-types';
 import {
+  autoSizingBudget,
   buildFundingArbCandidates,
   dynamicEntryBps,
   executableEntrySpreadBps,
@@ -20,6 +21,7 @@ import {
   roundTripCostBps,
   settlementInMs,
   sizePerpHedge,
+  type FundingArbAutoBudget,
 } from './funding-arb-scan.js';
 import { readFundingArbSettings } from './funding-arb-repository.js';
 import {
@@ -92,6 +94,12 @@ interface ScanContext {
   instruments: Map<string, CrossExInstrument>;
   strategies: StrategyRecord[];
   availableMarginUsd: number;
+  /** Account equity used by auto sizing. */
+  equityMarginUsd: number;
+  /** Margin currently locked by positions/orders, derived as equity - available. */
+  usedMarginUsd: number;
+  /** Populated only while `settings.autoSizing` is on. */
+  autoBudget: FundingArbAutoBudget | null;
   /** Realised funding over trailing 24h/7d, keyed by executable symbol. */
   persistence: Map<string, FundingPersistenceRow>;
   /** Realized PnL of our automatic strategies closed since 00:00 UTC. */
@@ -246,17 +254,32 @@ export class FundingArbMonitor {
 
     const strategies = this.deps.strategies();
     const availableMarginUsd = this.availableMarginUsd();
+    const equityMarginUsd = this.marginBalanceUsd() || availableMarginUsd;
+    const usedMarginUsd = Math.max(0, equityMarginUsd - availableMarginUsd);
     const context: ScanContext = {
       settings,
       now,
       instruments: this.deps.instruments(),
       strategies,
       availableMarginUsd,
+      equityMarginUsd,
+      usedMarginUsd,
+      autoBudget: null,
       persistence: loadFundingPersistence(this.deps.database, now),
       dailyPnlUsd: this.realizedTodayUsd(strategies, now),
       liveTradingEnabled: this.deps.liveTradingEnabled(),
       connectionHealthy: this.connectionHealthy(),
     };
+    if (settings.autoSizing) {
+      context.autoBudget = autoSizingBudget({
+        equityUsd: equityMarginUsd,
+        availableMarginUsd,
+        usedMarginUsd,
+        plannedPositions: settings.maxConcurrent,
+        openPositions: this.openOurStrategies(context).length,
+        bufferPct: settings.sizingBufferPct,
+      });
+    }
 
     const scannedAt = new Date(now).toISOString();
     const evaluated: FundingArbCandidate[] = [];
@@ -278,6 +301,8 @@ export class FundingArbMonitor {
         candidate.notionalUsd = priced.notionalUsd;
         candidate.quantity = priced.quantity;
         candidate.leverage = priced.leverage;
+        candidate.shortLeverage = priced.shortLeverage;
+        candidate.longLeverage = priced.longLeverage;
         candidate.settlementInMs = priced.settlementInMs;
         if (priced.reasons.length > 0) {
           candidate.verdict = 'REJECT';
@@ -445,8 +470,9 @@ export class FundingArbMonitor {
     }
     if (this.inCooldown(candidate, context)) reasons.push('COOLDOWN');
     if (this.openOurStrategies(context).length >= settings.maxConcurrent && !this.assetHasOpenStrategy(candidate, context)) reasons.push('SLOT_LIMIT');
-    if (this.entriesToday(context) >= settings.maxEntriesPerDay) reasons.push('DAILY_LIMIT');
-    if (this.currentExposureUsd(context) >= settings.maxTotalExposureUsd) reasons.push('EXPOSURE_LIMIT');
+    const maxEntries = settings.autoSizing ? settings.maxConcurrent * 2 : settings.maxEntriesPerDay;
+    if (this.entriesToday(context) >= maxEntries) reasons.push('DAILY_LIMIT');
+    if (!settings.autoSizing && this.currentExposureUsd(context) >= settings.maxTotalExposureUsd) reasons.push('EXPOSURE_LIMIT');
     if (!this.deps.account()) reasons.push('ACCOUNT_MISSING');
     return reasons;
   }
@@ -482,31 +508,34 @@ export class FundingArbMonitor {
     notionalUsd: number | null;
     quantity: string | null;
     leverage: number | null;
+    shortLeverage: number | null;
+    longLeverage: number | null;
     settlementInMs: number | null;
     reasons: string[];
   } {
     const shortMarket = this.deps.market(candidate.shortSymbol);
     const longMarket = this.deps.market(candidate.longSymbol);
     if (!shortMarket || !longMarket) {
-      return { entryBps: null, notionalUsd: null, quantity: null, leverage: null, settlementInMs: null, reasons: ['LEG_UNAVAILABLE'] };
+      return { entryBps: null, notionalUsd: null, quantity: null, leverage: null, shortLeverage: null, longLeverage: null, settlementInMs: null, reasons: ['LEG_UNAVAILABLE'] };
     }
     const spread = executableEntrySpreadBps(shortMarket.bidPrice, longMarket.askPrice);
     if (spread === null) {
-      return { entryBps: null, notionalUsd: null, quantity: null, leverage: null, settlementInMs: null, reasons: ['LEG_UNAVAILABLE'] };
+      return { entryBps: null, notionalUsd: null, quantity: null, leverage: null, shortLeverage: null, longLeverage: null, settlementInMs: null, reasons: ['LEG_UNAVAILABLE'] };
     }
     const price = Number(longMarket.lastPrice) > 0 ? Number(longMarket.lastPrice) : Number(longMarket.bidPrice);
     const shortInstrument = context.instruments.get(candidate.shortSymbol);
     const longInstrument = context.instruments.get(candidate.longSymbol);
     if (!shortInstrument || !longInstrument || !Number.isFinite(price) || price <= 0) {
-      return { entryBps: null, notionalUsd: null, quantity: null, leverage: null, settlementInMs: null, reasons: ['INSTRUMENT_MISSING'] };
+      return { entryBps: null, notionalUsd: null, quantity: null, leverage: null, shortLeverage: null, longLeverage: null, settlementInMs: null, reasons: ['INSTRUMENT_MISSING'] };
     }
-    const leverage = this.pickLeverage(candidate, context);
+    const leverages = this.pickLeverages(candidate, context);
+    const auto = context.settings.autoSizing ? context.autoBudget : null;
     const size = sizePerpHedge({
-      availableMarginUsd: context.availableMarginUsd * (1 - context.settings.marginHeadroomPct),
-      safetyFactor: context.settings.safetyFactor,
-      maxPerTradeUsd: context.settings.maxPerTradeUsd,
-      leftLeverage: leverage,
-      rightLeverage: leverage,
+      availableMarginUsd: auto ? auto.budgetPerSlotUsd : context.availableMarginUsd * (1 - context.settings.marginHeadroomPct),
+      safetyFactor: auto ? 1 : context.settings.safetyFactor,
+      maxPerTradeUsd: auto ? null : context.settings.maxPerTradeUsd,
+      leftLeverage: leverages.short,
+      rightLeverage: leverages.long,
       price,
       lotSize: higherLot(shortInstrument, longInstrument),
       minSize: lowerMin(shortInstrument, longInstrument),
@@ -514,12 +543,12 @@ export class FundingArbMonitor {
       maxMarketSize: minNullable(shortInstrument.maxMarketSize, longInstrument.maxMarketSize),
     });
     if (!size.ok) {
-      return { entryBps: null, notionalUsd: null, quantity: null, leverage: null, settlementInMs: null, reasons: [size.reason] };
+      return { entryBps: null, notionalUsd: null, quantity: null, leverage: null, shortLeverage: null, longLeverage: null, settlementInMs: null, reasons: [size.reason] };
     }
-    if (context.settings.maxMarginPerVenueUsd > 0) {
-      const perLegMargin = size.notionalUsd / Math.max(1, leverage);
+    if (!auto && context.settings.maxMarginPerVenueUsd > 0) {
+      const perLegMargin = Math.max(size.leftMarginUsd, size.rightMarginUsd);
       if (perLegMargin > context.settings.maxMarginPerVenueUsd) {
-        return { entryBps: null, notionalUsd: null, quantity: null, leverage: null, settlementInMs: null, reasons: ['BALANCE_INSUFFICIENT'] };
+        return { entryBps: null, notionalUsd: null, quantity: null, leverage: null, shortLeverage: null, longLeverage: null, settlementInMs: null, reasons: ['BALANCE_INSUFFICIENT'] };
       }
     }
     // Dynamic entry trigger: the executable spread minus a buffer that combines the operator's
@@ -532,27 +561,39 @@ export class FundingArbMonitor {
       notionalUsd: size.notionalUsd,
       quantity: size.quantity,
       leverage: size.leverage,
+      shortLeverage: leverages.short,
+      longLeverage: leverages.long,
       settlementInMs: settlementInMs(candidate.shortNextFundingAt, candidate.longNextFundingAt, context.now),
       reasons: [],
     };
   }
 
-  private pickLeverage(candidate: FundingArbCandidate, context: ScanContext): number {
+  private pickLeverages(candidate: FundingArbCandidate, context: ScanContext): { short: number; long: number } {
     const settings = context.settings;
-    if (settings.leverageMode === 'fixed') return settings.fixedLeverage;
     const shortMax = this.deps.leverageMax(candidate.shortSymbol) ?? settings.fixedLeverage;
     const longMax = this.deps.leverageMax(candidate.longSymbol) ?? settings.fixedLeverage;
-    const tierMax = Math.min(shortMax, longMax);
-    return Math.max(1, Math.min(tierMax, settings.maxLeverage));
+    if (settings.autoSizing) {
+      // Each leg takes its own venue ceiling. The engine stores them separately, so a 20x/10x pair
+      // is margin-sized correctly instead of forcing both legs to the lower common leverage.
+      return { short: Math.max(1, shortMax), long: Math.max(1, longMax) };
+    }
+    if (settings.leverageMode === 'fixed') return { short: settings.fixedLeverage, long: settings.fixedLeverage };
+    return {
+      short: Math.max(1, Math.min(shortMax, settings.maxLeverage)),
+      long: Math.max(1, Math.min(longMax, settings.maxLeverage)),
+    };
   }
 
   private canOpenMore(candidate: FundingArbCandidate, context: ScanContext, opened: FundingArbCandidate[]): boolean {
     const { settings } = context;
     const alreadyOpen = this.openOurStrategies(context).length + opened.length;
     if (alreadyOpen >= settings.maxConcurrent) return false;
-    const exposure = this.currentExposureUsd(context) + opened.reduce((sum, row) => sum + (row.notionalUsd ?? 0), 0);
-    if (exposure + (candidate.notionalUsd ?? 0) > settings.maxTotalExposureUsd) return false;
-    if (this.entriesToday(context) + opened.length >= settings.maxEntriesPerDay) return false;
+    const maxEntries = settings.autoSizing ? settings.maxConcurrent * 2 : settings.maxEntriesPerDay;
+    if (!settings.autoSizing) {
+      const exposure = this.currentExposureUsd(context) + opened.reduce((sum, row) => sum + (row.notionalUsd ?? 0), 0);
+      if (exposure + (candidate.notionalUsd ?? 0) > settings.maxTotalExposureUsd) return false;
+    }
+    if (this.entriesToday(context) + opened.length >= maxEntries) return false;
     return true;
   }
 
@@ -706,8 +747,8 @@ export class FundingArbMonitor {
       makerLeg: this.chooseMakerLeg(candidate, settings),
       totalAmount: quantity,
       perOrderQuantity: quantity,
-      leftLeverage: String(candidate.leverage ?? 1),
-      rightLeverage: String(candidate.leverage ?? 1),
+      leftLeverage: String(candidate.shortLeverage ?? candidate.leverage ?? 1),
+      rightLeverage: String(candidate.longLeverage ?? candidate.leverage ?? 1),
       stopLossBps: settings.hardStopLossBps > 0 ? settings.hardStopLossBps : undefined,
       exitFundingAprFloorPercent: settings.exitFundingAprFloorPercent,
       exitOnFundingFlip: settings.exitOnFundingFlip,
@@ -829,6 +870,19 @@ export class FundingArbMonitor {
       .reduce((sum, balance) => {
         const available = Number(balance.availableBalance);
         return Number.isFinite(available) && available > 0 ? sum + available : sum;
+      }, 0);
+  }
+
+  /** Account equity in USD terms, used as the base of the auto-sizing budget. */
+  private marginBalanceUsd(): number {
+    const balances = this.deps.balances();
+    return balances
+      .filter((balance) => ['USDT', 'USDC'].includes(balance.coin.toUpperCase()))
+      .reduce((sum, balance) => {
+        const equity = Number(balance.equity);
+        const fallback = Number(balance.balance);
+        const value = Number.isFinite(equity) && equity > 0 ? equity : fallback;
+        return Number.isFinite(value) && value > 0 ? sum + value : sum;
       }, 0);
   }
 

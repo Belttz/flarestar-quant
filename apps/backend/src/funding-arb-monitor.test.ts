@@ -164,6 +164,28 @@ describe('funding arbitrage monitor', () => {
     expect(decisions[0]!.verdict).toBe('PASS');
   });
 
+  it('auto-sizes from the 90% slot budget and ignores fixed leverage', async () => {
+    const database = testDatabase();
+    const monitor = buildMonitor(database);
+    const settings = {
+      ...readFundingArbSettings(database),
+      autoSizing: true,
+      leverageMode: 'fixed' as const,
+      fixedLeverage: 2,
+      maxConcurrent: 3,
+      sizingBufferPct: 0.10,
+    };
+    writeFundingArbSettings(database, settings);
+
+    const result = await monitor.runOnce({ manual: true });
+    const candidate = result!.candidates[0]!;
+    expect(candidate.verdict).toBe('PASS');
+    // Equity 1000 → target 900 across 3 slots = 300 margin per slot; 5x on both legs → 750 notional.
+    expect(candidate.notionalUsd).toBeCloseTo(750, 6);
+    expect(candidate.shortLeverage).toBe(5);
+    expect(candidate.longLeverage).toBe(5);
+  });
+
   it('does nothing while the switch is off (unless explicitly asked to scan)', async () => {
     const database = testDatabase();
     const monitor = buildMonitor(database, { enabled: false });

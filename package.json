@@ -1,7 +1,7 @@
 {
   "name": "gate-crossex-terminal",
   "private": true,
-  "version": "5.1.0",
+  "version": "5.2.0",
   "license": "AGPL-3.0-only",
   "type": "module",
   "workspaces": [

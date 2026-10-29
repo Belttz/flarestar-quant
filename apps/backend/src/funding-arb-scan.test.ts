@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { FundingOverviewResponse } from '@gate-crossex/shared-types';
 import {
+  autoSizingBudget,
   buildFundingArbCandidates,
   dynamicEntryBps,
   executableEntrySpreadBps,
@@ -146,6 +147,56 @@ describe('dynamic entry and sizing', () => {
       maxMarketSize: null,
     });
     expect(size.ok).toBe(false);
+  });
+
+  it('auto-sizes 90% of equity across the remaining planned slots', () => {
+    const budget = autoSizingBudget({
+      equityUsd: 92.21,
+      availableMarginUsd: 92.21,
+      usedMarginUsd: 0,
+      plannedPositions: 3,
+      openPositions: 0,
+      bufferPct: 0.10,
+    });
+    expect(budget.bufferUsd).toBeCloseTo(9.221, 6);
+    expect(budget.targetUsedUsd).toBeCloseTo(82.989, 6);
+    expect(budget.remainingSlots).toBe(3);
+    expect(budget.budgetPerSlotUsd).toBeCloseTo(27.663, 6);
+  });
+
+  it('uses each leg’s own maximum leverage when sizing', () => {
+    const size = sizePerpHedge({
+      availableMarginUsd: 300,
+      safetyFactor: 1,
+      maxPerTradeUsd: null,
+      leftLeverage: 20,
+      rightLeverage: 10,
+      price: 100,
+      lotSize: '0.1',
+      minSize: '0.1',
+      minNotional: '10',
+      maxMarketSize: null,
+    });
+    expect(size.ok).toBe(true);
+    if (!size.ok) return;
+    expect(size.notionalUsd).toBeCloseTo(2000, 6);
+    expect(size.leftMarginUsd).toBeCloseTo(100, 6);
+    expect(size.rightMarginUsd).toBeCloseTo(200, 6);
+    expect(size.leverage).toBe(10);
+  });
+
+  it('reserves one slot for every still-empty planned position', () => {
+    const budget = autoSizingBudget({
+      equityUsd: 1000,
+      availableMarginUsd: 400,
+      usedMarginUsd: 600,
+      plannedPositions: 3,
+      openPositions: 2,
+      bufferPct: 0.10,
+    });
+    expect(budget.remainingSlots).toBe(1);
+    expect(budget.remainingBudgetUsd).toBeCloseTo(300, 6);
+    expect(budget.budgetPerSlotUsd).toBeCloseTo(300, 6);
   });
 });
 

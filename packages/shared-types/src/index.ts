@@ -1990,7 +1990,11 @@ export const FundingArbCandidateSchema = z.object({
   /** Sizing result for PASS rows; null when rejected. */
   notionalUsd: z.number().finite().nullable().default(null),
   quantity: z.string().nullable().default(null),
+  /** Lower of the two per-leg leverages, kept for display and legacy consumers. */
   leverage: z.number().finite().nullable().default(null),
+  /** Per-leg leverage actually used for margin sizing (each leg may hit its own tier ceiling). */
+  shortLeverage: z.number().finite().nullable().default(null),
+  longLeverage: z.number().finite().nullable().default(null),
   /** Milliseconds until the slower leg's next settlement at scan time. */
   settlementInMs: z.number().int().nullable().default(null),
 });
@@ -2030,6 +2034,15 @@ export const FundingArbSettingsSchema = z.object({
    */
   minTradeNetBps: z.number().finite().min(0).max(100_000).default(10),
   maxCandidates: z.number().int().min(1).max(50).default(10),
+  /**
+   * Automatic sizing: the only sizing input is the planned concurrent position count
+   * (`maxConcurrent`). The runner splits `equity × (1 - sizingBufferPct)` across the remaining
+   * slots, applies each leg's own maximum leverage, and derives the per-trade/total caps itself.
+   * When false, the legacy manual caps below are used verbatim.
+   */
+  autoSizing: z.boolean().default(true),
+  /** Share of account equity deliberately kept unencumbered (fees, basis moves, margin calls). */
+  sizingBufferPct: z.number().finite().min(0).max(0.5).default(0.10),
   maxConcurrent: z.number().int().min(1).max(10).default(3),
   /** Keep a launched pair alive across funding-decay exits and re-enter when the edge recovers. */
   recurring: z.boolean().default(true),

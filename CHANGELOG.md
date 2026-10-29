@@ -2,6 +2,23 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [5.2.0] - 2026-10-29
+
+### Added
+
+- **Automatic funding-arbitrage sizing by capital budget.** The auto runner now derives per-position margin and notional from account equity, a configurable cash buffer (default 10%, i.e. 90% utilization), and the number of planned concurrent positions. Each leg uses its own venue/symbol maximum leverage, and the launch records separate `leftLeverage` / `rightLeverage` values.
+- **Per-leg auto budget previews.** Candidate and sizing payloads expose `leftLeverage`, `rightLeverage`, `leftMarginUsd` and `rightMarginUsd`, so the margin split is visible before launch.
+
+### Changed
+
+- The funding-arbitrage **Sizing & leverage** section now exposes only *Planned positions* and *Cash buffer* in auto mode; the legacy per-trade/total-exposure/leverage caps are hidden and ignored by the auto runner.
+- Auto sizing recomputes the remaining capital budget on every scan from live equity, used margin and the number of already-open automatic strategies; it reserves the remaining planned slots instead of letting concurrent launches oversubscribe the account.
+- The hard annualized entry gate remains **2000%**; this release does not lower it.
+
+### Fixed
+
+- Avoids the previous all-in/common-min-leverage behavior: auto launches no longer size every strategy from the same full available margin, and they do not force both legs to the lower of the two leverage limits.
+
 ## [5.1.0] - 2026-10-29
 
 ### Added
