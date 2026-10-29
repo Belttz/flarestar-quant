@@ -1594,8 +1594,6 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
       <div className="compact-fields">{mode === 'position' ? <>
         <label><span>{t('Per-order quantity')}</span><div><input placeholder="e.g. 0.10" value={positionOrderQuantity} onChange={(event) => setPositionOrderQuantity(event.target.value)} /><b>{asset}</b></div></label>
         <label><span>{t('Total amount')}</span><div><input placeholder="e.g. 1.00" value={amount} onChange={(event) => setAmount(event.target.value)} /><b>{asset}</b></div></label>
-        <label className="reduce-only-control"><span onClick={(event) => event.preventDefault()}>{t('Recurring arbitrage')}</span><div><input type="checkbox" checked={recurring} onChange={(event) => setRecurring(event.target.checked)} /><b>{t(recurring ? 'On' : 'Off')}</b></div></label>
-        {recurring && <label><span>{t('Recurring minimum APR')}</span><div><input value={recurringMinApr} onChange={(event) => setRecurringMinApr(event.target.value)} /><b>%</b></div></label>}
         <StrategyLeverageControl label="Exchange A leverage" symbol={leftHistorySymbol} exchangeName={leftExchange.name}
           asset={asset} quote={quoteFor(leftExchange.id)} value={leftLeverage} referencePrice={leftPrice}
           fallbackCurrent={leftPortfolioPosition?.leverage} fallbackMax={leftPortfolioPosition?.maxLeverage}
@@ -1615,7 +1613,17 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
           asset={asset} quote={quoteFor(rightExchange.id)} value={rightLeverage} referencePrice={rightPrice}
           fallbackCurrent={rightPortfolioPosition?.leverage} fallbackMax={rightPortfolioPosition?.maxLeverage}
           tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} onValueChange={setRightLeverage} onRiskLimitChange={setRightRiskPositionValue} />
-      </>}<label><span>{t('Entry threshold')}</span><div><input value={threshold} onChange={(event) => setThreshold(event.target.value)} /><b>bps</b></div></label><label><span>{t('Take-profit threshold')}</span><div><input value={takeProfitThreshold} onChange={(event) => setTakeProfitThreshold(event.target.value)} /><b>bps</b></div></label><label><span>{t('Stop-loss threshold')}</span><div><input placeholder={t('Optional')} value={stopLossThreshold} onChange={(event) => setStopLossThreshold(event.target.value)} /><b>bps</b></div></label><label><span>{t('Add-on step')}</span><div><input placeholder={t('Optional')} value={addOnStep} onChange={(event) => setAddOnStep(event.target.value)} /><b>bps</b></div></label></>}{mode === 'auto' && <AutoThresholdHints view={autoThresholds} armed={addOnStep.trim() !== ''} />}</div>
+      </>}<label><span>{t('Entry threshold')}</span><div><input value={threshold} onChange={(event) => setThreshold(event.target.value)} /><b>bps</b></div></label><label><span>{t('Take-profit threshold')}</span><div><input value={takeProfitThreshold} onChange={(event) => setTakeProfitThreshold(event.target.value)} /><b>bps</b></div></label><label><span>{t('Stop-loss threshold')}</span><div><input placeholder={t('Optional')} value={stopLossThreshold} onChange={(event) => setStopLossThreshold(event.target.value)} /><b>bps</b></div></label><label><span>{t('Add-on step')}</span><div><input placeholder={t('Optional')} value={addOnStep} onChange={(event) => setAddOnStep(event.target.value)} /><b>bps</b></div></label></>}{mode === 'auto' && <AutoThresholdHints view={autoThresholds} armed={addOnStep.trim() !== ''} />}
+        {mode === 'position' && <div className="recurring-arb-block">
+          <label className="reduce-only-control">
+            <span onClick={(event) => event.preventDefault()}>{t('Recurring arbitrage')}</span>
+            <div><input type="checkbox" checked={recurring} onChange={(event) => setRecurring(event.target.checked)} /><b>{t(recurring ? 'On' : 'Off')}</b></div>
+          </label>
+          <label className={recurring ? '' : 'disabled'}>
+            <span>{t('Recurring minimum APR')}</span>
+            <div><input value={recurringMinApr} onChange={(event) => setRecurringMinApr(event.target.value)} disabled={!recurring} /><b>%</b></div>
+          </label>
+        </div>}</div>
       {instrumentsReady && <div className={`strategy-size-check ${sizeInputsValid ? 'valid' : 'invalid'}`}><span>{sizeInputsValid ? '✓' : '!'}</span><p>{sizeInputsValid
         ? t('Per-order quantity meets both exchange minimums')
         : sizeIssues.join(' · ') || thresholdIssues.join(' · ') || t('Enter valid strategy amounts')}</p></div>}

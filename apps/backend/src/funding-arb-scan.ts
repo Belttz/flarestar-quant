@@ -93,6 +93,23 @@ export function buildFundingArbCandidates(
   return rows;
 }
 
+/**
+ * One candidate per asset per scan. The runner is allowed to hold only one live position per
+ * asset, so launching two same-asset pairs in one pass would take the same directional risk twice
+ * (both legs reverse together). Rows must already be ranked best-first.
+ */
+export function selectBestCandidateKeys(candidates: readonly FundingArbCandidate[]): Set<string> {
+  const best = new Map<string, FundingArbCandidate>();
+  for (const candidate of candidates) {
+    const current = best.get(candidate.asset);
+    if (!current
+      || (candidate.score ?? candidate.aprPercent) > (current.score ?? current.aprPercent)) {
+      best.set(candidate.asset, candidate);
+    }
+  }
+  return new Set(Array.from(best.values(), (candidate) => candidate.key));
+}
+
 function scanLeg(
   venueEntry: FundingOverviewVenueEntry,
   allowed: ReadonlySet<string>,

@@ -7,6 +7,7 @@ import {
   executableEntrySpreadBps,
   perSettlementFundingBps,
   roundTripCostBps,
+  selectBestCandidateKeys,
   settlementInMs,
   sizePerpHedge,
 } from './funding-arb-scan.js';
@@ -197,6 +198,33 @@ describe('dynamic entry and sizing', () => {
     expect(budget.remainingSlots).toBe(1);
     expect(budget.remainingBudgetUsd).toBeCloseTo(300, 6);
     expect(budget.budgetPerSlotUsd).toBeCloseTo(300, 6);
+  });
+});
+
+describe('same-asset candidate selection', () => {
+  it('keeps only the highest-ranked pair for an asset', () => {
+    const rows = buildFundingArbCandidates(overview([{
+      asset: 'ETH',
+      venues: [
+        {
+          venue: 'OKX', symbol: 'OKX_FUTURE_ETH_USDT', quote: 'USDT', fundingRate: '0.0001',
+          fundingIntervalHours: 8, fundingRate8h: '0.0001', nextFundingAt: null,
+          openInterestValue: null, lastPrice: '3000', change24h: null, fetchedAt: null,
+        },
+        {
+          venue: 'BYBIT', symbol: 'BYBIT_FUTURE_ETH_USDT', quote: 'USDT', fundingRate: '0.0005',
+          fundingIntervalHours: 8, fundingRate8h: '0.0005', nextFundingAt: null,
+          openInterestValue: null, lastPrice: '3001', change24h: null, fetchedAt: null,
+        },
+        {
+          venue: 'KRAKEN', symbol: 'KRAKEN_FUTURE_ETH_USD', quote: 'USD', fundingRate: '0.0003',
+          fundingIntervalHours: 8, fundingRate8h: '0.0003', nextFundingAt: null,
+          openInterestValue: null, lastPrice: '3002', change24h: null, fetchedAt: null,
+        },
+      ],
+    }]));
+    expect(rows).toHaveLength(3);
+    expect([...selectBestCandidateKeys(rows)]).toEqual(['ETH:BYBIT:OKX']);
   });
 });
 

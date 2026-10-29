@@ -2,6 +2,14 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [5.2.1] - 2026-10-29
+
+### Fixed
+
+- **Strategy setup panel no longer clips on laptop widths.** The setup rail expands to the full content width on MacBook-class viewports, and the panel header/title wraps safely instead of losing half a glyph.
+- **Recurring-arbitrage controls moved to the bottom of the position form.** The toggle and minimum-APR field now occupy a full-width row below the normal entry fields, keeping the two-column panel symmetric and avoiding a lopsided, top-heavy layout.
+- **Only one automatic position per asset is launched per scan.** When several venue pairs for the same coin pass the gates, the runner selects the highest-ranked pair and rejects the rest as `DUPLICATE_ASSET`; a synchronized reversal can no longer open two same-direction exposures on one asset.
+
 ## [5.2.0] - 2026-10-29
 
 ### Added

@@ -3144,3 +3144,34 @@ html[data-theme='light'] .funding-pair-short { border-left-color: rgba(192, 44, 
 .funding-table th:nth-child(3) { width: 105px; }
 .funding-table th:nth-child(4) { width: 200px; }
 @media (max-width: 900px) { .funding-table { min-width: 980px; } }
+
+/* ------------------------------------------------------------------------------------------------
+ * Strategy setup: recurring-arbitrage controls used to sit between the entry fields, which made
+ * the two-column form lopsided and pushed the panel's useful height upward. Keep them on their own
+ * full-width row at the bottom of the field grid instead.
+ * ---------------------------------------------------------------------------------------------- */
+.strategy-panel-head > div { min-width: 0; }
+.strategy-panel-head h2 { line-height: 1.35; overflow-wrap: anywhere; }
+.recurring-arb-block {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px;
+  margin-top: 2px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+.recurring-arb-block > label { min-width: 0; }
+.recurring-arb-block > label.disabled { opacity: .55; }
+.recurring-arb-block .reduce-only-control > div { background: #0a1118; }
+
+/* A MacBook-class viewport leaves the 370px setup rail tight enough that long labels and the
+ * panel header read as clipped. Let the setup rail use the full content width there. */
+@media (max-width: 1540px) {
+  .strategy-layout.revised { grid-template-columns: minmax(0, 1fr); }
+  .strategy-layout.revised .strategy-sidebar { grid-template-columns: minmax(0, 1fr); }
+  .strategy-layout.revised .strategy-rules-sidebar { width: 100%; }
+}
+@media (max-width: 640px) {
+  .recurring-arb-block { grid-template-columns: 1fr; }
+}

@@ -19,6 +19,7 @@ import {
   executableEntrySpreadBps,
   perSettlementFundingBps,
   roundTripCostBps,
+  selectBestCandidateKeys,
   settlementInMs,
   sizePerpHedge,
   type FundingArbAutoBudget,
@@ -330,9 +331,19 @@ export class FundingArbMonitor {
 
     // Launch (or simulate) the best candidates, subject to slot/exposure/daily limits.
     passRows.sort((left, right) => (right.score ?? 0) - (left.score ?? 0));
+    // Keep only the best pair per asset. Without this, two venue pairs on the same coin could
+    // both pass the gates and be launched in the same scan; a synchronized reversal would then
+    // stack the same directional risk instead of diversifying it.
+    const bestCandidateKeys = selectBestCandidateKeys(passRows);
     const opened: FundingArbCandidate[] = [];
     const openedStrategyIds = new Map<string, string>();
     for (const candidate of passRows) {
+      if (!bestCandidateKeys.has(candidate.key)) {
+        candidate.verdict = 'REJECT';
+        candidate.reasons = ['DUPLICATE_ASSET'];
+        candidate.score = null;
+        continue;
+      }
       if (!this.canOpenMore(candidate, context, opened)) {
         candidate.verdict = 'REJECT';
         candidate.reasons = ['SLOT_LIMIT'];

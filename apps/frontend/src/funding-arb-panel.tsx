@@ -222,7 +222,7 @@ const REASON_TEXT: Record<string, string> = {
   EXPOSURE_LIMIT: '总敞口已满',
   COOLDOWN: '冷却中',
   PAIR_COOLDOWN: '同对连亏暂停',
-  DUPLICATE_ASSET: '同资产已有仓位',
+  DUPLICATE_ASSET: '同资产已有仓位或已选最优机会',
   BLACKLISTED: '黑名单',
   CONNECTION_UNHEALTHY: '连接异常',
   LIVE_LOCKED: '非实盘模式',
