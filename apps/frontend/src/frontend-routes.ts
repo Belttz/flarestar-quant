@@ -46,6 +46,16 @@ function withQuery(path: string, query: FrontendQuery | null | undefined): strin
   return `${path}?${params.toString()}`;
 }
 
+/**
+ * A same-path navigation can still change the prefill: clicking 复制 on the page you are already
+ * standing on keeps the pathname but replaces the query with `copyStrategyId`. `history.pushState`
+ * must run for that case too, otherwise the strategy form's mount initializers read the old
+ * `window.location.search` and the copy silently does nothing.
+ */
+export function historyNeedsUpdate(currentPathAndSearch: string, nextPath: string): boolean {
+  return currentPathAndSearch !== nextPath;
+}
+
 /** Convert an application page into its canonical, reload-safe browser path. */
 export function frontendPath(route: FrontendRoute): string {
   if (route.workspace === 'Trade') return '/';

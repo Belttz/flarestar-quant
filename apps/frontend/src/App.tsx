@@ -28,7 +28,7 @@ import {
 import { parseStoredFavorites } from './local-preferences.js';
 import { scopeStrategiesToAccount, strategyBelongsToAccount } from './strategy-accounts.js';
 import { strategyCopyQuery, strategyPrefillKey, strategyRouteKind } from './strategy-copy.js';
-import { DEFAULT_FRONTEND_ROUTE, frontendPath, frontendRoute, type FrontendRoute, type OpportunityBoard, type StrategyRouteKind } from './frontend-routes.js';
+import { DEFAULT_FRONTEND_ROUTE, frontendPath, frontendRoute, historyNeedsUpdate, type FrontendRoute, type OpportunityBoard, type StrategyRouteKind } from './frontend-routes.js';
 import { LanguageContext, translate, useLanguage, type Language, type Theme } from './i18n.js';
 import { LoginPage } from './login-page.js';
 import type { FundingMetric, PairedPositionPrefill } from './route-shared.js';
@@ -693,7 +693,11 @@ function App() {
 
   const navigate = useCallback((nextRoute: FrontendRoute) => {
     const path = frontendPath(nextRoute);
-    if (window.location.pathname !== path) window.history.pushState(null, '', path);
+    // Compare the query too: copying a strategy of the same kind keeps the pathname but changes
+    // `copyStrategyId`, and that query is what makes the form remount with the copied values.
+    if (historyNeedsUpdate(`${window.location.pathname}${window.location.search}`, path)) {
+      window.history.pushState(null, '', path);
+    }
     setRoute(nextRoute);
   }, []);
 
@@ -1229,6 +1233,9 @@ function App() {
   }, [navigate]);
   const copyStrategy = useCallback((strategy: StrategyRecord) => {
     navigate({ workspace: 'Strategy', strategyKind: strategyRouteKind(strategy.kind), query: strategyCopyQuery(strategy) });
+    // The copy button lives in the historical table far down the page; without this the prefilled
+    // form remounts above the fold and the operator can reasonably think nothing happened.
+    window.scrollTo({ top: 0, behavior: 'smooth' });
   }, [navigate]);
 
   const content = useMemo(() => {

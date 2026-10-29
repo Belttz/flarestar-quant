@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { frontendPath, frontendRoute, type FrontendRoute } from './frontend-routes.js';
+import { frontendPath, frontendRoute, historyNeedsUpdate, type FrontendRoute } from './frontend-routes.js';
 
 describe('frontend routes', () => {
   const routes: FrontendRoute[] = [
@@ -67,6 +67,13 @@ describe('frontend routes', () => {
     for (const route of navWorkspaces) {
       expect(frontendRoute(frontendPath(route))).toEqual(route);
     }
+  });
+
+  it('updates browser history when only the prefill query changes', () => {
+    // 复制 on the page you are already on keeps the pathname and only swaps `copyStrategyId`.
+    expect(historyNeedsUpdate('/strategies/cross-exchange?strategyId=PAIR-1', '/strategies/cross-exchange?copyStrategyId=PAIR-2')).toBe(true);
+    expect(historyNeedsUpdate('/strategies/cross-exchange', '/strategies/cross-exchange?copyStrategyId=PAIR-2')).toBe(true);
+    expect(historyNeedsUpdate('/strategies/cross-exchange?copyStrategyId=PAIR-2', '/strategies/cross-exchange?copyStrategyId=PAIR-2')).toBe(false);
   });
 
   it('does not claim unknown or backend paths', () => {
