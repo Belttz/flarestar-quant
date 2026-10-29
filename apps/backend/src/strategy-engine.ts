@@ -114,6 +114,8 @@ interface StrategyActor {
   quotes: Map<QuoteIntent, MakerQuote>;
   repairAttempts: number;
   lastRepairAt: number;
+  /** Last time an entry clip was blocked/resized by the account-margin gate (log throttle). */
+  lastMarginBlockLogAt: number;
   failureCount: number;
   cooldownUntil: number;
   lastQuoteAt: number;
@@ -1107,7 +1109,7 @@ export class StrategyEngine {
     const actor: StrategyActor = {
       id: record.id, config: record.config, kind: record.kind, status: record.status,
       busy: false, queue: Promise.resolve(), quotes: new Map(), repairAttempts: 0,
-      lastRepairAt: 0, failureCount: 0, cooldownUntil: 0, lastQuoteAt: 0,
+      lastRepairAt: 0, lastMarginBlockLogAt: 0, failureCount: 0, cooldownUntil: 0, lastQuoteAt: 0,
       suspended, quiesceTarget: null, quiesceReason: null, unresolvedOrders: [], createdAt: Date.parse(record.createdAt),
       lastCloseAt: Date.parse(record.updatedAt),
       stopLossArmed: false,
@@ -1658,6 +1660,12 @@ export class StrategyEngine {
   ): void {
     const perOrder = new Decimal(config.perOrderQuantity);
     const target = this.strategyTarget(config);
+    // Parameter sanity: a per-order clip above the total target can never be executed as a pair,
+    // and a total above an explicit maxPosition breaches the operator's hard ceiling. Reject both
+    // before any order is submitted instead of discovering them on the second tranche.
+    if (config.kind === 'position' && config.totalAmount !== undefined && perOrder.gt(new Decimal(config.totalAmount))) {
+      throw new StrategyEngineError('strategy_per_order_exceeds_total', 400);
+    }
     const firstClip = Decimal.min(perOrder, target);
     const remainder = target.mod(perOrder);
     const leftClips = remainder.gt(QUANTITY_EPSILON) && !remainder.eq(firstClip)
@@ -1955,10 +1963,18 @@ export class StrategyEngine {
     const matched = this.matchedQuantity(exposure);
     const target = this.strategyTarget(actor.config);
     const progress = target.gt(0) ? Decimal.min(matched.div(target).mul(100), new Decimal(100)).toNumber() : 0;
+    // Position strategies previously persisted openPosition='0' unconditionally, so a paused
+    // strategy with a one-legged fill looked flat in the UI while the venue still held the leg
+    // (IOTX 2026-10-29: -53920 KRAKEN / +30000 BINANCE reported as open_position=0). Show the
+    // larger leg so an unhedged exposure is visible; reduce-only close plans keep 0 because they
+    // do not own the position.
+    const openPosition = actor.kind === 'position'
+      ? Decimal.max(exposure.left.abs(), exposure.right.abs()).toString()
+      : actor.config.reduceOnly ? '0' : matched.toString();
     this.database.prepare(`UPDATE execution_strategies SET status = ?, progress = ?, filled_quantity = ?,
       filled_left = ?, filled_right = ?, open_position = ?, updated_at = ? WHERE id = ?`).run(
       actor.status, progress, matched.toString(), exposure.left.abs().toString(), exposure.right.abs().toString(),
-      actor.kind === 'position' || actor.config.reduceOnly ? '0' : matched.toString(), new Date().toISOString(), actor.id);
+      openPosition, new Date().toISOString(), actor.id);
     const record = this.runtime.getStrategy(actor.id);
     this.runtime.emitStrategyUpdate(record);
     return record;
@@ -3661,6 +3677,44 @@ export class StrategyEngine {
     return true;
   }
 
+  /**
+   * Largest clip both legs can fund right now, capped at the requested quantity. Returns the
+   * requested quantity when the account read is unavailable (abstain, never block on data loss).
+   */
+  private async affordableEntryQuantity(
+    actor: StrategyActor,
+    requested: Decimal,
+    desired: { price: Decimal; makerLeg: LegDefinition; takerLeg: LegDefinition },
+  ): Promise<Decimal> {
+    const available = await this.runtime.accountAvailableMargin();
+    if (available === null) return requested;
+    const legs = legsOf(actor.config);
+    const leftIsMaker = legs.left.symbol === desired.makerLeg.symbol;
+    const leftPrice = leftIsMaker ? desired.price : this.executablePrice(legs.left.symbol, legs.left.side);
+    const rightPrice = leftIsMaker ? this.executablePrice(legs.right.symbol, legs.right.side) : desired.price;
+    if (leftPrice === null || rightPrice === null) return requested;
+    const leftLeverage = new Decimal(actor.config.leftLeverage ?? '1');
+    const rightLeverage = new Decimal(actor.config.rightLeverage ?? '1');
+    if (!leftLeverage.gt(0) || !rightLeverage.gt(0)) return Decimal.min(0, requested);
+    // 10% reserve mirrors prepareStrategyMargin: price drift + taker fee + rounding between the
+    // check and the fill.
+    const perUnit = leftPrice.div(leftLeverage).plus(rightPrice.div(rightLeverage)).mul('1.10');
+    if (!perUnit.gt(0)) return requested;
+    const affordable = available.div(perUnit);
+    const lot = this.constraintsFor(desired.makerLeg.symbol).lotSize;
+    const rounded = roundToStep(Decimal.max(0, affordable), lot, 'down');
+    return Decimal.min(requested, rounded);
+  }
+
+  private logMarginBlock(actor: StrategyActor, quantity: Decimal, price: Decimal): void {
+    const now = this.options.now();
+    if (now - actor.lastMarginBlockLogAt < 60_000) return;
+    actor.lastMarginBlockLogAt = now;
+    this.runtime.addStrategyLog(actor.id, 'warning', 'Entry blocked: insufficient pair margin',
+      `Clip ${quantity.toString()} ${actor.config.asset} at ${price.toString()}`, '0',
+      'Skipped: available margin cannot fund both the maker leg and its hedge leg');
+  }
+
   private async maintainQuote(actor: StrategyActor, intent: QuoteIntent, quantity: Decimal, tier = 0): Promise<void> {
     if (actor.status !== 'RUNNING') return;
     const desired = this.desiredMakerPrice(actor, intent, tier);
@@ -3685,11 +3739,31 @@ export class StrategyEngine {
     }
     if (now - actor.lastQuoteAt < this.options.requoteIntervalMs / 2) return;
     const lot = this.constraintsFor(desired.makerLeg.symbol).lotSize;
-    const roundedQuantity = roundToStep(quantity, lot, 'down');
+    let roundedQuantity = roundToStep(quantity, lot, 'down');
     const sizeError = this.orderSizeError(desired.makerLeg.symbol, roundedQuantity, desired.price);
     if (sizeError) {
       await this.pause(actor, `Order-size compliance check failed: ${sizeError.label ?? sizeError.code}`);
       return;
+    }
+    if (intent === 'entry') {
+      // Fail-fast and dynamic downsizing on the incremental clip: a pair whose hedge leg cannot be
+      // funded must never rest an entry quote that fills only one leg (IOTX 2026-10-29).
+      const affordable = await this.affordableEntryQuantity(actor, roundedQuantity, desired);
+      if (!affordable.gt(QUANTITY_EPSILON)) {
+        this.logMarginBlock(actor, roundedQuantity, desired.price);
+        return;
+      }
+      if (affordable.lt(roundedQuantity)) {
+        const resized = roundToStep(affordable, lot, 'down');
+        if (!resized.gt(QUANTITY_EPSILON)) {
+          this.logMarginBlock(actor, roundedQuantity, desired.price);
+          return;
+        }
+        roundedQuantity = resized;
+        this.runtime.addStrategyLog(actor.id, 'warning', 'Entry resized to available margin',
+          `Requested ${quantity.toString()} ${actor.config.asset}`, `${resized.toString()} ${actor.config.asset}`,
+          'Shrunk so both legs can be funded before the maker quote is rested');
+      }
     }
     actor.busy = true;
     try {
@@ -3882,6 +3956,56 @@ export class StrategyEngine {
     if (this.marketOrderSizeError(symbol, paddingSide, padding)
       || this.marketOrderSizeError(symbol, trimSide, trimQuantity)) return null;
     return padding;
+  }
+
+  /**
+   * Emergency reduce-only flatten of the over-filled leg. Called only after the normal hedge
+   * retry budget is exhausted, so a margin/venue failure cannot leave a naked directional
+   * position behind a PAUSED strategy.
+   */
+  private async flattenNakedExposure(
+    actor: StrategyActor,
+    exposure: { left: Decimal; right: Decimal },
+  ): Promise<boolean> {
+    const leftAbs = exposure.left.abs();
+    const rightAbs = exposure.right.abs();
+    const excess = leftAbs.minus(rightAbs);
+    if (excess.lte(QUANTITY_EPSILON)) return true;
+    const legs = legsOf(actor.config);
+    const excessIsLeft = leftAbs.gt(rightAbs);
+    const leg = excessIsLeft ? legs.left : legs.right;
+    const side = oppositeSide(leg.side);
+    const lot = this.constraintsFor(leg.symbol).lotSize;
+    const quantity = roundToStep(excess, lot, 'down');
+    if (!quantity.gt(QUANTITY_EPSILON)) return false;
+    const sizeError = this.marketOrderSizeError(leg.symbol, side, quantity);
+    if (sizeError) {
+      this.runtime.addStrategyLog(actor.id, 'warning', 'Emergency flatten unavailable',
+        `Unhedged ${excess.toString()} ${actor.config.asset}`, quantity.toString(),
+        sizeError.label ?? sizeError.code);
+      return false;
+    }
+    this.runtime.addStrategyLog(actor.id, 'warning', 'Flattening unhedged exposure',
+      `Unhedged ${excess.toString()} ${actor.config.asset}`, `${quantity.toString()} ${actor.config.asset}`,
+      `${side} ${leg.symbol} market · reduce-only`);
+    try {
+      const order = await this.runtime.createOrder({
+        symbol: leg.symbol, side, type: 'MARKET', timeInForce: 'IOC',
+        quantity: quantity.toString(), reduceOnly: true,
+      }, { strategyId: actor.id, strategyLeg: leg.leg, riskReducing: true });
+      const settled = await this.runtime.awaitTerminalOrder(order.id, this.options.orderTimeoutMs);
+      const filled = new Decimal(settled.executedQuantity || '0');
+      const complete = settled.state === 'FILLED' && filled.gte(quantity.minus(QUANTITY_EPSILON));
+      this.runtime.addStrategyLog(actor.id, complete ? 'info' : 'warning', 'Unhedged exposure flatten settled',
+        `Unhedged ${excess.toString()}`, `${settled.executedQuantity}/${settled.quantity}`,
+        `${settled.state} · ${failureSummary(settled.failureReason) ?? `reduce-only market`}`);
+      return complete;
+    } catch (error) {
+      this.runtime.addStrategyLog(actor.id, 'warning', 'Unhedged exposure flatten failed',
+        `Unhedged ${excess.toString()}`, quantity.toString(),
+        error instanceof Error ? error.message.slice(0, 160) : 'submit error');
+      return false;
+    }
   }
 
   private async executeTerminalTopUpAndTrim(
@@ -4147,7 +4271,12 @@ export class StrategyEngine {
     const now = this.options.now();
     if (now - actor.lastRepairAt < this.options.repairCooldownMs) return;
     if (actor.repairAttempts >= 3) {
-      await this.pause(actor, `Unable to hedge residual exposure of ${target.residual.toString()} ${actor.config.asset} after 3 attempts; manual review required`);
+      // Never leave a one-legged position behind a paused strategy: try a reduce-only market
+      // flatten of the excess leg first, then pause regardless and say which outcome happened.
+      const flattened = await this.flattenNakedExposure(actor, exposure);
+      await this.pause(actor, flattened
+        ? `Hedge failed; unhedged ${target.residual.toString()} ${actor.config.asset} was reduced to flat before pausing`
+        : `Unable to hedge residual exposure of ${target.residual.toString()} ${actor.config.asset} after 3 attempts; manual review required`);
       return;
     }
     const legs = legsOf(actor.config);

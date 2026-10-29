@@ -875,9 +875,14 @@ describe('strategy engine', () => {
     const paused = runtime.getStrategy(record.id);
     expect(paused.status).toBe('PAUSED');
     expect(runtime.strategyLogs(record.id).some((log) => log.event === 'Strategy paused')).toBe(true);
-    // A paused strategy must not submit anything further.
+    // The failed hedge must not leave the filled left leg naked: one reduce-only flatten is sent
+    // before pausing. A paused strategy then submits nothing further.
+    expect(gateway.createdOrders).toHaveLength(2);
+    expect(gateway.createdOrders[1]).toMatchObject({
+      symbol: 'BINANCE_FUTURE_BTC_USDT', side: 'BUY', type: 'MARKET',
+    });
     await engine.tick();
-    expect(gateway.createdOrders).toHaveLength(1);
+    expect(gateway.createdOrders).toHaveLength(2);
   });
 
   it('manually resumes a paused strategy only on its active account', async () => {

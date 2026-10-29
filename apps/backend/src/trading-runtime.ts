@@ -520,6 +520,8 @@ export class TradingRuntime {
   /** In-flight on-demand position reconciliation; concurrent callers share one remote read. */
   private positionsReconcileRun: Promise<PortfolioFuturesPosition[]> | null = null;
   private readonly preparedStatements = new Map<string, Database.Statement>();
+  /** Short-lived account-margin cache: entry clips are checked many times per second. */
+  private availableMarginCache: { at: number; value: Decimal } | null = null;
   private readonly runAuthenticatedWrite: <T>(work: () => Promise<T>) => Promise<T>;
 
   constructor(
@@ -552,6 +554,30 @@ export class TradingRuntime {
     const prepared = this.database.prepare(sql);
     this.preparedStatements.set(sql, prepared);
     return prepared;
+  }
+
+  /**
+   * Best-effort available margin for an incremental clip. A single account read is cached for
+   * five seconds: maker entry evaluation runs on a 500 ms tick and must not turn a margin gate
+   * into a REST hammer. Returns null when the account cannot be read (the caller then abstains
+   * rather than blocking a healthy entry on a transient data failure).
+   */
+  async accountAvailableMargin(): Promise<Decimal | null> {
+    const now = Date.now();
+    if (this.availableMarginCache && now - this.availableMarginCache.at < 5_000) {
+      return this.availableMarginCache.value;
+    }
+    const credentials = await this.vault.get(DEFAULT_CREDENTIAL_PROFILE);
+    if (!credentials) return null;
+    try {
+      const account = await this.gateway.queryAccount(credentials);
+      const value = new Decimal(account.available_margin ?? '0');
+      if (!value.isFinite() || value.lt(0)) return null;
+      this.availableMarginCache = { at: now, value };
+      return value;
+    } catch {
+      return null;
+    }
   }
 
   /**

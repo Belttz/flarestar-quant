@@ -1722,6 +1722,15 @@ export const STRATEGY_LOG_EVENT_CATEGORY: Record<string, StrategyLogEventCategor
   // A position strategy's entry clip refused because it would breach the configured `maxPosition`
   // ceiling. Risk control, not an execution failure: nothing was submitted and exposure is intact.
   'Entry blocked by max position': 'risk',
+  // Incremental-clip margin gates (IOTX 2026-10-29): the maker entry is resized to what both legs
+  // can fund, or withheld entirely rather than risking a one-legged fill.
+  'Entry resized to available margin': 'risk',
+  'Entry blocked: insufficient pair margin': 'risk',
+  // Emergency unwind after the hedge retry budget is exhausted.
+  'Emergency flatten unavailable': 'risk',
+  'Flattening unhedged exposure': 'risk',
+  'Unhedged exposure flatten settled': 'risk',
+  'Unhedged exposure flatten failed': 'risk',
   'Timed close triggered': 'risk',
   'Timed close slice executed': 'risk',
   'Timed close slice failed': 'risk',
