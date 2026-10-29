@@ -19,6 +19,9 @@ export interface PairedPositionPrefill {
   asset: string;
   longVenue: ExchangeLogoId;
   shortVenue: ExchangeLogoId;
+  /** Funding-arb opportunity rows prefill the long-running recurring position form. */
+  recurring?: boolean;
+  recurringFundingAprMin?: number;
 }
 
 export const DIALOG_FOCUSABLE = [

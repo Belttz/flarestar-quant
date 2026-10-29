@@ -255,6 +255,57 @@ export const DEFAULT_OPPORTUNITY_FILTERS: OpportunityViewFilters = {
 export const ALL_SPREAD_VENUES: readonly string[] = exchanges.map((venue) => venue.id.toUpperCase());
 export const ALL_SPREAD_MARKETS: readonly SpreadMarketFilter[] = ['spot', 'perp'];
 
+/** Browser-local view preferences, versioned so a shape change cannot poison the state. */
+const OPPORTUNITY_FILTERS_STORAGE_KEY = 'gct.opportunity.filters.v1';
+const OPPORTUNITY_HEDGE_STORAGE_KEY = 'gct.opportunity.hedge.v1';
+
+/** Storage is best-effort: private mode / a stubbed window must never break the board. */
+function readStoredObject<T>(key: string): T | null {
+  try {
+    if (typeof window === 'undefined' || !('localStorage' in window)) return null;
+    const raw = window.localStorage.getItem(key);
+    if (raw === null) return null;
+    const parsed: unknown = JSON.parse(raw);
+    return parsed !== null && typeof parsed === 'object' ? parsed as T : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredObject(key: string, value: object): void {
+  try {
+    if (typeof window === 'undefined' || !('localStorage' in window)) return;
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Ignore quota / disabled-storage failures; persistence is a convenience, not correctness.
+  }
+}
+
+function opportunityFiltersStorageKey(board: OpportunityBoard): string {
+  return `${OPPORTUNITY_FILTERS_STORAGE_KEY}.${board}`;
+}
+
+/** Stored filters are untrusted input: keep only the known shape, then let the URL override it. */
+function storedOpportunityFilters(board: OpportunityBoard): Partial<OpportunityViewFilters> | null {
+  const stored = readStoredObject<Partial<OpportunityViewFilters>>(opportunityFiltersStorageKey(board));
+  if (stored === null) return null;
+  const next: Partial<OpportunityViewFilters> = {};
+  const textKeys: Array<keyof OpportunityViewFilters> = [
+    'minApr', 'minBps', 'asset', 'venues', 'markets', 'superClasses', 'classes',
+    'preIpo', 'sort', 'dir', 'page', 'pageSize',
+  ];
+  for (const key of textKeys) {
+    const value = stored[key];
+    if (typeof value === 'string') (next as Record<string, string>)[key] = value;
+  }
+  if (typeof stored.executableOnly === 'boolean') next.executableOnly = stored.executableOnly;
+  return next;
+}
+
+function persistOpportunityFilters(board: OpportunityBoard, filters: OpportunityViewFilters): void {
+  writeStoredObject(opportunityFiltersStorageKey(board), filters);
+}
+
 /**
  * Read the venue selection out of its query text. An empty or unknown selection falls back to
  * "every exchange" so a hand-edited URL never leaves the board empty.
@@ -521,12 +572,28 @@ function filtersFromQuery<T extends object>(defaults: T, keys: string[]): T {
   return next as T;
 }
 
-/** Read one board's unified filters back out of the URL (with the legacy `limit` alias). */
+/**
+ * Read one board's unified filters back out of the URL, falling back to the last values the
+ * operator used on this board. Navigating to another workspace and back drops the query string;
+ * without this fallback every return trip silently reset thresholds to their defaults.
+ *
+ * An explicit URL always wins (shared/prefilled links must not be overridden by old local state).
+ */
 function opportunityFiltersFromQuery(board: OpportunityBoard): OpportunityViewFilters {
   const query = new URLSearchParams(window.location.search);
   const text = (key: string) => query.get(key) ?? '';
+  const filterKeys = [
+    'minApr', 'minBps', 'asset', 'venues', 'markets', 'executableOnly',
+    'superClasses', 'classes', 'assetSuperClass', 'assetClass', 'preIpo',
+    'sort', 'dir', 'page', 'pageSize', 'limit',
+  ];
+  const hasExplicitFilters = filterKeys.some((key) => query.has(key));
+  const stored = storedOpportunityFilters(board);
   const base = filtersFromQuery<OpportunityViewFilters>(
-    DEFAULT_OPPORTUNITY_FILTERS,
+    hasExplicitFilters
+      ? DEFAULT_OPPORTUNITY_FILTERS
+      // Stored values are view state, not a page position: a return visit opens on page 1.
+      : { ...DEFAULT_OPPORTUNITY_FILTERS, ...(stored ?? {}), page: '1' },
     ['minApr', 'minBps', 'asset', 'venues', 'markets', 'superClasses', 'classes'],
   );
   const executableOnly = query.get('executableOnly');
@@ -537,10 +604,10 @@ function opportunityFiltersFromQuery(board: OpportunityBoard): OpportunityViewFi
   return {
     ...base,
     // The URL uses the backend's parameter names; the state fields are the filter-model names.
-    superClasses: text('assetSuperClass'),
-    classes: text('assetClass'),
-    executableOnly: executableOnly === null ? true : executableOnly !== '0',
-    preIpo: parsePreIpoFilter(text('preIpo')),
+    superClasses: text('assetSuperClass') || base.superClasses,
+    classes: text('assetClass') || base.classes,
+    executableOnly: executableOnly === null ? base.executableOnly : executableOnly !== '0',
+    preIpo: text('preIpo') === '' ? base.preIpo : parsePreIpoFilter(text('preIpo')),
     sort: sortKey,
     dir: sortState.dir,
     page: text('page') || '1',
@@ -660,9 +727,22 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
   const isSpreadQualityBoard = board === 'spread-quality';
   // Funding hedge legs: perpetual pairs come from the venue funding overview, spot pairs from the
   // carry board. Kept in view state rather than the URL because both modes page client-side.
-  const [hedgeMode, setHedgeMode] = useState<'spot' | 'perp'>('spot');
-  const [hedgeVenues, setHedgeVenues] = useState<string[]>(() => [...ALL_SPREAD_VENUES]);
-  const [hedgeSort, setHedgeSort] = useState<FundingHedgeSortKey>(DEFAULT_HEDGE_SORT);
+  const [hedgeMode, setHedgeMode] = useState<'spot' | 'perp'>(() => {
+    const stored = readStoredObject<{ mode?: unknown }>(OPPORTUNITY_HEDGE_STORAGE_KEY);
+    return stored?.mode === 'spot' ? 'spot' : 'perp';
+  });
+  const [hedgeVenues, setHedgeVenues] = useState<string[]>(() => {
+    const stored = readStoredObject<{ venues?: unknown }>(OPPORTUNITY_HEDGE_STORAGE_KEY);
+    return Array.isArray(stored?.venues) && stored.venues.every((venue) => typeof venue === 'string')
+      ? stored.venues as string[]
+      : [...ALL_SPREAD_VENUES];
+  });
+  const [hedgeSort, setHedgeSort] = useState<FundingHedgeSortKey>(() => {
+    const stored = readStoredObject<{ sort?: unknown }>(OPPORTUNITY_HEDGE_STORAGE_KEY);
+    return FUNDING_HEDGE_SORTS.some((entry) => entry.key === stored?.sort)
+      ? stored?.sort as FundingHedgeSortKey
+      : DEFAULT_HEDGE_SORT;
+  });
   const [fundingOverview, setFundingOverview] = useState<FundingOverviewResponse | null>(null);
   const [executableSymbols, setExecutableSymbols] = useState<ReadonlySet<string> | null>(null);
   const [overviewLoading, setOverviewLoading] = useState(false);
@@ -703,6 +783,16 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
       [fundingFilters, isFundingBoard, isFundingTopBoard, isSpreadQualityBoard, spreadFilters]),
     boardPath,
   );
+
+  // Remember the operator's choices per board. The URL mirror above handles reloads; this
+  // survives leaving the workspace entirely (the route change drops the query string).
+  useEffect(() => { persistOpportunityFilters('funding', fundingFilters); }, [fundingFilters]);
+  useEffect(() => { persistOpportunityFilters('spread', spreadFilters); }, [spreadFilters]);
+  useEffect(() => {
+    writeStoredObject(OPPORTUNITY_HEDGE_STORAGE_KEY, {
+      mode: hedgeMode, venues: hedgeVenues, sort: hedgeSort,
+    });
+  }, [hedgeMode, hedgeSort, hedgeVenues]);
 
   /** Patch the active board's filters (the inactive board's state is preserved untouched). */
   const patchFilters = useCallback((updater: (current: OpportunityViewFilters) => OpportunityViewFilters) => {

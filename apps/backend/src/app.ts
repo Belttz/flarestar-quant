@@ -1506,7 +1506,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   // Automatic perp ⇄ perp funding-rate arbitrage runner. It reuses the Funding page's hedge model
   // server-side (short the higher-funding venue, long the lower-funding one), sizes the hedge from
   // available margin × leverage, and in auto mode launches the paired position strategy through the
-  // same engine the UI uses. The scan loop is clock-aligned (:30) and idle while the switch is off.
+  // same engine the UI uses. The scan loop is clock-aligned (:30) and idle while the switch is off; the default cadence is 10 minutes.
   const fundingArbMonitor = new FundingArbMonitor({
     database,
     fundingOverview: fundingOverviewService,

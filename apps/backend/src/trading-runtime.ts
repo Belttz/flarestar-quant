@@ -118,6 +118,8 @@ export const CreateStrategyInputSchema = z.object({
   fundingDirection: z.enum(['POSITIVE', 'NEGATIVE']).default('POSITIVE'),
   /** carry: annualized funding percentage gate that must be met before opening (15 = 15% APR). */
   fundingAprMin: z.number().gt(0).lte(1000).default(15),
+  /** Recurring-cycle hard APR gate; kept separate from carry's 0..1000 field so a 2000%+ entry gate survives. */
+  recurringFundingAprMin: z.number().gt(0).lte(1_000_000).optional(),
   /** carry: basis convergence take-profit between the perpetual and the spot leg, in bps. */
   basisTakeProfitBps: z.number().gt(0).lt(10_000).default(20),
   /** carry: leverage preset for the perpetual leg; the engine never adjusts account leverage. */
@@ -161,6 +163,15 @@ export const CreateStrategyInputSchema = z.object({
   /** position: cancel + pause when an unfilled entry quote rested this long (0 disables). */
   makerEntryTimeoutSeconds: z.number().int().min(0).max(86_400).optional(),  /** position: marks a strategy created by the automatic funding arbitrage runner. */
   autoFundingArb: z.boolean().optional(),
+  /**
+   * position: keep the strategy alive after a funding-decay / settlement / take-profit exit and
+   * re-arm the same opportunity once the funding edge recovers. Stop-loss remains terminal.
+   */
+  recurring: z.boolean().default(false),
+  /** position: quiet period after a recurring exit before the next entry is allowed. */
+  recurringCooldownSeconds: z.number().int().min(0).max(86_400).default(600),
+  /** Internal: start of the current recurring cycle, used to ignore the previous cycle's exits. */
+  recurringStartedAt: z.string().datetime().optional(),
   /** Maker entry proximity band around the trigger, in bps. Defaults to the engine constant. */
   makerEntryProximityBps: z.number().int().min(1).max(5000).optional(),
   closePlan: z.object({
@@ -198,6 +209,9 @@ export const CreateStrategyInputSchema = z.object({
   if (value.leftSide === value.rightSide) context.addIssue({ code: 'custom', path: ['rightSide'], message: 'legs must have opposing sides' });
   // The settlement exit only makes sense for a paired position strategy. Rejecting it elsewhere
   // (instead of silently ignoring it) keeps a misconfigured caller from believing the exit exists.
+  if (value.recurring && value.kind !== 'position') {
+    context.addIssue({ code: 'custom', path: ['recurring'], message: 'recurring is a position-strategy option' });
+  }
   if (value.kind !== 'position' && (value.exitAfterSettlements !== undefined
     || value.exitSettlementDelaySeconds !== undefined
     || value.exitFundingAprFloorPercent !== undefined

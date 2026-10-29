@@ -1575,6 +1575,14 @@ export const StrategyConfigSchema = z.object({
   /** position: cancel + pause when an unfilled entry quote rested this long (0 disables). */
   makerEntryTimeoutSeconds: z.number().int().min(0).max(86_400).optional(),  /** position: true when the strategy was created by the automatic funding runner (dedupe/limits). */
   autoFundingArb: z.boolean().optional(),
+  /** position: keep the same strategy id alive and re-enter after a funding/price exit. */
+  recurring: z.boolean().optional(),
+  /** position: cooldown between a recurring exit and the next entry attempt. */
+  recurringCooldownSeconds: z.number().int().min(0).max(86_400).optional(),
+  /** position: hard annualized funding gate for recurring re-entry. */
+  recurringFundingAprMin: z.number().gt(0).lte(1_000_000).optional(),
+  /** position: server-owned start of the current recurring cycle. */
+  recurringStartedAt: z.string().datetime().optional(),
   /**
    * position/auto: distance from the entry trigger within which a MAKER_TAKER entry quote is
    * allowed to rest. Outside the band the strategy parks (no quote) instead of chasing the price.
@@ -1717,6 +1725,9 @@ export const STRATEGY_LOG_EVENT_CATEGORY: Record<string, StrategyLogEventCategor
   'Settlement exit Executed': 'risk',
   'Funding decay exit triggered': 'risk',
   'Funding decay exit Executed': 'risk',
+  'Recurring cycle armed': 'system',
+  'Waiting for recurring funding threshold': 'system',
+  'Recurring funding threshold recovered': 'system',
   'Max holding exit triggered': 'risk',
   'Max holding exit Executed': 'risk',
   // A position strategy's entry clip refused because it would breach the configured `maxPosition`
@@ -1996,7 +2007,7 @@ export const FundingArbSettingsSchema = z.object({
   dryRun: z.boolean().default(true),
   /** Create the position strategy automatically. Requires live trading mode. */
   autoExecute: z.boolean().default(false),
-  scanIntervalMinutes: z.number().int().min(5).max(1440).default(60),
+  scanIntervalMinutes: z.number().int().min(5).max(1440).default(10),
   /**
    * Funding differential annualized APR gate, in percent. The 30-day historical replay
    * (`design/funding-arb-sim-30d.md`) puts the break-even a little above 1500% APR at the modelled
@@ -2010,16 +2021,20 @@ export const FundingArbSettingsSchema = z.object({
    * 1000% APR collect only ~11 bps per settlement — below the 27.2 bps round trip — which is the
    * dominant source of losing trades, so the default requires a positive per-wave edge.
    */
-  minNetPerSettlementBps: z.number().finite().min(0).max(100_000).default(20),
+  minNetPerSettlementBps: z.number().finite().min(0).max(100_000).default(10),
   /**
    * Minimum net edge after the one-off round-trip cost, measured over the *minimum holding
    * window* (funding collected across that window minus the 27.2 bps round trip). Kept separate
    * from the per-wave threshold so a 4000% 1h pair is not rejected just because one settlement's
    * gross funding is smaller than the whole round trip.
    */
-  minTradeNetBps: z.number().finite().min(0).max(100_000).default(20),
+  minTradeNetBps: z.number().finite().min(0).max(100_000).default(10),
   maxCandidates: z.number().int().min(1).max(50).default(10),
   maxConcurrent: z.number().int().min(1).max(10).default(3),
+  /** Keep a launched pair alive across funding-decay exits and re-enter when the edge recovers. */
+  recurring: z.boolean().default(true),
+  /** Quiet period after a recurring exit before the same pair may re-enter (seconds). */
+  recurringCooldownSeconds: z.number().int().min(0).max(86_400).default(600),
   maxPerTradeUsd: z.number().finite().positive().default(200),
   maxTotalExposureUsd: z.number().finite().positive().default(1000),
   /** Share of available margin the sizing formula may use (keeps a fee/liquidation buffer). */
@@ -2046,7 +2061,7 @@ export const FundingArbSettingsSchema = z.object({
   /** The pair must stay below the decay floor for this long before the soft exit fires. */
   exitFundingDecayDwellSeconds: z.number().int().min(0).max(86_400).default(180),
   /** Require the same candidate to pass every gate on this many consecutive scans before opening. */
-  confirmScans: z.number().int().min(1).max(10).default(2),
+  confirmScans: z.number().int().min(1).max(10).default(1),
   /** After this many losing closes of the same asset within the cooldown window, pause that asset. */
   pairLossThreshold: z.number().int().min(1).max(10).default(2),
   pairLossCooldownHours: z.number().int().min(0).max(720).default(48),
@@ -2059,7 +2074,7 @@ export const FundingArbSettingsSchema = z.object({
    * `24h7d` additionally requires a positive, non-spiking week (strictest, fewest trades).
    */
   fundingPersistenceMode: z.enum(['off', '24h', '24h7d']).default('24h'),
-  maxCurrentTo24hRatio: z.number().finite().min(1).max(100).default(3),
+  maxCurrentTo24hRatio: z.number().finite().min(1).max(100).default(4),
   max24hTo7dRatio: z.number().finite().min(1).max(100).default(3),
   persistenceMinSamples24h: z.number().int().min(1).max(100).default(1),
   persistenceMinSamples7d: z.number().int().min(1).max(1000).default(3),

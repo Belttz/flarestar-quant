@@ -211,6 +211,8 @@ interface StrategyActor {
   positionExitArmed: boolean;
   /** position: which threshold armed {@link positionExitArmed}; drives event names and the status. */
   positionExitReason: 'take-profit' | 'stop-loss' | 'settlement' | 'funding-decay' | 'max-hold' | null;
+  /** recurring: whether the last recurring gate check was blocked (log only on transition). */
+  recurringGateBlocked: boolean;
   /**
    * True while an entry clip is withheld because it would push exposure past `maxPosition`; gates
    * the one-shot `Entry blocked by max position` row so a capped strategy does not write a row on
@@ -407,6 +409,7 @@ interface StrategyOrderRow {
   executed_quantity: string;
   strategy_clip: string | null;
   reduce_only: number;
+  created_at: string;
 }
 
 interface StrategyLedgerCache {
@@ -544,7 +547,7 @@ export class StrategyEngine {
       maxTakerSlippageBps: options.maxTakerSlippageBps ?? 50,
       now: options.now ?? Date.now,
     };
-    this.strategyOrderRowsStatement = database.prepare(`SELECT strategy_leg AS leg, symbol, side, quantity, executed_quantity, strategy_clip, reduce_only
+    this.strategyOrderRowsStatement = database.prepare(`SELECT strategy_leg AS leg, symbol, side, quantity, executed_quantity, strategy_clip, reduce_only, created_at
       FROM execution_orders WHERE strategy_id = ? ORDER BY created_at ASC, rowid ASC`);
     this.openStrategyOrderIdsStatement = database.prepare(`SELECT id FROM execution_orders
       WHERE strategy_id = ? AND state IN ('PENDING_SUBMIT', 'PENDING_CANCEL', 'NEW', 'OPEN', 'PARTIALLY_FILLED')`);
@@ -719,6 +722,9 @@ export class StrategyEngine {
     options: { allowStaleQuote?: boolean } = {},
   ): Promise<StrategyRecord> {
     const input = CreateStrategyInputSchema.parse(raw);
+    // The cycle clock is server-owned: a caller cannot make an old exit look like the current
+    // cycle by supplying a timestamp. Every new recurring strategy starts at "now".
+    if (input.recurring) input.recurringStartedAt = new Date().toISOString();
     // Grid strategies remain readable/resumable for historical compatibility, but the product no
     // longer allows creating new premium grids.
     if (input.kind === 'premium' && input.grid) {
@@ -1131,6 +1137,7 @@ export class StrategyEngine {
       positionExitArmed: false,
       positionExitReason: null,
       positionCapBlocked: false,
+      recurringGateBlocked: false,
       carry: record.kind === 'carry' ? emptyCarryState() : null,
       lastCarryMetricsJson: null,
       quoteWatchRelease: null,
@@ -1340,10 +1347,17 @@ export class StrategyEngine {
       return ledger.premiumExitStarted;
     }
     const legs = legsOf(actor.config);
-    const started = ledger.rows.some((row) => row.reduce_only === 1 && (
-      (row.leg === 'left' && row.side === oppositeSide(legs.left.side))
-      || (row.leg === 'right' && row.side === oppositeSide(legs.right.side))
-    ));
+    // Recurring strategies reuse the same strategy id across cycles. Orders from earlier cycles
+    // must not latch the new cycle's exit; `recurringStartedAt` is bumped whenever a cycle re-arms.
+    const cycleStartMs = actor.config.recurringStartedAt
+      ? Date.parse(actor.config.recurringStartedAt)
+      : Number.NEGATIVE_INFINITY;
+    const started = ledger.rows.some((row) => row.reduce_only === 1
+      && Date.parse(row.created_at) >= cycleStartMs
+      && (
+        (row.leg === 'left' && row.side === oppositeSide(legs.left.side))
+        || (row.leg === 'right' && row.side === oppositeSide(legs.right.side))
+      ));
     ledger.configKey = configKey;
     ledger.premiumExitStarted = started;
     return started;
@@ -1994,6 +2008,49 @@ export class StrategyEngine {
     await this.checkCompletion(actor);
   }
 
+  /**
+   * Re-arm a recurring position after it has gone flat.
+   *
+   * The same actor and strategy id stay alive, but the durable exit trace from the previous cycle
+   * must not latch the next one: `recurringStartedAt` moves forward in the config, the ledger cache
+   * is invalidated, and every per-position latch is cleared. A cooldown prevents an immediate
+   * re-entry into the exact condition that just triggered the exit.
+   */
+  private rearmRecurringPosition(actor: StrategyActor): void {
+    const now = this.options.now();
+    const startedAt = new Date(now).toISOString();
+    actor.config = { ...actor.config, recurringStartedAt: startedAt };
+    this.database.prepare('UPDATE execution_strategies SET config_json = ?, updated_at = ? WHERE id = ?')
+      .run(JSON.stringify(actor.config), startedAt, actor.id);
+    this.invalidateLedger(actor.id);
+    actor.positionExitArmed = false;
+    actor.positionExitReason = null;
+    actor.positionOpenedAt = null;
+    actor.fundingDecaySince = null;
+    actor.fundingAprReadings = [];
+    actor.settlementExitAt = null;
+    actor.stopLossArmed = false;
+    actor.makerEntryParked = false;
+    actor.makerExitArmed = false;
+    actor.makerExitStartedAt = null;
+    actor.makerExitFallbackLogged = false;
+    actor.makerExitHedge = null;
+    actor.makerExitHedgeRequotes = 0;
+    actor.makerExitHedgeFailures = 0;
+    actor.makerExitHedgeRetryAt = 0;
+    actor.failureCount = 0;
+    actor.repairAttempts = 0;
+    actor.recurringGateBlocked = false;
+    actor.cooldownUntil = now + Math.max(60_000, (actor.config.recurringCooldownSeconds ?? 600) * 1000);
+    actor.quotes.clear();
+    actor.status = 'RUNNING';
+    this.persist(actor, { left: new Decimal(0), right: new Decimal(0) });
+    this.runtime.addStrategyLog(actor.id, 'info', 'Recurring cycle armed',
+      `Previous cycle closed; next entry allowed after ${Math.round((actor.cooldownUntil - now) / 1000)}s`,
+      `${actor.config.totalAmount ?? '0'} ${actor.config.asset}`,
+      'The strategy stays RUNNING and re-enters when the funding and entry conditions recover');
+  }
+
   private async checkCompletion(actor: StrategyActor): Promise<void> {
     if (actor.status !== 'RUNNING') return;
     if (actor.config.closePlan) return;
@@ -2013,6 +2070,14 @@ export class StrategyEngine {
       const flat = exposure.left.abs().lte(QUANTITY_EPSILON)
         && exposure.right.abs().lte(QUANTITY_EPSILON);
       if (noOpenOrders && flat) {
+        // A recurring position is a long-lived opportunity: after a funding/price exit, reset the
+        // cycle instead of completing or stopping. Stop-loss stays terminal (same safety rule as
+        // the automatic runner), so a bad position is never re-entered automatically.
+        if (actor.config.recurring && actor.positionExitReason !== 'stop-loss') {
+          if (!(await this.cancelQuotes(actor))) return;
+          this.rearmRecurringPosition(actor);
+          return;
+        }
         if (actor.positionExitReason === 'stop-loss') {
           if (!(await this.cancelQuotes(actor))) return;
           actor.status = 'STOPPED';
@@ -2297,6 +2362,11 @@ export class StrategyEngine {
         await this.checkCompletion(actor);
         return;
       }
+      // Recurring strategies only take on a new cycle while the funding differential still clears
+      // the configured APR floor. The original entry was screened by the operator/scanner; after a
+      // decay exit this gate is what stops an immediate re-entry into the same dead opportunity.
+      if (actor.config.recurring && this.matchedQuantity(exposure).lte(QUANTITY_EPSILON)
+        && !this.recurringEntryFundingOk(actor)) return;
       // Funding-decay exit: hold the hedge while the pair's funding differential still clears
       // `exitFundingAprFloorPercent`, close when it decays (or flips negative), and force-close at
       // the `maxHoldingHours` cap. This is the automatic runner's primary exit.
@@ -2487,7 +2557,15 @@ export class StrategyEngine {
     if (config.kind !== 'position' || config.closePlan) return false;
     const takeProfit = optionalDecimal(config.takeProfitBps);
     const stopLoss = optionalDecimal(config.stopLossBps);
-    return takeProfit !== null || (stopLoss !== null && stopLoss.gt(0));
+    // Funding/settlement exits and a holding cap are monitoring too: the auto funding runner may
+    // launch with no hard stop-loss, and without this predicate its funding exit would never be
+    // evaluated — the strategy would complete as soon as the entry filled.
+    return takeProfit !== null
+      || (stopLoss !== null && stopLoss.gt(0))
+      || config.exitAfterSettlements !== undefined
+      || (config.exitFundingAprFloorPercent !== undefined && config.exitFundingAprFloorPercent > 0)
+      || config.exitOnFundingFlip === true
+      || (config.maxHoldingHours !== undefined && config.maxHoldingHours > 0);
   }
 
   /**
@@ -2500,6 +2578,46 @@ export class StrategyEngine {
    * the rate is still paying. Missing quotes or rates abstain — the exit only fires on a complete
    * reading, never on a fabricated zero.
    */
+  /**
+   * Recurring entry gate: require the live annualized differential to clear the dedicated recurring
+   * gate *in the same direction the legs were opened for*. A flipped differential must not re-enter
+   * just because its absolute value is large. Missing quotes/rates abstain rather than fabricating
+   * a zero.
+   */
+  private recurringEntryFundingOk(actor: StrategyActor): boolean {
+    const legs = legsOf(actor.config);
+    const leftMarket = this.markets.market(legs.left.symbol);
+    const rightMarket = this.markets.market(legs.right.symbol);
+    if (!leftMarket || !rightMarket) return false;
+    const leftRate = Number(leftMarket.fundingRate);
+    const rightRate = Number(rightMarket.fundingRate);
+    if (!Number.isFinite(leftRate) || !Number.isFinite(rightRate)) return false;
+    const leftInterval = this.options.fundingIntervalHours?.(legs.left.symbol) ?? 8;
+    const rightInterval = this.options.fundingIntervalHours?.(legs.right.symbol) ?? 8;
+    const left8h = leftInterval > 0 ? leftRate * 8 / leftInterval : leftRate;
+    const right8h = rightInterval > 0 ? rightRate * 8 / rightInterval : rightRate;
+    const short8h = legs.left.side === 'SELL' ? left8h : right8h;
+    const long8h = legs.left.side === 'SELL' ? right8h : left8h;
+    const net8h = short8h - long8h;
+    const direction = actor.config.fundingDirection ?? 'POSITIVE';
+    const signed8h = direction === 'NEGATIVE' ? -net8h : net8h;
+    const apr = signed8h * 3 * 365 * 100;
+    const min = actor.config.recurringFundingAprMin ?? actor.config.fundingAprMin ?? 15;
+    const ok = apr >= min;
+    if (!ok && !actor.recurringGateBlocked) {
+      actor.recurringGateBlocked = true;
+      this.runtime.addStrategyLog(actor.id, 'info', 'Waiting for recurring funding threshold',
+        `Pair APR ${apr.toFixed(1)}% · needs ≥ ${min}%`,
+        actor.config.asset, 'Recurring strategy stays armed but does not re-enter');
+    } else if (ok && actor.recurringGateBlocked) {
+      actor.recurringGateBlocked = false;
+      this.runtime.addStrategyLog(actor.id, 'info', 'Recurring funding threshold recovered',
+        `Pair APR ${apr.toFixed(1)}% ≥ ${min}%`,
+        actor.config.asset, 'Entry conditions may now be evaluated');
+    }
+    return ok;
+  }
+
   private async maybeTriggerFundingExit(actor: StrategyActor): Promise<boolean> {
     const config = actor.config;
     if (config.kind !== 'position' || config.closePlan || actor.positionExitArmed) return false;

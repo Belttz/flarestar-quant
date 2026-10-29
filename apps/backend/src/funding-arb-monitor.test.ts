@@ -31,6 +31,18 @@ afterEach(() => {
   for (const database of databases.splice(0)) database.close();
 });
 
+describe('funding arb threshold posture', () => {
+  it('keeps the hard annualized gate and tunes only responsiveness', () => {
+    const settings = parseFundingArbSettings({});
+    expect(settings.minAprPercent).toBe(2000);
+    expect(settings.scanIntervalMinutes).toBe(10);
+    expect(settings.confirmScans).toBe(1);
+    expect(settings.maxCurrentTo24hRatio).toBe(4);
+    expect(settings.minNetPerSettlementBps).toBe(10);
+    expect(settings.recurring).toBe(true);
+  });
+});
+
 function market(symbol: string, bid: string, ask: string, last: string, nextFundingAt: string): LiveMarket {
   return {
     symbol, venue: symbol.split('_')[0]!, asset: symbol.split('_')[2]!, lastPrice: last,

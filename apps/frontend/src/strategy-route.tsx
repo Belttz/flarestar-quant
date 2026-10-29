@@ -980,6 +980,11 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const [legBookDepths, setLegBookDepths] = useState<Record<string, MarketBookDepth>>({});
   const [amount, setAmount] = useState(() => queryDecimal(query.get('totalAmount')) ?? '');
   const [positionOrderQuantity, setPositionOrderQuantity] = useState(() => queryDecimal(query.get('perOrderQuantity')) ?? '');
+  // A funding-arb opportunity prefill asks for a long-lived strategy. The hard APR floor stays at
+  // the auto runner's 2000% default; the operator can only raise it here.
+  const [recurring, setRecurring] = useState(() => prefill?.recurring === true || autoQuery?.get('recurring') === '1');
+  const [recurringMinApr, setRecurringMinApr] = useState(() => queryDecimal(autoQuery?.get('recurringAprMin'))
+    ?? (prefill?.recurringFundingAprMin !== undefined ? String(prefill.recurringFundingAprMin) : '2000'));
   const [threshold, setThreshold] = useState(() => queryDecimal(autoQuery?.get('entryBps')) ?? '0');
   const [takeProfitThreshold, setTakeProfitThreshold] = useState(() => queryDecimal(autoQuery?.get('takeProfitBps')) ?? '0.4');
   const [stopLossThreshold, setStopLossThreshold] = useState(() => queryDecimal(autoQuery?.get('stopLossBps')) ?? '100');
@@ -1432,7 +1437,9 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
     && (mode !== 'auto' || (!autoThresholds.addOnStepInvalid && !autoThresholds.firstTierBeyondStop))
     && instrumentsReady
     && sizeIssues.length === 0;
-  const strategyInputsValid = sizeInputsValid && !marginInsufficient
+  const recurringInputsValid = mode !== 'position' || !recurring
+    || (isPositiveDecimal(recurringMinApr) && Number(recurringMinApr) >= 2000 && Number(recurringMinApr) <= 1_000_000);
+  const strategyInputsValid = sizeInputsValid && !marginInsufficient && recurringInputsValid
     && (mode !== 'position' || reduceOnly || (!positionRiskReviewUnavailable && !positionRiskLimitExceeded));
 
   useEffect(() => {
@@ -1522,7 +1529,21 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
       executionMethod: executionMethod === 'Maker–Taker' ? 'MAKER_TAKER' : 'TAKER_TAKER',
       ...(executionMethod === 'Maker–Taker' ? { makerLeg } : {}),
       ...(mode === 'position'
-        ? { totalAmount: amount, leftLeverage, rightLeverage }
+        ? {
+          totalAmount: amount, leftLeverage, rightLeverage,
+          // The recurring lifecycle needs funding exits, otherwise it would only complete on a
+          // price target. 500% is the auto runner's decay floor; the 2000% entry gate above is
+          // deliberately separate, so a close on decay does not immediately re-enter a weak pair.
+          ...(recurring ? {
+            recurring: true,
+            recurringCooldownSeconds: 600,
+            recurringFundingAprMin: Number(recurringMinApr),
+            exitOnFundingFlip: true,
+            exitFundingAprFloorPercent: 500,
+            maxHoldingHours: 168,
+            minHoldingHours: 2,
+          } : {}),
+        }
         : {
           maxPosition,
           takeProfitBps: takeProfitThreshold,
@@ -1573,6 +1594,8 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
       <div className="compact-fields">{mode === 'position' ? <>
         <label><span>{t('Per-order quantity')}</span><div><input placeholder="e.g. 0.10" value={positionOrderQuantity} onChange={(event) => setPositionOrderQuantity(event.target.value)} /><b>{asset}</b></div></label>
         <label><span>{t('Total amount')}</span><div><input placeholder="e.g. 1.00" value={amount} onChange={(event) => setAmount(event.target.value)} /><b>{asset}</b></div></label>
+        <label className="reduce-only-control"><span onClick={(event) => event.preventDefault()}>{t('Recurring arbitrage')}</span><div><input type="checkbox" checked={recurring} onChange={(event) => setRecurring(event.target.checked)} /><b>{t(recurring ? 'On' : 'Off')}</b></div></label>
+        {recurring && <label><span>{t('Recurring minimum APR')}</span><div><input value={recurringMinApr} onChange={(event) => setRecurringMinApr(event.target.value)} /><b>%</b></div></label>}
         <StrategyLeverageControl label="Exchange A leverage" symbol={leftHistorySymbol} exchangeName={leftExchange.name}
           asset={asset} quote={quoteFor(leftExchange.id)} value={leftLeverage} referencePrice={leftPrice}
           fallbackCurrent={leftPortfolioPosition?.leverage} fallbackMax={leftPortfolioPosition?.maxLeverage}

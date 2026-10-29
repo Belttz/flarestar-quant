@@ -371,15 +371,17 @@ describe('funding board SSR', () => {
     expect([...html.matchAll(/aria-pressed=/g)]).toHaveLength(0);
   });
 
-  it('opens on the carry board and offers the perpetual ⇄ perpetual switch', () => {
+  it('opens on the perpetual ⇄ perpetual board and offers the spot switch', () => {
     const html = renderBoard('funding', '');
     expect(html).toContain('hedge-mode-switch');
     expect(html).toContain('Spot ⇄ perpetual');
     expect(html).toContain('Perpetual ⇄ perpetual');
-    // The mode switch is a radio group: exactly one mode is active, and it starts on carry.
-    expect([...html.matchAll(/aria-checked="(true|false)"/g)].map((match) => match[1])).toEqual(['true', 'false']);
-    expect(html).toContain('Funding-rate opportunities');
-    expect(html).not.toContain('Cross-exchange funding hedge');
+    // The mode switch is a radio group: exactly one mode is active, and it starts on perp/perp.
+    const segment = html.slice(html.indexOf('hedge-mode-switch'));
+    const group = segment.slice(0, segment.indexOf('</div>'));
+    expect([...group.matchAll(/aria-checked="(true|false)"/g)].map((match) => match[1])).toEqual(['false', 'true']);
+    expect(html).toContain('Cross-exchange funding hedge');
+    expect(html).not.toContain('Positive funding buys spot against the perpetual');
   });
 });
 

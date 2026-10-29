@@ -2,6 +2,26 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [5.1.0] - 2026-10-29
+
+### Added
+
+- **Recurring funding-arbitrage strategies.** Position strategies can keep the same strategy id alive across funding/price exits and re-enter after a cooldown when the live funding differential still clears a dedicated annualized gate. Stop-loss remains terminal; a flipped funding direction never re-enters just because its absolute value is large. Automatic funding-arbitrage launches use recurring mode by default, and manual position launches expose a recurring toggle and minimum-APR field.
+- **Execute actions on the automatic funding-arbitrage candidate board** prefill the paired-position form with the candidate's asset and venue legs.
+- **Opportunity view preferences persist locally.** Funding/spread filters, venue selection, sorting and hedge mode survive leaving the workspace; explicit URL query parameters still take precedence for shared links.
+- **Funding-arbitrage threshold presets** (Conservative / Balanced / Fast) tune net-edge, persistence, confirmation and scan cadence while keeping the hard annualized entry gate.
+
+### Changed
+
+- The opportunities funding hedge board now opens in **perpetual ⇄ perpetual** mode by default.
+- The automatic funding-arbitrage runner keeps the **2000% annualized hard gate** but reacts faster: default scan cadence 10 minutes (was 60), one confirmation (was two), and a 4x current-to-24h ratio.
+- Recurring re-entry has its own annualized gate, so a 2000%+ entry threshold is not clamped by the carry strategy's 1000% field limit.
+
+### Fixed
+
+- Position monitoring now stays enabled for funding-decay, settlement and max-holding exits, so those exits are evaluated instead of silently skipping monitoring.
+- Missing Chinese labels for recurring-cycle and unhedged-exposure safety events.
+
 ## [5.0.0] - 2026-10-27
 
 ### Added

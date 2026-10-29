@@ -306,6 +306,12 @@ const chinese: Record<string, string> = {
   // A position strategy refused an entry clip because it would breach the configured max position:
   // nothing was submitted, so the wording must not read like an order failure.
   'Entry blocked by max position': '已达最大仓位，本次开仓被拒绝',
+  'Entry blocked: insufficient pair margin': '配对保证金不足，本次开仓被拦截',
+  'Entry resized to available margin': '保证金不足，开仓数量已按可用保证金缩小',
+  'Emergency flatten unavailable': '紧急平掉裸露仓位失败',
+  'Flattening unhedged exposure': '正在平掉裸露敞口',
+  'Unhedged exposure flatten settled': '裸露敞口已平掉',
+  'Unhedged exposure flatten failed': '裸露敞口平仓失败',
   // Pending states mean "asked the venue, still waiting": they are not terminal, so they must never
   // read like `Strategy paused` / `Strategy stopped`.
   'Strategy engine error': '策略引擎报错',
@@ -320,7 +326,13 @@ const chinese: Record<string, string> = {
   // A recovered strategy whose symbol is not in the market catalog never gets a live feed, so it
   // would sit there looking healthy while writing no rows at all. The symbol rides in `condition`.
   'Strategy market unavailable': '行情源没有这个标的，策略拿不到实时行情',
-  'Strategy started': '策略已启动', 'Started on latest available quote': '以最近可用报价启动', 'Strategy resumed': '策略已恢复', 'Strategy stopped': '策略已停止', 'Strategy completed': '策略已完成', 'Strategy paused': '策略已暂停', info: '信息', warning: '警告', error: '错误',
+  'Strategy started': '策略已启动', 'Started on latest available quote': '以最近可用报价启动', 'Strategy resumed': '策略已恢复', 'Strategy stopped': '策略已停止', 'Strategy completed': '策略已完成', 'Strategy paused': '策略已暂停',
+  'Recurring arbitrage': '持续套利',
+  'Recurring minimum APR': '循环最低年化',
+  'Recurring cycle armed': '已进入下一轮套利，等待再次入场条件',
+  'Waiting for recurring funding threshold': '等待循环套利的资金费门槛',
+  'Recurring funding threshold recovered': '资金费门槛已恢复，可再次入场',
+  info: '信息', warning: '警告', error: '错误',
   'Timed close triggered': '定时平仓已触发', 'Timed close slice executed': '定时平仓分单已执行', 'Timed close slice failed': '定时平仓分单失败',
   'Persistent backend log': '持久化后端日志', 'Showing executions for': '仅显示', only: '的执行记录',
   'Loading execution log…': '正在加载执行日志…', 'Execution log unavailable': '执行日志暂不可用', 'No execution events yet.': '暂无执行事件。',

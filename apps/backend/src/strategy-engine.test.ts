@@ -4175,3 +4175,59 @@ describe('MAKER_TAKER take-profit exit latch', () => {
     expect(hedgeAttempts(gateway).length).toBe(4);
   });
 });
+
+describe('recurring position lifecycle', () => {
+  it('keeps funding-exit monitoring on and re-arms the same actor after a flat cycle', async () => {
+    const { engine, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100', '101', undefined, undefined, '0.0001');
+    markets.set('OKX_FUTURE_BTC_USDT', '100', '101', undefined, undefined, '-0.0001');
+    const record = await engine.startStrategy({
+      ...takerTakerConfig,
+      recurring: true,
+      recurringCooldownSeconds: 60,
+      exitOnFundingFlip: true,
+      fundingAprMin: 15,
+    } as never);
+    const actor = (engine as unknown as { actors: Map<string, Record<string, unknown>> }).actors.get(record.id)!;
+    expect(actor).toBeTruthy();
+    expect((engine as unknown as { positionMonitoringEnabled: (config: unknown) => boolean })
+      .positionMonitoringEnabled(actor.config)).toBe(true);
+
+    const before = String((actor.config as Record<string, unknown>).recurringStartedAt);
+    (actor as Record<string, unknown>).positionExitArmed = true;
+    (actor as Record<string, unknown>).positionExitReason = 'funding-decay';
+    (engine as unknown as { rearmRecurringPosition: (value: unknown) => void })
+      .rearmRecurringPosition(actor);
+
+    expect(actor.status).toBe('RUNNING');
+    expect(actor.positionExitArmed).toBe(false);
+    expect(actor.positionExitReason).toBeNull();
+    expect(String((actor.config as Record<string, unknown>).recurringStartedAt)).not.toBe(before);
+    expect(Number(actor.cooldownUntil)).toBeGreaterThan(Date.now());
+  });
+
+  it('computes the recurring gate from both live funding legs and abstains without quotes', async () => {
+    const { engine, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100', '101', undefined, undefined, '0.02');
+    markets.set('OKX_FUTURE_BTC_USDT', '100', '101', undefined, undefined, '-0.02');
+    const record = await engine.startStrategy({
+      ...takerTakerConfig, recurring: true, recurringFundingAprMin: 5000,
+    } as never);
+    const actor = (engine as unknown as { actors: Map<string, Record<string, unknown>> }).actors.get(record.id)!;
+    const gate = (engine as unknown as { recurringEntryFundingOk: (value: unknown) => boolean })
+      .recurringEntryFundingOk.bind(engine);
+
+    // 4%/8h differential ≈ 4380% APR, below the dedicated 5000% recurring gate.
+    expect(gate(actor)).toBe(false);
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100', '101', undefined, undefined, '0.03');
+    markets.set('OKX_FUTURE_BTC_USDT', '100', '101', undefined, undefined, '-0.03');
+    // 6%/8h differential ≈ 6570% APR clears it.
+    expect(gate(actor)).toBe(true);
+    // A flipped differential with the same magnitude must stay blocked: re-entry is directional.
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100', '101', undefined, undefined, '-0.03');
+    markets.set('OKX_FUTURE_BTC_USDT', '100', '101', undefined, undefined, '0.03');
+    expect(gate(actor)).toBe(false);
+    markets.remove('OKX_FUTURE_BTC_USDT');
+    expect(gate(actor)).toBe(false);
+  });
+});

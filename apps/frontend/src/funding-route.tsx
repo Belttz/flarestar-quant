@@ -1018,7 +1018,7 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
       </div>
     </section>
 
-    <FundingArbPanel onOpenModeDialog={onOpenModeDialog} />
+    <FundingArbPanel onOpenModeDialog={onOpenModeDialog} onOpenPairedPosition={onOpenStrategy} />
 
     <section className="funding-card terminal-panel">
       <div className="exchange-filter" role="group" aria-label="Filter exchanges">

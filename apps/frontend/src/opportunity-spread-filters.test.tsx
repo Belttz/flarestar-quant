@@ -262,8 +262,8 @@ describe('spread board filter buttons', () => {
     const html = renderFundingBoard('?venues=GATE&markets=spot');
     expect(html).not.toContain('opportunity-filter-groups');
     expect(html).not.toContain('market-filter');
-    // No spread-filter checkboxes: the funding board's only checked control is the hedge-mode radiogroup.
-    expect([...html.matchAll(/role="checkbox"/g)]).toHaveLength(0);
+    // The perp/perp board does render its exchange checkbox filter; what must not appear is the
+    // spread board's venue + market filter group.
   });
 });
 

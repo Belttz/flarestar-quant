@@ -8,6 +8,8 @@ import {
   type FundingArbStatusResponse,
 } from './api.js';
 import { useLanguage } from './i18n.js';
+import type { ExchangeLogoId } from './exchange-logos.js';
+import type { PairedPositionPrefill } from './route-shared.js';
 
 /**
  * Automatic perp ⇄ perp funding-rate arbitrage panel (Funding page).
@@ -73,7 +75,7 @@ const GROUPS: GroupDef[] = [
     title: 'Scan & confirmation',
     hint: { en: 'How often the runner scans and how many consecutive scans a candidate must pass.', zh: '扫描频率，以及候选需要连续通过几次扫描。' },
     fields: [
-      { key: 'scanIntervalMinutes', label: 'Scan interval', unit: 'min', help: { en: 'Clock-aligned scan cadence (default 60 min at :30).', zh: '扫描间隔，默认 60 分钟、整点 :30 触发。' } },
+      { key: 'scanIntervalMinutes', label: 'Scan interval', unit: 'min', help: { en: 'Clock-aligned scan cadence (default 10 min at :30).', zh: '扫描间隔，默认 10 分钟；缩短后对机会变化更敏感。' } },
       { key: 'confirmScans', label: 'Entry confirmations', help: { en: 'Consecutive scans a candidate must pass; restart confirmation is replayed from funding history.', zh: '候选需连续通过几次扫描；重启后会用历史结算费率回放，不需要等待。' } },
     ],
   },
@@ -131,6 +133,8 @@ const GROUPS: GroupDef[] = [
       { key: 'minHoldingHours', label: 'Min holding', unit: 'h', help: { en: 'Soft exits are skipped before this holding time.', zh: '最短持有时间，期间不执行软退出（硬止损仍生效）。' } },
       { key: 'maxHoldingHours', label: 'Max holding', unit: 'h', help: { en: 'Force close after this many hours.', zh: '最长持有时间，到点强制平仓。' } },
       { key: 'exitOnFundingFlip', label: 'Close when funding flips', kind: 'toggle', help: { en: 'Close when the differential turns negative.', zh: '价差转负时立即平仓。' } },
+      { key: 'recurring', label: 'Recurring strategy', kind: 'toggle', help: { en: 'After a funding exit, keep this opportunity armed and re-enter when the edge recovers; stop-loss stays terminal.', zh: '因资金费率衰减平仓后不关闭策略，费率恢复时自动重新入场；止损仍会终止策略。' } },
+      { key: 'recurringCooldownSeconds', label: 'Recurring cooldown', unit: 's', help: { en: 'Quiet period after a recurring exit before re-entry is evaluated.', zh: '循环平仓后等待多久才允许再次入场。' } },
     ],
   },
   {
@@ -149,6 +153,49 @@ const GROUPS: GroupDef[] = [
       { key: 'adlReduceFraction', label: 'ADL reduce fraction', unit: '0-1', help: { en: 'Share of each leg closed at the warning rank.', zh: '预警档位时两腿各平掉的比例。' } },
       { key: 'adlExitRank', label: 'ADL exit rank', help: { en: 'Rank that forces a full close.', zh: '强制全平的 ADL 档位。' } },
     ],
+  },
+];
+
+/**
+ * Operator-facing threshold presets. The runner used to default to 2000% APR, which in practice
+ * produced no live candidates; these trade a little selectivity for actual flow, while the
+ * stop-loss, pair-cooldown, guard and sizing rules stay in force.
+ */
+const THRESHOLD_PRESETS: Array<{
+  id: string;
+  label: string;
+  hint: string;
+  patch: Partial<FundingArbSettings>;
+}> = [
+  {
+    id: 'conservative',
+    label: 'Conservative',
+    hint: 'The hard APR gate stays at 2000%; persistence and two confirmations slow entries down.',
+    patch: {
+      minAprPercent: 2000, minNetPerSettlementBps: 20, minTradeNetBps: 20,
+      fundingPersistenceMode: '24h', confirmScans: 2, scanIntervalMinutes: 30,
+      maxCurrentTo24hRatio: 3, max24hTo7dRatio: 3,
+    },
+  },
+  {
+    id: 'balanced',
+    label: 'Balanced',
+    hint: 'Same APR gate; one confirmation and a 10-minute scan react faster.',
+    patch: {
+      minAprPercent: 2000, minNetPerSettlementBps: 10, minTradeNetBps: 10,
+      fundingPersistenceMode: '24h', confirmScans: 1, scanIntervalMinutes: 10,
+      maxCurrentTo24hRatio: 4, max24hTo7dRatio: 3,
+    },
+  },
+  {
+    id: 'opportunity',
+    label: 'Fast / more opportunities',
+    hint: 'Same APR gate; current snapshot, one confirmation, 5-minute scans. Stop-loss and guards still apply.',
+    patch: {
+      minAprPercent: 2000, minNetPerSettlementBps: 5, minTradeNetBps: 5,
+      fundingPersistenceMode: 'off', confirmScans: 1, scanIntervalMinutes: 5,
+      maxCurrentTo24hRatio: 5, max24hTo7dRatio: 5,
+    },
   },
 ];
 
@@ -192,7 +239,10 @@ function formatMs(ms: number | null): string {
   return minutes >= 60 ? `${Math.floor(minutes / 60)}h ${minutes % 60}m` : `${minutes}m`;
 }
 
-export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () => void }) {
+export function FundingArbPanel({ onOpenModeDialog, onOpenPairedPosition }: {
+  onOpenModeDialog?: () => void;
+  onOpenPairedPosition?: (prefill: PairedPositionPrefill) => void;
+}) {
   const { t, language } = useLanguage();
   const [status, setStatus] = useState<FundingArbStatusResponse | null>(null);
   const [draft, setDraft] = useState<FundingArbSettings | null>(null);
@@ -478,7 +528,7 @@ export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () =>
                   <tr>
                     <th>{t('Asset')}</th><th>{t('Short / long')}</th><th>{t('APR')}</th>
                     <th>{t('Entry bps')}</th><th>{t('Notional')}</th><th>{t('To settlement')}</th>
-                    <th>{t('Verdict')}</th><th>{t('Reasons')}</th>
+                    <th>{t('Verdict')}</th><th>{t('Reasons')}</th><th>{t('Action')}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -496,10 +546,27 @@ export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () =>
                         <td>{formatMs(candidate.settlementInMs)}</td>
                         <td><span className={candidate.verdict === 'PASS' ? 'funding-arb-pass' : 'funding-arb-reject'}>{t(candidate.verdict === 'PASS' ? 'Pass' : 'Reject')}</span></td>
                         <td className="funding-arb-reasons">{candidate.reasons.length === 0 ? '—' : candidate.reasons.map((reason) => reasonLabel(reason, language)).join('、')}</td>
+                        <td>
+                          <button type="button" className="funding-arb-btn primary"
+                            disabled={!onOpenPairedPosition}
+                            title={candidate.verdict === 'PASS' ? t('Open the pre-filled strategy form') : t('Review the rejection reasons before executing')}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              onOpenPairedPosition?.({
+                                asset: candidate.asset,
+                                shortVenue: candidate.shortVenue.toLowerCase() as ExchangeLogoId,
+                                longVenue: candidate.longVenue.toLowerCase() as ExchangeLogoId,
+                                recurring: true,
+                                recurringFundingAprMin: 2000,
+                              });
+                            }}>
+                            {t('Execute')}
+                          </button>
+                        </td>
                       </tr>,
                       expanded ? (
                         <tr key={`${candidate.key}-detail`} className="fa-candidate-detail">
-                          <td colSpan={8}>
+                          <td colSpan={9}>
                             <div className="fa-detail-grid">
                               <div><span>{t('Candidate')}</span><strong>{candidate.key}</strong></div>
                               <div><span>{t('Short leg')}</span><strong>{candidate.shortVenue} · {candidate.shortSymbol}</strong><small>{candidate.shortIntervalHours ?? '—'}h · rate8h {candidate.shortRate8h}</small></div>
@@ -514,7 +581,7 @@ export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () =>
                       ) : null,
                     ];
                   })}
-                  {filteredCandidates.length === 0 && <tr><td colSpan={8} className="funding-arb-empty">{t('No scan yet — press “Scan now”.')}</td></tr>}
+                  {filteredCandidates.length === 0 && <tr><td colSpan={9} className="funding-arb-empty">{t('No scan yet — press “Scan now”.')}</td></tr>}
                 </tbody>
               </table>
             </div>
@@ -598,6 +665,26 @@ export function FundingArbPanel({ onOpenModeDialog }: { onOpenModeDialog?: () =>
                   ]).map((step) => <li key={step}>{step}</li>)}
                 </ol>
               </details>
+
+              <section className="fa-threshold-presets" aria-label={t('Threshold presets')}>
+                <div>
+                  <strong>{t('Threshold presets')}</strong>
+                  <small>{t('Apply a preset to the draft, then press Save parameters.')}</small>
+                </div>
+                <div className="fa-preset-row">
+                  {THRESHOLD_PRESETS.map((preset) => (
+                    <button key={preset.id} type="button" className="funding-arb-btn" disabled={busy || !draft}
+                      title={preset.hint}
+                      onClick={() => {
+                        draftDirty.current = true;
+                        setSaveState('idle');
+                        setDraft((current) => (current ? { ...current, ...preset.patch } : current));
+                      }}>
+                      {t(preset.label)}
+                    </button>
+                  ))}
+                </div>
+              </section>
 
               {draft && GROUPS.map((group, index) => (
                 <details key={group.title} className="funding-arb-group" open={index === 0}>

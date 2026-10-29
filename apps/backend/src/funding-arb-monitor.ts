@@ -43,7 +43,7 @@ import {
  * entry logic (one leg maker, one leg taker).
  *
  * The loop is deliberately separate from the 500 ms strategy tick: it runs on a clock-aligned
- * cadence (default 60 min at :30) and does no work while the switch is off.
+ * cadence (default 10 min, anchored at :30) and does no work while the switch is off.
  */
 
 const DEFAULT_TAKER_FEE_BPS = 4.8;
@@ -719,6 +719,9 @@ export class FundingArbMonitor {
       makerEntryTimeoutSeconds: settings.makerEntryTimeoutSeconds,
       makerEntryProximityBps: settings.makerEntryProximityBps,
       autoFundingArb: true,
+      recurring: settings.recurring,
+      recurringCooldownSeconds: settings.recurringCooldownSeconds,
+      recurringFundingAprMin: settings.minAprPercent,
       reduceOnly: false,
     };
     try {
