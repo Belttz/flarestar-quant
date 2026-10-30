@@ -356,6 +356,8 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   }, [focusPositionsSignal]);
   const [stoppingIds, setStoppingIds] = useState<string[]>([]);
   const [resumingIds, setResumingIds] = useState<string[]>([]);
+  const [pausingIds, setPausingIds] = useState<string[]>([]);
+  const [pausingAll, setPausingAll] = useState(false);
   const [selectedLogStrategyId, setSelectedLogStrategyId] = useState<string | null>(null);
   const [selectedStrategyLogs, setSelectedStrategyLogs] = useState<DisplayStrategyLog[]>([]);
   const [logLoadState, setLogLoadState] = useState<{ status: 'idle' | 'loading' | 'loaded' | 'error'; message?: string }>({ status: 'idle' });
@@ -519,7 +521,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   // A failed stop must never be silent: the strategy would keep trading while the user
   // believes it is halted.
   async function stopStrategy(id: string) {
-    if (stoppingIds.includes(id) || resumingIds.includes(id)) return;
+    if (stoppingIds.includes(id) || resumingIds.includes(id) || pausingIds.includes(id)) return;
     setStoppingIds((current) => [...current, id]);
     try {
       await api.stopStrategy(id);
@@ -532,12 +534,48 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
     }
   }
 
+  async function pauseAllStrategies() {
+    const active = runningStrategies.filter((strategy) => strategy.status === 'RUNNING');
+    if (active.length === 0 || pausingAll) return;
+    setPausingAll(true);
+    setStopNotice(null);
+    const failures: string[] = [];
+    for (const strategy of active) {
+      try {
+        await api.pauseStrategy(strategy.id);
+      } catch (error) {
+        failures.push(`${strategy.id}: ${error instanceof ApiError ? error.message : t('Backend unavailable')}`);
+      }
+    }
+    await onStrategiesChanged();
+    setPausingAll(false);
+    if (failures.length > 0) {
+      setStopNotice(`${t('Pause all failed')}: ${failures.join(' · ')}`);
+    } else {
+      setStopNotice(`${t('All strategies paused')} (${active.length})`);
+    }
+  }
+
+  async function pauseStrategy(id: string) {
+    if (pausingIds.includes(id) || stoppingIds.includes(id) || resumingIds.includes(id)) return;
+    setPausingIds((current) => [...current, id]);
+    setStopNotice(null);
+    try {
+      await api.pauseStrategy(id);
+      await onStrategiesChanged();
+    } catch (error) {
+      setStopNotice(`${t('Pause failed')} (${id}): ${error instanceof ApiError ? error.message : t('Backend unavailable')}`);
+    } finally {
+      setPausingIds((current) => current.filter((item) => item !== id));
+    }
+  }
+
   async function resumeStrategy(id: string) {
     if (tradingMode !== 'live') {
       onOpenModeDialog();
       return;
     }
-    if (resumingIds.includes(id) || stoppingIds.includes(id)) return;
+    if (resumingIds.includes(id) || stoppingIds.includes(id) || pausingIds.includes(id)) return;
     setResumingIds((current) => [...current, id]);
     setStopNotice(null);
     try {
@@ -718,6 +756,17 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
         <button role="tab" aria-selected={showingHistory} className={showingHistory ? 'active' : ''} onClick={() => { setActiveStrategyTab('historical'); setHistoryPage(1); setEditingTakeProfitId(null); }}>{t('Historical')} <span>({historicalStrategies.length})</span></button>
       </div>
       {showingPositions ? <>
+        {positionsView.status === 'fresh' && (positionsView.rows.length > 0 || runningStrategies.some((strategy) => strategy.status === 'RUNNING')) && <div className="strategy-holdings-toolbar">
+          <div className="strategy-holdings-copy">
+            <strong>{t('Strategy positions')}</strong>
+            <small>{positionsView.rows.length} {t('positions')} · {runningStrategies.filter((strategy) => strategy.status === 'RUNNING').length} {t('running strategies')}</small>
+          </div>
+          <div className="strategy-holdings-actions">
+            <button className="pause-all-button" onClick={() => void pauseAllStrategies()} disabled={pausingAll || !runningStrategies.some((strategy) => strategy.status === 'RUNNING')}>{pausingAll ? t('Pausing all…') : t('Pause all')}</button>
+            <button className="close-all-positions-button" onClick={() => requestPositionClose(positionsView.rows)} disabled={pausingAll || positionsView.rows.length === 0}>{t('Close all positions')}</button>
+          </div>
+        </div>}
+        {stopNotice && <div className="launch-notice error panel-notice strategy-holdings-notice">{stopNotice}</div>}
         {positionsView.status === 'fresh' && positionsView.rows.length > 0 && <PositionsTable rows={positionsView.rows} onClose={requestPositionClose} />}
         {positionsView.status === 'fresh' && positionsView.rows.length === 0 && <div className="no-strategies"><span>◎</span><strong>{t('No open positions')}</strong><small>{t('The live account has no open futures positions.')}</small></div>}
         {positionsView.status === 'stale' && <div className="no-strategies stale-strategy-positions"><span>!</span><strong>{t('Position snapshot is stale')}</strong><small>{t('Waiting for a fresh account snapshot.')}</small></div>}
@@ -772,7 +821,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
         <span className="strategy-log-actions"><button className="logs-button" onClick={() => void openLogs(strategy.id)}>{t('View logs')}</button>{showingHistory && <button className="copy-button" onClick={() => copyStrategyConfig(strategy)}>{t('Copy')}</button>}</span>
         <span>{strategyRuntime(strategy, showingHistory)}</span>
         <span className={`strategy-status ${strategy.status.toLowerCase()}`}><i />{strategy.status}<small>{strategy.progress.toFixed(0)}%</small></span>
-        {!showingHistory && <span className="strategy-actions">{config.kind === 'carry' && strategy.status === 'RUNNING' && <button className="close-carry-button" onClick={() => void closeCarryStrategy(strategy)} disabled={closingCarryIds.includes(strategy.id)}>{closingCarryIds.includes(strategy.id) ? t('Closing…') : t('Close all')}</button>}{strategy.status === 'PAUSED' && <button className="resume-button" onClick={() => void resumeStrategy(strategy.id)} disabled={resumingIds.includes(strategy.id) || stoppingIds.includes(strategy.id)}>{resumingIds.includes(strategy.id) ? t('Resuming…') : t('Resume')}</button>}<button className="stop-button" onClick={() => void stopStrategy(strategy.id)} disabled={stoppingIds.includes(strategy.id) || resumingIds.includes(strategy.id)}>{stoppingIds.includes(strategy.id) ? t('Stopping…') : t('Stop')}</button></span>}
+        {!showingHistory && <span className="strategy-actions">{config.kind === 'carry' && strategy.status === 'RUNNING' && <button className="close-carry-button" onClick={() => void closeCarryStrategy(strategy)} disabled={closingCarryIds.includes(strategy.id)}>{closingCarryIds.includes(strategy.id) ? t('Closing…') : t('Close all')}</button>}{strategy.status === 'RUNNING' && <button className="pause-button" onClick={() => void pauseStrategy(strategy.id)} disabled={pausingIds.includes(strategy.id) || stoppingIds.includes(strategy.id) || resumingIds.includes(strategy.id)}>{pausingIds.includes(strategy.id) ? t('Pausing…') : t('Pause')}</button>}{strategy.status === 'PAUSED' && <button className="resume-button" onClick={() => void resumeStrategy(strategy.id)} disabled={resumingIds.includes(strategy.id) || stoppingIds.includes(strategy.id) || pausingIds.includes(strategy.id)}>{resumingIds.includes(strategy.id) ? t('Resuming…') : t('Resume')}</button>}<button className="stop-button" onClick={() => void stopStrategy(strategy.id)} disabled={stoppingIds.includes(strategy.id) || resumingIds.includes(strategy.id) || pausingIds.includes(strategy.id)}>{stoppingIds.includes(strategy.id) ? t('Stopping…') : t('Stop')}</button></span>}
       </div>;
     })}</div>{showingHistory && historicalStrategies.length >= HISTORICAL_STRATEGIES_PAGE_SIZE && <div className="funding-pagination strategy-pagination"><span className="page-range">{historyStart + 1}–{Math.min(historyStart + HISTORICAL_STRATEGIES_PAGE_SIZE, historicalStrategies.length)} / {historicalStrategies.length}</span><div className="page-controls"><button onClick={() => setHistoryPage((current) => Math.max(1, current - 1))} disabled={historyPage === 1}>{t('Prev')}</button><span className="page-indicator">{t('Page')} {historyPage} / {historyPages}</span><button onClick={() => setHistoryPage((current) => Math.min(historyPages, current + 1))} disabled={historyPage === historyPages}>{t('Next')}</button></div><span className="page-size">10 {t('per page')}</span></div>}{stopNotice && <div className="launch-notice error panel-notice">{stopNotice}</div>}{visibleStrategies.length === 0 && <div className="no-strategies"><span>◎</span><strong>{t(showingHistory ? 'No historical strategies' : 'No strategies running')}</strong><small>{t(showingHistory ? 'Stopped and completed strategies will appear here.' : 'Configure a strategy above and start it when ready.')}</small></div>}
       </>}

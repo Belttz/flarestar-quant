@@ -584,6 +584,10 @@ export const api = {
       headers: { 'x-gct-trading-intent': 'update-strategy-take-profit' },
       body: JSON.stringify({ takeProfitPremiumPct }),
     }),
+  pauseStrategy: (id: string) => request(StrategyRecordSchema, `/api/strategies/${encodeURIComponent(id)}/pause`, {
+    method: 'POST',
+    headers: { 'x-gct-trading-intent': 'pause-strategy' },
+  }),
   stopStrategy: (id: string) => request(StrategyRecordSchema, `/api/strategies/${encodeURIComponent(id)}/stop`, {
     method: 'POST',
     headers: { 'x-gct-trading-intent': 'stop-strategy' },

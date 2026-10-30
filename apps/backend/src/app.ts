@@ -2338,6 +2338,22 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     }
   });
 
+  app.post('/api/strategies/:id/pause', {
+    preHandler: async (request, reply) => {
+      if (request.headers['x-gct-trading-intent'] !== 'pause-strategy') return reply.code(403).send({ error: 'missing_trading_intent' });
+    },
+  }, async (request, reply) => {
+    const parsed = z.object({ id: z.string().regex(STRATEGY_ID) }).safeParse(request.params);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_strategy_id' });
+    try { return await runAuthenticatedWrite(() => strategyEngine.pauseStrategy(parsed.data.id)); }
+    catch (error) {
+      if (error instanceof StrategyEngineError || error instanceof TradingRuntimeError) {
+        return reply.code(error.statusCode).send({ error: error.code });
+      }
+      return reply.code(500).send({ error: 'strategy_pause_failed' });
+    }
+  });
+
   app.post('/api/strategies/:id/stop', {
     preHandler: async (request, reply) => {
       if (request.headers['x-gct-trading-intent'] !== 'stop-strategy') return reply.code(403).send({ error: 'missing_trading_intent' });

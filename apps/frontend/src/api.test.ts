@@ -108,6 +108,33 @@ describe('local API request coordination', () => {
     expect(new Headers(init?.headers).get('x-gct-trading-intent')).toBe('resume-strategy');
   });
 
+  it('sends explicit live-trading intent when pausing a strategy', async () => {
+    const strategy = {
+      id: 'PAIR-PAUSE01', kind: 'position', status: 'RUNNING',
+      accountProfileId: 'gate-crossex-default', accountLabel: 'Gate CrossEx',
+      config: {
+        kind: 'position', asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'OKX',
+        leftSide: 'SELL', rightSide: 'BUY', entryBps: '10', totalAmount: '0.1',
+        perOrderQuantity: '0.1', reduceOnly: false, executionMethod: 'TAKER_TAKER',
+      },
+      progress: 0, filledQuantity: '0', filledLeft: '0', filledRight: '0', openPosition: '0',
+      realizedPnl: '0', createdAt: '2026-08-14T00:00:00.000Z',
+      updatedAt: '2026-08-14T00:01:00.000Z', stoppedAt: null,
+    };
+    const fetchMock = vi.fn(async (_path: string, _init?: RequestInit) => {
+      void _path;
+      void _init;
+      return new Response(JSON.stringify(strategy));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.pauseStrategy(strategy.id)).resolves.toMatchObject({ id: strategy.id, status: 'RUNNING' });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/strategies/PAIR-PAUSE01/pause');
+    const init = fetchMock.mock.calls[0]?.[1];
+    expect(init?.method).toBe('POST');
+    expect(new Headers(init?.headers).get('x-gct-trading-intent')).toBe('pause-strategy');
+  });
+
   it('exposes the orders that blocked a live activation as structured details', async () => {
     const blocking = {
       id: 'order-1', remoteOrderId: 'live-1', clientOrderId: 'gct-1', symbol: 'BINANCE_FUTURE_BTC_USDT', venue: 'BINANCE',

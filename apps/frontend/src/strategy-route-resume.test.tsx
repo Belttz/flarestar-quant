@@ -46,6 +46,13 @@ describe('paused strategy actions', () => {
   it('offers resume alongside stop only for a paused strategy', () => {
     expect(render('PAUSED')).toContain('>Resume<');
     expect(render('PAUSED')).toContain('>Stop<');
+    expect(render('PAUSED')).not.toContain('>Pause<');
     expect(render('RUNNING')).not.toContain('>Resume<');
+  });
+
+  it('offers pause alongside stop for a running strategy', () => {
+    expect(render('RUNNING')).toContain('>Pause<');
+    expect(render('RUNNING')).toContain('>Stop<');
+    expect(render('RUNNING')).not.toContain('>Pausing…<');
   });
 });

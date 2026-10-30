@@ -2,6 +2,18 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [5.4.1] - 2026-10-30
+
+### Added
+
+- Strategy holdings toolbar with **Pause all** and **Close all positions**; close-all reuses the existing position-close confirmation flow.
+- Per-strategy **Pause** action on running strategies, backed by `POST /api/strategies/:id/pause` (requires the `pause-strategy` trading-intent header).
+
+### Fixed
+
+- The strategy leverage popover is no longer covered by the market panel on desktop, and no longer clipped by the mobile setup sheet; on phones it opens as a fixed panel above the bottom tab bar.
+- Pausing a persisted running strategy after a restart now quiesces remote orders before marking it `PAUSED`; unresolved orders return `strategy_pause_pending_remote`.
+
 ## [5.4.0] - 2026-10-30
 
 ### Changed

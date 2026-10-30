@@ -871,6 +871,41 @@ export class StrategyEngine {
     return stopped;
   }
 
+  async pauseStrategy(id: string): Promise<StrategyRecord> {
+    const record = this.runtime.getStrategy(id);
+    if (record.status === 'PAUSED') return record;
+    if (!['RUNNING', 'PAUSE_PENDING_REMOTE', 'STOP_PENDING_REMOTE'].includes(record.status)) {
+      throw new StrategyEngineError('strategy_not_running', 409);
+    }
+    const actor = this.actors.get(id);
+    if (actor) {
+      actor.suspended = true;
+      actor.quiesceTarget = 'PAUSED';
+      actor.quiesceReason = 'Manual pause';
+      await actor.queue.catch(() => undefined);
+      const finished = await this.finishQuiesce(actor);
+      if (!finished) throw new StrategyEngineError('strategy_pause_pending_remote', 409);
+    } else {
+      // A restart leaves a persisted RUNNING row without an actor. Prove every remote order is
+      // terminal before parking it, so resume cannot re-arm execution alongside a stale quote.
+      const quiesced = await this.runtime.quiesceOpenOrders({
+        strategyId: id,
+        timeoutMs: this.options.orderTimeoutMs,
+      });
+      if (quiesced.unresolved.length > 0) {
+        throw new StrategyEngineError('strategy_pause_pending_remote', 409);
+      }
+      const now = new Date().toISOString();
+      this.database.prepare("UPDATE execution_strategies SET status = 'PAUSED', updated_at = ? WHERE id = ?")
+        .run(now, id);
+      this.runtime.addStrategyLog(id, 'info', 'Strategy paused', 'Manual pause', '—',
+        'Paused after all remote orders reached terminal state');
+    }
+    const paused = this.runtime.getStrategy(id);
+    this.runtime.emitStrategyUpdate(paused);
+    return paused;
+  }
+
   async resumeStrategy(id: string, credentialProfileId: string): Promise<StrategyRecord> {
     if (!this.session.liveTradingEnabled) throw new StrategyEngineError('live_trading_locked', 403);
     const record = this.runtime.getStrategy(id);

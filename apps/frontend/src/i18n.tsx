@@ -387,7 +387,7 @@ const chinese: Record<string, string> = {
   'Above maximum order size': '超过最大订单数量', 'Below minimum notional': '低于最小名义价值',
   'Each order needs at least': '每单至少需要', 'minimum notional': '最小名义价值',
   'Order cancelled': '订单已撤销', 'Cancel failed': '撤单失败',
-  'Cancelling…': '撤单中…', Resume: '恢复', 'Resuming…': '正在恢复…', 'Resume failed': '恢复失败', 'Stop failed': '停止失败', 'Stopping…': '停止中…',
+  'Cancelling…': '撤单中…', Pause: '暂停', 'Pausing…': '正在暂停…', 'Pause failed': '暂停失败', 'Pause all': '全部暂停', 'Pausing all…': '正在暂停全部…', 'Pause all failed': '全部暂停失败', 'All strategies paused': '已暂停全部策略', 'Strategy positions': '策略持仓', positions: '个持仓', 'running strategies': '个运行中策略', 'Close all positions': '一键平仓全部仓位', Resume: '恢复', 'Resuming…': '正在恢复…', 'Resume failed': '恢复失败', 'Stop failed': '停止失败', 'Stopping…': '停止中…',
   'Confirm order': '确认订单', 'Go back': '返回',
   // Spot-perpetual carry bot & price-difference extensions
   'Spot-perpetual carry bot': '现货–永续费率套利', 'Spot-perpetual carry bot.': '现货–永续费率套利。',

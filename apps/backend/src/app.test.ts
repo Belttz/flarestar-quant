@@ -971,6 +971,16 @@ describe('local backend', () => {
     const logs = await app.inject({ method: 'GET', url: `/api/strategies/${started.id}/logs`, headers: { host: '127.0.0.1:17840' } });
     expect(logs.json().logs.some((log: { event: string }) => log.event === 'Strategy started')).toBe(true);
 
+    const pause = await app.inject({ method: 'POST', url: `/api/strategies/${started.id}/pause`, headers: {
+      host: '127.0.0.1:17840', 'x-gct-trading-intent': 'pause-strategy',
+    } });
+    expect(pause.statusCode).toBe(200);
+    expect(pause.json()).toMatchObject({ status: 'PAUSED' });
+    const pauseLogs = await app.inject({ method: 'GET', url: `/api/strategies/${started.id}/logs`, headers: { host: '127.0.0.1:17840' } });
+    expect(pauseLogs.json().logs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ event: 'Strategy paused' }),
+    ]));
+
     const stop = await app.inject({ method: 'POST', url: `/api/strategies/${started.id}/stop`, headers: {
       host: '127.0.0.1:17840', 'x-gct-trading-intent': 'stop-strategy',
     } });

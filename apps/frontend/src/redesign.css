@@ -1737,6 +1737,9 @@ body {
   .app-shell .strategy-layout.revised .strategy-sidebar {
     position: sticky;
     top: 78px;
+    /* The market card is z-index 3; without a stacking context here its sibling card paints over
+       the leverage popover that extends left out of the config sidebar. */
+    z-index: 4;
   }
 
   .app-shell .strategy-layout.revised .strategy-rules-sidebar,
@@ -3999,4 +4002,40 @@ body {
     overflow-wrap: anywhere;
     line-height: 1.2;
   }
+}
+
+/* Strategy holdings: one place to pause every live strategy or flatten the whole book.
+ * Kept above the position cards so it is reachable on both desktop and phone without opening
+ * a strategy row. Closing is still routed through the existing confirmation dialog. */
+.app-shell .strategy-holdings-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(255, 255, 255, .012);
+}
+.app-shell .strategy-holdings-copy { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.app-shell .strategy-holdings-copy strong { font-size: 13px; color: var(--text); }
+.app-shell .strategy-holdings-copy small { font-size: 10px; color: var(--muted); }
+.app-shell .strategy-holdings-actions { display: flex; align-items: center; gap: 8px; flex: none; }
+.app-shell .strategy-holdings-actions button {
+  height: 32px;
+  padding: 0 14px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 650;
+}
+.app-shell .pause-all-button { border: 1px solid #5b4a28; background: #241f12; color: #e2c37a; }
+.app-shell .pause-all-button:hover:not(:disabled) { border-color: #8c733d; color: #f5d99a; }
+.app-shell .close-all-positions-button { border: 1px solid #6b2a32; background: #2a1216; color: #f2a6ad; }
+.app-shell .close-all-positions-button:hover:not(:disabled) { border-color: #a84450; color: #ffced3; }
+.app-shell .strategy-holdings-actions button:disabled { opacity: .45; cursor: not-allowed; }
+.app-shell .strategy-holdings-notice { margin: 8px 12px 0; }
+
+@media (max-width: 640px) {
+  .app-shell .strategy-holdings-toolbar { flex-direction: column; align-items: stretch; gap: 8px; padding: 9px 10px; }
+  .app-shell .strategy-holdings-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .app-shell .strategy-holdings-actions button { height: 38px; width: 100%; }
 }

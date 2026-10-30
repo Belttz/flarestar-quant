@@ -587,3 +587,30 @@
     white-space: normal;
   }
 }
+
+/* Strategy leverage editor: the desktop popover is absolutely positioned inside the setup card.
+ * On a phone the setup card is a transformed, scrollable bottom sheet, which both clips the
+ * popover and makes position:fixed resolve against the sheet. While the editor is open, drop the
+ * sheet transform/overflow and pin the popover to the viewport above the tabbar so every field and
+ * the apply button stay reachable. */
+@media (max-width: 640px) {
+  .app-shell .strategy-view .strategy-sidebar.mobile-config-sheet:has(.leverage-popover) {
+    transform: none;
+    overflow: visible;
+  }
+
+  .app-shell .strategy-view .strategy-sidebar.mobile-config-sheet .leverage-popover {
+    position: fixed;
+    z-index: 160;
+    top: auto;
+    right: 10px;
+    bottom: calc(76px + env(safe-area-inset-bottom));
+    left: 10px;
+    width: auto;
+    max-height: min(72dvh, 520px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    border-radius: 14px;
+    box-shadow: 0 -18px 48px rgba(0, 0, 0, .62);
+  }
+}
