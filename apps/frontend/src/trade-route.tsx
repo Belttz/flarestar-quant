@@ -296,6 +296,9 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   const [notice, setNotice] = useState<{ kind: 'ok' | 'error'; title: string; text: string } | null>(null);
   const noticeTimer = useRef<number | null>(null);
   const [confirming, setConfirming] = useState(false);
+  // Phone flow: a fixed Buy/Sell bar opens the very same order ticket as a bottom sheet, so the
+  // ticket no longer sits below the chart/orderbook and the desktop layout is left untouched.
+  const [mobileTicketOpen, setMobileTicketOpen] = useState(false);
   const [skipFutureConfirmations, setSkipFutureConfirmations] = useState(false);
   const [exchangeId, setExchangeId] = useState('gate');
   const [pendingExchangeId, setPendingExchangeId] = useState<string | null>(null);
@@ -630,6 +633,19 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   }, [side, orderType, price, amount, reduceOnly, exchangeId, isSpot]);
 
   useEffect(() => {
+    // The phone ticket sheet closes on Escape and does not let the page scroll behind it.
+    if (!mobileTicketOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') setMobileTicketOpen(false); };
+    document.addEventListener('keydown', onKeyDown);
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [mobileTicketOpen]);
+
+  useEffect(() => {
     if (!leverageOpen) return;
     const onPointerDown = (event: MouseEvent) => {
       if (leverageRef.current && !leverageRef.current.contains(event.target as Node)) setLeverageOpen(false);
@@ -838,6 +854,8 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
         reduceOnly: isSpot ? false : reduceOnly,
       });
       showNotice('ok', t('Execution update'), `${order.state}: ${t(side)} ${amount || '0'} ${spotQuoteBuy ? quote : asset} ${t('on')} ${exchange.name}`);
+      // Return to the terminal so the confirmation toast is not hidden behind the phone sheet.
+      setMobileTicketOpen(false);
       await onTradingChanged();
     } catch (error) {
       showNotice('error', t('Order rejected'), error instanceof ApiError ? error.message : t('Backend unavailable'));
@@ -871,6 +889,16 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
       </dl>
       <button className="star-button" onClick={() => onToggleFavorite(symbol)} aria-label={`${isFavorite ? 'Remove' : 'Add'} ${asset} favorite`}>{isFavorite ? '★' : '☆'}</button>
     </section>
+
+    {/* Phone entry point: always one tap away, above the bottom tabbar. Hidden above 640px. */}
+    <div className="mobile-order-bar" role="region" aria-label={t('Trade')}>
+      <div className="mobile-order-bar-info">
+        <strong>{asset}{isSpot ? `/${spotQuote}` : ''}</strong>
+        <small>{exchange.name} · {isSpot ? t('Spot') : t('Perpetual')}</small>
+      </div>
+      <button type="button" className="mobile-order-bar-buy" onClick={() => { setSide('Buy'); setMobileTicketOpen(true); }}>{t('Buy / Long')}</button>
+      <button type="button" className="mobile-order-bar-sell" onClick={() => { setSide('Sell'); setMobileTicketOpen(true); }}>{t('Sell / Short')}</button>
+    </div>
 
     <section className="terminal-grid">
       <div className="chart-panel terminal-panel">
@@ -912,7 +940,12 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
 
       <OrderBookPanel book={orderBook?.symbol === symbol ? orderBook : null} trades={publicTrades.symbol === symbol ? publicTrades.trades : []} liveMarket={liveMarket} quote={quote} base={asset} sizeMultiplier={sizeMultiplier} tickSize={instrument?.tickSize ?? null} />
 
-      <aside className="order-panel terminal-panel">
+      <aside className={`order-panel terminal-panel${mobileTicketOpen ? ' mobile-ticket-open' : ''}`}>
+        <div className="mobile-ticket-sheet-head">
+          <span className="mobile-ticket-sheet-handle" aria-hidden="true" />
+          <div><strong>{t('Trade')}</strong><small>{asset} · {exchange.name}</small></div>
+          <button type="button" className="mobile-ticket-sheet-close" aria-label={t('Close')} onClick={() => setMobileTicketOpen(false)}>✕</button>
+        </div>
         <div className="market-type-tabs" role="group" aria-label={t('Market type')}>
           <button className={marketType === 'FUTURE' ? 'active' : ''} onClick={() => setMarketType('FUTURE')}>{t('Perpetual futures')}</button>
           <button className={marketType === 'SPOT' ? 'active' : ''} onClick={() => setMarketType('SPOT')}>{t('Spot')}</button>
@@ -972,6 +1005,7 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
         </dl>
       </aside>
     </section>
+    <div className={`mobile-ticket-backdrop${mobileTicketOpen ? ' open' : ''}`} role="presentation" onClick={() => setMobileTicketOpen(false)} />
 
     <ExecutionTables snapshot={tradingSnapshot} portfolio={authenticatedPortfolio} instruments={instrumentCatalog} marketSnapshot={marketSnapshot} spotVenues={spotCapableVenues} bottomTab={bottomTab} setBottomTab={setBottomTab} onTradingChanged={onTradingChanged} onPositionsRefresh={onPositionsRefresh} notify={showNotice} tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} />
     {confirming && <div className="modal-backdrop confirm-order-backdrop" role="presentation" onMouseDown={() => setConfirming(false)}>

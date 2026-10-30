@@ -2,6 +2,24 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [5.4.0] - 2026-10-30
+
+### Changed
+
+- **Phone-native operation flows** replace the desktop tables squeezed into mobile: positions, orders, fills and spot holdings render as cards with full contract names and the same close actions; strategy and trade use fixed action bars with bottom sheets for setup/order entry.
+- **Unified opportunity cards** across funding, spread and quality boards: every card uses the same header/legs/metrics/footer structure, with a combination expand/collapse for different venue pairs and full contract names that wrap instead of clipping.
+- Funding opportunity filters are always expanded; all opportunity groups render instead of a truncated three-card mobile slice.
+- Quality board scans up to 100 candidates and shows the coverage count; quality execution buttons were removed because those pairs are same-exchange spot/perp, and redundant "details" toggles were replaced by the requested combination fold.
+- Strategy history charts restore a readable 230px desktop / 190px phone height with legends; the mobile setup sheet uses single-box inputs and collapsed strategy legs by default.
+- All strategy mode icons are flat single-stroke SVGs instead of mixed 3D/emoji glyphs.
+
+### Fixed
+
+- Compound mobile inputs no longer render an input inside another input.
+- Funding hedge cards no longer overlap text and match the spread-card layout.
+- Strategy holdings show complete pair names on desktop and mobile.
+- Portfolio orders/fills and funding history detail tables no longer require horizontal scrolling.
+
 ## [5.3.0] - 2026-10-30
 
 ### Added

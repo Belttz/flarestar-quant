@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
-import { SpotHoldingsTable } from './execution-tables.js';
+import { SpotHoldingsCards, SpotHoldingsTable } from './execution-tables.js';
 import { LanguageContext } from './i18n.js';
 import type { SpotHoldingsRow } from './execution-split.js';
 
@@ -101,5 +101,27 @@ describe('SpotHoldingsTable', () => {
     const paged = render(<SpotHoldingsTable {...baseProps} rows={elevenRows} />);
     expect(paged).toContain('1–10 / 11');
     expect(paged).toContain('Page 1 / 2');
+  });
+});
+
+describe('SpotHoldingsCards', () => {
+  it('spells out the venue, balance and valuation with the close action', () => {
+    const html = render(<SpotHoldingsCards rows={[row()]} closeState={{ onRequest: vi.fn(), isClosable: () => true }} />);
+    expect(html).toContain('execution-mobile-cards');
+    expect(html).toContain('Gate.io');
+    expect(html).toContain('<dt>Total</dt><dd>1</dd>');
+    expect(html).toContain('<dt>Valuation (USDT)</dt><dd>$62,000</dd>');
+    expect(html).toContain('Close position');
+  });
+
+  it('keeps the buy-back label and the repayment explainer for a liability', () => {
+    const liabilities = [row({ total: -100, available: -100, valuationUsd: -40 })];
+    expect(render(<SpotHoldingsCards rows={liabilities} closeState={{ onRequest: vi.fn(), isClosable: () => true }} />))
+      .toContain('Buy back');
+
+    const explain = render(<SpotHoldingsCards rows={liabilities}
+      closeState={{ onRequest: vi.fn(), isClosable: () => false, blockerFor: () => 'No spot market on this exchange to buy this debt back.', onExplain: vi.fn() }} />);
+    expect(explain).toContain('How to repay');
+    expect(explain).toContain('No spot market on this exchange to buy this debt back.');
   });
 });

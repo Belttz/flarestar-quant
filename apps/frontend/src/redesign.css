@@ -567,6 +567,10 @@ body {
   border-bottom-color: var(--line-soft);
 }
 
+.app-shell .mobile-spread-bar {
+  display: none;
+}
+
 .app-shell .strategy-panel-head h2 {
   color: #f1f2f7;
   font-weight: 720;
@@ -2008,6 +2012,16 @@ body {
   font-size: 12px;
 }
 
+/* The custom OI field is a 26px flex/outline control; keep its input inside it. */
+.app-shell .alternate-view .oi-filter .oi-custom input {
+  height: 22px;
+  min-height: 0;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
 .app-shell .alternate-view :is(table) th {
   font-size: 10px;
   letter-spacing: .055em;
@@ -2201,4 +2215,1788 @@ body {
   border-color: var(--brand-2);
   color: #fff;
   background: rgba(124, 58, 237, .28);
+}
+
+/* --------------------------------------------------- mobile trade mode sheet
+ * OKX-style centre action: tapping 交易 opens a bottom sheet to switch between the
+ * strategy modes and the trade terminal without squeezing another rail into the page. */
+.app-shell .mobile-tabbar .mobile-trade-trigger {
+  align-content: end;
+  gap: 1px;
+  padding-top: 0;
+  background: transparent;
+}
+
+.app-shell .mobile-tabbar .mobile-trade-trigger-icon {
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  margin-top: -18px;
+  border: 1px solid rgba(196, 181, 253, .55);
+  border-radius: 13px;
+  color: #fff;
+  background: linear-gradient(150deg, #8b5cf6 0%, #6d28d9 58%, #3b82f6 100%);
+  box-shadow: 0 10px 24px rgba(91, 33, 182, .55), inset 0 1px 0 rgba(255, 255, 255, .24);
+}
+
+.app-shell .mobile-tabbar .mobile-trade-trigger-icon svg {
+  width: 21px;
+  height: 21px;
+  stroke-width: 1.8;
+}
+
+.app-shell .mobile-tabbar .mobile-trade-trigger.active {
+  color: #f0ecff;
+  background: transparent;
+}
+
+.app-shell .mobile-tabbar .mobile-trade-trigger.active .mobile-trade-trigger-icon {
+  border-color: rgba(245, 196, 81, .68);
+  box-shadow: 0 0 0 3px rgba(124, 58, 237, .26), 0 10px 26px rgba(91, 33, 182, .62);
+}
+
+.app-shell .mobile-trade-sheet-backdrop {
+  position: fixed;
+  z-index: 110;
+  inset: 0;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 0 8px;
+  background: rgba(3, 3, 8, .7);
+  backdrop-filter: blur(5px);
+  animation: mobile-sheet-fade .18s ease-out;
+}
+
+.app-shell .mobile-trade-sheet {
+  width: min(100%, 560px);
+  max-height: min(82vh, 720px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 8px 14px calc(16px + env(safe-area-inset-bottom));
+  border: 1px solid var(--brand-line);
+  border-bottom: 0;
+  border-radius: 18px 18px 0 0;
+  background: linear-gradient(180deg, #15131f 0%, #0b0b13 100%);
+  box-shadow: 0 -24px 60px rgba(0, 0, 0, .62);
+  animation: mobile-sheet-rise .24s cubic-bezier(.2, .8, .2, 1);
+}
+
+.app-shell .mobile-trade-sheet-handle {
+  width: 38px;
+  height: 4px;
+  margin: 2px auto 8px;
+  border-radius: 999px;
+  background: rgba(167, 139, 250, .34);
+}
+
+.app-shell .mobile-trade-sheet-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 2px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.app-shell .mobile-trade-sheet-head .eyebrow {
+  margin: 0 0 3px;
+  font-size: 9px;
+  letter-spacing: .12em;
+}
+
+.app-shell .mobile-trade-sheet-head h2 {
+  margin: 0;
+  font-size: 17px;
+  letter-spacing: -.02em;
+}
+
+.app-shell .mobile-trade-sheet-close {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, .035);
+  font-size: 19px;
+  line-height: 1;
+}
+
+.app-shell .mobile-trade-sheet-section {
+  display: grid;
+  gap: 7px;
+  padding: 12px 0 2px;
+}
+
+.app-shell .mobile-trade-sheet-section > small {
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+
+.app-shell .mobile-trade-sheet-list {
+  display: grid;
+  gap: 6px;
+}
+
+.app-shell .mobile-trade-sheet-list > button {
+  width: 100%;
+  min-height: 54px;
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--text);
+  background: rgba(255, 255, 255, .025);
+  text-align: left;
+}
+
+.app-shell .mobile-trade-sheet-list > button.active {
+  border-color: var(--brand-line);
+  background: linear-gradient(135deg, rgba(124, 58, 237, .25), rgba(59, 130, 246, .12));
+}
+
+.app-shell .mobile-trade-mode-glyph {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--brand-line);
+  border-radius: 9px;
+  color: #ddd6fe;
+  background: rgba(124, 58, 237, .14);
+  font-size: 17px;
+  font-weight: 700;
+}
+
+.app-shell .mobile-trade-mode-copy {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.app-shell .mobile-trade-mode-copy strong {
+  overflow: hidden;
+  color: #f2efff;
+  font-size: 12px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-shell .mobile-trade-mode-copy small {
+  overflow: hidden;
+  color: #7c8498;
+  font-size: 10px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-shell .mobile-trade-mode-check {
+  color: var(--gold);
+  font-size: 13px;
+  text-align: center;
+}
+
+@keyframes mobile-sheet-rise {
+  from { opacity: 0; transform: translateY(26px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes mobile-sheet-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-shell .mobile-trade-sheet,
+  .app-shell .mobile-trade-sheet-backdrop {
+    animation: none;
+  }
+}
+
+/* --------------------------------------------------- compact mobile strategy
+ * The desktop strategy workspace is a two-column dashboard. On a phone that becomes a
+ * three-screen stack, so keep the same information in a dense order: pair + legs first,
+ * a short funding strip, the chart at a glance, then inputs and launch controls. */
+@media (max-width: 640px) {
+  .app-shell .strategy-view .view-heading.strategy-heading {
+    gap: 6px;
+    margin-bottom: 10px;
+  }
+
+  .app-shell .strategy-view .strategy-heading .eyebrow {
+    margin: 0 0 2px;
+    font-size: 8px;
+  }
+
+  .app-shell .strategy-view .strategy-heading h1 {
+    margin-bottom: 0;
+    font-size: 26px;
+  }
+
+  .app-shell .strategy-view .strategy-heading p:not(.eyebrow),
+  .app-shell .strategy-view .strategy-heading .demo-automation {
+    display: none;
+  }
+
+  .app-shell .strategy-view .strategy-layout,
+  .app-shell .strategy-view .strategy-layout.revised {
+    gap: 8px;
+  }
+
+  .app-shell .strategy-view .strategy-main,
+  .app-shell .strategy-view .strategy-sidebar {
+    gap: 8px;
+  }
+
+  /* Market card: pair selector in the header, legs side by side, spread between them. */
+  .app-shell .strategy-view .strategy-market-panel .strategy-panel-head {
+    min-height: 46px;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+  }
+
+  .app-shell .strategy-view .strategy-market-panel .strategy-panel-head .eyebrow,
+  .app-shell .strategy-view .strategy-market-panel .strategy-panel-head h2 {
+    display: none;
+  }
+
+  .app-shell .strategy-view .strategy-market-panel .strategy-asset-search {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .app-shell .strategy-view .strategy-market-panel .strategy-asset-search-control {
+    height: 32px;
+  }
+
+  .app-shell .strategy-view .strategy-legs {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    align-items: stretch;
+    gap: 6px;
+    padding: 8px 8px 6px;
+  }
+
+  .app-shell .strategy-view .leg-spread {
+    display: none;
+  }
+
+  .app-shell .strategy-view .strategy-leg {
+    min-width: 0;
+    padding: 7px;
+    border-radius: 8px;
+  }
+
+  .app-shell .strategy-view .leg-top {
+    display: grid;
+    gap: 4px;
+    align-items: stretch;
+  }
+
+  .app-shell .strategy-view .leg-top .exchange-selector,
+  .app-shell .strategy-view .leg-top button {
+    min-width: 0;
+  }
+
+  .app-shell .strategy-view .leg-top em {
+    padding: 3px 5px;
+    font-size: 10px;
+    line-height: 1.2;
+  }
+
+  .app-shell .strategy-view .leg-top .exchange-details small {
+    display: none;
+  }
+
+  .app-shell .strategy-view .leg-top em span {
+    margin-left: 3px;
+    padding-left: 3px;
+    font-size: 8px;
+  }
+
+  .app-shell .strategy-view .strategy-leg dl {
+    display: grid;
+    gap: 2px;
+    margin: 5px 0 0;
+  }
+
+  .app-shell .strategy-view .strategy-leg dl > div {
+    min-height: 0;
+    padding: 0;
+    font-size: 10px;
+    line-height: 1.3;
+  }
+
+  /* Best price is the only quote row that still earns its space on a phone. */
+  .app-shell .strategy-view .strategy-leg dl > div:not(:first-child) {
+    display: none;
+  }
+
+  .app-shell .strategy-view .strategy-leg dt,
+  .app-shell .strategy-view .strategy-leg dd {
+    font-size: 10px;
+  }
+
+  .app-shell .strategy-view .mobile-spread-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 0 8px 7px;
+    padding: 7px 10px;
+    border: 1px solid rgba(124, 58, 237, .35);
+    border-radius: 9px;
+    background: linear-gradient(135deg, rgba(124, 58, 237, .14), rgba(59, 130, 246, .06));
+  }
+
+  .app-shell .strategy-view .mobile-spread-bar > div {
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .app-shell .strategy-view .mobile-spread-bar span {
+    color: var(--text-muted);
+    font-size: 10px;
+  }
+
+  .app-shell .strategy-view .mobile-spread-bar strong {
+    font-size: 18px;
+    line-height: 1;
+    letter-spacing: -.02em;
+    white-space: nowrap;
+  }
+
+  .app-shell .strategy-view .mobile-spread-bar small {
+    overflow: hidden;
+    color: var(--text-muted);
+    font-size: 9px;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  .app-shell .strategy-view .mobile-spread-bar .switch-direction {
+    flex: 0 0 auto;
+    width: 34px;
+    height: 34px;
+    margin: 0;
+  }
+
+  .app-shell .strategy-view .switch-direction {
+    width: 26px;
+    height: 26px;
+    margin: 0 auto;
+    font-size: 11px;
+  }
+
+  .app-shell .strategy-view .switch-direction i {
+    transform: none;
+  }
+
+  /* Funding strip: five compact tiles instead of a 2×2 stack plus full-width row. */
+  .app-shell .strategy-view .position-funding-summary {
+    grid-template-columns: repeat(5, minmax(0, 1fr)) !important;
+  }
+
+  .app-shell .strategy-view .position-funding-summary > div,
+  .app-shell .strategy-view .position-funding-summary > div:first-child,
+  .app-shell .strategy-view .position-funding-summary > div:last-child {
+    grid-column: auto;
+    min-height: 46px;
+    gap: 1px;
+    padding: 5px 5px;
+    border-right: 1px solid #1e332d;
+    border-bottom: 0;
+  }
+
+  .app-shell .strategy-view .position-funding-summary > div:last-child {
+    border-right: 0;
+  }
+
+  .app-shell .strategy-view .position-funding-summary > div:first-child {
+    background: #0d201b;
+  }
+
+  .app-shell .strategy-view .position-funding-summary span {
+    font-size: 8px;
+    line-height: 1.2;
+  }
+
+  .app-shell .strategy-view .position-funding-summary strong,
+  .app-shell .strategy-view .position-funding-summary > div:first-child strong {
+    font-size: 12px;
+  }
+
+  .app-shell .strategy-view .position-funding-summary small {
+    font-size: 8px;
+    line-height: 1.2;
+  }
+
+  /* Chart: keep the shape visible, drop the desktop-height panel and legend padding. */
+  .app-shell .strategy-view .strategy-funding-history {
+    display: block;
+  }
+
+  .app-shell .strategy-view .strategy-funding-history .premium-history-head {
+    min-height: 40px;
+    align-items: center;
+    padding: 6px 10px;
+  }
+
+  .app-shell .strategy-view .strategy-funding-history .premium-history-head .eyebrow,
+  .app-shell .strategy-view .strategy-funding-history .premium-history-head > div > small {
+    display: none;
+  }
+
+  .app-shell .strategy-view .strategy-funding-history .premium-history-head h2 {
+    font-size: 13px;
+  }
+
+  .app-shell .strategy-view .strategy-funding-history .premium-history-controls {
+    gap: 4px;
+  }
+
+  .app-shell .strategy-view .strategy-funding-history .premium-live-badge {
+    display: none;
+  }
+
+  .app-shell .strategy-view .strategy-funding-history .premium-history-controls > div {
+    height: 24px;
+  }
+
+  .app-shell .strategy-view .strategy-funding-history .premium-history-controls button {
+    min-width: 28px;
+    height: 24px;
+    padding: 0 5px;
+    font-size: 9px;
+  }
+
+  .app-shell .strategy-view .strategy-funding-history .funding-history-chart {
+    height: 112px;
+  }
+
+  .app-shell .strategy-view .strategy-funding-history .funding-detail-legend {
+    min-height: 22px;
+    gap: 7px;
+    padding: 2px 10px 4px;
+    font-size: 8px;
+  }
+
+  /* Parameters: the rules panel keeps two columns, only the success check is removed. */
+  .app-shell .strategy-view .strategy-rules.compact .strategy-panel-head {
+    min-height: 42px;
+    padding: 0 10px;
+  }
+
+  .app-shell .strategy-view .strategy-rules.compact .strategy-panel-head .eyebrow {
+    display: none;
+  }
+
+  .app-shell .strategy-view .strategy-rules.compact .strategy-panel-head h2 {
+    font-size: 13px;
+  }
+
+  .app-shell .strategy-view .strategy-rules.compact .compact-fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+    gap: 6px;
+    padding: 8px 10px 7px;
+  }
+
+  .app-shell .strategy-view .compact-fields label {
+    min-width: 0;
+    gap: 3px;
+  }
+
+  .app-shell .strategy-view .compact-fields label > span {
+    font-size: 9px;
+    line-height: 1.25;
+  }
+
+  .app-shell .strategy-view .compact-fields label > div {
+    height: 32px;
+    min-width: 0;
+  }
+
+  .app-shell .strategy-view input:not([type='checkbox']):not([type='radio']) {
+    height: 30px;
+    min-height: 0;
+    padding-block: 0;
+  }
+
+  .app-shell .strategy-view .compact-fields label > div input {
+    min-width: 0;
+    font-size: 11px;
+  }
+
+  .app-shell .strategy-view .compact-fields label > div b {
+    font-size: 8px;
+  }
+
+  .app-shell .strategy-view .recurring-arb-block {
+    grid-column: 1 / -1;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+    padding: 6px 0 0;
+  }
+
+  .app-shell .strategy-view .strategy-size-check {
+    min-height: 0;
+    padding: 5px 10px;
+    font-size: 9px;
+    line-height: 1.3;
+  }
+
+  .app-shell .strategy-view .strategy-size-check.valid {
+    display: none;
+  }
+
+  .app-shell .strategy-view .strategy-setup-actions {
+    grid-template-columns: 1fr;
+    gap: 6px;
+    padding: 7px 10px 8px;
+  }
+
+  .app-shell .strategy-view .compact-trigger,
+  .app-shell .strategy-view .compact-method {
+    min-height: 38px;
+    padding: 5px 8px;
+  }
+
+  .app-shell .strategy-view .compact-method > span,
+  .app-shell .strategy-view .compact-trigger p {
+    font-size: 9px;
+  }
+
+  .app-shell .strategy-view .method-options button {
+    min-height: 30px;
+    font-size: 10px;
+  }
+
+  .app-shell .strategy-view .maker-depth-row {
+    display: none;
+  }
+
+  /* Launch card: intent + the first four review cells, no duplicate notes on mobile. */
+  .app-shell .strategy-view .strategy-launch {
+    padding: 9px 10px;
+  }
+
+  .app-shell .strategy-view .launch-status {
+    min-height: 24px;
+  }
+
+  .app-shell .strategy-view .launch-intent {
+    margin: 5px 0;
+    gap: 4px;
+  }
+
+  .app-shell .strategy-view .launch-intent strong {
+    font-size: 14px;
+  }
+
+  .app-shell .strategy-view .launch-intent p {
+    gap: 4px;
+  }
+
+  .app-shell .strategy-view .launch-intent p span {
+    padding: 3px 5px;
+    font-size: 9px;
+  }
+
+  .app-shell .strategy-view .launch-summary.review-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .app-shell .strategy-view .launch-summary.review-grid > div {
+    min-height: 32px;
+    padding: 4px 6px;
+  }
+
+  .app-shell .strategy-view .launch-summary.review-grid > div:nth-child(n+5) {
+    display: none;
+  }
+
+  .app-shell .strategy-view .launch-summary dt,
+  .app-shell .strategy-view .launch-summary dd {
+    font-size: 9px;
+  }
+
+  .app-shell .strategy-view .launch-warning {
+    padding: 5px 7px;
+    font-size: 9px;
+    line-height: 1.35;
+  }
+
+  .app-shell .strategy-view .start-strategy {
+    height: 40px;
+    margin-top: 5px;
+    font-size: 12px;
+  }
+
+  .app-shell .strategy-view .background-strategy-note {
+    display: none;
+  }
+
+  .app-shell .strategy-view .running-strategies {
+    margin-top: 0;
+  }
+
+  .app-shell .strategy-view .running-strategies .strategy-panel-head {
+    min-height: 40px;
+    padding: 0 10px;
+  }
+
+  .app-shell .strategy-view .running-strategies .strategy-panel-head h2 {
+    font-size: 14px;
+  }
+
+  .app-shell .strategy-view .running-strategies .strategy-panel-head > small {
+    display: none;
+  }
+
+  .app-shell .strategy-view .no-strategies {
+    min-height: 48px;
+    padding: 5px 10px;
+  }
+
+  .app-shell .strategy-view .no-strategies small {
+    display: none;
+  }
+}
+
+@media (max-width: 640px) {
+  /* The fixed tabbar already reserves its own safe area; don't double-pad the page. */
+  .app-shell .strategy-view.alternate-view {
+    padding-bottom: 12px;
+  }
+
+  .app-shell .strategy-view .strategy-funding-history .premium-history-head {
+    min-height: 34px;
+    padding: 4px 10px;
+  }
+
+  .app-shell .strategy-view .strategy-funding-history .funding-history-chart {
+    height: 92px;
+  }
+
+  .app-shell .strategy-view .strategy-funding-history .funding-detail-legend {
+    display: none;
+  }
+
+  .app-shell .strategy-view .compact-stop {
+    display: none;
+  }
+
+  .app-shell .strategy-view .running-head {
+    height: 24px;
+    font-size: 9px;
+  }
+
+  .app-shell .strategy-view .no-strategies {
+    min-height: 40px;
+  }
+
+  /* When the button is already locked, the extra lock explanation repeats the button label. */
+  .app-shell .strategy-view .strategy-launch:has(.start-strategy.locked) > .launch-warning:last-child {
+    display: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .app-shell .strategy-view.alternate-view {
+    padding-bottom: 0;
+  }
+
+  /* The empty running panel is pure vertical cost; keep it only when it has rows. */
+  .app-shell .strategy-view .running-strategies:has(.no-strategies) {
+    display: none;
+  }
+
+  .app-shell .strategy-view .strategy-funding-history .premium-history-head {
+    min-height: 30px;
+    padding: 2px 8px;
+  }
+
+  .app-shell .strategy-view .strategy-funding-history .premium-history-head h2 {
+    font-size: 11px;
+  }
+
+  .app-shell .strategy-view .strategy-funding-history .funding-history-chart {
+    height: 76px;
+  }
+
+  /* The threshold is already a field above; the green readiness strip repeats it. */
+  .app-shell .strategy-view .strategy-setup-actions .compact-trigger {
+    display: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .app-shell .alternate-view .view-heading {
+    margin-bottom: 12px;
+  }
+}
+
+/* Very narrow phones: side-by-side legs no longer fit; stack them and keep the
+ * spread as a full-width row between the pair card and the funding strip. */
+@media (max-width: 380px) {
+  .app-shell .strategy-view .strategy-legs {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .app-shell .strategy-view .strategy-leg {
+    padding: 8px 9px;
+  }
+
+  .app-shell .strategy-view .leg-top {
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+  }
+
+  .app-shell .strategy-view .leg-top .exchange-control {
+    min-width: 0;
+  }
+
+  .app-shell .strategy-view .leg-top em {
+    white-space: nowrap;
+  }
+}
+
+/* Mobile opportunity boards: the desktop tables stay for pointer/keyboard, but
+ * on phones each row becomes a self-contained card so the action is never
+ * off-screen and the page never scrolls horizontally. */
+@media (max-width: 640px) {
+  .app-shell .opportunity-view .opportunity-board > .table-wrap,
+  .app-shell .opportunity-view .opportunity-board > .opportunity-table {
+    overflow: visible;
+  }
+
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table table,
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table tbody,
+  .app-shell .opportunity-view .opportunity-board > .opportunity-table:not(.opportunity-spread-table):not(.funding-hedge-table) table,
+  .app-shell .opportunity-view .opportunity-board > .opportunity-table:not(.opportunity-spread-table):not(.funding-hedge-table) tbody {
+    display: block;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table thead,
+  .app-shell .opportunity-view .opportunity-board > .opportunity-table:not(.opportunity-spread-table):not(.funding-hedge-table) thead {
+    display: none;
+  }
+
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table tr.hedge-asset-row,
+  .app-shell .opportunity-view .opportunity-board > .opportunity-table:not(.opportunity-spread-table):not(.funding-hedge-table) tbody > tr {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 7px 10px;
+    margin: 0 0 8px;
+    padding: 10px 11px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, .018);
+  }
+
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table tr.hedge-asset-row td,
+  .app-shell .opportunity-view .opportunity-board > .opportunity-table:not(.opportunity-spread-table):not(.funding-hedge-table) tbody > tr > td {
+    display: block;
+    min-height: 0;
+    padding: 0;
+    border: 0;
+  }
+
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table tr.hedge-asset-row td:nth-child(1),
+  .app-shell .opportunity-view .opportunity-board > .opportunity-table:not(.opportunity-spread-table):not(.funding-hedge-table) tbody > tr > td:nth-child(1) {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table tr.hedge-asset-row td:nth-child(10),
+  .app-shell .opportunity-view .opportunity-board > .opportunity-table:not(.opportunity-spread-table):not(.funding-hedge-table) tbody > tr > td:nth-child(11) {
+    grid-column: 2;
+    grid-row: 1;
+    justify-self: end;
+    align-self: start;
+  }
+
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table tr.hedge-asset-row td:nth-child(2),
+  .app-shell .opportunity-view .opportunity-board > .opportunity-table:not(.opportunity-spread-table):not(.funding-hedge-table) tbody > tr > td:nth-child(2) {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table tr.hedge-asset-row td:nth-child(3),
+  .app-shell .opportunity-view .opportunity-board > .opportunity-table:not(.opportunity-spread-table):not(.funding-hedge-table) tbody > tr > td:nth-child(3) {
+    grid-column: 2;
+    grid-row: 2;
+  }
+
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table tr.hedge-asset-row td:nth-child(4) {
+    grid-column: 1;
+    grid-row: 3;
+  }
+
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table tr.hedge-asset-row td:nth-child(5) {
+    grid-column: 2;
+    grid-row: 3;
+    text-align: right;
+  }
+
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table tr.hedge-asset-row td:nth-child(6) {
+    grid-column: 1;
+    grid-row: 4;
+  }
+
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table tr.hedge-asset-row td:nth-child(7) {
+    grid-column: 2;
+    grid-row: 4;
+    text-align: right;
+  }
+
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table tr.hedge-asset-row td:nth-child(8),
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table tr.hedge-asset-row td:nth-child(9),
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table .hedge-detail-row {
+    display: none;
+  }
+
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table .opportunity-leg {
+    gap: 1px;
+  }
+
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table .opportunity-leg b {
+    font-size: 10px;
+  }
+
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table .opportunity-leg small {
+    font-size: 9px;
+  }
+
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table .hedge-pair b {
+    font-size: 12px;
+  }
+
+  /* Carry table: same card shell, with the APR and execute action kept visible. */
+  .app-shell .opportunity-view .opportunity-board > .opportunity-table:not(.opportunity-spread-table):not(.funding-hedge-table) tbody > tr > td:nth-child(4) {
+    grid-column: 1;
+    grid-row: 3;
+  }
+
+  .app-shell .opportunity-view .opportunity-board > .opportunity-table:not(.opportunity-spread-table):not(.funding-hedge-table) tbody > tr > td:nth-child(5) {
+    grid-column: 2;
+    grid-row: 3;
+    text-align: right;
+  }
+
+  .app-shell .opportunity-view .opportunity-board > .opportunity-table:not(.opportunity-spread-table):not(.funding-hedge-table) tbody > tr > td:nth-child(6),
+  .app-shell .opportunity-view .opportunity-board > .opportunity-table:not(.opportunity-spread-table):not(.funding-hedge-table) tbody > tr > td:nth-child(7) {
+    grid-column: 1;
+    grid-row: 4;
+  }
+
+  .app-shell .opportunity-view .opportunity-board > .opportunity-table:not(.opportunity-spread-table):not(.funding-hedge-table) tbody > tr > td:nth-child(8) {
+    grid-column: 2;
+    grid-row: 4;
+    text-align: right;
+  }
+
+  .app-shell .opportunity-view .opportunity-board > .opportunity-table:not(.opportunity-spread-table):not(.funding-hedge-table) tbody > tr > td:nth-child(9),
+  .app-shell .opportunity-view .opportunity-board > .opportunity-table:not(.opportunity-spread-table):not(.funding-hedge-table) tbody > tr > td:nth-child(10) {
+    display: none;
+  }
+
+  .app-shell .opportunity-view .opportunity-board .execute-action {
+    min-height: 30px;
+    padding-inline: 12px;
+    font-size: 11px;
+  }
+
+  .app-shell .opportunity-view .opportunity-filters {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-bottom: 8px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+  }
+
+  .app-shell .opportunity-view .opportunity-filter {
+    min-width: 0;
+  }
+
+  .app-shell .opportunity-view .opportunity-filter span {
+    font-size: 10px;
+  }
+
+  .app-shell .opportunity-view .opportunity-hint {
+    display: none;
+  }
+}
+
+/* Mobile fee comparison: rows are cards, not a clipped seven-column table. */
+@media (max-width: 640px) {
+  .app-shell .fee-results-card .fee-table-wrap {
+    max-height: none;
+    overflow: visible;
+  }
+
+  .app-shell .fee-results-card .fee-table-wrap table,
+  .app-shell .fee-results-card .fee-table-wrap tbody {
+    display: block;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .app-shell .fee-results-card .fee-table-wrap thead {
+    display: none;
+  }
+
+  .app-shell .fee-results-card .fee-table-wrap tbody > tr {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 7px 10px;
+    margin-bottom: 8px;
+    padding: 10px 11px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, .018);
+  }
+
+  .app-shell .fee-results-card .fee-table-wrap td {
+    display: block;
+    padding: 0;
+    border: 0;
+  }
+
+  .app-shell .fee-results-card .fee-table-wrap td:nth-child(1) { grid-column: 1; grid-row: 1; }
+  .app-shell .fee-results-card .fee-table-wrap td:nth-child(2) { grid-column: 2; grid-row: 1; text-align: right; }
+  .app-shell .fee-results-card .fee-table-wrap td:nth-child(3) { grid-column: 1; grid-row: 2; }
+  .app-shell .fee-results-card .fee-table-wrap td:nth-child(4) { grid-column: 2; grid-row: 2; text-align: right; }
+  .app-shell .fee-results-card .fee-table-wrap td:nth-child(5),
+  .app-shell .fee-results-card .fee-table-wrap td:nth-child(6) { display: none; }
+  .app-shell .fee-results-card .fee-table-wrap td:nth-child(7) { grid-column: 1 / -1; grid-row: 3; }
+
+  .app-shell .fee-results-card .fee-table-wrap td:nth-child(3)::before,
+  .app-shell .fee-results-card .fee-table-wrap td:nth-child(4)::before,
+  .app-shell .fee-results-card .fee-table-wrap td:nth-child(7)::before {
+    display: block;
+    color: var(--text-muted);
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: .04em;
+  }
+
+  .app-shell .fee-results-card .fee-table-wrap td:nth-child(3)::before { content: 'Maker'; }
+  .app-shell .fee-results-card .fee-table-wrap td:nth-child(4)::before { content: 'Taker'; }
+  .app-shell .fee-results-card .fee-table-wrap td:nth-child(7)::before { content: 'Round trip'; }
+
+  .app-shell .fee-results-card .fee-table-wrap td:nth-child(2) strong {
+    font-size: 11px;
+  }
+
+  .app-shell .fee-results-card .fee-table-wrap td:nth-child(2) small {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+}
+
+/* Mobile portfolio: a two-up KPI grid and a shorter chart keep the page focused. */
+@media (max-width: 640px) {
+  .app-shell .portfolio-summary {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    overflow: visible;
+    padding-bottom: 0;
+  }
+
+  .app-shell .portfolio-summary article {
+    flex: none;
+    min-width: 0;
+    min-height: 72px;
+    padding: 10px 11px;
+  }
+
+  .app-shell .portfolio-summary article:first-child {
+    grid-column: 1 / -1;
+    min-height: 80px;
+  }
+
+  .app-shell .portfolio-summary strong {
+    font-size: 18px;
+  }
+
+  .app-shell .portfolio-summary article:first-child strong {
+    font-size: 24px;
+  }
+
+  .app-shell .portfolio-summary article > em {
+    display: none;
+  }
+
+  .app-shell .portfolio-summary article > span:first-child {
+    font-size: 9px;
+  }
+
+  .app-shell .equity-card {
+    margin-top: 10px;
+  }
+
+  .app-shell .equity-card .equity-chart {
+    height: 210px;
+  }
+}
+
+/* Mobile Boros: one opportunity per row and no nested list scroller. */
+@media (max-width: 640px) {
+  .app-shell .boros-opportunities .boros-opportunity-list {
+    max-height: none;
+    overflow: visible;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .app-shell .boros-opportunity-card {
+    min-height: 0;
+  }
+
+  .app-shell .funding-mobile-more {
+    display: block;
+    width: 100%;
+    min-height: 34px;
+    margin-top: 8px;
+    border: 1px solid rgba(124, 58, 237, .45);
+    border-radius: 8px;
+    color: var(--text-primary);
+    background: rgba(124, 58, 237, .12);
+    font: inherit;
+    font-size: 11px;
+  }
+
+  .app-shell .funding-mobile-cards {
+    max-height: none;
+    overflow: visible;
+  }
+}
+
+@media (max-width: 640px) {
+  .app-shell .fee-results-card .fee-table-wrap tbody > tr {
+    align-content: start;
+    grid-auto-rows: min-content;
+    gap: 3px 10px;
+    padding: 8px 10px;
+  }
+
+  .app-shell .fee-results-card .fee-table-wrap td {
+    min-height: 0;
+    height: auto;
+    line-height: 1.25;
+  }
+
+  .app-shell .fee-results-card .fee-table-wrap td:nth-child(7) {
+    margin-top: 3px;
+    padding-top: 4px;
+    border-top: 1px solid var(--line);
+  }
+
+  .app-shell .fee-results-card .fee-table-wrap:not(.mobile-expanded) tbody > tr:nth-child(n+7) {
+    display: none;
+  }
+
+  .app-shell .fee-mobile-more {
+    display: block;
+    width: 100%;
+    min-height: 34px;
+    border: 1px solid rgba(124, 58, 237, .45);
+    border-radius: 8px;
+    color: var(--text-primary);
+    background: rgba(124, 58, 237, .12);
+    font: inherit;
+    font-size: 11px;
+  }
+}
+
+@media (max-width: 640px) {
+  .app-shell .opportunity-view .opportunity-table {
+    max-height: none;
+    overflow: visible;
+  }
+}
+
+
+@media (max-width: 640px) {
+  .app-shell .strategy-view .view-heading.strategy-heading {
+    margin-bottom: 6px;
+  }
+
+  .app-shell .strategy-view .strategy-heading h1 {
+    font-size: 24px;
+  }
+
+  .app-shell .strategy-view .strategy-market-panel .strategy-panel-head {
+    min-height: 40px;
+    padding: 5px 9px;
+  }
+
+  .app-shell .strategy-view .strategy-funding-history .funding-history-chart {
+    height: 60px;
+  }
+
+  .app-shell .strategy-view .position-funding-summary > div,
+  .app-shell .strategy-view .position-funding-summary > div:first-child,
+  .app-shell .strategy-view .position-funding-summary > div:last-child {
+    min-height: 42px;
+    padding: 4px 5px;
+  }
+
+  .app-shell .strategy-view .strategy-launch .launch-summary.review-grid {
+    gap: 0;
+  }
+
+  .app-shell .strategy-view .strategy-launch .launch-summary.review-grid > div {
+    min-height: 26px;
+    padding: 3px 5px;
+  }
+
+  .app-shell .strategy-view .strategy-launch .background-strategy-note {
+    display: none;
+  }
+
+  .app-shell .strategy-view .launch-summary.review-grid dd {
+    overflow-wrap: anywhere;
+  }
+}
+
+@media (max-width: 640px) {
+  .app-shell .opportunity-view .funding-hedge-table tr.hedge-asset-row.mobile-limited {
+    display: none;
+  }
+
+  .app-shell .opportunity-view .opportunity-mobile-more {
+    display: block;
+    width: 100%;
+    min-height: 34px;
+    margin-top: 8px;
+    border: 1px solid rgba(124, 58, 237, .45);
+    border-radius: 8px;
+    color: var(--text-primary);
+    background: rgba(124, 58, 237, .12);
+    font: inherit;
+    font-size: 11px;
+  }
+}
+
+@media (max-width: 640px) {
+  .app-shell .boros-opportunity-list > button.mobile-limited {
+    display: none;
+  }
+
+  .app-shell .boros-opportunity-list > .boros-mobile-more {
+    display: block;
+    grid-column: 1 / -1;
+    min-height: 34px;
+    margin: 0;
+    border: 1px solid rgba(124, 58, 237, .45);
+    border-radius: 0 0 10px 10px;
+    color: var(--text-primary);
+    background: rgba(124, 58, 237, .12);
+    font: inherit;
+    font-size: 11px;
+  }
+}
+
+@media (min-width: 641px) {
+  .app-shell :is(.fee-mobile-more, .opportunity-mobile-more, .boros-mobile-more) {
+    display: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .app-shell .opportunity-view .funding-hedge-table tr.hedge-asset-row td[data-label]::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 2px;
+    color: var(--text-subtle);
+    font-size: 8px;
+    font-weight: 600;
+    letter-spacing: .02em;
+    text-align: inherit;
+  }
+
+  .app-shell .opportunity-view .funding-hedge-table tr.hedge-asset-row {
+    gap: 4px 10px;
+    padding: 8px 10px;
+  }
+}
+
+/* Shared mobile opportunity cards (funding ranking, spread, spread-quality). */
+.opportunity-mobile-cards {
+  display: none;
+}
+
+@media (max-width: 640px) {
+  .app-shell .funding-ranking-wrap .funding-ranking-table,
+  .app-shell .opportunity-view .opportunity-spread-table,
+  .app-shell .opportunity-view .opportunity-spread-quality-table {
+    display: none;
+  }
+
+  .app-shell .opportunity-mobile-cards {
+    display: grid;
+    gap: 8px;
+    margin-top: 10px;
+  }
+
+  .app-shell .opportunity-mobile-card {
+    display: grid;
+    gap: 8px;
+    padding: 11px 12px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, .018);
+  }
+
+  .app-shell .om-card-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
+  .app-shell .om-asset {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .app-shell .om-asset > i {
+    display: grid;
+    place-items: center;
+    flex: 0 0 26px;
+    width: 26px;
+    height: 26px;
+    border: 1px solid rgba(124, 58, 237, .4);
+    border-radius: 50%;
+    color: #d9c9ff;
+    background: rgba(124, 58, 237, .14);
+    font-size: 11px;
+    font-style: normal;
+    font-weight: 800;
+  }
+
+  .app-shell .om-asset > span {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .app-shell .om-asset strong {
+    color: var(--text-primary);
+    font-size: 13px;
+    line-height: 1.2;
+  }
+
+  .app-shell .om-asset small {
+    overflow: hidden;
+    color: var(--text-subtle);
+    font-size: 9px;
+    line-height: 1.3;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .app-shell .om-card-head > strong {
+    flex: 0 0 auto;
+    font-size: 15px;
+    text-align: right;
+  }
+
+  .app-shell .om-card-head .row-action.execute-action {
+    min-width: 64px;
+    height: 28px;
+    padding: 0 10px;
+    font-size: 10px;
+  }
+
+  .app-shell .om-primary {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 7px 8px;
+    border-radius: 7px;
+    background: rgba(124, 58, 237, .08);
+  }
+
+  .app-shell .om-primary > strong {
+    font-size: 18px;
+    line-height: 1;
+  }
+
+  .app-shell .om-primary > span {
+    color: var(--text-subtle);
+    font-size: 9px;
+    text-align: right;
+  }
+
+  .app-shell .om-primary em {
+    color: var(--text-subtle);
+    font-style: normal;
+  }
+
+  .app-shell .om-legs {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 6px;
+  }
+
+  .app-shell .om-legs > div {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    padding: 6px 7px;
+    border: 1px solid var(--line-soft);
+    border-radius: 6px;
+  }
+
+  .app-shell .om-legs span,
+  .app-shell .om-legs small {
+    overflow: hidden;
+    color: var(--text-subtle);
+    font-size: 8px;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .app-shell .om-legs strong {
+    font-size: 11px;
+    line-height: 1.2;
+  }
+
+  .app-shell .om-metrics {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 5px 10px;
+  }
+
+  .app-shell .om-metrics > div {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+  }
+
+  .app-shell .om-metrics span {
+    color: var(--text-subtle);
+    font-size: 8px;
+  }
+
+  .app-shell .om-metrics strong {
+    overflow: hidden;
+    color: var(--text-primary);
+    font-size: 10px;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .app-shell .om-card-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding-top: 6px;
+    border-top: 1px solid var(--line-soft);
+    color: var(--text-subtle);
+    font-size: 8px;
+  }
+
+  .app-shell .funding-ranking-more,
+  .app-shell .spread-mobile-cards .opportunity-mobile-more,
+  .app-shell .quality-mobile-cards .opportunity-mobile-more {
+    display: block;
+  }
+
+  .app-shell .om-asset .asset-class-badge,
+  .app-shell .om-asset .quality-class-badge {
+    flex: 0 0 auto;
+    font-size: 8px;
+  }
+}
+
+@media (max-width: 640px) {
+  .app-shell .opportunity-view .opportunity-filter-groups {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .app-shell .opportunity-view .opportunity-filter-groups .exchange-filter,
+  .app-shell .opportunity-view .opportunity-filter-groups .market-filter {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    overflow: visible;
+  }
+
+  .app-shell .opportunity-view .opportunity-filter-groups .exchange-filter > span,
+  .app-shell .opportunity-view .opportunity-filter-groups .market-filter > span,
+  .app-shell .opportunity-view .opportunity-filter-groups small {
+    flex: 0 0 100%;
+    color: var(--text-subtle);
+    font-size: 10px;
+  }
+
+  .app-shell .opportunity-view .opportunity-filter-groups button {
+    flex: 0 0 auto;
+    min-height: 30px;
+    padding: 0 9px;
+    font-size: 10px;
+  }
+
+  .app-shell .opportunity-view .funding-hedge-table tr.hedge-asset-row td:nth-child(4),
+  .app-shell .opportunity-view .funding-hedge-table tr.hedge-asset-row td:nth-child(5) {
+    padding-top: 5px;
+    border-top: 1px solid var(--line-soft);
+  }
+}
+
+/* The expand chevron is absolutely positioned inside the first cell; keep the
+ * contract name clear of it so long symbols are never clipped on the left. */
+.app-shell .alternate-view .positions-table .aggregate-row td:first-child {
+  padding-left: 44px;
+}
+
+@media (max-width: 640px) {
+  /* Keep the holdings tab reachable on phones: the empty running-state panel
+   * still contains the positions table when the account has open positions. */
+  .app-shell .strategy-view .running-strategies:has(.no-strategies) {
+    display: block;
+  }
+}
+
+/* Compound fields draw the only border; the native input is transparent inside it. */
+.app-shell .compact-fields label > div > input,
+.app-shell .strategy-asset-search-control input,
+.app-shell .boros-fields label > div input,
+.app-shell .strategy-field label > div input {
+  height: 100%;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+/* Mobile opportunity cards: one compact summary, every secondary field stays behind Details. */
+.app-shell .om-details {
+  border-top: 1px solid var(--line-soft);
+  padding-top: 6px;
+}
+
+.app-shell .om-details > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 26px;
+  color: #c4b5fd;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 650;
+  list-style: none;
+}
+
+.app-shell .om-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.app-shell .om-details > summary::after {
+  content: '▾';
+  color: var(--text-subtle);
+  font-size: 10px;
+  transition: transform .15s ease;
+}
+
+.app-shell .om-details[open] > summary::after {
+  transform: rotate(180deg);
+}
+
+.app-shell .om-details-open {
+  display: none;
+}
+
+.app-shell .om-details[open] .om-details-closed {
+  display: none;
+}
+
+.app-shell .om-details[open] .om-details-open {
+  display: inline;
+}
+
+.app-shell .om-details > .om-legs,
+.app-shell .om-details > .om-metrics {
+  margin-top: 5px;
+}
+
+.app-shell .opportunity-view .om-asset strong {
+  font-size: 14px;
+}
+
+.app-shell .opportunity-view .om-asset small,
+.app-shell .opportunity-view .om-primary > span,
+.app-shell .opportunity-view .om-legs span,
+.app-shell .opportunity-view .om-legs small,
+.app-shell .opportunity-view .om-metrics span {
+  font-size: 10px;
+}
+
+.app-shell .opportunity-view .om-legs strong,
+.app-shell .opportunity-view .om-metrics strong {
+  font-size: 11px;
+}
+
+/* Strategy history charts must stay readable: never squeeze the 24h/30d series into a strip. */
+.app-shell .strategy-view .strategy-funding-history .funding-history-chart {
+  height: 230px;
+}
+
+.app-shell .strategy-view .strategy-funding-history .funding-detail-legend {
+  display: flex;
+  min-height: 30px;
+  padding: 4px 12px 8px;
+  font-size: 10px;
+}
+
+.app-shell .strategy-view .strategy-funding-history .premium-history-head h2 {
+  font-size: 14px;
+}
+
+@media (max-width: 640px) {
+  .app-shell .strategy-view .strategy-funding-history .funding-history-chart {
+    height: 190px;
+  }
+
+  .app-shell .strategy-view .strategy-funding-history .premium-history-head h2 {
+    font-size: 12px;
+  }
+}
+
+@media (max-width: 380px) {
+  .app-shell .strategy-view .strategy-funding-history .funding-history-chart {
+    height: 170px;
+  }
+}
+
+.app-shell .quality-coverage {
+  color: #c4b5fd;
+  font-size: 10px;
+}
+
+.app-shell .funding-search input,
+.app-shell .transfer-input-wrap input,
+.app-shell .fee-notional-input input {
+  height: 100%;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.app-shell .om-combinations-toggle {
+  width: 100%;
+  min-height: 30px;
+  margin-top: 8px;
+  border: 1px solid rgba(139, 92, 246, .38);
+  border-radius: 6px;
+  background: rgba(124, 58, 237, .10);
+  color: #ddd6fe;
+  font-size: 10px;
+  letter-spacing: .02em;
+}
+
+.app-shell .om-combinations {
+  margin-top: 6px;
+  border-top: 1px solid rgba(139, 92, 246, .22);
+}
+
+.app-shell .om-combination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 28px;
+  border-bottom: 1px solid rgba(255, 255, 255, .06);
+  font-size: 10px;
+  color: #cbd5e1;
+}
+
+.app-shell .om-combination span {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.app-shell .om-combination b {
+  color: #f8fafc;
+  font-weight: 600;
+}
+
+.app-shell .om-combination .best-tag {
+  margin-left: 2px;
+}
+
+.hedge-mobile-combination-row {
+  display: none;
+}
+
+@media (max-width: 640px) {
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table .hedge-mobile-combination-row {
+    display: table-row;
+  }
+
+  .hedge-mobile-combinations {
+    display: grid;
+    gap: 4px;
+    padding: 6px 8px 10px;
+  }
+
+  .hedge-mobile-combination {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 2px 10px;
+    padding: 6px 8px;
+    border: 1px solid rgba(255, 255, 255, .07);
+    border-radius: 5px;
+  }
+
+  .hedge-mobile-combination .hmc-path {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    font-size: 10px;
+  }
+
+  .hedge-mobile-combination .hmc-path b {
+    color: #f8fafc;
+  }
+
+  .hedge-mobile-combination strong {
+    font-size: 11px;
+  }
+
+  .hedge-mobile-combination small {
+    grid-column: 1 / -1;
+    color: #94a3b8;
+    font-size: 9px;
+  }
+
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table .spread-toggle {
+    display: inline-grid;
+  }
+}
+
+.app-shell .hedge-toggle-label {
+  display: none;
+}
+
+@media (max-width: 640px) {
+  .app-shell .opportunity-view .opportunity-board .funding-hedge-table tr.hedge-asset-row .spread-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    min-height: 28px;
+    margin-bottom: 5px;
+    padding: 0 8px;
+    border: 1px solid rgba(139, 92, 246, .38);
+    border-radius: 5px;
+    background: rgba(124, 58, 237, .10);
+    color: #ddd6fe;
+    font-size: 10px;
+  }
+
+  .app-shell .hedge-toggle-label {
+    display: inline;
+  }
+}
+
+.funding-hedge-cards {
+  display: none;
+}
+
+@media (max-width: 640px) {
+  .app-shell .funding-hedge-wrap > .opportunity-table,
+  .app-shell .funding-hedge-wrap > .funding-hedge-table {
+    display: none;
+  }
+
+  .app-shell .funding-hedge-cards {
+    display: grid;
+  }
+
+  .app-shell .funding-hedge-wrap > .opportunity-mobile-more {
+    display: block;
+  }
+
+  .app-shell .funding-hedge-wrap > .opportunity-mobile-desktop-more {
+    display: none;
+  }
+
+  .app-shell .om-direction {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .app-shell .om-direction small {
+    overflow: hidden;
+    color: var(--text-subtle);
+    font-size: 9px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .app-shell .om-leg-venue {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+  }
+}
+
+@media (max-width: 640px) {
+  .app-shell .funding-hedge-cards .om-legs small {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    line-height: 1.2;
+  }
 }

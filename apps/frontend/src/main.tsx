@@ -3,6 +3,8 @@ import { createRoot } from 'react-dom/client';
 import App from './App.js';
 import './styles.css';
 import './redesign.css';
+import './mobile-tables.css';
+import './mobile-flows.css';
 
 interface ErrorBoundaryState {
   failed: boolean;

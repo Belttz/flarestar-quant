@@ -64,6 +64,7 @@ export function FundingHedgeTable({ rows, history24h, nowMs, onExecute, superCla
 }) {
   const { t } = useLanguage();
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [mobileExpanded, setMobileExpanded] = useState(false);
   const supported = (row: FundingHedgeRow): boolean => executableSymbols === undefined || executableSymbols === null
     || row.legs.every((leg) => executableSymbols.has(leg.symbol));
   // One parent row per asset, best *executable* net funding first. Binance BLUR has public funding
@@ -81,6 +82,57 @@ export function FundingHedgeTable({ rows, history24h, nowMs, onExecute, superCla
       return { asset, best: executable[0] ?? pairs[0], pairs, hasExecutable: executable.length > 0 };
     });
   }, [rows, executableSymbols]);
+  const mobileCards = <div className="opportunity-mobile-cards funding-hedge-cards">
+    {groups.map((group) => {
+      const best = group.best;
+      const open = expanded === group.asset;
+      const fundingLeg = hedgeFundingLeg(best);
+      const net24h = hedgeNet24hPercent(best, history24h);
+      return <article key={`${group.asset}:hedge-card`} className={`opportunity-mobile-card${group.hasExecutable ? '' : ' not-executable'}`}>
+        <header className="om-card-head">
+          <span className="om-asset"><i aria-hidden="true">{assetIcon(group.asset)}</i><span>
+            <strong>{group.asset}</strong>
+            {assetName(group.asset) !== group.asset && <small>{assetName(group.asset)}</small>}
+          </span><AssetClassBadge superClass={superClassFor?.(group.asset) ?? 'CRYPTO'} /></span>
+          <button type="button" className="row-action execute-action" disabled={!group.hasExecutable} onClick={() => onExecute(best)}>
+            {group.hasExecutable ? t('Execute') : t('Not supported')}
+          </button>
+        </header>
+        <div className="om-primary"><strong className="positive">{formatFundingPercent(best.net8hPercent)}</strong>
+          <span>{t('Net funding')} · {t('Per 8h')}</span></div>
+        <div className="om-legs">
+          {best.legs.map((leg) => <div key={`${best.key}:${leg.venue}:${leg.symbol}`} className="om-leg">
+            <span className="om-leg-venue"><VenueTag code={leg.venue} /></span>
+            <small className="mono" title={leg.symbol}>{leg.symbol === '' ? '—' : leg.symbol}</small>
+            <em className={leg.rate8hPercent !== null && leg.rate8hPercent < 0 ? 'negative' : 'positive'}>{formatFundingPercent(leg.rate8hPercent)}</em>
+          </div>)}
+        </div>
+        <div className="om-metrics">
+          <div><span>{t('Annualized')}</span><strong className="positive">{formatFundingPercent(best.aprPercent, 2)}</strong></div>
+          <div><span>{t('Countdown')}</span><strong>{formatFundingCountdown(fundingCountdownMs(fundingLeg.nextFundingAt, nowMs))}</strong></div>
+          <div><span>{t('Past 24h')}</span><strong className={net24h === null ? 'funding-missing' : net24h >= 0 ? 'positive' : 'negative'}>{formatFundingPercent(net24h)}</strong></div>
+          <div><span>APY</span><strong className="positive">{net24h === null ? '—' : formatFundingPercent(fundingApyPercent(net24h, 365), 2)}</strong></div>
+        </div>
+        <div className="om-direction">
+          <span className="direction-tag positive">{t('Short')} {fundingVenueName(best.short.venue)}</span>
+          <small>{t('Long')} {fundingVenueName(best.long.venue)}</small>
+        </div>
+        <button type="button" className="om-combinations-toggle" aria-expanded={open}
+          onClick={() => setExpanded(open ? null : group.asset)}>
+          {t(open ? 'Collapse combinations' : 'Expand combinations')} · {group.pairs.length}
+        </button>
+        {open && <div className="om-combinations">
+          {group.pairs.map((pair, index) => <div key={`${pair.key}:mobile`} className="om-combination">
+            <span><b>{fundingVenueName(pair.short.venue)}</b> <em aria-hidden="true">→</em> <b>{fundingVenueName(pair.long.venue)}</b>
+              {index === 0 && <em className="best-tag">{t('Best')}</em>}</span>
+            <strong className="positive">{formatFundingPercent(pair.net8hPercent)}</strong>
+            <small>{pair.net24hPercent === null ? '—' : formatFundingPercent(fundingApyPercent(pair.net24hPercent, 365), 2)} APY</small>
+          </div>)}
+        </div>}
+      </article>;
+    })}
+  </div>;
+
   const rowCells = (row: FundingHedgeRow, compact: boolean) => {
     const fundingLeg = hedgeFundingLeg(row);
     const net24h = hedgeNet24hPercent(row, history24h);
@@ -106,7 +158,9 @@ export function FundingHedgeTable({ rows, history24h, nowMs, onExecute, superCla
       </button></td>
     </tr>;
   };
-  return <div className="opportunity-table funding-hedge-table table-wrap"><table>
+  return <div className="funding-hedge-wrap">
+    {mobileCards}
+    <div className="opportunity-table funding-hedge-table table-wrap"><table>
     <thead>
       <tr>
         <th>{t('Exchange pair')}</th>
@@ -121,23 +175,26 @@ export function FundingHedgeTable({ rows, history24h, nowMs, onExecute, superCla
         <th />
       </tr>
     </thead>
-    <tbody>{groups.map((group) => {
+    <tbody>{groups.map((group, groupIndex) => {
       const open = expanded === group.asset;
+      const mobileLimited = groupIndex >= 3 && !mobileExpanded;
       return <Fragment key={group.asset}>
-        <tr className={`hedge-asset-row${open ? ' open' : ''}`}>
+        <tr className={`hedge-asset-row${open ? ' open' : ''}${mobileLimited ? ' mobile-limited' : ''}`}>
           <td>
             <button type="button" className="row-action spread-toggle" aria-expanded={open}
               aria-label={t(open ? 'Collapse combinations' : 'Expand combinations')}
-              onClick={() => setExpanded(open ? null : group.asset)}>{open ? '▾' : '▸'}</button>
+              onClick={() => setExpanded(open ? null : group.asset)}>
+              {open ? '▾' : '▸'}<span className="hedge-toggle-label">{t(open ? 'Collapse combinations' : 'Expand combinations')} · {group.pairs.length}</span>
+            </button>
             <span className="opportunity-asset"><i aria-hidden="true">{assetIcon(group.asset)}</i>
-              <strong>{group.asset}</strong><small>{assetName(group.asset)}</small></span>
+              <strong>{group.asset}</strong>{assetName(group.asset) !== group.asset && <small>{assetName(group.asset)}</small>}</span>
             <AssetClassBadge superClass={superClassFor?.(group.asset) ?? 'CRYPTO'} />
           </td>
           <FundingLegCell leg={group.best.legs[0]} />
           <FundingLegCell leg={group.best.legs[1]} />
-          <td><strong className="positive">{formatFundingPercent(group.best.net8hPercent)}</strong>
+          <td data-label={t('Net funding')}><strong className="positive">{formatFundingPercent(group.best.net8hPercent)}</strong>
             <small className="funding-period-label">{t('Per 8h')}</small></td>
-          <td className="mono"><strong className="positive">{formatFundingPercent(group.best.aprPercent, 2)}</strong></td>
+          <td className="mono" data-label={t('Annualized')}><strong className="positive">{formatFundingPercent(group.best.aprPercent, 2)}</strong></td>
           <td className="mono">{formatFundingCountdown(fundingCountdownMs(hedgeFundingLeg(group.best).nextFundingAt, nowMs))}</td>
           <td><span className="direction-tag positive">{t('Short')} {fundingVenueName(group.best.short.venue)}</span>
             <small>{t('Long')} {fundingVenueName(group.best.long.venue)}</small></td>
@@ -148,6 +205,16 @@ export function FundingHedgeTable({ rows, history24h, nowMs, onExecute, superCla
             {group.hasExecutable ? t('Execute') : t('Not supported')}
           </button></td>
         </tr>
+        {open && <tr className="hedge-mobile-combination-row"><td colSpan={10}>
+          <div className="hedge-mobile-combinations">
+            {group.pairs.map((pair, index) => <div key={`${pair.key}:mobile`} className="hedge-mobile-combination">
+              <span className="hmc-path"><b>{fundingVenueName(pair.short.venue)}</b> <em aria-hidden="true">→</em> <b>{fundingVenueName(pair.long.venue)}</b>
+                {index === 0 && <em className="best-tag">{t('Best')}</em>}</span>
+              <strong className="positive">{formatFundingPercent(pair.net8hPercent)}</strong>
+              <small>{pair.net24hPercent === null ? '—' : formatFundingPercent(fundingApyPercent(pair.net24hPercent, 365), 2)} APY</small>
+            </div>)}
+          </div>
+        </td></tr>}
         {open && group.pairs.map((row) => <tr key={`${row.key}:detail`} className="hedge-detail-row">
           <td colSpan={10}>
             <table className="hedge-combination-table"><thead><tr>
@@ -159,7 +226,11 @@ export function FundingHedgeTable({ rows, history24h, nowMs, onExecute, superCla
         </tr>)}
       </Fragment>;
     })}</tbody>
-  </table></div>;
+  </table>{groups.length > 3 && <button type="button" className="opportunity-mobile-desktop-more" onClick={() => setMobileExpanded((current) => !current)}>
+    {mobileExpanded ? t('Show fewer') : `${t('Show more')} · 3/${groups.length}`}
+  </button>}
+    </div>
+  </div>;
 }
 
 /**
@@ -179,6 +250,7 @@ export function FundingRankingTable({ rows, venueCode, nowMs, locale, assetVenue
 }) {
   const { t } = useLanguage();
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [mobileVisible, setMobileVisible] = useState(5);
   const settlementText = (iso: string | null) => {
     if (iso === null) return '—';
     const parsed = Date.parse(iso);
@@ -192,7 +264,30 @@ export function FundingRankingTable({ rows, venueCode, nowMs, locale, assetVenue
     return Number.isFinite(parsed) ? new Date(parsed).toLocaleTimeString(locale, { hour12: false }) : '—';
   };
   const moneyText = (value: number | null) => value === null ? '—' : `$${Math.round(value).toLocaleString(locale)}`;
-  return <div className="opportunity-table funding-ranking-table table-wrap"><table>
+  const mobileCards = <div className="opportunity-mobile-cards funding-ranking-cards">
+    {rows.slice(0, mobileVisible).map((row, index) => <article key={`${row.symbol}:${index}:card`} className="opportunity-mobile-card">
+      <header className="om-card-head">
+        <span className="om-asset"><i aria-hidden="true">{assetIcon(row.asset)}</i><span>
+          <strong>{row.asset}</strong>
+          {assetName(row.asset) !== row.asset && <small>{assetName(row.asset)}</small>}
+        </span><AssetClassBadge superClass={superClassFor?.(row.asset) ?? 'CRYPTO'} /></span>
+        <strong className={row.ratePercent >= 0 ? 'positive' : 'negative'}>{formatFundingPercent(row.ratePercent)}</strong>
+      </header>
+      <div className="om-metrics">
+        <div><span>{t('Annualized')}</span><strong>{row.intervalHours ? formatFundingPercent(row.absRatePercent * (24 / row.intervalHours) * 365, 2) : '—'}</strong></div>
+        <div><span>{t('Time to settlement')}</span><strong>{formatFundingCountdown(fundingCountdownMs(row.nextFundingAt, nowMs))}</strong></div>
+        <div><span>{t('Open interest')}</span><strong>{moneyText(row.openInterestValue)}</strong></div>
+        <div><span>{t('Next settlement')}</span><strong>{settlementText(row.nextFundingAt)}</strong></div>
+      </div>
+      <footer className="om-card-foot"><span>{fundingVenueName(venueCode)} · {formatFundingInterval(row.intervalHours) ?? '—'}</span><span>{t('Updated')} {updatedText(row.updatedAt)}</span></footer>
+    </article>)}
+    {rows.length > mobileVisible && <button type="button" className="opportunity-mobile-more funding-ranking-more" onClick={() => setMobileVisible((current) => current + 5)}>
+      {t('Show more')} · {mobileVisible}/{rows.length}
+    </button>}
+  </div>;
+  return <div className="funding-ranking-wrap">
+    {mobileCards}
+    <div className="opportunity-table funding-ranking-table table-wrap"><table>
     <thead><tr>
       <th className="hedge-index">#</th>
       <th>{t('Asset')}</th>
@@ -265,5 +360,6 @@ export function FundingRankingTable({ rows, venueCode, nowMs, locale, assetVenue
       </tr>;
       return [summary, detail];
     })}</tbody>
-  </table></div>;
+  </table></div>
+  </div>;
 }

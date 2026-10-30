@@ -1344,6 +1344,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       coverage: (pairs, fromMs) => spreadSampleCoverage(database, pairs, fromMs),
       series: (leftSymbol, rightSymbol, fromMs) => readSpreadSeries(database, leftSymbol, rightSymbol, fromMs),
     },
+  }, {
+    // Scan more executable combinations than the sampler needs: the quality board is a
+    // read-only ranking, and a 50-candidate cap only surfaced the handful with candle history.
+    candidateLimit: 100,
   });
 
   // Second track of the dual-source quality board: persist the executable spread of every

@@ -1,0 +1,589 @@
+/* Mobile strategy/trade flow overrides. Loaded after redesign.css.
+ *
+ * This file only adds the phone-specific flow chrome: a fixed primary-action bar and a bottom
+ * sheet each for the strategy setup and the trade order ticket. Every rule lives either behind
+ * `@media (max-width: 640px)` or is a bare `display: none` for the new elements, so the desktop
+ * (>640px) markup and layout are untouched. The existing centre 交易 sheet, confirm dialogs and
+ * trading-mode locks are not redefined here.
+ */
+
+/* ------------------------------------------------------------ invisible on desktop */
+
+.mobile-order-bar,
+.mobile-strategy-bar,
+.mobile-ticket-sheet-head,
+.mobile-ticket-backdrop,
+.mobile-setup-sheet-head,
+.mobile-setup-backdrop {
+  display: none;
+}
+
+@media (max-width: 640px) {
+  /* ----------------------------------------------------------- trade: quick entry bar */
+
+  .app-shell.trading-page {
+    /* Leave room for the fixed order bar above the tabbar plus the tabbar itself. */
+    padding-bottom: calc(146px + env(safe-area-inset-bottom));
+  }
+
+  .app-shell .mobile-order-bar {
+    position: fixed;
+    z-index: 58;
+    right: 0;
+    bottom: calc(66px + env(safe-area-inset-bottom));
+    left: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border-top: 1px solid var(--line);
+    background: linear-gradient(180deg, rgba(13, 18, 28, .96), #0a0e15 78%);
+    backdrop-filter: blur(14px);
+    box-shadow: 0 -12px 30px rgba(0, 0, 0, .45);
+  }
+
+  .app-shell .mobile-order-bar-info {
+    min-width: 0;
+    display: grid;
+    flex: 1 1 auto;
+    gap: 1px;
+    line-height: 1.2;
+  }
+
+  .app-shell .mobile-order-bar-info strong {
+    overflow: hidden;
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 700;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .app-shell .mobile-order-bar-info small {
+    overflow: hidden;
+    color: var(--muted);
+    font-size: 9px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .app-shell .mobile-order-bar-buy,
+  .app-shell .mobile-order-bar-sell {
+    min-width: 88px;
+    min-height: 44px;
+    padding: 0 12px;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    font-size: 12px;
+    font-weight: 800;
+    letter-spacing: .01em;
+    white-space: nowrap;
+  }
+
+  .app-shell .mobile-order-bar-buy {
+    border-color: rgba(24, 214, 173, .38);
+    color: #061210;
+    background: linear-gradient(135deg, #22e2b9, #12b295);
+  }
+
+  .app-shell .mobile-order-bar-sell {
+    border-color: rgba(240, 91, 114, .4);
+    color: #140306;
+    background: linear-gradient(135deg, #ff7d92, #e1435c);
+  }
+
+  .app-shell .mobile-order-bar-buy:active,
+  .app-shell .mobile-order-bar-sell:active {
+    transform: translateY(1px);
+    filter: brightness(.94);
+  }
+
+  /* ------------------------------------------- trade: order ticket as a bottom sheet */
+
+  .app-shell.trading-page .order-panel {
+    position: fixed;
+    z-index: 115;
+    top: auto;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    max-height: calc(100dvh - 56px);
+    margin: 0;
+    padding: 0 0 calc(14px + env(safe-area-inset-bottom));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    border: 1px solid var(--brand-line, #2a2b47);
+    border-bottom: 0;
+    border-radius: 18px 18px 0 0;
+    background: linear-gradient(180deg, #15131f 0%, #0b0b13 100%);
+    box-shadow: 0 -24px 60px rgba(0, 0, 0, .62);
+    transform: translateY(104%);
+    visibility: hidden;
+    transition: transform .24s cubic-bezier(.2, .8, .2, 1), visibility .24s;
+  }
+
+  .app-shell.trading-page .order-panel.mobile-ticket-open {
+    transform: translateY(0);
+    visibility: visible;
+  }
+
+  .app-shell .mobile-ticket-sheet-head {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 15px 14px 10px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .app-shell .mobile-ticket-sheet-handle {
+    position: absolute;
+    top: 6px;
+    left: 50%;
+    width: 38px;
+    height: 4px;
+    border-radius: 999px;
+    background: rgba(167, 139, 250, .34);
+    transform: translateX(-50%);
+  }
+
+  .app-shell .mobile-ticket-sheet-head > div {
+    min-width: 0;
+    display: grid;
+    gap: 1px;
+  }
+
+  .app-shell .mobile-ticket-sheet-head strong {
+    color: #f2efff;
+    font-size: 14px;
+    font-weight: 700;
+  }
+
+  .app-shell .mobile-ticket-sheet-head small {
+    overflow: hidden;
+    color: var(--muted);
+    font-size: 10px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .app-shell .mobile-ticket-sheet-close {
+    width: 30px;
+    height: 30px;
+    flex: 0 0 auto;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    color: var(--muted);
+    background: rgba(255, 255, 255, .035);
+    font-size: 17px;
+    line-height: 1;
+  }
+
+  .app-shell.trading-page .order-panel .market-type-tabs {
+    margin: 10px 14px 2px;
+  }
+
+  .app-shell.trading-page .order-panel .trade-side-tabs {
+    height: 54px;
+    padding: 8px 14px 0;
+  }
+
+  .app-shell.trading-page .order-panel .trade-side-tabs button {
+    font-size: 14px;
+    font-weight: 750;
+  }
+
+  .app-shell.trading-page .order-panel .ticket-toolbar {
+    height: 46px;
+    padding: 0 14px;
+  }
+
+  .app-shell.trading-page .order-panel .order-type-tabs button {
+    min-height: 30px;
+    padding: 0 11px;
+    font-size: 11px;
+  }
+
+  .app-shell.trading-page .order-panel .trade-input {
+    height: 48px;
+    margin: 0 14px 10px;
+    grid-template-columns: 54px minmax(0, 1fr) 48px;
+    padding: 0 11px;
+    font-size: 14px;
+  }
+
+  .app-shell.trading-page .order-panel .trade-input input {
+    font-size: 15px;
+  }
+
+  .app-shell.trading-page .order-panel .allocation {
+    padding: 0 14px 10px;
+  }
+
+  .app-shell.trading-page .order-panel .submit-order {
+    width: calc(100% - 28px);
+    height: 52px;
+    margin: 4px 14px 0;
+    font-size: 16px;
+    font-weight: 800;
+  }
+
+  .app-shell.trading-page .order-panel .order-summary {
+    margin: 12px 14px 0;
+  }
+
+  /* The desktop leverage popover would overflow a 360px sheet; pin it to the viewport bottom. */
+  .app-shell.trading-page .order-panel .leverage-popover {
+    position: fixed;
+    z-index: 140;
+    top: auto;
+    right: 10px;
+    bottom: calc(10px + env(safe-area-inset-bottom));
+    left: 10px;
+    width: auto;
+    max-height: 72dvh;
+    overflow-y: auto;
+    border-radius: 14px;
+    box-shadow: 0 -18px 48px rgba(0, 0, 0, .6);
+  }
+
+  .app-shell .mobile-ticket-backdrop {
+    position: fixed;
+    z-index: 100;
+    inset: 0;
+    display: none;
+    background: rgba(3, 3, 8, .7);
+    backdrop-filter: blur(5px);
+  }
+
+  .app-shell .mobile-ticket-backdrop.open {
+    display: block;
+  }
+
+  /* The success/error toast must stay readable above the sheet and both action bars. */
+  .app-shell .toast {
+    z-index: 150;
+    right: 12px;
+    bottom: calc(140px + env(safe-area-inset-bottom));
+    left: 12px;
+    min-width: 0;
+  }
+
+  /* ------------------------------------------------- strategy: phone setup + launch flow */
+
+  .app-shell .alternate-view.strategy-view {
+    /* The fixed action bar sits above the holdings panel; keep the tail of the page reachable. */
+    padding-bottom: calc(160px + env(safe-area-inset-bottom));
+  }
+
+  .app-shell .strategy-view .strategy-sidebar.mobile-config-sheet {
+    position: fixed;
+    z-index: 120;
+    top: auto;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    max-height: calc(100dvh - 48px);
+    display: block;
+    margin: 0;
+    padding: 0 10px calc(14px + env(safe-area-inset-bottom));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    border: 1px solid var(--brand-line, #2a2b47);
+    border-bottom: 0;
+    border-radius: 18px 18px 0 0;
+    background: linear-gradient(180deg, #15131f 0%, #0b0b13 100%);
+    box-shadow: 0 -24px 60px rgba(0, 0, 0, .62);
+    transform: translateY(104%);
+    visibility: hidden;
+    transition: transform .24s cubic-bezier(.2, .8, .2, 1), visibility .24s;
+  }
+
+  .app-shell .strategy-view .strategy-sidebar.mobile-config-sheet.mobile-setup-open {
+    transform: translateY(0);
+    visibility: visible;
+  }
+
+  .app-shell .strategy-view .mobile-config-sheet > .strategy-rules,
+  .app-shell .strategy-view .mobile-config-sheet > .strategy-launch {
+    width: 100%;
+    margin: 0 0 8px;
+    border-radius: 12px;
+  }
+
+  /* The sheet header already names the panel; drop the duplicated desktop panel title. */
+  .app-shell .strategy-view .mobile-config-sheet > .strategy-rules > .strategy-panel-head {
+    display: none;
+  }
+
+  .app-shell .mobile-setup-sheet-head {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 16px 6px 10px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .app-shell .mobile-setup-sheet-handle {
+    position: absolute;
+    top: 6px;
+    left: 50%;
+    width: 38px;
+    height: 4px;
+    border-radius: 999px;
+    background: rgba(167, 139, 250, .34);
+    transform: translateX(-50%);
+  }
+
+  .app-shell .mobile-setup-sheet-head > div {
+    min-width: 0;
+    display: grid;
+    gap: 1px;
+  }
+
+  .app-shell .mobile-setup-sheet-head strong {
+    color: #f2efff;
+    font-size: 14px;
+    font-weight: 700;
+  }
+
+  .app-shell .mobile-setup-sheet-head small {
+    overflow: hidden;
+    color: var(--muted);
+    font-size: 10px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .app-shell .mobile-setup-sheet-close {
+    width: 30px;
+    height: 30px;
+    flex: 0 0 auto;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    color: var(--muted);
+    background: rgba(255, 255, 255, .035);
+    font-size: 17px;
+    line-height: 1;
+  }
+
+  .app-shell .mobile-strategy-bar {
+    position: fixed;
+    z-index: 59;
+    right: 0;
+    bottom: calc(66px + env(safe-area-inset-bottom));
+    left: 0;
+    display: grid;
+    gap: 6px;
+    padding: 7px 12px 8px;
+    border-top: 1px solid var(--line);
+    background: linear-gradient(180deg, rgba(13, 18, 28, .96), #0a0e15 78%);
+    backdrop-filter: blur(14px);
+    box-shadow: 0 -12px 30px rgba(0, 0, 0, .45);
+  }
+
+  .app-shell .mobile-strategy-bar-summary {
+    min-width: 0;
+    display: grid;
+    gap: 1px;
+    line-height: 1.25;
+  }
+
+  .app-shell .mobile-strategy-bar-summary span,
+  .app-shell .mobile-strategy-bar-summary strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .app-shell .mobile-strategy-bar-summary span {
+    color: var(--muted);
+    font-size: 10px;
+  }
+
+  .app-shell .mobile-strategy-bar-summary strong {
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .app-shell .mobile-strategy-bar-actions {
+    display: grid;
+    grid-template-columns: auto auto minmax(0, 1fr);
+    gap: 6px;
+    align-items: stretch;
+  }
+
+  .app-shell .mobile-strategy-bar-button {
+    min-height: 38px;
+    padding: 0 12px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    color: var(--text);
+    background: rgba(255, 255, 255, .045);
+    font-size: 11px;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+
+  .app-shell .mobile-strategy-bar-start {
+    min-height: 44px;
+    min-width: 0;
+    padding: 0 10px;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    color: #04110d;
+    background: linear-gradient(135deg, #22e2b9, #12b295);
+    font-size: 12px;
+    font-weight: 800;
+    line-height: 1.15;
+  }
+
+  .app-shell .mobile-strategy-bar-start.locked,
+  .app-shell .mobile-strategy-bar-start:disabled {
+    color: var(--muted);
+    background: rgba(255, 255, 255, .07);
+    border-color: var(--line);
+  }
+
+  .app-shell .mobile-setup-backdrop {
+    position: fixed;
+    z-index: 110;
+    inset: 0;
+    display: none;
+    background: rgba(3, 3, 8, .7);
+    backdrop-filter: blur(5px);
+  }
+
+  .app-shell .mobile-setup-backdrop.open {
+    display: block;
+  }
+
+  /* The fixed bar must not hide the holdings the user just asked to see. */
+  .app-shell .strategy-holdings-anchor {
+    scroll-margin-top: 70px;
+  }
+
+  /* Three holdings tabs must fit a 360px screen instead of requiring an inner swipe. */
+  .app-shell .strategy-view #strategy-holdings .strategy-history-tabs {
+    gap: 14px;
+    padding: 0 12px;
+  }
+
+  .app-shell .strategy-view #strategy-holdings .strategy-history-tabs button {
+    font-size: 11px;
+  }
+
+  /* The Positions shortcut must land on a real section even on an empty account, so keep the
+     (localized "No open positions") panel visible instead of removing it like the old flow did. */
+  .app-shell .strategy-view .running-strategies:has(.no-strategies) {
+    display: block;
+  }
+
+  /* Phone contract names wrap instead of being clipped to a few characters. */
+  .app-shell .strategy-view .leg-top em {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .app-shell .strategy-view .leg-top em span {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .app-shell.trading-page .order-panel,
+    .app-shell .strategy-view .strategy-sidebar.mobile-config-sheet {
+      transition: none;
+    }
+  }
+}
+
+@media (max-width: 640px) {
+  .app-shell .boros-perp-legs article > div {
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 6px;
+  }
+
+  .app-shell .boros-perp-legs article > div > span {
+    flex: 1 1 100%;
+    min-width: 0;
+    order: 2;
+  }
+
+  .app-shell .boros-perp-legs article > div > em {
+    margin-left: auto;
+    order: 3;
+  }
+
+  .app-shell .boros-perp-legs strong {
+    display: block;
+    overflow: visible;
+    max-width: 100%;
+    color: #f4f1ff;
+    font-size: 10px;
+    line-height: 1.3;
+    text-overflow: clip;
+    white-space: normal;
+    word-break: break-all;
+  }
+
+  .app-shell .boros-fields label > small,
+  .app-shell .boros-fields small {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+  }
+
+  .app-shell .boros-heading-actions,
+  .app-shell .boros-opportunities .section-title {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .app-shell .us-stock-page .strategy-leg,
+  .app-shell .us-stock-page .strategy-leg > *,
+  .app-shell .us-stock-page .us-leg-ticker {
+    min-width: 0;
+    max-width: 100%;
+  }
+}
+
+@media (max-width: 380px) {
+  .app-shell .opportunity-board-tabs {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+    overflow: visible;
+  }
+
+  .app-shell .opportunity-board-tabs button {
+    width: 100%;
+    min-width: 0;
+  }
+}
+
+@media (max-width: 640px) {
+  .app-shell .boros-view small,
+  .app-shell .boros-view label > small,
+  .app-shell .boros-view .boros-fields small {
+    overflow: visible;
+    max-width: 100%;
+    text-overflow: clip;
+    white-space: normal;
+  }
+}

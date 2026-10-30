@@ -2285,10 +2285,10 @@ describe('local backend', () => {
     expect(response.statusCode).toBe(200);
     const body = SpreadQualityResponseSchema.parse(response.json());
     expect(body.windowHours).toBe(24);
-    // The seeded hub markets produce far more than 50 executable combinations, so the
+    // The seeded hub markets produce far more than 100 executable combinations, so the
     // candidate cap applies and every capped candidate reconstructs a full 24h series.
-    expect(body.totalCandidates).toBe(50);
-    expect(body.rows).toHaveLength(50);
+    expect(body.totalCandidates).toBe(100);
+    expect(body.rows).toHaveLength(100);
     // Ranked by composite score, descending.
     for (let index = 1; index < body.rows.length; index += 1) {
       expect(body.rows[index - 1]!.score).toBeGreaterThanOrEqual(body.rows[index]!.score);

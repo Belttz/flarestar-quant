@@ -1188,8 +1188,8 @@ describe('spread quality route', () => {
     const body = SpreadQualityResponseSchema.parse(first.json());
     expect(body.windowHours).toBe(24);
     // The seeded hub board fills the candidate cap; every row is candle-reconstructed.
-    expect(body.totalCandidates).toBe(50);
-    expect(body.rows).toHaveLength(50);
+    expect(body.totalCandidates).toBe(100);
+    expect(body.rows).toHaveLength(100);
     for (const row of body.rows) {
       expect(row.source).toBe('candles');
       expect(row.sampleCount).toBe(288);
@@ -1267,7 +1267,7 @@ describe('spread quality route', () => {
     expect(response.statusCode).toBe(200);
     const body = SpreadQualityResponseSchema.parse(response.json());
     assertNoNonFinite(body);
-    expect(body.rows).toHaveLength(50);
+    expect(body.rows).toHaveLength(100);
     // The promoted pair tops the board even though it is nowhere near the first candidate.
     const promoted = body.rows.find((row) => row.leftSymbol === left && row.rightSymbol === right)!;
     expect(body.rows[0]).toBe(promoted);
@@ -1283,7 +1283,7 @@ describe('spread quality route', () => {
     expect(promoted.spreadVolatilityBps!).toBeCloseTo(statistics.volatility!, 8);
     expect(promoted.halfLifeHours!).toBeCloseTo(statistics.halfLifeHours!, 8);
     // Every other row stays on candles, and the candidate-order-first row is not the top row.
-    expect(body.rows.filter((row) => row.source === 'candles')).toHaveLength(49);
+    expect(body.rows.filter((row) => row.source === 'candles')).toHaveLength(99);
     const firstCandidate = [...body.rows].sort((l, r) => l.asset.localeCompare(r.asset)
       || l.leftSymbol.localeCompare(r.leftSymbol)
       || l.rightSymbol.localeCompare(r.rightSymbol))[0]!;
@@ -1312,7 +1312,7 @@ describe('spread quality route', () => {
     assertNoNonFinite(body);
     // Every leg's history is unusable: no series survives, no row is published, no error either.
     expect(body.rows).toEqual([]);
-    expect(body.totalCandidates).toBe(50);
+    expect(body.totalCandidates).toBe(100);
 
     // Partial rot: one symbol's page is dirty, so only the pairs on that leg drop out.
     fixture.publicMarketGateway.candles = (symbol) => (symbol === 'GATE_FUTURE_AAVE_USDT' ? dirtyCandles() : flatCandles(5));
@@ -1321,7 +1321,7 @@ describe('spread quality route', () => {
     const partialBody = SpreadQualityResponseSchema.parse(second.json());
     assertNoNonFinite(partialBody);
     expect(partialBody.rows.length).toBeGreaterThan(0);
-    expect(partialBody.rows.length).toBeLessThan(50);
+    expect(partialBody.rows.length).toBeLessThan(100);
     for (const row of partialBody.rows) {
       expect(row.source).toBe('candles');
       expect(row.sampleCount).toBe(288);

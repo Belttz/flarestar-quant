@@ -1,8 +1,8 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 import { LanguageContext } from './i18n.js';
-import { PositionsTable } from './positions-table.js';
-import type { PositionTableRow } from './strategy-positions.js';
+import { PositionsMobileCards, PositionsTable } from './positions-table.js';
+import { groupPositionRows, type PositionTableRow } from './strategy-positions.js';
 
 function row(overrides: Partial<PositionTableRow>): PositionTableRow {
   return {
@@ -48,5 +48,62 @@ describe('shared positions table', () => {
     expect(html).toContain('HYPE/USDT PERP');
     expect(html).toContain('Close all');
     expect(html).not.toContain('<th>Leverage</th>');
+  });
+});
+
+describe('phone position cards', () => {
+  const renderCards = (rows: PositionTableRow[]): string => renderToStaticMarkup(
+    <LanguageContext.Provider value={{ language: 'en', theme: 'dark', t: (key) => key, setLanguage: vi.fn() }}>
+      <PositionsMobileCards groups={groupPositionRows(rows)} onClose={vi.fn()} />
+    </LanguageContext.Provider>,
+  );
+
+  it('shows the complete contract, both venues, size, prices and PnL for a single leg', () => {
+    const html = renderCards([row({
+      id: 'clo', positionId: 'clo', symbol: 'GATE_FUTURE_CLO_USDT', venue: 'GATE', asset: 'CLO',
+      quote: 'USDT', quantity: 12, value: 480, entryPrice: 40, markPrice: 41, unrealizedPnl: 12,
+      realizedPnl: 1.5, fundingFee: -0.25,
+    })]);
+
+    expect(html).toContain('CLO/USDT PERP');
+    expect(html).toContain('class="long-tag position-mobile-side">Long<');
+    expect(html).toContain('Gate.io');
+    expect(html).toContain('12.0000 CLO');
+    expect(html).toContain('480 USDT');
+    expect(html).toContain('<dt>Entry price</dt><dd>40</dd>');
+    expect(html).toContain('<dt>Mark price</dt><dd>41</dd>');
+    expect(html).toContain('+12.00 USDT');
+    expect(html).toContain('1.50 USDT');
+    expect(html).toContain('-0.25 USDT');
+    expect(html).toContain('Close position');
+  });
+
+  it('collapses a hedged aggregate by default and exposes the leg toggle', () => {
+    const html = renderCards([
+      row({ id: 'long', positionId: 'long' }),
+      row({
+        id: 'short', positionId: 'short', symbol: 'DERIBIT_FUTURE_HYPE_USDC', venue: 'DERIBIT',
+        quote: 'USDC', side: 'Short', quantity: -10, value: 515, entryPrice: 52, markPrice: 51.5,
+      }),
+    ]);
+
+    expect(html).toContain('HYPE/USDT PERP');
+    expect(html).toContain('class="hedged-tag position-mobile-side">Hedged<');
+    expect(html).toContain('2 exchanges');
+    expect(html).toContain('Close all');
+    expect(html).toContain('Expand legs (2)');
+    expect(html).toContain('aria-expanded="false"');
+    expect(html).not.toContain('HYPE/USDC PERP');
+    expect(html).not.toContain('Bybit');
+    expect(html).not.toContain('Deribit');
+  });
+
+  it('renders an unknown price or notional as — instead of a fabricated zero', () => {
+    const html = renderCards([row({
+      id: 'unknown', positionId: 'unknown', markPriceUnavailable: true, valueUnavailable: true, pnlUnavailable: true,
+    })]);
+
+    expect(html.match(/<dd[^>]*>—<\/dd>/g)?.length).toBeGreaterThanOrEqual(3);
+    expect(html).not.toContain('NaN');
   });
 });

@@ -80,6 +80,16 @@ import { bpsFigure, pnlUsdtFigure, PNL_DASH } from './strategy-pnl.js';
 import { StrategyConfigDetailDialog } from './strategy-config-detail.js';
 
 /** Execution-log page size, shared by the client pager and the server-side fetch. */
+/** Compact review-only amounts; the full value stays in the title attribute. */
+function compactReviewAmount(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—';
+  const abs = Math.abs(value);
+  if (abs >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(2).replace(/\.?0+$/, '')}B`;
+  if (abs >= 1_000_000) return `${(value / 1_000_000).toFixed(2).replace(/\.?0+$/, '')}M`;
+  if (abs >= 1_000) return `${(value / 1_000).toFixed(1).replace(/\.0$/, '')}K`;
+  return value.toFixed(2);
+}
+
 const LOG_PAGE_SIZE = 50;
 /**
  * A category query fetches a grouping **superset** (dependency rows the tab then filters away), and
@@ -321,7 +331,7 @@ export function rowClickOpensStrategy(target: EventTarget | null | undefined): b
   return closest.call(target, ROW_INTERACTIVE_SELECTOR) === null;
 }
 
-export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tradingSnapshot, instruments, tradingMode, requestedStrategyId, onOpenModeDialog, onStrategiesChanged, onPositionsRefresh, onOpenStrategyConfig, onCopyStrategy }: {
+export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tradingSnapshot, instruments, tradingMode, requestedStrategyId, onOpenModeDialog, onStrategiesChanged, onPositionsRefresh, onOpenStrategyConfig, onCopyStrategy, focusPositionsSignal }: {
   strategies: StrategyRecord[];
   authenticatedPortfolio: AuthenticatedPortfolioSnapshot | null;
   tradingSnapshot: TradingSnapshot | null;
@@ -336,9 +346,14 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   onOpenStrategyConfig: (strategy: StrategyRecord) => void;
   /** Jump to the launch form prefilled with this strategy's configuration. */
   onCopyStrategy: (strategy: StrategyRecord) => void;
+  /** Bumped by the phone action bar's Positions shortcut so the shared panel opens that tab. */
+  focusPositionsSignal?: number;
 }) {
   const { language, t } = useLanguage();
   const [activeStrategyTab, setActiveStrategyTab] = useState<'running' | 'positions' | 'historical'>('running');
+  useEffect(() => {
+    if (focusPositionsSignal) setActiveStrategyTab('positions');
+  }, [focusPositionsSignal]);
   const [stoppingIds, setStoppingIds] = useState<string[]>([]);
   const [resumingIds, setResumingIds] = useState<string[]>([]);
   const [selectedLogStrategyId, setSelectedLogStrategyId] = useState<string | null>(null);
@@ -1008,6 +1023,10 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   // state updates), so the synchronous ref closes it. Both must agree before a submit proceeds.
   const launchingRef = useRef(false);
   const [confirmingLaunch, setConfirmingLaunch] = useState(false);
+  // Phone flow: the configuration lives in a bottom sheet instead of a long desktop column, and
+  // the holdings panel is reachable from the fixed action bar. Both are inert on wider screens.
+  const [mobileSetupOpen, setMobileSetupOpen] = useState(false);
+  const [focusPositionsSignal, setFocusPositionsSignal] = useState(0);
   const [launchNotice, setLaunchNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
   const [priceDifferenceRange, setPriceDifferenceRange] = useState<PairHistoryRange>('24H');
   const [positionFundingDuration, setPositionFundingDuration] = useState<PositionFundingDuration>(30);
@@ -1441,6 +1460,29 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
     || (isPositiveDecimal(recurringMinApr) && Number(recurringMinApr) >= 2000 && Number(recurringMinApr) <= 1_000_000);
   const strategyInputsValid = sizeInputsValid && !marginInsufficient && recurringInputsValid
     && (mode !== 'position' || reduceOnly || (!positionRiskReviewUnavailable && !positionRiskLimitExceeded));
+  // One label/disabled pair feeds both the desktop launch card and the phone action bar, so the
+  // two can never disagree about whether live execution is allowed.
+  const startDisabled = launching || (tradingEnabled && !strategyInputsValid);
+  const startLabel = launching
+    ? t('Launching…')
+    : tradingEnabled
+      ? marginInsufficient
+        ? t('Insufficient margin')
+        : positionRiskLimitExceeded
+          ? t('Position exceeds leverage limit')
+          : positionRiskReviewUnavailable
+            ? t('Loading position limits…')
+            : !strategyInputsValid
+              ? t('Enter valid strategy amounts')
+              : t(mode === 'position' ? 'Execute strategy' : 'Launch strategy')
+      : t('Live trading locked');
+  // Compact phone summary: the key size/leverage/threshold numbers stay visible in the bar even
+  // while the detailed setup is collapsed into the bottom sheet.
+  const mobileConfigSummary = [
+    mode === 'position' ? `${positionOrderQuantity || '0'} ${asset}` : `${orderQuantity || '0'} ${asset}`,
+    ...(mode === 'position' || autoAllPerp ? [`${leftLeverage || '—'}×/${rightLeverage || '—'}×`] : []),
+    `${threshold || '0'} bps`,
+  ].join(' · ');
 
   useEffect(() => {
     // Strategy cards need quote/funding/OI updates for both legs, but not the high-volume book,
@@ -1585,10 +1627,36 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
     setConfirmingLaunch(true);
   }
 
+  function jumpToHoldings() {
+    setMobileSetupOpen(false);
+    setFocusPositionsSignal((current) => current + 1);
+    window.requestAnimationFrame(() => {
+      document.getElementById('strategy-holdings')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  }
+
+  useEffect(() => {
+    // The phone setup sheet closes on Escape and stops the page behind it from scrolling away.
+    if (!mobileSetupOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') setMobileSetupOpen(false); };
+    document.addEventListener('keydown', onKeyDown);
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [mobileSetupOpen]);
+
   const leftSide = directionFlipped ? 'Buy' : 'Sell';
   const rightSide = directionFlipped ? 'Sell' : 'Buy';
   const strategySetup = (
-    <article className="strategy-panel strategy-rules compact strategy-rules-sidebar terminal-panel">
+    <article className={`strategy-panel strategy-rules compact strategy-rules-sidebar terminal-panel${mobileSetupOpen ? ' mobile-setup-open' : ''}`}>
+      <div className="mobile-setup-sheet-head">
+        <span className="mobile-setup-sheet-handle" aria-hidden="true" />
+        <div><strong>{t('Strategy setup')}</strong><small>{mobileConfigSummary}</small></div>
+        <button type="button" className="mobile-setup-sheet-close" aria-label={t('Close')} onClick={() => setMobileSetupOpen(false)}>✕</button>
+      </div>
       <header className="strategy-panel-head"><div><p className="eyebrow">{t('Strategy setup')}</p><h2>{t(mode === 'position' ? 'Configure cross-exchange hedge' : 'Configure continuous bot')}</h2></div></header>
       {copyNoticeStrategyId && <div className="strategy-copy-notice" role="status"><span>⧉</span><p>{t('Prefilled from strategy')} <strong>{copyNoticeStrategyId}</strong> {t('Review the details, then launch.')}</p><button onClick={() => setCopyNoticeStrategyId(null)}>{t('Dismiss prefill notice')}</button></div>}
       <div className="compact-fields">{mode === 'position' ? <>
@@ -1707,6 +1775,16 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
               </dl>
             </div>
           </div>
+          <div className="mobile-spread-bar" data-spread-status={spreadReadout.status}>
+            <div>
+              <span>{t('Price difference')}</span>
+              {priceDiffBps === null
+                ? <strong>—</strong>
+                : <strong className={priceDiffBps >= 0 ? 'positive' : 'negative'}>{priceDiffBps >= 0 ? '+' : ''}{priceDiffBps.toFixed(2)} bps</strong>}
+              <small>{priceDiffBps === null ? spreadHint : t('Switch direction')}</small>
+            </div>
+            <button className="switch-direction" onClick={() => setDirectionFlipped((current) => !current)} aria-label={t('Switch direction')}>⇄</button>
+          </div>
           {mode === 'auto' && <div className="launch-warning strategy-market-warning"><span>ⓘ</span><p>{tradingEnabled
             ? t('Both legs execute live orders. Fills are hedged automatically; residual imbalances pause the strategy for review.')
             : t('Live trading is locked. Use the trading-mode switch in the top bar to enable it.')}</p></div>}
@@ -1824,18 +1902,18 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
         </article>}
       </div>
 
-      <aside className="strategy-sidebar">
+      <aside className={`strategy-sidebar mobile-config-sheet${mobileSetupOpen ? ' mobile-setup-open' : ''}`}>
         {strategySetup}
         <article className={`strategy-launch terminal-panel ${mode === 'auto' ? 'auto-launch' : ''}`}>
           <div className="launch-status"><span><i />{t(mode === 'position' ? 'Review & execute' : 'Review & launch')}</span><small>{t(mode === 'position' ? 'Finite' : 'Continuous')}</small></div>
           <div className="launch-intent"><div><small>{t(mode === 'position' ? 'Total execution' : 'Strategy')}</small><strong>{mode === 'position' ? `${amount || '0'} ${asset}` : `${asset} ${t('spread bot')}`}</strong></div><p><span className={leftSide.toLowerCase()}>{t(leftSide)} {leftExchange.name}</span><i>⇄</i><span className={rightSide.toLowerCase()}>{t(rightSide)} {rightExchange.name}</span></p></div>
-          <dl className="launch-summary review-grid"><div><dt>{t('Entry')}</dt><dd>{Number(threshold) < 0 ? '≤' : '≥'} {threshold || '0'} bps</dd></div>{mode === 'auto' && <div><dt>{t('Take profit')}</dt><dd>≤ {takeProfitThreshold || '0'} bps</dd></div>}{mode === 'auto' && stopLossThreshold.trim() !== '' && <div><dt>{t('Stop loss')}</dt><dd>{stopLossThreshold} bps{autoThresholds.stopBuffer !== null ? ` · ${t('Effective stop buffer')}: ${formatBps(autoThresholds.stopBuffer.bufferBps)} bps` : ''}</dd></div>}{mode === 'auto' && autoThresholds.ladder !== null && <div><dt>{t('Add-on ladder')}</dt><dd>{formatTierLevels(autoThresholds.ladder)} bps</dd></div>}{autoAllPerp && <div><dt>{t('Leverage')}</dt><dd>{leftLeverage || '1'}× / {rightLeverage || '1'}×</dd></div>}{mode === 'position' && <><div><dt>{t('Per order')}</dt><dd>{positionOrderQuantity || '0'} {asset}</dd></div><div><dt>{t('Leverage')}</dt><dd>{leftLeverage || '—'}× / {rightLeverage || '—'}×</dd></div><div><dt>{t('Max position at selected leverage')}</dt><dd>{leftRiskPositionValue !== null && leftRiskPositionValue !== undefined ? formatAmount(leftRiskPositionValue) : '—'} {quoteFor(leftExchange.id)} / {rightRiskPositionValue !== null && rightRiskPositionValue !== undefined ? formatAmount(rightRiskPositionValue) : '—'} {quoteFor(rightExchange.id)}</dd></div><div><dt>{t('Projected position')}</dt><dd>{projectedLeftPositionValue !== null ? formatAmount(projectedLeftPositionValue) : '—'} {quoteFor(leftExchange.id)} / {projectedRightPositionValue !== null ? formatAmount(projectedRightPositionValue) : '—'} {quoteFor(rightExchange.id)}</dd></div><div><dt>{t('Reduce only')}</dt><dd>{t(reduceOnly ? 'Yes' : 'No')}</dd></div></>}<div><dt>{t('Method')}{language === 'zh' ? '：' : ': '}</dt><dd>{configuredExecutionMethod.replaceAll('–', '-')}</dd></div>{mode === 'position' && selectedFeeRows.map(({ exchange, symbol, feeKind }) => {
+          <dl className="launch-summary review-grid"><div><dt>{t('Entry')}</dt><dd>{Number(threshold) < 0 ? '≤' : '≥'} {threshold || '0'} bps</dd></div>{mode === 'auto' && <div><dt>{t('Take profit')}</dt><dd>≤ {takeProfitThreshold || '0'} bps</dd></div>}{mode === 'auto' && stopLossThreshold.trim() !== '' && <div><dt>{t('Stop loss')}</dt><dd>{stopLossThreshold} bps{autoThresholds.stopBuffer !== null ? ` · ${t('Effective stop buffer')}: ${formatBps(autoThresholds.stopBuffer.bufferBps)} bps` : ''}</dd></div>}{mode === 'auto' && autoThresholds.ladder !== null && <div><dt>{t('Add-on ladder')}</dt><dd>{formatTierLevels(autoThresholds.ladder)} bps</dd></div>}{autoAllPerp && <div><dt>{t('Leverage')}</dt><dd>{leftLeverage || '1'}× / {rightLeverage || '1'}×</dd></div>}{mode === 'position' && <><div><dt>{t('Per order')}</dt><dd>{positionOrderQuantity || '0'} {asset}</dd></div><div><dt>{t('Leverage')}</dt><dd>{leftLeverage || '—'}× / {rightLeverage || '—'}×</dd></div><div><dt>{t('Max position at selected leverage')}</dt><dd title={`${leftRiskPositionValue !== null && leftRiskPositionValue !== undefined ? formatAmount(leftRiskPositionValue) : '—'} ${quoteFor(leftExchange.id)} / ${rightRiskPositionValue !== null && rightRiskPositionValue !== undefined ? formatAmount(rightRiskPositionValue) : '—'} ${quoteFor(rightExchange.id)}`}>{compactReviewAmount(leftRiskPositionValue)} {quoteFor(leftExchange.id)} / {compactReviewAmount(rightRiskPositionValue)} {quoteFor(rightExchange.id)}</dd></div><div><dt>{t('Projected position')}</dt><dd>{projectedLeftPositionValue !== null ? formatAmount(projectedLeftPositionValue) : '—'} {quoteFor(leftExchange.id)} / {projectedRightPositionValue !== null ? formatAmount(projectedRightPositionValue) : '—'} {quoteFor(rightExchange.id)}</dd></div><div><dt>{t('Reduce only')}</dt><dd>{t(reduceOnly ? 'Yes' : 'No')}</dd></div></>}<div><dt>{t('Method')}{language === 'zh' ? '：' : ': '}</dt><dd>{configuredExecutionMethod.replaceAll('–', '-')}</dd></div>{mode === 'position' && selectedFeeRows.map(({ exchange, symbol, feeKind }) => {
             const rate = numericFutureFeeRate(fees, exchange.id, symbol, feeKind) ?? Number.NaN;
             return <div key={exchange.id}><dt>{exchange.name} · {t(feeKind === 'maker' ? 'Maker fee' : 'Taker fee')}</dt><dd>{Number.isFinite(rate) ? `${(rate * 100).toFixed(4)}%` : t('Exchange setting')}</dd></div>;
           })}</dl>
           {marginInsufficient && <div className="launch-warning"><span>!</span><p>{t('Configured maximum exposure exceeds the available margin.')}</p></div>}
           {positionRiskLimitExceeded && <div className="launch-warning"><span>!</span><p>{t('Configured position exceeds the maximum at selected leverage')}</p></div>}
-          <button className={tradingEnabled ? 'start-strategy' : 'start-strategy locked'} onClick={requestStrategyLaunch} disabled={launching || (tradingEnabled && !strategyInputsValid)}>{launching ? t('Launching…') : tradingEnabled ? marginInsufficient ? t('Insufficient margin') : positionRiskLimitExceeded ? t('Position exceeds leverage limit') : positionRiskReviewUnavailable ? t('Loading position limits…') : !strategyInputsValid ? t('Enter valid strategy amounts') : t(mode === 'position' ? 'Execute strategy' : 'Launch strategy') : t('Live trading locked')}</button>
+          <button className={tradingEnabled ? 'start-strategy' : 'start-strategy locked'} onClick={requestStrategyLaunch} disabled={startDisabled}>{startLabel}</button>
           {tradingEnabled && !marketQuotesReady && <p className="launch-disabled-reason">{t('Live quotes for both legs are missing or not time-aligned — entry estimates may be stale.')}</p>}
           {tradingEnabled && !instrumentsReady && <p className="launch-disabled-reason">
             {t('Not tradable through CrossEx')}: {!leftInstrument ? leftHistorySymbol : rightHistorySymbol}
@@ -1848,6 +1926,21 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
         </article>
       </aside>
     </section>
+
+    {/* Phone action bar: the primary start action stays one thumb-tap away while the long
+        configuration and review details live in the setup sheet above. Hidden above 640px. */}
+    <div className="mobile-strategy-bar" role="region" aria-label={t('Strategy setup')}>
+      <div className="mobile-strategy-bar-summary">
+        <span>{t(leftSide)} {leftExchange.name} ⇄ {t(rightSide)} {rightExchange.name}</span>
+        <strong>{mobileConfigSummary}</strong>
+      </div>
+      <div className="mobile-strategy-bar-actions">
+        <button type="button" className="mobile-strategy-bar-button" onClick={jumpToHoldings}>{t('Positions')}</button>
+        <button type="button" className="mobile-strategy-bar-button" onClick={() => setMobileSetupOpen(true)} aria-expanded={mobileSetupOpen}>{t('Settings')}</button>
+        <button type="button" className={tradingEnabled ? 'mobile-strategy-bar-start' : 'mobile-strategy-bar-start locked'} onClick={requestStrategyLaunch} disabled={startDisabled}>{startLabel}</button>
+      </div>
+    </div>
+    <div className={`mobile-setup-backdrop${mobileSetupOpen ? ' open' : ''}`} role="presentation" onClick={() => setMobileSetupOpen(false)} />
 
     {confirmingLaunch && <StrategyLaunchConfirmation
       market={`${asset} · ${leftExchange.name} ⇄ ${rightExchange.name}`}
@@ -1875,7 +1968,9 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
       onCancel={() => setConfirmingLaunch(false)}
       onConfirm={() => { void launchStrategy(); }}
     />}
-    <RunningStrategiesPanel strategies={strategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} instruments={instruments} tradingMode={tradingMode} requestedStrategyId={requestedStrategyId} onOpenModeDialog={onOpenModeDialog} onStrategiesChanged={onStrategiesChanged} onPositionsRefresh={onPositionsRefresh} onOpenStrategyConfig={onOpenStrategyConfig} onCopyStrategy={onCopyStrategy} />
+    <div id="strategy-holdings" className="strategy-holdings-anchor">
+      <RunningStrategiesPanel strategies={strategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} instruments={instruments} tradingMode={tradingMode} requestedStrategyId={requestedStrategyId} onOpenModeDialog={onOpenModeDialog} onStrategiesChanged={onStrategiesChanged} onPositionsRefresh={onPositionsRefresh} onOpenStrategyConfig={onOpenStrategyConfig} onCopyStrategy={onCopyStrategy} focusPositionsSignal={focusPositionsSignal} />
+    </div>
   </div>;
 }
 

@@ -34,6 +34,7 @@ import { LoginPage } from './login-page.js';
 import type { FundingMetric, PairedPositionPrefill } from './route-shared.js';
 import { UnresolvedOrdersNotice } from './trading-mode-recovery.js';
 import brandMark from './assets/brand-mark.svg';
+import { StrategyModeIcon } from './strategy-mode-icon.js';
 
 const TradingView = lazy(() => import('./trade-route.js').then((module) => ({ default: module.TradingView })));
 const StrategyView = lazy(() => import('./strategy-route.js').then((module) => ({ default: module.StrategyView })));
@@ -549,6 +550,9 @@ function App() {
   const [positionPrefill, setPositionPrefill] = useState<PairedPositionPrefill | null>(null);
   const [catalog, setCatalog] = useState<MarketCatalogAsset[] | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // OKX-style mobile action sheet: the centre tab opens a mode switcher instead of navigating.
+  const [mobileTradeSheetOpen, setMobileTradeSheetOpen] = useState(false);
+  const mobileTradeSheetRef = useDialogFocus(mobileTradeSheetOpen, () => setMobileTradeSheetOpen(false));
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [notificationsSeenAt, setNotificationsSeenAt] = useState(() => window.localStorage.getItem('crossex-notifications-seen') ?? new Date(0).toISOString());
   const [favorites, setFavorites] = useState<string[]>(() => parseStoredFavorites(window.localStorage.getItem('crossex-favorites')));
@@ -1632,15 +1636,19 @@ function App() {
     <nav className="mobile-tabbar" aria-label={t('Main navigation')}>
       <button className={workspace === 'Trade' ? 'active' : ''} onClick={() => navigate({ workspace: 'Trade' })}>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V9M9 19V5M15 19v-7M20 19V8" /></svg>
-        <span>{t('Trade')}</span>
+        <span>{t('Markets')}</span>
       </button>
       <button className={workspace === 'Opportunities' ? 'active' : ''} onClick={() => navigate({ workspace: 'Opportunities', board: opportunityBoard })}>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z" /><path d="m18.5 15 .8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2Z" /></svg>
         <span>{t('Opportunities')}</span>
       </button>
-      <button className={workspace === 'Strategy' ? 'active' : ''} onClick={() => navigate({ workspace: 'Strategy', strategyKind })}>
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16M8 4v6M16 14v6" /></svg>
-        <span>{t('Strategy')}</span>
+      <button className={`mobile-trade-trigger ${workspace === 'Strategy' ? 'active' : ''}`}
+        onClick={() => setMobileTradeSheetOpen(true)}
+        aria-haspopup="dialog" aria-expanded={mobileTradeSheetOpen} aria-label={t('Open trading mode switcher')}>
+        <span className="mobile-trade-trigger-icon">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h9M5 17h14M18 10l3 2-3 2" /></svg>
+        </span>
+        <span>{t('Trade')}</span>
       </button>
       <button className={workspace === 'Funding Rates' ? 'active' : ''} onClick={() => navigate({ workspace: 'Funding Rates', asset: null })}>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 18 12-12M8.5 7.5a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0ZM18.5 16.5a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0Z" /></svg>
@@ -1651,6 +1659,43 @@ function App() {
         <span>{t('Portfolio')}</span>
       </button>
     </nav>
+    {mobileTradeSheetOpen && <div className="mobile-trade-sheet-backdrop" onClick={() => setMobileTradeSheetOpen(false)}>
+      <section ref={mobileTradeSheetRef} className="mobile-trade-sheet" role="dialog" aria-modal="true" aria-labelledby="mobile-trade-sheet-title" onClick={(event) => event.stopPropagation()}>
+        <div className="mobile-trade-sheet-handle" aria-hidden="true" />
+        <header className="mobile-trade-sheet-head">
+          <div><p className="eyebrow">{t('Trading mode')}</p><h2 id="mobile-trade-sheet-title">{t('Switch trading mode')}</h2></div>
+          <button className="mobile-trade-sheet-close" onClick={() => setMobileTradeSheetOpen(false)} aria-label={t('Close')}>×</button>
+        </header>
+        <div className="mobile-trade-sheet-section">
+          <small>{t('Strategy')}</small>
+          <div className="mobile-trade-sheet-list">
+            {strategyPages.map((page) => {
+              const active = workspace === 'Strategy' && strategyKind === page.kind;
+              return <button key={page.kind} className={active ? 'active' : ''} onClick={() => { openStrategyPage(page.kind); setMobileTradeSheetOpen(false); }}>
+                <span className="mobile-trade-mode-glyph"><StrategyModeIcon kind={page.kind} /></span>
+                <span className="mobile-trade-mode-copy"><strong>{t(page.label)}</strong><small>{t(page.detail)}</small></span>
+                <span className="mobile-trade-mode-check" aria-hidden="true">{active ? '✓' : ''}</span>
+              </button>;
+            })}
+            <button className={workspace === 'Strategy' && strategyKind === 'boros' ? 'active' : ''} onClick={() => { openStrategyPage('boros'); setMobileTradeSheetOpen(false); }}>
+              <span className="mobile-trade-mode-glyph"><StrategyModeIcon kind="boros" /></span>
+              <span className="mobile-trade-mode-copy"><strong>{t('Fixed funding-rate arbitrage')}</strong><small>{t('Boros by Pendle.')}</small></span>
+              <span className="mobile-trade-mode-check" aria-hidden="true">{workspace === 'Strategy' && strategyKind === 'boros' ? '✓' : ''}</span>
+            </button>
+          </div>
+        </div>
+        <div className="mobile-trade-sheet-section">
+          <small>{t('Trade')}</small>
+          <div className="mobile-trade-sheet-list">
+            <button className={workspace === 'Trade' ? 'active' : ''} onClick={() => { navigate({ workspace: 'Trade' }); setMobileTradeSheetOpen(false); }}>
+              <span className="mobile-trade-mode-glyph"><StrategyModeIcon kind="trade" /></span>
+              <span className="mobile-trade-mode-copy"><strong>{t('Trade terminal')}</strong><small>{t('Spot and perpetual order ticket')}</small></span>
+              <span className="mobile-trade-mode-check" aria-hidden="true">{workspace === 'Trade' ? '✓' : ''}</span>
+            </button>
+          </div>
+        </div>
+      </section>
+    </div>}
     <footer className="statusbar"><div>{terminalStreamEnabled ? <><span className={streamState === 'connected' ? 'connected' : ''}><i /> {t(streamState === 'connected' ? 'Backend stream connected' : 'Reconnecting backend stream')}</span><span>LIVE {t('environment')}</span><span className={marketSnapshot?.connectionState === 'healthy' ? 'connected' : ''}><i /> {t('Market data')} {t(marketSnapshot?.connectionState ?? 'connecting')}</span><span className={accountStatusConnected ? 'connected' : ''}><i /> {accountStatusLabel}</span></> : <span className={fundingOverview ? 'connected' : ''}><i /> {fundingOverview ? t('Funding data source connected') : t('Funding data source loading')}</span>}</div><div><UtcClock /><span className="footer-brand" title="星闪量化 FlareStar Quant"><img src={brandMark} alt="" /><b>星闪量化</b></span><span title={`Release ${RELEASE_VERSION}`}>{RELEASE_VERSION}</span><button onClick={() => window.open('https://becod.eu.org/', '_blank', 'noopener')}>{t('Blog')}</button></div></footer>
     <AccountManagerDialog
       open={accountManagerOpen}

@@ -232,6 +232,7 @@ export function BorosStrategyView({
   const [leverageRefreshKey, setLeverageRefreshKey] = useState(0);
   const [currentLeverageSnapshot, setCurrentLeverageSnapshot] = useState<CurrentLeverageSnapshot | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [mobileExpanded, setMobileExpanded] = useState(false);
   const [borosConfirmed, setBorosConfirmed] = useState(false);
   const [borosConfirmationAttention, setBorosConfirmationAttention] = useState(false);
   const [quantityAttention, setQuantityAttention] = useState(false);
@@ -823,13 +824,13 @@ export function BorosStrategyView({
           : !opportunityCardsReady
             ? <div className="boros-loading error"><span>{t('Complete opportunity data is temporarily unavailable.')}</span><button onClick={refreshOpportunityData}>{t('Try again')}</button></div>
           : <div className="boros-opportunity-list" role="radiogroup" aria-label={t('Fixed-rate strategies')}>
-            {displayedOpportunities.map(({ strategy, ready }) => {
+            {displayedOpportunities.map(({ strategy, ready }, opportunityIndex) => {
               const leverages = strategyLeverages(strategy, ready);
               const ticketReturn = opportunityReturnAt100k(strategy, leverages, fees, catalog);
               return <button
                 key={strategy.id}
                 role="radio"
-                className={`${strategy.id === selected?.id ? 'selected' : ''}${ready ? '' : ' unavailable'}`}
+                className={`${strategy.id === selected?.id ? 'selected' : ''}${ready ? '' : ' unavailable'}${opportunityIndex >= 3 && !mobileExpanded ? ' mobile-limited' : ''}`}
                 onClick={() => selectOpportunity(strategy.id)}
                 aria-checked={strategy.id === selected?.id}
               >
@@ -840,6 +841,9 @@ export function BorosStrategyView({
                 <em>{ready ? t('CrossEx ready') : t('Not executable on CrossEx')}</em>
               </button>;
             })}
+            {displayedOpportunities.length > 3 && <button type="button" className="opportunity-mobile-more boros-mobile-more" onClick={() => setMobileExpanded((current) => !current)}>
+              {mobileExpanded ? t('Show fewer') : `${t('Show more')} · 3/${displayedOpportunities.length}`}
+            </button>}
           </div>}
     </section>
 

@@ -20,6 +20,7 @@ import {
   buildPerpFundingHedges,
   buildVenueFundingRanking,
   fundingVenueOptions,
+  formatFundingPercent,
   hedgePairedPositionPrefill,
   sortFundingHedges,
   type FundingHedgeRow,
@@ -27,9 +28,9 @@ import {
 } from './funding-hedge.js';
 import { FundingHedgeTable, FundingRankingTable } from './funding-hedge-tables.js';
 import { useLanguage } from './i18n.js';
-import { LegFundingRates } from './leg-funding-rates.js';
+import { LegFundingRates, formatFundingRatePercent } from './leg-funding-rates.js';
 import { assetIcon, assetName, exchanges, formatOpportunityAmount, fundingVenueName, VenueIcon, type PairedPositionPrefill } from './route-shared.js';
-import { SpreadQualitySortChips, SpreadQualitySourceBadge, SpreadQualityTable, type SpreadQualitySortDir, type SpreadQualitySortKey } from './spread-quality-table.js';
+import { SpreadQualitySortChips, SpreadQualitySourceBadge, SpreadQualitySymmetryBadge, SpreadQualityTable, formatHalfLifeHours, formatOpportunityScore, formatSpreadQualityBps, groupSpreadQualityRows, type SpreadQualitySortDir, type SpreadQualitySortKey } from './spread-quality-table.js';
 
 // The amount formatter moved to route-shared so the spread-quality table can share it without a
 // circular import back into this module; the re-export keeps this module's public surface stable.
@@ -721,6 +722,7 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
   const [expandedAsset, setExpandedAsset] = useState<string | null>(null);
   // Spread board expands straight from the payload: each asset row already carries its pairs.
   const [expandedSpread, setExpandedSpread] = useState<string | null>(null);
+  const [mobileSpreadVisible, setMobileSpreadVisible] = useState(4);
   const isFundingBoard = board === 'funding';
   const isFundingTopBoard = board === 'funding-top';
   const isSpreadBoard = board === 'spread';
@@ -770,6 +772,7 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
   // Per-asset combination expansion, mirroring the spread board's controlled pattern: the payload
   // is pair-level, so the table groups rows by asset and this state picks the expanded one.
   const [expandedSpreadQuality, setExpandedSpreadQuality] = useState<string | null>(null);
+  const [mobileQualityVisible, setMobileQualityVisible] = useState(4);
 
   const boardPath = board === 'spread' ? '/opportunities/spread'
     : board === 'funding-top' ? '/opportunities/funding-top'
@@ -986,16 +989,6 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
     navigate({ workspace: 'Strategy', strategyKind: 'carry', query: carryPrefillQuery(row) });
   };
 
-  const executeQuality = (row: SpreadQualityRow) => {
-    // The quality board ranks executable combinations; hand the paired-position form the same
-    // asset/venue prefill the spread board uses so the row is actionable instead of display-only.
-    if (!onOpenPairedPosition) return;
-    onOpenPairedPosition({
-      asset: row.asset,
-      longVenue: row.rightVenue.toLowerCase() as PairedPositionPrefill['longVenue'],
-      shortVenue: row.leftVenue.toLowerCase() as PairedPositionPrefill['shortVenue'],
-    });
-  };
   const executeSpread = (row: SpreadOpportunity) => {
     navigate({ workspace: 'Strategy', strategyKind: 'auto', query: spreadPrefillQuery(row) });
   };
@@ -1113,6 +1106,7 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
     () => (isSpreadQualityBoard ? spreadQualityData?.rows ?? [] : []),
     [isSpreadQualityBoard, spreadQualityData],
   );
+  const spreadQualityGroups = useMemo(() => groupSpreadQualityRows(spreadQualityRows), [spreadQualityRows]);
   // Asset super-class lookup for boards whose own payloads do not carry the classification.
   const superClassByAsset = useMemo(() => {
     const map = new Map<string, 'RWA' | 'CRYPTO'>();
@@ -1271,7 +1265,7 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
               <th />
             </tr></thead>
             <tbody>{fundingRows.map((row) => <tr key={`${row.asset}:${row.venue}:${row.spotVenue ?? ''}`} className={row.executable ? '' : 'not-executable'}>
-              <td><span className="opportunity-asset"><i aria-hidden="true">{assetIcon(row.asset)}</i><strong>{row.asset}</strong><small>{assetName(row.asset)}</small></span>
+              <td><span className="opportunity-asset"><i aria-hidden="true">{assetIcon(row.asset)}</i><strong>{row.asset}</strong>{assetName(row.asset) !== row.asset && <small>{assetName(row.asset)}</small>}</span>
                 <OpportunityClassBadge row={row} />
                 <button className="row-action expand-combinations" onClick={() => toggleExpandedAsset(row.asset)}
                   aria-expanded={expandedAsset === row.asset}>
@@ -1393,6 +1387,49 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
           <small>{t('Same asset, same quote: the sell leg goes first, the buy leg second.')}</small>
         </header>
         {spreadRows.length === 0 && !failed && <div className="empty-state"><span>◎</span><strong>{t('No opportunities match the current filters.')}</strong></div>}
+        {spreadRows.length > 0 && <div className="opportunity-mobile-cards spread-mobile-cards">
+          {spreadRows.slice(0, mobileSpreadVisible).map((row) => {
+            const open = expandedSpread === row.asset;
+            return <article key={`${row.asset}:mobile`} className="opportunity-mobile-card">
+              <header className="om-card-head">
+                <span className="om-asset"><i aria-hidden="true">{assetIcon(row.asset)}</i><span>
+                  <strong>{row.asset}</strong>
+                  {assetName(row.asset) !== row.asset && <small>{assetName(row.asset)}</small>}
+                </span><OpportunityClassBadge row={row} /></span>
+                <button className="row-action execute-action" onClick={() => executeSpread(row)} disabled={!row.executable}>
+                  {row.executable ? t('Execute') : t('Not connected')}
+                </button>
+              </header>
+              <div className="om-primary">
+                <strong className={row.spreadBps >= 0 ? 'positive' : 'negative'}>{formatSpreadPercent(row.spreadBps)}</strong>
+                <span>{fundingVenueName(row.leftVenue)} <em aria-hidden="true">→</em> {fundingVenueName(row.rightVenue)}</span>
+              </div>
+              <div className="om-legs">
+                <div><span>{fundingVenueName(row.leftVenue)}</span><strong>{formatFundingRatePercent(row.leftFundingRate8h)}</strong></div>
+                <div><span>{fundingVenueName(row.rightVenue)}</span><strong>{formatFundingRatePercent(row.rightFundingRate8h)}</strong></div>
+              </div>
+              <div className="om-metrics">
+                <div><span>{t('Venues')}</span><strong>{spreadCombinationVenues(row).length}</strong></div>
+                <div><span>{t('24h volume')}</span><strong>{formatOpportunityAmount(row.leftStats?.quoteVolume24h ?? null)} / {formatOpportunityAmount(row.rightStats?.quoteVolume24h ?? null)}</strong></div>
+                <div><span>{t('Last updated')}</span><strong>{new Date(row.updatedAt).toLocaleTimeString(locale, { hour12: false })}</strong></div>
+              </div>
+              <button type="button" className="om-combinations-toggle" aria-expanded={open}
+                onClick={() => setExpandedSpread(open ? null : row.asset)}>
+                {open ? t('Collapse combinations') : `${t('Expand combinations')} · ${row.combinations.length}`}
+              </button>
+              {open && <div className="om-combinations">
+                {row.combinations.map((combination, index) => <div key={`${combination.leftSymbol}:${combination.rightSymbol}:mobile`} className="om-combination">
+                  <span><b>{fundingVenueName(combination.leftVenue)}</b> <em aria-hidden="true">→</em> <b>{fundingVenueName(combination.rightVenue)}</b>
+                    {index === 0 && <em className="best-tag">{t('Best')}</em>}</span>
+                  <strong className={combination.spreadBps >= 0 ? 'positive' : 'negative'}>{formatSpreadPercent(combination.spreadBps)}</strong>
+                </div>)}
+              </div>}
+            </article>;
+          })}
+          {spreadRows.length > mobileSpreadVisible && <button type="button" className="opportunity-mobile-more" onClick={() => setMobileSpreadVisible((current) => current + 4)}>
+            {t('Show more')} · {mobileSpreadVisible}/{spreadRows.length}
+          </button>}
+        </div>}
         {spreadRows.length > 0 && <div className="opportunity-table opportunity-spread-table table-wrap"><table>
           <thead><tr>
             <th aria-label={t('Expand combinations')} />
@@ -1414,7 +1451,7 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
                 <td><button type="button" className="row-action spread-toggle"
                   aria-expanded={open} aria-label={t(open ? 'Collapse combinations' : 'Expand combinations')}
                   onClick={() => setExpandedSpread(open ? null : row.asset)}>{open ? '▾' : '▸'}</button></td>
-                <td><span className="opportunity-asset"><i aria-hidden="true">{assetIcon(row.asset)}</i><strong>{row.asset}</strong><small>{assetName(row.asset)}</small></span>
+                <td><span className="opportunity-asset"><i aria-hidden="true">{assetIcon(row.asset)}</i><strong>{row.asset}</strong>{assetName(row.asset) !== row.asset && <small>{assetName(row.asset)}</small>}</span>
                   <OpportunityClassBadge row={row} /></td>
                 <td><span className="spread-path"><b>{fundingVenueName(row.leftVenue)}</b><i aria-hidden="true">→</i><b>{fundingVenueName(row.rightVenue)}</b></span></td>
                 <td className="opportunity-funding-cell"><LegFundingRates
@@ -1476,12 +1513,59 @@ export function OpportunitiesView({ board, navigate, onOpenPairedPosition }: Opp
         <header className="opportunity-board-head">
           <h2 id="opportunity-spread-quality-title">{t('Spread quality')}</h2>
           <small>{t('Ranked by 24h spread-distribution quality: mean, volatility, skewness, reversion speed, holding cost and book depth.')}</small>
+          {spreadQualityData && <small className="quality-coverage">
+            {t('Executable combinations scanned')}: {spreadQualityData.totalCandidates} · {spreadQualityData.total} {t('with enough 24h history')}
+          </small>}
           {spreadQualityRows.length > 0 && <SpreadQualitySourceBadge source={spreadQualityRows[0].source} />}
         </header>
         <SpreadQualitySortChips sort={qualitySort} dir={qualityDir} onSortChange={changeQualitySort} />
         {spreadQualityFailed && <p className="opportunity-error" role="alert">{t('Unable to load opportunities')}. {t('Check the backend connection and try again.')}</p>}
         {spreadQualityRows.length === 0 && !spreadQualityFailed && <div className="empty-state"><span>◎</span>
           <strong>{spreadQualityLoading ? t('Loading…') : t('No opportunities match the current filters.')}</strong></div>}
+        {spreadQualityRows.length > 0 && <div className="opportunity-mobile-cards quality-mobile-cards">
+          {spreadQualityGroups.slice(0, mobileQualityVisible).map((group) => {
+            const best = group.best;
+            const open = expandedSpreadQuality === group.asset;
+            return <article key={`${group.asset}:quality-mobile`} className="opportunity-mobile-card">
+              <header className="om-card-head">
+                <span className="om-asset"><i aria-hidden="true">{assetIcon(group.asset)}</i><span>
+                  <strong>{group.asset}</strong>
+                  {assetName(group.asset) !== group.asset && <small>{assetName(group.asset)}</small>}
+                </span></span>
+              </header>
+              <div className="om-primary">
+                <strong className={best.currentSpreadBps >= 0 ? 'positive' : 'negative'}>{formatSpreadQualityBps(best.currentSpreadBps)}</strong>
+                <span>{t('Current spread')} · {formatOpportunityScore(best.score)} {t('Opportunity score')}</span>
+              </div>
+              <div className="om-legs">
+                <div><span>{fundingVenueName(best.leftVenue)}</span><small className="mono">{best.leftSymbol}</small></div>
+                <div><span>{fundingVenueName(best.rightVenue)}</span><small className="mono">{best.rightSymbol}</small></div>
+              </div>
+              <div className="om-metrics">
+                <div><span>{t('Mean spread')}</span><strong>{formatSpreadQualityBps(best.meanSpreadBps)}</strong></div>
+                <div><span>{t('Spread volatility')}</span><strong>{formatSpreadQualityBps(best.spreadVolatilityBps)}</strong></div>
+                <div><span>{t('Half-life')}</span><strong>{formatHalfLifeHours(best.halfLifeHours)}</strong></div>
+                <div><span>{t('Holding cost')}</span><strong>{formatSpreadQualityBps(best.holdingCostBps)}</strong></div>
+                <div><span>{t('Book depth')}</span><strong>{formatOpportunityAmount(String(best.bookDepthUsdt))}</strong></div>
+                <div><span>{t('Symmetric')}</span><strong><SpreadQualitySymmetryBadge symmetric={best.symmetric} /></strong></div>
+              </div>
+              <button type="button" className="om-combinations-toggle" aria-expanded={open}
+                onClick={() => toggleExpandedSpreadQuality(group.asset)}>
+                {open ? t('Collapse combinations') : `${t('Expand combinations')} · ${group.combinations.length}`}
+              </button>
+              {open && <div className="om-combinations">
+                {group.combinations.map((combination, index) => <div key={`${combination.leftSymbol}:${combination.rightSymbol}:quality-mobile`} className="om-combination">
+                  <span><b>{fundingVenueName(combination.leftVenue)}</b> <em aria-hidden="true">→</em> <b>{fundingVenueName(combination.rightVenue)}</b>
+                    {index === 0 && <em className="best-tag">{t('Best')}</em>}</span>
+                  <strong className={combination.currentSpreadBps >= 0 ? 'positive' : 'negative'}>{formatSpreadQualityBps(combination.currentSpreadBps)}</strong>
+                </div>)}
+              </div>}
+            </article>;
+          })}
+          {spreadQualityGroups.length > mobileQualityVisible && <button type="button" className="opportunity-mobile-more" onClick={() => setMobileQualityVisible((current) => current + 4)}>
+            {t('Show more')} · {mobileQualityVisible}/{spreadQualityGroups.length}
+          </button>}
+        </div>}
         {spreadQualityRows.length > 0 && <SpreadQualityTable
           rows={spreadQualityRows}
           expandedAsset={expandedSpreadQuality}

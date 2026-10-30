@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { useLanguage } from './i18n.js';
 import { VenueIcon } from './route-shared.js';
 import {
@@ -122,6 +123,10 @@ export function FundingSettlementBoard({
   emptyLabel = DEFAULT_EMPTY_LABEL,
 }: FundingSettlementBoardProps) {
   const { t, language } = useLanguage();
+  // Phones render cards, so page them with an explicit load-more instead of a nested scroller.
+  const [mobileVisible, setMobileVisible] = useState(4);
+  const mobileRows = rows.slice(0, mobileVisible);
+  const hasMoreMobile = mobileVisible < rows.length;
   const locale = language === 'zh' ? 'zh-CN' : 'en-GB';
   /** `t()` has no interpolation; `{name}` placeholders keep word order natural in both languages. */
   const tv = (key: string, vars: Readonly<Record<string, string | number>>): string =>
@@ -293,7 +298,7 @@ export function FundingSettlementBoard({
     {/* Phones get a decision card per pair instead of a horizontally clipped
      * eight-column table. The desktop table remains the source of truth. */}
     <div className="funding-mobile-cards">
-      {rows.map((row) => {
+      {mobileRows.map((row) => {
         const countdown = formatFundingCountdown(fundingSettlementCountdown(row.nextFundingAt, now));
         const longInterval = fundingIntervalLabel(row.long.intervalHours);
         const shortInterval = fundingIntervalLabel(row.short.intervalHours);
@@ -328,6 +333,9 @@ export function FundingSettlementBoard({
         </article>;
       })}
       {rows.length === 0 && <div className="funding-empty">{t('No venue pair matches the current filters.')}</div>}
+      {hasMoreMobile && <button type="button" className="funding-mobile-more" onClick={() => setMobileVisible((current) => current + 4)}>
+        {t('Load more')} · {mobileVisible}/{rows.length}
+      </button>}
     </div>
     <div className="funding-settlement-legend">
       <span><i className="funding-settlement-bar funding-tone-pay" />{t('Charged to longs — you pay')}</span>

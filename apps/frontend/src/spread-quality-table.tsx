@@ -195,7 +195,7 @@ export function SpreadQualityTable({ rows, expandedAsset, onToggleExpand, onExec
             <span className="opportunity-asset">
               <i aria-hidden="true">{assetIcon(group.asset)}</i>
               <strong>{group.asset}</strong>
-              <small>{assetName(group.asset)}</small>
+              {assetName(group.asset) !== group.asset && <small>{assetName(group.asset)}</small>}
             </span>
             <QualityClassBadge superClass={best.assetSuperClass} />
             <span className="quality-legs">

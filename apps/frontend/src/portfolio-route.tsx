@@ -916,7 +916,8 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
         <div className="activity-table-wrap">
           {activityLoading ? <div className="activity-message"><span>◌</span><strong>{t('Loading funding activity…')}</strong></div>
             : activityError ? <div className="activity-message error"><span>!</span><strong>{t(activityError)}</strong><button onClick={() => void loadActivity()}>{t('Try again')}</button></div>
-              : activityTab === 'transfers' ? (visibleTransfers.length ? <table className="activity-table">
+              : activityTab === 'transfers' ? (visibleTransfers.length ? <>
+                <table className="activity-table">
                 <thead><tr><th>{t('Time')}</th><th>{t('Asset')}</th><th>{t('Route')}</th><th>{t('Requested')}</th><th>{t('Received')}</th><th>{t('Status')}</th><th>{t('Reference')}</th></tr></thead>
                 <tbody>{visibleTransfers.slice(activityPage.start, activityPage.end).map((record) => <tr key={record.id}>
                   <td>{formatWhen(record.createdAt)}</td>
@@ -927,8 +928,19 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
                   <td><span className={`status-tag ${record.status.toLowerCase()}`}>{t(readableCode(record.status))}</span>{record.failureReason && <small className="activity-failure">{record.failureReason}</small>}</td>
                   <td><span className="activity-reference">{record.text || record.id}</span></td>
                 </tr>)}</tbody>
-              </table> : <div className="activity-message"><span>◎</span><strong>{t('No transfer history')}</strong><small>{t('Submitted transfers will appear here.')}</small></div>)
-                : (visibleAccountEntries.length ? <table className="activity-table account-book-table">
+              </table>
+              <div className="activity-mobile-cards">
+                {visibleTransfers.slice(activityPage.start, activityPage.end).map((record) => <article className="activity-mobile-card" key={`mobile-${record.id}`}>
+                  <header><strong>{record.coin}</strong><span className={`status-tag ${record.status.toLowerCase()}`}>{t(readableCode(record.status))}</span></header>
+                  <div className="amc-line"><span>{formatWhen(record.createdAt)}</span><strong>{record.amount}</strong></div>
+                  <div className="amc-line"><span>{transferAccountLabel(record.from)} → {transferAccountLabel(record.to)}</span><span>{t('Received')} {record.actualReceive ?? '—'}</span></div>
+                  {record.failureReason && <p className="amc-error">{record.failureReason}</p>}
+                  <small className="amc-ref">{record.text || record.id}</small>
+                </article>)}
+              </div>
+            </> : <div className="activity-message"><span>◎</span><strong>{t('No transfer history')}</strong><small>{t('Submitted transfers will appear here.')}</small></div>)
+                : (visibleAccountEntries.length ? <>
+                <table className="activity-table account-book-table">
                   <thead><tr><th>{t('Time')}</th><th>{t('Type')}</th><th>{t('Asset')}</th><th>{t('Exchange')}</th><th>{t('Change')}</th><th>{t('Balance')}</th><th>{t('Reference')}</th></tr></thead>
                   <tbody>{visibleAccountEntries.slice(activityPage.start, activityPage.end).map((record) => {
                     const change = parseNumber(record.change) ?? 0;
@@ -942,7 +954,20 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
                       <td><span className="activity-reference">{record.businessId || record.id}</span></td>
                     </tr>;
                   })}</tbody>
-                </table> : <div className="activity-message"><span>◎</span><strong>{t(activityTab === 'funding-fees' ? 'No funding fee history' : 'No account activity')}</strong><small>{t(activityTab === 'funding-fees' ? 'Funding fee entries will appear here.' : 'Balance changes, fees, and funding entries will appear here.')}</small></div>)}
+                </table>
+                <div className="activity-mobile-cards">
+                  {visibleAccountEntries.slice(activityPage.start, activityPage.end).map((record) => {
+                    const change = parseNumber(record.change) ?? 0;
+                    return <article className="activity-mobile-card" key={`mobile-${record.id}`}>
+                      <header><strong>{record.coin}</strong><span className="statement-tag">{t(readableCode(record.statementType))}</span></header>
+                      <div className="amc-line"><span>{formatWhen(record.createdAt)}</span><strong className={change > 0 ? 'positive' : change < 0 ? 'negative' : ''}>{change === 0 ? record.change : signedAmount(change)}</strong></div>
+                      <div className="amc-line"><span>{record.venue ? <VenueFromCode code={record.venue} /> : '—'}</span><span>{t('Balance')} {record.balance}</span></div>
+                      {record.symbol && <small className="amc-ref">{record.symbol}</small>}
+                      <small className="amc-ref">{record.businessId || record.id}</small>
+                    </article>;
+                  })}
+                </div>
+              </> : <div className="activity-message"><span>◎</span><strong>{t(activityTab === 'funding-fees' ? 'No funding fee history' : 'No account activity')}</strong><small>{t(activityTab === 'funding-fees' ? 'Funding fee entries will appear here.' : 'Balance changes, fees, and funding entries will appear here.')}</small></div>)}
         </div>
         {!activityLoading && !activityError && activityItemCount > 0 && <ExecutionPagination
           itemCount={activityItemCount}
@@ -967,7 +992,7 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
         <span className="table-source">{tableSource}</span>
       </div>
       {activeTab === 'positions' && (positionRows.length ? <PositionsTable rows={positionRows} onClose={requestPositionClose} /> : <EmptyTable label="positions" />)}
-      {activeTab === 'orders' && (orderRows.length ? <><div className="positions-table table-wrap"><table>
+      {activeTab === 'orders' && (orderRows.length ? <><div className="positions-table table-wrap portfolio-orders-table"><table>
         <thead><tr><th>{t('Time')}</th><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Side / Type')}</th><th>{t('Price')}</th><th>{t('Amount')}</th><th>{t('Filled')}</th><th>{t('Status')}</th><th>{t('Order ID')}</th></tr></thead>
         <tbody>{orderRows.slice(openOrdersPage.start, openOrdersPage.end).map((row) => <tr key={row.id}>
           <td>{formatWhen(row.createdAt)}</td>
@@ -980,8 +1005,24 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
           <td><span className={`status-tag ${row.state.toLowerCase()}`}>{row.state}</span></td>
           <td>{row.reference}</td>
         </tr>)}</tbody>
-      </table></div><ExecutionPagination itemCount={orderRows.length} page={openOrdersPage.page} onPageChange={(page) => setTablePages((current) => ({ ...current, openOrders: page }))} /></> : <EmptyTable label="open orders" />)}
-      {activeTab === 'fills' && (fillRows.length ? <><div className="positions-table table-wrap"><table>
+      </table></div>
+      <div className="portfolio-mobile-cards">
+        {orderRows.slice(openOrdersPage.start, openOrdersPage.end).map((row) => <article className="portfolio-mobile-card" key={`mo-${row.id}`}>
+          <header><strong>{`${row.asset}/${row.quote}`}</strong><span className={`status-tag ${row.state.toLowerCase()}`}>{row.state}</span></header>
+          <div className="pmc-grid">
+            <span>{t('Time')}<b>{formatWhen(row.createdAt)}</b></span>
+            <span>{t('Exchange')}<b><VenueFromCode code={row.venue} /></b></span>
+            <span>{t('Side / Type')}<b>{t(row.side === 'BUY' ? 'Buy' : 'Sell')} · {t(row.type === 'LIMIT' ? 'Limit' : row.type === 'MARKET' ? 'Market' : row.type)}</b></span>
+            <span>{t('Price')}<b>{row.price ?? t('Market')}</b></span>
+            <span>{t('Amount')}<b>{row.quantity} {row.asset}</b></span>
+            <span>{t('Filled')}<b>{row.executedQuantity}</b></span>
+          </div>
+          {row.reduceOnly && <small className="pmc-tag">{t('Reduce only')}</small>}
+          <small className="pmc-ref">{row.reference}</small>
+        </article>)}
+      </div>
+      <ExecutionPagination itemCount={orderRows.length} page={openOrdersPage.page} onPageChange={(page) => setTablePages((current) => ({ ...current, openOrders: page }))} /></> : <EmptyTable label="open orders" />)}
+      {activeTab === 'fills' && (fillRows.length ? <><div className="positions-table table-wrap portfolio-fills-table"><table>
         <thead><tr><th>{t('Time')}</th><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Side')}</th><th>{t('Execution price')}</th><th>{t('Size')}</th><th>{t('Fee')}</th><th>{t('Role')}</th><th>{t('Realized PnL')}</th></tr></thead>
         <tbody>{fillRows.slice(tradeHistoryPage.start, tradeHistoryPage.end).map((row) => <tr key={row.id}>
           <td>{formatWhen(row.createdAt)}</td>
@@ -994,7 +1035,22 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
           <td>{row.matchRole ?? '—'}</td>
           <td className={row.realizedPnl > 0 ? 'positive' : row.realizedPnl < 0 ? 'negative' : ''}>{row.realizedPnl === 0 ? '0.00' : signedAmount(row.realizedPnl)}</td>
         </tr>)}</tbody>
-      </table></div><ExecutionPagination itemCount={fillRows.length} page={tradeHistoryPage.page} onPageChange={(page) => setTablePages((current) => ({ ...current, tradeHistory: page }))} /></> : <EmptyTable label="trade history" />)}
+      </table></div>
+      <div className="portfolio-mobile-cards">
+        {fillRows.slice(tradeHistoryPage.start, tradeHistoryPage.end).map((row) => <article className="portfolio-mobile-card" key={`mf-${row.id}`}>
+          <header><strong>{`${row.asset}/${row.quote}`}</strong><span className={row.realizedPnl > 0 ? 'positive' : row.realizedPnl < 0 ? 'negative' : ''}>{row.realizedPnl === 0 ? '0.00' : signedAmount(row.realizedPnl)}</span></header>
+          <div className="pmc-grid">
+            <span>{t('Time')}<b>{formatWhen(row.createdAt)}</b></span>
+            <span>{t('Exchange')}<b><VenueFromCode code={row.venue} /></b></span>
+            <span>{t('Side')}<b>{t(row.side === 'BUY' ? 'Buy' : 'Sell')}</b></span>
+            <span>{t('Execution price')}<b>{row.price}</b></span>
+            <span>{t('Size')}<b>{row.quantity} {row.asset}</b></span>
+            <span>{t('Fee')}<b>{formatAmount(row.fee, 6)}{row.feeCoin ? ` ${row.feeCoin}` : ''}</b></span>
+          </div>
+          <small className="pmc-ref">{row.matchRole ?? '—'}</small>
+        </article>)}
+      </div>
+      <ExecutionPagination itemCount={fillRows.length} page={tradeHistoryPage.page} onPageChange={(page) => setTablePages((current) => ({ ...current, tradeHistory: page }))} /></> : <EmptyTable label="trade history" />)}
       {activeTab === 'margin' && marginRows.length > 0 && <><div className="positions-table table-wrap"><table>
         <thead><tr><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Size')}</th><th>{t('Value')}</th><th>{t('Entry price')}</th><th>{t('Index price')}</th><th>{t('Leverage')}</th><th>{t('Liability')}</th><th>{t('Interest')}</th><th>{t('Unrealized PnL')}</th></tr></thead>
         <tbody>{marginRows.slice(marginPage.start, marginPage.end).map((row) => <tr key={row.id}>

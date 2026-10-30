@@ -31,6 +31,7 @@ export function FeeComparisonView({ catalog, marketSnapshot, favorites, fees, fe
   const { t } = useLanguage();
   const [tickerInput, setTickerInput] = useState('BTC');
   const [notionalInput, setNotionalInput] = useState('10000');
+  const [mobileExpanded, setMobileExpanded] = useState(false);
   const ticker = resolveCatalogTicker(tickerInput, catalog);
   const notional = Number(notionalInput);
   const validNotional = Number.isFinite(notional) && notional > 0;
@@ -99,7 +100,7 @@ export function FeeComparisonView({ catalog, marketSnapshot, favorites, fees, fe
         <div><h2>{ticker || '—'} {t('Perpetual contract')}</h2><p>{t('Sorted by lowest taker fee')}</p></div>
         <button onClick={onRefresh} disabled={!feesReady}>{t(feesReady ? 'Refresh rates' : 'Loading rates…')}</button>
       </header>
-      <div className="fee-table-wrap">
+      <div className={`fee-table-wrap${mobileExpanded ? ' mobile-expanded' : ''}`}>
         <table className="fee-comparison-table">
           <thead><tr>
             <th>{t('Exchange')}</th><th>{t('Contract')}</th><th>{t('Maker rate')}</th><th>{t('Taker rate')}</th><th>{t('Est. maker fee')}</th><th>{t('Est. taker fee')}</th><th>{t('Taker round trip')}</th>
@@ -118,6 +119,9 @@ export function FeeComparisonView({ catalog, marketSnapshot, favorites, fees, fe
           })}</tbody>
         </table>
       </div>
+      {rows.length > 6 && <button type="button" className="fee-mobile-more" onClick={() => setMobileExpanded(true)}>
+        {mobileExpanded ? t('All rates shown') : `${t('Show more')} · 6/${rows.length}`}
+      </button>}
       {!feesReady && <div className="fee-empty" role="status">{t('Loading market and fee data…')}</div>}
       {feesReady && error && <div className="fee-empty error"><strong>{t('Unable to load account fee rates')}</strong><span>{t(error === 'credential_not_configured' ? 'Configure Gate API credentials in Settings first.' : 'Check the backend connection and try again.')}</span></div>}
       {feesReady && !error && !market && <div className="fee-empty"><strong>{t('Ticker not found')}</strong><span>{t('Choose a ticker from the CrossEx market catalog.')}</span></div>}

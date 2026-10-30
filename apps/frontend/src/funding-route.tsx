@@ -470,6 +470,19 @@ export function FundingDetailView({ asset, onBack, fundingOverview, onFundingOve
             <td>{row.settlements}</td>
           </tr>)}</tbody>
         </table>
+        <div className="funding-detail-mobile-cards">
+          {rows.map((row) => <article className="funding-detail-mobile-card" key={`m-${row.symbol}`}>
+            <header><span><i style={{ background: row.color }} /><strong>{row.name}</strong></span><small>{row.symbol}</small></header>
+            <div className="fdmc-grid">
+              <span>{t('Mean')}<b className={row.mean >= 0 ? 'positive' : 'negative'}>{formatPercent(row.mean)}</b></span>
+              <span>{t('Min')}<b className={row.min >= 0 ? 'positive' : 'negative'}>{formatPercent(row.min)}</b></span>
+              <span>{t('Max')}<b className={row.max >= 0 ? 'positive' : 'negative'}>{formatPercent(row.max)}</b></span>
+              <span>{t('Latest')}<b className={row.latest >= 0 ? 'positive' : 'negative'}>{formatPercent(row.latest)}</b></span>
+              <span>{t('Cumulative')}<b className={row.cumulative >= 0 ? 'positive' : 'negative'}>{formatPercent(row.cumulative)}</b></span>
+              <span>{t('Settlements')}<b>{row.settlements}</b></span>
+            </div>
+          </article>)}
+        </div>
         {rows.length === 0 && <div className={`funding-detail-empty${failed ? ' error' : ''}`}>{pending > 0 ? t('Loading venue histories…') : t('Funding history unavailable.')}</div>}
       </div>
       <footer className="funding-detail-footer"><span><i /> {t('Historical settlements stored locally · latest tail refreshed ~15m')}</span><span>{t('Select a duration or chart mode to explore realized funding.')}</span></footer>
