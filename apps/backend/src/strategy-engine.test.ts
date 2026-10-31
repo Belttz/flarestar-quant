@@ -4194,6 +4194,10 @@ describe('recurring position lifecycle', () => {
       .positionMonitoringEnabled(actor.config)).toBe(true);
 
     const before = String((actor.config as Record<string, unknown>).recurringStartedAt);
+    // `rearmRecurringPosition` stamps `recurringStartedAt` from `Date.now()`; if the harness
+    // started the strategy in the same millisecond the re-arm is invisible to the assertion below
+    // (it flaked under full-suite timing). Let the clock tick so "refreshed" is observable.
+    await new Promise((resolve) => setTimeout(resolve, 5));
     (actor as Record<string, unknown>).positionExitArmed = true;
     (actor as Record<string, unknown>).positionExitReason = 'funding-decay';
     (engine as unknown as { rearmRecurringPosition: (value: unknown) => void })
