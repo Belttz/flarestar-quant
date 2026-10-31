@@ -2,6 +2,18 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [5.4.6] - 2026-10-31
+
+### Fixed
+
+- **A strategy detail dialog no longer re-opens itself after you close it.** Opening `/strategies?strategyId=…` deep-links the detail dialog, but closing it only cleared local state while the URL parameter stayed behind: every strategy poll produced a new list identity, the deep-link effect re-ran, and the dialog popped back up without the operator touching Run / Copy / Logs. The consumed id is now remembered (`consumedRequestedStrategyIdRef`) and `closeDetail` marks the current deep-link as consumed before clearing the selection, so closing the dialog actually closes it.
+
+### Changed
+
+- **Scan audit window is 24 hours and only rows that never became a trade expire.** The funding-arb audit trail now keeps one day of scan rows (`FUNDING_ARB_DECISION_RETENTION_MS = DAY_MS`) and deletes a row only when `strategy_id IS NULL`; anything bound to an opened strategy is kept forever regardless of verdict. A `PASS` that opened nothing expires with the rest — passing the gates is not a trade (production: 2.55M rows scanned, 34 `PASS`, 8 with a strategy).
+- **The audit prune runs after every scan, not only in the daily maintenance pass.** A daily-only prune makes the file hold "24h kept + up to 24h accumulated", i.e. it swings by hundreds of MB every day; pruning right after the write (`pruneFundingArbDecisions`) keeps the window true in real time. The daily pass still runs the same rule as the fallback for a stopped scanner, so the maintenance interval goes back to 24 hours.
+- **The funding-arb scan cadence default is 60 minutes, not 10.** Settlements are 1h–8h apart, so a 10-minute cadence only multiplied the audit rows; the three threshold presets move to 60/30/10 minutes (conservative/balanced/fast).
+
 ## [5.4.5] - 2026-10-31
 
 ### Fixed

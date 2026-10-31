@@ -44,19 +44,24 @@ export const SPREAD_SAMPLE_GRACE_MS = 2 * 60 * 60_000;
 export const SPREAD_SAMPLE_RETENTION_MS = CACHE_RETENTION_MS + SPREAD_SAMPLE_GRACE_MS;
 
 /**
- * Retention for **rejected** funding-arb scan candidates (`funding_arb_decisions`).
+ * Retention for **unacted-on** funding-arb scan candidates (`funding_arb_decisions`).
  *
- * That table is an audit trail, not a cache: every 10-minute scan writes one row per evaluated
- * candidate (≈6.9k rows per scan, 99.999% of them `REJECT`). Nothing ever reads a row older than
- * the newest 200 the audit tab asks for, yet the table had no retention rule at all and grew to
- * ~3 GB (0.6M rows/day) in four days — the single largest object in the database.
+ * That table is an audit trail, not a cache: every scan writes one row per evaluated candidate
+ * (≈6.9k rows per scan, 99.999% of them `REJECT`). Nothing ever reads a row older than the newest
+ * 200 the audit tab asks for, yet the table had no retention rule at all and grew to ~3 GB
+ * (0.6M rows/day) in four days — the single largest object in the database.
  *
- * Six hours is deliberately far below the 24h cache window: rejected candidates are only useful
- * for explaining "why did the scanner skip this pair *just now*", and six hours still covers ~36
- * scans. `PASS` rows and rows bound to an opened strategy are never pruned by age: they document
- * an actual trade and are cheap (tens per day), so they stay.
+ * The operator's rule (2026-10-31) is one sentence: **keep the last day of scan rows, and keep
+ * forever anything that actually became a trade.** So a row expires at 24h *only* when
+ * `strategy_id IS NULL` — a row bound to an opened strategy documents a real position and is never
+ * pruned by age (production: 8 such rows out of 2.5M). `PASS` on its own is not "acted on": it only
+ * means the candidate cleared the gates, so a `PASS` row that opened nothing expires with the rest
+ * (keeping it would be the same as keeping every scanned row).
+ *
+ * 24h matches the operator's cache window, so the whole disposable half of the database has a
+ * single, explainable lifetime.
  */
-export const FUNDING_ARB_REJECT_RETENTION_MS = 6 * 60 * 60_000;
+export const FUNDING_ARB_DECISION_RETENTION_MS = DAY_MS;
 
 /** How many rows one DELETE statement may remove, so a maintenance pass never holds the write lock. */
 export const CACHE_PRUNE_BATCH_SIZE = 500;
@@ -158,18 +163,20 @@ export const CACHE_RETENTION_TABLES: readonly CacheRetentionRule[] = [
     table: 'funding_arb_decisions',
     column: 'scanned_at',
     timestamp: 'iso',
-    retentionMs: FUNDING_ARB_REJECT_RETENTION_MS,
-    // Only rejected candidates that never opened a strategy are audit noise; a PASS row (and any
-    // row bound to an opened strategy) documents a real trade and is kept forever.
-    predicate: "verdict = 'REJECT' AND strategy_id IS NULL",
-    // ≈0.6M rows/day has to be drainable in one daily pass; 1 000-row batches keep each write lock
-    // short while 1 200 batches leave headroom over the ~610 batches a pass actually needs.
+    retentionMs: FUNDING_ARB_DECISION_RETENTION_MS,
+    // Operator's rule: keep the last 24h of scan rows, keep anything that became a trade forever.
+    // A row without a strategy id is audit noise whatever its verdict (PASS alone is not a trade).
+    predicate: 'strategy_id IS NULL',
+    // ≈0.6M rows/day (before the scan cadence was relaxed to hourly) has to be drainable by the
+    // prune that runs after every scan; 1 000-row batches keep each write lock short while 1 200
+    // batches leave headroom over the ~600 batches a full day of production needs.
     batchSize: 1_000,
     maxBatchesPerPass: 1_200,
     reason:
-      'Per-candidate audit trail of the funding-arb scanner (≈6.9k rows every 10 min, 99.999% '
-      + 'REJECT). The panel only reads the newest 200 rows, so a rejected candidate older than 6h '
-      + 'is dead weight; PASS rows and rows tied to an opened strategy are kept regardless of age.',
+      'Per-candidate audit trail of the funding-arb scanner (≈6.9k rows per scan, 99.999% REJECT). '
+      + 'The panel only reads the newest 200 rows, so an unacted-on candidate older than 24h is '
+      + 'dead weight; rows tied to an opened strategy are kept regardless of age because they '
+      + 'document an actual trade.',
   },
 ] as const;
 
@@ -383,4 +390,41 @@ export function pruneExpiredCacheTables(
     batches,
     skippedTables,
   };
+}
+
+/**
+ * Prune the funding-arb audit table alone, using its own rule from `CACHE_RETENTION_TABLES`.
+ *
+ * Called right after the scanner has written a new batch of decisions: keeping the 24h window
+ * "live" this way means the table does not swing between window and window-plus-one-maintenance-gap
+ * (a daily pass alone would let 24h of rows accumulate on top of the retained 24h, i.e. ~48h of
+ * rows, and the file would visibly swell and shrink every day instead). The maintenance pass still
+ * runs it too, so a stopped scanner cannot leave rows behind.
+ *
+ * Never throws: a failed prune must not fail the scan that produced the rows.
+ *
+ * @param database open database handle.
+ * @param nowMs reference instant in epoch milliseconds (defaults to `Date.now()`).
+ * @returns number of expired rows deleted (0 when the table is missing or the prune failed).
+ */
+export function pruneFundingArbDecisions(
+  database: Database.Database,
+  nowMs: number = Date.now(),
+): number {
+  const rule = CACHE_RETENTION_TABLES.find((entry) => entry.table === 'funding_arb_decisions');
+  if (!rule) return 0;
+  const safeNow = Number.isFinite(nowMs) ? Math.max(0, Math.trunc(nowMs)) : 0;
+  try {
+    const deleted = pruneTableInBatches(
+      database,
+      rule,
+      safeNow - rule.retentionMs,
+      CACHE_PRUNE_BATCH_SIZE,
+      CACHE_PRUNE_MAX_BATCHES_PER_TABLE,
+      () => undefined,
+    );
+    return deleted ?? 0;
+  } catch {
+    return 0;
+  }
 }

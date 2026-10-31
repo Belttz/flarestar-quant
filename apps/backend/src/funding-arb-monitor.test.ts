@@ -35,7 +35,7 @@ describe('funding arb threshold posture', () => {
   it('keeps the hard annualized gate and tunes only responsiveness', () => {
     const settings = parseFundingArbSettings({});
     expect(settings.minAprPercent).toBe(2000);
-    expect(settings.scanIntervalMinutes).toBe(10);
+    expect(settings.scanIntervalMinutes).toBe(60);
     expect(settings.confirmScans).toBe(1);
     expect(settings.maxCurrentTo24hRatio).toBe(4);
     expect(settings.minNetPerSettlementBps).toBe(10);

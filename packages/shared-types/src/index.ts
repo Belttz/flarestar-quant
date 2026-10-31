@@ -2011,7 +2011,10 @@ export const FundingArbSettingsSchema = z.object({
   dryRun: z.boolean().default(true),
   /** Create the position strategy automatically. Requires live trading mode. */
   autoExecute: z.boolean().default(false),
-  scanIntervalMinutes: z.number().int().min(5).max(1440).default(10),
+  // One hour by default: the operator found the original 10-minute cadence far too frequent for a
+  // funding-rate board whose settlements are 1h–8h apart (2026-10-31). Shortening it is an explicit
+  // choice, not the shipped posture.
+  scanIntervalMinutes: z.number().int().min(5).max(1440).default(60),
   /**
    * Funding differential annualized APR gate, in percent. The 30-day historical replay
    * (`design/funding-arb-sim-30d.md`) puts the break-even a little above 1500% APR at the modelled

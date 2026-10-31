@@ -1580,13 +1580,13 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     // runner, so booting the background loop would report running=true while every tick returns
     // at the enabled guard — a state that looks live but never scans.
     if (readFundingArbSettings(database).enabled) fundingArbMonitor.startBackground();
-    // Hourly, not daily: the funding-arb audit rule keeps a 6-hour window (see cache-retention.ts),
-    // and a daily pass would let up to 30 hours of rejected candidates pile up before it ran — the
-    // file would swing hundreds of MB every day instead of staying flat. The monthly gzipped
-    // archive is idempotent per calendar month, so the extra calls are no-ops.
+    // Daily. The one table that could still swing the file size (the funding-arb audit trail) is
+    // pruned after every scan instead of here — see `pruneFundingArbDecisions` in cache-retention.ts
+    // — so the daily pass is only the safety net for a stopped scanner plus the monthly archive,
+    // which is idempotent per calendar month.
     databaseMaintenanceTimer = setInterval(() => {
       runMaintenancePass();
-    }, 60 * 60_000);
+    }, 24 * 60 * 60_000);
     databaseMaintenanceTimer.unref?.();
     schedulePortfolioReconciliation();
     // Bootstrap once per backend process. Concurrent UI tabs and a private-stream ready event

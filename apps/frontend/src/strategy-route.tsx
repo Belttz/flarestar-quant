@@ -408,7 +408,16 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   // strategy views share — duplicating it per view would be four copies of the same state machine.
   const [detailStrategyId, setDetailStrategyId] = useState<string | null>(null);
   const selectedDetailStrategy = strategies.find((strategy) => strategy.id === detailStrategyId) ?? null;
-  const detailDialogRef = useDialogFocus(Boolean(selectedDetailStrategy), () => setDetailStrategyId(null));
+  // The parent keeps `?strategyId=` in the URL after the dialog closes, and the strategy list is
+  // polled, so the deep-link effect below used to fire again on every poll and re-open a dialog the
+  // user had just dismissed ("it keeps popping back up"). Remember which request was already
+  // honoured; closing marks the current one consumed, and a new/changed id still opens normally.
+  const consumedRequestedStrategyIdRef = useRef<string | null>(null);
+  const closeDetail = () => {
+    if (requestedStrategyId) consumedRequestedStrategyIdRef.current = requestedStrategyId;
+    setDetailStrategyId(null);
+  };
+  const detailDialogRef = useDialogFocus(Boolean(selectedDetailStrategy), closeDetail);
 
   function requestPositionClose(positions: StrategyPositionRow[]) {
     if (tradingMode !== 'live') {
@@ -496,8 +505,13 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   // reuses the mounted view, and the list itself arrives asynchronously — so we keep waiting until
   // the record exists. An unknown id stays silent: no error, no URL rewrite.
   useEffect(() => {
-    if (!requestedStrategyId) return;
+    if (!requestedStrategyId) {
+      consumedRequestedStrategyIdRef.current = null;
+      return;
+    }
+    if (consumedRequestedStrategyIdRef.current === requestedStrategyId) return;
     if (!strategies.some((strategy) => strategy.id === requestedStrategyId)) return;
+    consumedRequestedStrategyIdRef.current = requestedStrategyId;
     setDetailStrategyId(requestedStrategyId);
   }, [requestedStrategyId, strategies]);
 
@@ -860,9 +874,9 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
     {selectedDetailStrategy && <StrategyConfigDetailDialog
       strategy={selectedDetailStrategy}
       // Closing first keeps a single modal on screen; the log dialog then owns the focus trap.
-      onViewLogs={() => { setDetailStrategyId(null); void openLogs(selectedDetailStrategy.id); }}
+      onViewLogs={() => { closeDetail(); void openLogs(selectedDetailStrategy.id); }}
       onCopy={() => copyStrategyConfig(selectedDetailStrategy)}
-      onClose={() => setDetailStrategyId(null)}
+      onClose={closeDetail}
       dialogRef={detailDialogRef}
     />}
   </>;

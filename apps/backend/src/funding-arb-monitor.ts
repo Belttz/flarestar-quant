@@ -25,6 +25,7 @@ import {
   type FundingArbAutoBudget,
 } from './funding-arb-scan.js';
 import { readFundingArbSettings } from './funding-arb-repository.js';
+import { pruneFundingArbDecisions } from './cache-retention.js';
 import {
   annualizeWindow, latestSettledRate, loadFundingPersistence, type FundingPersistenceRow,
 } from './funding-arb-persistence.js';
@@ -373,6 +374,12 @@ export class FundingArbMonitor {
       }
     });
     write();
+
+    // Keep the 24h audit window true in real time: prune expired unacted-on rows right after the
+    // write instead of waiting for the daily maintenance pass (which would let a second day of rows
+    // pile on top of the retained one, swinging the file by hundreds of MB every day). Rows bound to
+    // an opened strategy are never touched; see cache-retention.ts.
+    pruneFundingArbDecisions(this.deps.database, context.now);
 
     return { settings, scannedAt, dataFresh, candidates: evaluated };
   }

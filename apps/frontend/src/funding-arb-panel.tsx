@@ -80,7 +80,7 @@ const GROUPS: GroupDef[] = [
     title: 'Scan & confirmation',
     hint: { en: 'How often the runner scans and how many consecutive scans a candidate must pass.', zh: '扫描频率，以及候选需要连续通过几次扫描。' },
     fields: [
-      { key: 'scanIntervalMinutes', label: 'Scan interval', unit: 'min', help: { en: 'Clock-aligned scan cadence (default 10 min at :30).', zh: '扫描间隔，默认 10 分钟；缩短后对机会变化更敏感。' } },
+      { key: 'scanIntervalMinutes', label: 'Scan interval', unit: 'min', help: { en: 'Clock-aligned scan cadence; 60 min by default, shorten only deliberately.', zh: '扫描间隔，默认 60 分钟；缩短后对机会变化更敏感。' } },
       { key: 'confirmScans', label: 'Entry confirmations', help: { en: 'Consecutive scans a candidate must pass; restart confirmation is replayed from funding history.', zh: '候选需连续通过几次扫描；重启后会用历史结算费率回放，不需要等待。' } },
     ],
   },
@@ -181,27 +181,27 @@ const THRESHOLD_PRESETS: Array<{
     hint: 'The hard APR gate stays at 2000%; persistence and two confirmations slow entries down.',
     patch: {
       minAprPercent: 2000, minNetPerSettlementBps: 20, minTradeNetBps: 20,
-      fundingPersistenceMode: '24h', confirmScans: 2, scanIntervalMinutes: 30,
+      fundingPersistenceMode: '24h', confirmScans: 2, scanIntervalMinutes: 60,
       maxCurrentTo24hRatio: 3, max24hTo7dRatio: 3,
     },
   },
   {
     id: 'balanced',
     label: 'Balanced',
-    hint: 'Same APR gate; one confirmation and a 10-minute scan react faster.',
+    hint: 'Same APR gate; one confirmation and a 30-minute scan react a little faster.',
     patch: {
       minAprPercent: 2000, minNetPerSettlementBps: 10, minTradeNetBps: 10,
-      fundingPersistenceMode: '24h', confirmScans: 1, scanIntervalMinutes: 10,
+      fundingPersistenceMode: '24h', confirmScans: 1, scanIntervalMinutes: 30,
       maxCurrentTo24hRatio: 4, max24hTo7dRatio: 3,
     },
   },
   {
     id: 'opportunity',
     label: 'Fast / more opportunities',
-    hint: 'Same APR gate; current snapshot, one confirmation, 5-minute scans. Stop-loss and guards still apply.',
+    hint: 'Same APR gate; current snapshot, one confirmation, 10-minute scans. Stop-loss and guards still apply.',
     patch: {
       minAprPercent: 2000, minNetPerSettlementBps: 5, minTradeNetBps: 5,
-      fundingPersistenceMode: 'off', confirmScans: 1, scanIntervalMinutes: 5,
+      fundingPersistenceMode: 'off', confirmScans: 1, scanIntervalMinutes: 10,
       maxCurrentTo24hRatio: 5, max24hTo7dRatio: 5,
     },
   },
