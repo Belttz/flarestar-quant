@@ -2,6 +2,13 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [5.4.2] - 2026-10-31
+
+### Fixed
+
+- The strategy launch review no longer stops after four rows on phones: the mobile rule that hid everything from the fifth row on is gone, so the projected position, the reduce-only flag, the execution method and both venue taker fees stay visible inside the setup sheet.
+- The launch review now quotes the size behind its leverage-tier cap and adds a **max buy quantity** row, so phone and desktop both show the position value, the position size and the margin-limited order size — the same figures the trade ticket quotes. Both limit rows span the full review width and sit last in the grid, so the paired two-column rows above them leave no empty cells.
+
 ## [5.4.1] - 2026-10-30
 
 ### Added

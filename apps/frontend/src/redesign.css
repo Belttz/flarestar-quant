@@ -2830,10 +2830,6 @@ body {
     padding: 4px 6px;
   }
 
-  .app-shell .strategy-view .launch-summary.review-grid > div:nth-child(n+5) {
-    display: none;
-  }
-
   .app-shell .strategy-view .launch-summary dt,
   .app-shell .strategy-view .launch-summary dd {
     font-size: 9px;
@@ -3382,6 +3378,11 @@ body {
 
   .app-shell .strategy-view .launch-summary.review-grid dd {
     overflow-wrap: anywhere;
+  }
+
+  .app-shell .strategy-view .launch-summary.review-grid > div.review-span dd {
+    white-space: normal;
+    text-overflow: clip;
   }
 }
 

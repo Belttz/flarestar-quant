@@ -214,6 +214,38 @@ export function projectedPositionValue(
   return Math.abs(existingQuantity + plannedQuantity) * referencePrice;
 }
 
+/**
+ * Quantity equivalent of a notional figure at a reference price. The leverage popover, the launch
+ * review and the trade ticket all quote the venue risk-tier cap, but the ticket quotes it as a size,
+ * so the conversion lives here instead of being re-derived at each call site.
+ */
+export function notionalToQuantity(value: number | null | undefined, referencePrice: number): number | null {
+  if (value === null || value === undefined || !Number.isFinite(value) || value < 0) return null;
+  if (!Number.isFinite(referencePrice) || referencePrice <= 0) return null;
+  return value / referencePrice;
+}
+
+/**
+ * Largest size the free margin carries at a leverage, never above the venue risk-tier cap. Mirrors
+ * the trade ticket's "max order quantity" (margin × leverage / price, then the risk ceiling).
+ * Unknown margin yields `null` rather than a zero that would read as a real, unusable maximum.
+ */
+export function marginLimitedQuantity(
+  availableMargin: number | null | undefined,
+  leverage: number,
+  referencePrice: number,
+  riskQuantityCap: number | null,
+): number | null {
+  if (availableMargin === null || availableMargin === undefined) return null;
+  if (!Number.isFinite(availableMargin) || availableMargin <= 0) return null;
+  if (!Number.isFinite(leverage) || leverage <= 0) return null;
+  if (!Number.isFinite(referencePrice) || referencePrice <= 0) return null;
+  const affordable = (availableMargin * leverage) / referencePrice;
+  return riskQuantityCap !== null && Number.isFinite(riskQuantityCap) && riskQuantityCap > 0
+    ? Math.min(affordable, riskQuantityCap)
+    : affordable;
+}
+
 export function usesSharedCrossExMargin(portfolio: AuthenticatedPortfolioSnapshot | null): boolean {
   return portfolio?.snapshot.account.accountMode === 'CROSS_EXCHANGE';
 }

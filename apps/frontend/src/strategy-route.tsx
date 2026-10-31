@@ -49,8 +49,10 @@ import {
   incrementalExposure,
   isPositiveDecimal,
   liveMarketFor,
+  marginLimitedQuantity,
   maxPositionValueAtLeverage,
   minimumNotionalIssue,
+  notionalToQuantity,
   priceText,
   projectedPositionValue,
   quoteFor,
@@ -1480,6 +1482,17 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   );
   const marginAvailabilityKnown = marginAssessment.known;
   const marginInsufficient = !reduceOnly && marginEstimateAvailable && marginAssessment.insufficient;
+  // Launch-review sizes: the risk tier caps the position, the free margin caps the order — the same
+  // pair the trade ticket quotes as "max position at selected leverage" and "max order quantity".
+  // A venue balance wins over the shared pool because it is the leg whose margin is actually spent.
+  const leftMaxPositionQuantity = notionalToQuantity(leftRiskPositionValue, leftPrice);
+  const rightMaxPositionQuantity = notionalToQuantity(rightRiskPositionValue, rightPrice);
+  const leftMaxBuyQuantity = marginLimitedQuantity(
+    leftAvailableMargin ?? aggregateAvailableMargin, leftLeverageNumber, leftPrice, leftMaxPositionQuantity,
+  );
+  const rightMaxBuyQuantity = marginLimitedQuantity(
+    rightAvailableMargin ?? aggregateAvailableMargin, rightLeverageNumber, rightPrice, rightMaxPositionQuantity,
+  );
   // Auto-only threshold rules, surfaced verbatim so the operator knows why launch is blocked.
   const thresholdIssues = mode === 'auto'
     ? [
@@ -1956,10 +1969,10 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
         <article className={`strategy-launch terminal-panel ${mode === 'auto' ? 'auto-launch' : ''}`}>
           <div className="launch-status"><span><i />{t(mode === 'position' ? 'Review & execute' : 'Review & launch')}</span><small>{t(mode === 'position' ? 'Finite' : 'Continuous')}</small></div>
           <div className="launch-intent"><div><small>{t(mode === 'position' ? 'Total execution' : 'Strategy')}</small><strong>{mode === 'position' ? `${amount || '0'} ${asset}` : `${asset} ${t('spread bot')}`}</strong></div><p><span className={leftSide.toLowerCase()}>{t(leftSide)} {leftExchange.name}</span><i>⇄</i><span className={rightSide.toLowerCase()}>{t(rightSide)} {rightExchange.name}</span></p></div>
-          <dl className="launch-summary review-grid"><div><dt>{t('Entry')}</dt><dd>{Number(threshold) < 0 ? '≤' : '≥'} {threshold || '0'} bps</dd></div>{mode === 'auto' && <div><dt>{t('Take profit')}</dt><dd>≤ {takeProfitThreshold || '0'} bps</dd></div>}{mode === 'auto' && stopLossThreshold.trim() !== '' && <div><dt>{t('Stop loss')}</dt><dd>{stopLossThreshold} bps{autoThresholds.stopBuffer !== null ? ` · ${t('Effective stop buffer')}: ${formatBps(autoThresholds.stopBuffer.bufferBps)} bps` : ''}</dd></div>}{mode === 'auto' && autoThresholds.ladder !== null && <div><dt>{t('Add-on ladder')}</dt><dd>{formatTierLevels(autoThresholds.ladder)} bps</dd></div>}{autoAllPerp && <div><dt>{t('Leverage')}</dt><dd>{leftLeverage || '1'}× / {rightLeverage || '1'}×</dd></div>}{mode === 'position' && <><div><dt>{t('Per order')}</dt><dd>{positionOrderQuantity || '0'} {asset}</dd></div><div><dt>{t('Leverage')}</dt><dd>{leftLeverage || '—'}× / {rightLeverage || '—'}×</dd></div><div><dt>{t('Max position at selected leverage')}</dt><dd title={`${leftRiskPositionValue !== null && leftRiskPositionValue !== undefined ? formatAmount(leftRiskPositionValue) : '—'} ${quoteFor(leftExchange.id)} / ${rightRiskPositionValue !== null && rightRiskPositionValue !== undefined ? formatAmount(rightRiskPositionValue) : '—'} ${quoteFor(rightExchange.id)}`}>{compactReviewAmount(leftRiskPositionValue)} {quoteFor(leftExchange.id)} / {compactReviewAmount(rightRiskPositionValue)} {quoteFor(rightExchange.id)}</dd></div><div><dt>{t('Projected position')}</dt><dd>{projectedLeftPositionValue !== null ? formatAmount(projectedLeftPositionValue) : '—'} {quoteFor(leftExchange.id)} / {projectedRightPositionValue !== null ? formatAmount(projectedRightPositionValue) : '—'} {quoteFor(rightExchange.id)}</dd></div><div><dt>{t('Reduce only')}</dt><dd>{t(reduceOnly ? 'Yes' : 'No')}</dd></div></>}<div><dt>{t('Method')}{language === 'zh' ? '：' : ': '}</dt><dd>{configuredExecutionMethod.replaceAll('–', '-')}</dd></div>{mode === 'position' && selectedFeeRows.map(({ exchange, symbol, feeKind }) => {
+          <dl className="launch-summary review-grid"><div><dt>{t('Entry')}</dt><dd>{Number(threshold) < 0 ? '≤' : '≥'} {threshold || '0'} bps</dd></div>{mode === 'auto' && <div><dt>{t('Take profit')}</dt><dd>≤ {takeProfitThreshold || '0'} bps</dd></div>}{mode === 'auto' && stopLossThreshold.trim() !== '' && <div><dt>{t('Stop loss')}</dt><dd>{stopLossThreshold} bps{autoThresholds.stopBuffer !== null ? ` · ${t('Effective stop buffer')}: ${formatBps(autoThresholds.stopBuffer.bufferBps)} bps` : ''}</dd></div>}{mode === 'auto' && autoThresholds.ladder !== null && <div><dt>{t('Add-on ladder')}</dt><dd>{formatTierLevels(autoThresholds.ladder)} bps</dd></div>}{autoAllPerp && <div><dt>{t('Leverage')}</dt><dd>{leftLeverage || '1'}× / {rightLeverage || '1'}×</dd></div>}{mode === 'position' && <><div><dt>{t('Per order')}</dt><dd>{positionOrderQuantity || '0'} {asset}</dd></div><div><dt>{t('Leverage')}</dt><dd>{leftLeverage || '—'}× / {rightLeverage || '—'}×</dd></div><div><dt>{t('Projected position')}</dt><dd>{projectedLeftPositionValue !== null ? formatAmount(projectedLeftPositionValue) : '—'} {quoteFor(leftExchange.id)} / {projectedRightPositionValue !== null ? formatAmount(projectedRightPositionValue) : '—'} {quoteFor(rightExchange.id)}</dd></div><div><dt>{t('Reduce only')}</dt><dd>{t(reduceOnly ? 'Yes' : 'No')}</dd></div></>}<div><dt>{t('Method')}{language === 'zh' ? '：' : ': '}</dt><dd>{configuredExecutionMethod.replaceAll('–', '-')}</dd></div>{mode === 'position' && selectedFeeRows.map(({ exchange, symbol, feeKind }) => {
             const rate = numericFutureFeeRate(fees, exchange.id, symbol, feeKind) ?? Number.NaN;
             return <div key={exchange.id}><dt>{exchange.name} · {t(feeKind === 'maker' ? 'Maker fee' : 'Taker fee')}</dt><dd>{Number.isFinite(rate) ? `${(rate * 100).toFixed(4)}%` : t('Exchange setting')}</dd></div>;
-          })}</dl>
+          })}<div className="review-span"><dt>{t('Max position at selected leverage')}</dt><dd title={`${leftRiskPositionValue !== null && leftRiskPositionValue !== undefined ? formatAmount(leftRiskPositionValue) : '—'} ${quoteFor(leftExchange.id)} / ${rightRiskPositionValue !== null && rightRiskPositionValue !== undefined ? formatAmount(rightRiskPositionValue) : '—'} ${quoteFor(rightExchange.id)}`}>{compactReviewAmount(leftRiskPositionValue)} {quoteFor(leftExchange.id)}{leftMaxPositionQuantity !== null && <small>≈ {formatAmount(leftMaxPositionQuantity, 6)} {asset}</small>} / {compactReviewAmount(rightRiskPositionValue)} {quoteFor(rightExchange.id)}{rightMaxPositionQuantity !== null && <small>≈ {formatAmount(rightMaxPositionQuantity, 6)} {asset}</small>}</dd></div><div className="review-span"><dt>{t('Max buy quantity')}</dt><dd title={`${leftMaxBuyQuantity !== null ? formatAmount(leftMaxBuyQuantity, 6) : '—'} ${asset} / ${rightMaxBuyQuantity !== null ? formatAmount(rightMaxBuyQuantity, 6) : '—'} ${asset}`}>{leftMaxBuyQuantity !== null ? `${formatAmount(leftMaxBuyQuantity, 6)} ${asset}` : '—'} / {rightMaxBuyQuantity !== null ? `${formatAmount(rightMaxBuyQuantity, 6)} ${asset}` : '—'}</dd></div></dl>
           {marginInsufficient && <div className="launch-warning"><span>!</span><p>{t('Configured maximum exposure exceeds the available margin.')}</p></div>}
           {positionRiskLimitExceeded && <div className="launch-warning"><span>!</span><p>{t('Configured position exceeds the maximum at selected leverage')}</p></div>}
           <button className={tradingEnabled ? 'start-strategy' : 'start-strategy locked'} onClick={requestStrategyLaunch} disabled={startDisabled}>{startLabel}</button>

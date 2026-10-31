@@ -3175,3 +3175,15 @@ html[data-theme='light'] .funding-pair-short { border-left-color: rgba(192, 44, 
 @media (max-width: 640px) {
   .recurring-arb-block { grid-template-columns: 1fr; }
 }
+
+/* Launch review rows that quote a notional together with its size need the full width: the
+ * half-width cell ellipsized the second number, which is exactly the figure the operator checks. */
+.launch-summary.review-grid > div.review-span {
+  grid-column: 1 / -1;
+  border-right: 0;
+}
+.launch-summary.review-grid dd small {
+  margin-left: 4px;
+  font-size: inherit;
+  color: #627184;
+}

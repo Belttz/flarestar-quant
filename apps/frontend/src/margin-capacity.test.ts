@@ -5,7 +5,9 @@ import {
   balanceFor,
   balanceUnitFor,
   classifyLeverageMargin,
+  marginLimitedQuantity,
   maxPositionValueAtLeverage,
+  notionalToQuantity,
   projectedPositionValue,
 } from './route-shared.js';
 
@@ -109,5 +111,27 @@ describe('CrossEx leverage-tier position capacity', () => {
     expect(projectedPositionValue(4, 2, 100)).toBe(600);
     expect(projectedPositionValue(-4, 2, 100)).toBe(200);
     expect(projectedPositionValue(-4, 6, 100)).toBe(200);
+  });
+
+  it('converts a tier notional cap into the size it buys at the reference price', () => {
+    expect(notionalToQuantity(350000000, 70000)).toBe(5000);
+    expect(notionalToQuantity(0, 70000)).toBe(0);
+    // Missing or unusable inputs stay unknown so the panel can render an em dash, never a fake 0.
+    expect(notionalToQuantity(null, 70000)).toBeNull();
+    expect(notionalToQuantity(undefined, 70000)).toBeNull();
+    expect(notionalToQuantity(Number.POSITIVE_INFINITY, 70000)).toBeNull();
+    expect(notionalToQuantity(350000000, 0)).toBeNull();
+  });
+
+  it('caps the margin-limited buy size at the tier cap and refuses unknown margin', () => {
+    // 1000 USDT of free margin at 5x buys 5000 USDT, i.e. 0.05 BTC at 100,000.
+    expect(marginLimitedQuantity(1000, 5, 100000, null)).toBeCloseTo(0.05, 10);
+    expect(marginLimitedQuantity(1000, 5, 100000, 0.01)).toBe(0.01);
+    // Above the tier cap: the venue limit wins.
+    expect(marginLimitedQuantity(1000000, 50, 100000, 0.01)).toBe(0.01);
+    expect(marginLimitedQuantity(null, 5, 100000, 0.01)).toBeNull();
+    expect(marginLimitedQuantity(0, 5, 100000, 0.01)).toBeNull();
+    expect(marginLimitedQuantity(1000, 0, 100000, 0.01)).toBeNull();
+    expect(marginLimitedQuantity(1000, 5, 0, 0.01)).toBeNull();
   });
 });

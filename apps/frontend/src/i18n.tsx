@@ -103,7 +103,7 @@ const chinese: Record<string, string> = {
   Leverage: '杠杆', 'SKHY leverage': 'SKHY 杠杆', 'SKHYNIX leverage': 'SKHYNIX 杠杆',
   'Adjust leverage': '调整杠杆', 'Current leverage': '当前杠杆', 'Apply leverage': '应用杠杆',
     'Leverage updated': '杠杆已更新', 'Leverage rejected': '杠杆调整失败', 'Set leverage': '设置杠杆',
-    'Max position at selected leverage': '所选杠杆下最大仓位', 'Projected position': '预计最终仓位',
+    'Max position at selected leverage': '所选杠杆下最大仓位', 'Max buy quantity': '最大买入量', 'Projected position': '预计最终仓位',
     'Projected position exceeds the maximum at selected leverage': '预计最终仓位超过所选杠杆下的上限',
     'Unable to verify max position at selected leverage': '暂时无法验证所选杠杆下的最大仓位',
     'Configured position exceeds the maximum at selected leverage': '配置仓位超过所选杠杆下的上限',
