@@ -2,6 +2,12 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [5.4.5] - 2026-10-31
+
+### Fixed
+
+- **The maintenance pass now runs hourly, so the 6-hour audit window actually holds.** 5.4.4 added a retention rule for `funding_arb_decisions` but the only pass ran once a day: up to 30 hours of rejected candidates could pile up between passes, so the file would have swung by hundreds of MB every day instead of staying flat. The pass is hourly now (`apps/backend/src/app.ts`); the monthly gzipped archive is idempotent per calendar month, so the extra calls are no-ops.
+
 ## [5.4.4] - 2026-10-31
 
 ### Fixed

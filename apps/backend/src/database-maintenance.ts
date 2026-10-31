@@ -90,7 +90,7 @@ export function maintenanceDeletedRowCount(result: DatabaseMaintenanceResult): n
  *    them. They keep their own per-key bounds instead.
  *
  * The monthly archive runs *after* the transaction (SQLite refuses `VACUUM` inside one) and is
- * idempotent per calendar month, so the daily interval can call this unconditionally.
+ * idempotent per calendar month, so the hourly interval can call this unconditionally.
  *
  * @param database open handle.
  * @param now reference instant in epoch milliseconds (defaults to `Date.now()`).
