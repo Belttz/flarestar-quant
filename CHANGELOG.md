@@ -2,6 +2,12 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [5.4.3] - 2026-10-31
+
+### Fixed
+
+- **Max buy quantity** in the strategy launch review now answers "how much can my money buy": it is free margin × leverage ÷ reference price, and is no longer clamped by the venue risk-tier cap. The tier cap keeps its own row (`max position at selected leverage`, value plus size), so phone and desktop show the capital ceiling and the exchange ceiling side by side instead of one figure that silently reported the smaller of the two.
+
 ## [5.4.2] - 2026-10-31
 
 ### Fixed

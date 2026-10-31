@@ -226,24 +226,22 @@ export function notionalToQuantity(value: number | null | undefined, referencePr
 }
 
 /**
- * Largest size the free margin carries at a leverage, never above the venue risk-tier cap. Mirrors
- * the trade ticket's "max order quantity" (margin × leverage / price, then the risk ceiling).
- * Unknown margin yields `null` rather than a zero that would read as a real, unusable maximum.
+ * Largest size the operator's free margin carries at a leverage: margin × leverage / price.
+ * Deliberately *not* clamped by the venue risk-tier cap — the launch review shows the capital
+ * ceiling next to the venue ceiling so the operator can compare the two, and the capital figure
+ * is what "how much can my money buy" means. Unknown margin yields `null` rather than a zero
+ * that would read as a real, unusable maximum.
  */
-export function marginLimitedQuantity(
+export function marginAffordableQuantity(
   availableMargin: number | null | undefined,
   leverage: number,
   referencePrice: number,
-  riskQuantityCap: number | null,
 ): number | null {
   if (availableMargin === null || availableMargin === undefined) return null;
   if (!Number.isFinite(availableMargin) || availableMargin <= 0) return null;
   if (!Number.isFinite(leverage) || leverage <= 0) return null;
   if (!Number.isFinite(referencePrice) || referencePrice <= 0) return null;
-  const affordable = (availableMargin * leverage) / referencePrice;
-  return riskQuantityCap !== null && Number.isFinite(riskQuantityCap) && riskQuantityCap > 0
-    ? Math.min(affordable, riskQuantityCap)
-    : affordable;
+  return (availableMargin * leverage) / referencePrice;
 }
 
 export function usesSharedCrossExMargin(portfolio: AuthenticatedPortfolioSnapshot | null): boolean {
