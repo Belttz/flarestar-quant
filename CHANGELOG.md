@@ -2,6 +2,17 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [5.4.8] - 2026-10-31
+
+### Fixed
+
+- **A second strategy can no longer spend margin that another running strategy has already planned.** The launch preflight only saw the exchange's available margin, which shrinks when a fill happens — not when a plan is submitted. Two BLUR strategies launched 0.62 s apart therefore both read the same untouched balance (45.9799 USDT), both passed preflight, and the second one had 197 entry orders rejected with no warning before it was stopped by hand. The runtime now keeps a per-strategy reservation of the still-unfilled part of its plan (`setStrategyMarginReservation`), nets every other strategy's claim out of `accountAvailableMargin` and `prepareStrategyMargin`, and the engine re-scales its own claim after every fill (basis × unfilled share of the target) and releases it on stop, pause, completion, and reduce-only/close plans. A strategy never blocks itself, so its own quoting still sees the full remaining balance.
+- **A margin-rejected launch now says what is missing.** The error label carries `required X USDT, available Y USDT · Z USDT reserved by running strategies`, so the toast no longer shows only `insufficient strategy margin`.
+
+### Changed
+
+- `TradingRuntime.prepareStrategyMargin` accepts an optional `strategyId` (resume path) and `accountAvailableMargin` accepts one too; both subtract only *other* strategies' reservations.
+
 ## [5.4.7] - 2026-10-31
 
 ### Fixed

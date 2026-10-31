@@ -685,6 +685,39 @@ describe('strategy engine', () => {
     expect(gateway.createdOrders).toHaveLength(0);
   });
 
+  it('claims a running strategy unfilled margin so a second launch cannot spend it twice', async () => {
+    const { engine, gateway, markets } = await createHarness();
+    // 2026-10-31 production: two strategies launched 0.62 s apart both read the same untouched
+    // available balance and the second one was rejected 197 times with no warning. The first
+    // strategy's plan (0.2 BTC per leg at 5x ≈ 8,800 USDT) must be reserved while it is unfilled.
+    gateway.availableMargin = '10000';
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100000', '100001');
+    markets.set('OKX_FUTURE_BTC_USDT', '99999', '100000');
+    const config = { ...takerTakerConfig, leftLeverage: '5', rightLeverage: '5' };
+
+    const first = await engine.startStrategy(config);
+    expect(first.status).toBe('RUNNING');
+
+    await expect(engine.startStrategy(config)).rejects.toMatchObject({
+      code: 'insufficient_strategy_margin', statusCode: 409,
+    });
+  });
+
+  it('nets other strategies reservations out of the available margin but never its own', async () => {
+    const { runtime, gateway } = await createHarness();
+    gateway.availableMargin = '1000';
+    expect((await runtime.accountAvailableMargin())?.toString()).toBe('1000');
+
+    runtime.setStrategyMarginReservation('PAIR-A', new Decimal('250'));
+    expect((await runtime.accountAvailableMargin())?.toString()).toBe('750');
+    // A strategy sizing its own clip must see its own balance: the claim belongs to its plan.
+    expect((await runtime.accountAvailableMargin('PAIR-A'))?.toString()).toBe('1000');
+    expect((await runtime.accountAvailableMargin('PAIR-B'))?.toString()).toBe('750');
+
+    runtime.setStrategyMarginReservation('PAIR-A', new Decimal('0'));
+    expect((await runtime.accountAvailableMargin())?.toString()).toBe('1000');
+  });
+
   it('uses unified available margin without applying venue asset-row caps in cross-exchange mode', async () => {
     const { engine, gateway, markets } = await createHarness();
     gateway.availableMargin = '100000';

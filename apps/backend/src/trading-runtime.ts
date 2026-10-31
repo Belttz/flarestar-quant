@@ -536,6 +536,16 @@ export class TradingRuntime {
   private readonly preparedStatements = new Map<string, Database.Statement>();
   /** Short-lived account-margin cache: entry clips are checked many times per second. */
   private availableMarginCache: { at: number; value: Decimal } | null = null;
+  /**
+   * Margin already promised to live strategies for capacity they planned but have not filled yet.
+   * The exchange's available margin only shrinks once a fill exists, so two strategies launched
+   * seconds apart each read the same untouched balance and both believe they can fund their whole
+   * plan (2026-10-31: two BLUR strategies 0.62 s apart, the second one rejected 197 times). Each
+   * strategy holds its remaining unfilled requirement here and every read nets the others out.
+   * This is process state on purpose: each strategy re-establishes its own claim on boot and after
+   * every fill, so a restart can never leak a phantom reservation.
+   */
+  private readonly strategyMarginReservations = new Map<string, Decimal>();
   private readonly runAuthenticatedWrite: <T>(work: () => Promise<T>) => Promise<T>;
 
   constructor(
@@ -576,7 +586,14 @@ export class TradingRuntime {
    * into a REST hammer. Returns null when the account cannot be read (the caller then abstains
    * rather than blocking a healthy entry on a transient data failure).
    */
-  async accountAvailableMargin(): Promise<Decimal | null> {
+  async accountAvailableMargin(strategyId?: string): Promise<Decimal | null> {
+    const raw = await this.rawAccountAvailableMargin();
+    if (raw === null) return null;
+    return Decimal.max(0, raw.minus(this.strategyMarginReservedByOthers(strategyId)));
+  }
+
+  /** Account read backing `accountAvailableMargin`, before in-process strategy reservations. */
+  private async rawAccountAvailableMargin(): Promise<Decimal | null> {
     const now = Date.now();
     if (this.availableMarginCache && now - this.availableMarginCache.at < 5_000) {
       return this.availableMarginCache.value;
@@ -595,15 +612,41 @@ export class TradingRuntime {
   }
 
   /**
+   * Record (or, with null/zero, clear) the margin a strategy claims for its planned but unfilled
+   * capacity. Called by the engine after every fill so the claim shrinks as the position grows,
+   * and on start/recovery so a launch never reads a balance another live strategy already spent.
+   */
+  setStrategyMarginReservation(strategyId: string, amount: Decimal | null): void {
+    if (amount === null || !amount.isFinite() || amount.lte(0)) {
+      this.strategyMarginReservations.delete(strategyId);
+      return;
+    }
+    this.strategyMarginReservations.set(strategyId, amount);
+  }
+
+  /** Margin promised to every live strategy except `strategyId`: a strategy never blocks itself. */
+  strategyMarginReservedByOthers(strategyId?: string): Decimal {
+    let total = new Decimal(0);
+    for (const [id, amount] of this.strategyMarginReservations) {
+      if (id !== strategyId) total = total.plus(amount);
+    }
+    return total;
+  }
+
+  /**
    * Validate the full planned strategy exposure against a fresh account balance, then apply the
    * requested per-leg leverage. The 10% reserve covers small price moves, taker fees, and rounding
    * between this check and the actual entry. Spot legs (full cash, no leverage tiers) skip the
    * futures risk-limit gate, and `mutateLeverage: false` keeps carry strategies from touching the
    * account's leverage preset at all.
+   *
+   * The account figure is netted against the other live strategies' unfilled reservations, because
+   * the exchange cannot see a plan that has not been filled yet. `strategyId` is the caller's own
+   * id when it already exists (resume); a fresh launch has none yet and simply sees every claim.
    */
   async prepareStrategyMargin(
     legs: StrategyMarginLeg[],
-    options: { mutateLeverage?: boolean } = {},
+    options: { mutateLeverage?: boolean; strategyId?: string } = {},
   ): Promise<StrategyMarginPreflight> {
     if (!this.session.liveTradingEnabled) throw new TradingRuntimeError('live_trading_locked', 403);
     const credentials = await this.vault.get(DEFAULT_CREDENTIAL_PROFILE);
@@ -694,13 +737,23 @@ export class TradingRuntime {
       const venue = leg.venue.toUpperCase();
       requiredByVenue.set(venue, (requiredByVenue.get(venue) ?? new Decimal(0)).plus(requirement));
     }
+    const reservedByOthers = this.strategyMarginReservedByOthers(options.strategyId);
+    // State the shortfall in the error label so the launch toast says what is missing instead of
+    // only the machine code (the old silent path made the 2026-10-31 double-launch look like a
+    // mystery).
+    const marginShortfallLabel = (available: Decimal): string => {
+      const reserved = reservedByOthers.gt(0)
+        ? ` · ${reservedByOthers.toFixed(2)} USDT reserved by running strategies`
+        : '';
+      return `required ${requiredMargin.toFixed(2)} USDT, available ${available.toFixed(2)} USDT${reserved}`;
+    };
     let availableMargin = new Decimal(0);
     if (account?.account_mode === 'CROSS_EXCHANGE') {
       // In CrossEx unified mode, Gate's top-level available_margin is authoritative. assets[] is a
       // venue/currency allocation breakdown and cannot be used as a per-leg spending limit.
-      availableMargin = new Decimal(account.available_margin);
+      availableMargin = Decimal.max(0, new Decimal(account.available_margin).minus(reservedByOthers));
       if (!availableMargin.isFinite() || availableMargin.lt(requiredMargin)) {
-        throw new TradingRuntimeError('insufficient_strategy_margin', 409);
+        throw new TradingRuntimeError('insufficient_strategy_margin', 409, marginShortfallLabel(availableMargin));
       }
     } else {
       if (isolatedAccounts.length !== venues.length
@@ -716,6 +769,11 @@ export class TradingRuntime {
           throw new TradingRuntimeError('insufficient_strategy_margin', 409);
         }
         availableMargin = availableMargin.plus(venueAvailable);
+      }
+      // Isolated venues gate per venue above; the shared claim still has to fit in the total.
+      availableMargin = Decimal.max(0, availableMargin.minus(reservedByOthers));
+      if (availableMargin.lt(requiredMargin)) {
+        throw new TradingRuntimeError('insufficient_strategy_margin', 409, marginShortfallLabel(availableMargin));
       }
     }
 

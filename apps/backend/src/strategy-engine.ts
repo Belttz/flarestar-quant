@@ -507,6 +507,11 @@ export class StrategyEngineError extends TradingRuntimeError {}
 
 export class StrategyEngine {
   private readonly actors = new Map<string, StrategyActor>();
+  /**
+   * Full-planned margin each live strategy claimed at launch, kept so its live reservation can be
+   * scaled down as the position fills. See TradingRuntime.setStrategyMarginReservation.
+   */
+  private readonly strategyMarginBasis = new Map<string, Decimal>();
   private readonly options: Required<StrategyEngineOptions>;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private tickRun: Promise<void> | null = null;
@@ -806,6 +811,10 @@ export class StrategyEngine {
         credential_profile_label, created_at, updated_at, stopped_at)
         VALUES (?, ?, 'live', 'RUNNING', ?, 0, '0', '0', '0', '0', ?, ?, ?, ?, NULL)`)
         .run(id, input.kind, JSON.stringify(input), account?.profileId ?? null, account?.label ?? null, now, now);
+      // Claim the preflight's requirement before the first fill exists: filling a pair takes time,
+      // and until it happens the exchange still reports the money as available.
+      this.strategyMarginBasis.set(id, new Decimal(marginPreflight.requiredMargin));
+      this.runtime.setStrategyMarginReservation(id, new Decimal(marginPreflight.requiredMargin));
       const shortPremium = input.leftSide === 'SELL';
       const hedgeModeLabel = input.hedgeMode === 'EQUAL_NOTIONAL' ? 'equal-notional hedge' : 'share-ratio hedge';
       const startCondition = input.closePlan
@@ -935,6 +944,7 @@ export class StrategyEngine {
     // between (fresh-price wait, size checks, the post-wait re-checks, persistence) — including a
     // concurrent request consuming the final running slot while the wait runs — releases it.
     let resumeQuoteWatchRelease: (() => void) | null = null;
+    let resumePreflight = { requiredMargin: '0', availableMargin: '0' };
     try {
       if (config.closePlan) {
         for (const target of config.closePlan.targets) {
@@ -958,7 +968,8 @@ export class StrategyEngine {
         resumeQuoteWatchRelease = this.openLegWatch([legs.left.symbol, legs.right.symbol]);
         await this.awaitFreshMarketPair(legs);
         this.validateStrategyOrderSizes(config, legs);
-        await this.prepareStrategy(config, legs);
+        // Exclude this strategy's own (already released) claim, not the other live strategies'.
+        resumePreflight = await this.prepareStrategy(config, legs, false, id);
       }
 
       // Re-check after the asynchronous account and order preflights. Another request may have
@@ -982,6 +993,9 @@ export class StrategyEngine {
       this.runtime.addStrategyLog(id, 'info', 'Strategy resumed', 'Manual resume', '—', 'Preflight passed · monitoring live spreads');
       const resumed = this.runtime.getStrategy(id);
       const actor = this.attach(resumed);
+      // Resume re-claims the remaining planned capacity for the same reason a launch does.
+      this.strategyMarginBasis.set(id, new Decimal(resumePreflight.requiredMargin));
+      this.runtime.setStrategyMarginReservation(id, new Decimal(resumePreflight.requiredMargin));
       // Keep the legs' ticker subscription alive for the whole strategy lifetime.
       actor.quoteWatchRelease = resumeQuoteWatchRelease;
       resumeQuoteWatchRelease = null;
@@ -1178,6 +1192,7 @@ export class StrategyEngine {
       quoteWatchRelease: null,
     };
     this.actors.set(record.id, actor);
+    if (!suspended) this.claimPlannedMargin(record);
     return actor;
   }
 
@@ -1201,6 +1216,7 @@ export class StrategyEngine {
     config: CreateStrategyInput,
     legs: { left: LegDefinition; right: LegDefinition },
     allowStaleQuote = false,
+    strategyId?: string,
   ): Promise<{ requiredMargin: string; availableMargin: string }> {
     const pair = this.freshMarketPair(legs.left.symbol, legs.right.symbol)
       ?? (allowStaleQuote ? this.latestMarketPair(legs.left.symbol, legs.right.symbol) : null);
@@ -1245,7 +1261,10 @@ export class StrategyEngine {
     }
     // Carry must not touch the account leverage preset: the perp leg trades at whatever the user
     // configured, and the engine only reserves margin against that preset.
-    return this.runtime.prepareStrategyMargin(plannedLegs, { mutateLeverage: config.kind !== 'carry' });
+    return this.runtime.prepareStrategyMargin(plannedLegs, {
+      mutateLeverage: config.kind !== 'carry',
+      strategyId,
+    });
   }
 
   private enqueue(actor: StrategyActor, work: () => Promise<void>): void {
@@ -1809,6 +1828,7 @@ export class StrategyEngine {
       `${actor.config.closePlan?.orderCount ?? 0} timed close slices`, '100%',
       pendingNote ?? 'All reduce-only close orders filled');
     this.releaseQuoteWatch(actor);
+    this.releaseStrategyMargin(actor.id);
     this.actors.delete(actor.id);
     this.runtime.emitStrategyUpdate(this.runtime.getStrategy(actor.id));
   }
@@ -2008,7 +2028,85 @@ export class StrategyEngine {
     return new Decimal(config.maxPosition ?? '0');
   }
 
+  /**
+   * Keep this strategy's in-process margin claim equal to what its unfilled capacity still needs.
+   *
+   * The exchange's available margin only drops once a fill exists, so a strategy launched while
+   * another is still working its plan would read the same untouched balance (2026-10-31: two BLUR
+   * strategies 0.62 s apart, the second rejected 197 times with no warning). The claim starts at the
+   * launch preflight's requirement and shrinks with the fill; every other strategy's reads net it
+   * out (see TradingRuntime.setStrategyMarginReservation).
+   */
+  private refreshMarginReservation(actor: StrategyActor, exposure: { left: Decimal; right: Decimal }): void {
+    if (actor.config.closePlan || actor.config.reduceOnly) {
+      this.releaseStrategyMargin(actor.id);
+      return;
+    }
+    const target = this.strategyTarget(actor.config);
+    if (!target.gt(0)) {
+      this.releaseStrategyMargin(actor.id);
+      return;
+    }
+    let basis = this.strategyMarginBasis.get(actor.id) ?? null;
+    if (basis === null) {
+      basis = this.estimateStrategyMargin(actor.config, target);
+      // No live price yet: keep whatever claim the strategy already holds rather than dropping the
+      // gate for everyone else.
+      if (basis === null) return;
+      this.strategyMarginBasis.set(actor.id, basis);
+    }
+    const unfilled = Decimal.max(0, target.minus(this.matchedQuantity(exposure))).div(target);
+    const amount = basis.mul(unfilled);
+    this.runtime.setStrategyMarginReservation(actor.id, amount.gt(QUANTITY_EPSILON) ? amount : null);
+  }
+
+  /**
+   * Claim a strategy's full planned margin without consulting the ledger. Used when an actor is
+   * attached without a launch preflight (boot recovery, resume of a paused strategy): its position
+   * is not knowable here without a ledger read, so it claims the whole plan up front and shrinks on
+   * the first fill (see refreshMarginReservation).
+   */
+  private claimPlannedMargin(record: StrategyRecord): void {
+    if (this.strategyMarginBasis.has(record.id)) return;
+    const config = record.config;
+    if (config.closePlan || config.reduceOnly) return;
+    const target = this.strategyTarget(config);
+    if (!target.gt(0)) return;
+    const basis = this.estimateStrategyMargin(config, target);
+    if (basis === null) return;
+    this.strategyMarginBasis.set(record.id, basis);
+    this.runtime.setStrategyMarginReservation(record.id, basis);
+  }
+
+  /**
+   * Approximate the launch requirement for a strategy this process did not launch itself (boot
+   * recovery, resume): planned notional per leg ÷ its leverage × the same 10% reserve the preflight
+   * uses. Null while a leg has no usable price, so the caller keeps the previous claim.
+   */
+  private estimateStrategyMargin(config: CreateStrategyInput, target: Decimal): Decimal | null {
+    const legs = legsOf(config);
+    const leftPrice = this.executablePrice(legs.left.symbol, legs.left.side);
+    const rightPrice = this.executablePrice(legs.right.symbol, legs.right.side);
+    if (leftPrice === null || rightPrice === null) return null;
+    const leftLeverage = new Decimal(config.leftLeverage ?? '1');
+    const rightLeverage = new Decimal(
+      config.kind === 'carry' ? config.contractLeverage ?? '1' : config.rightLeverage ?? '1',
+    );
+    if (!leftLeverage.gt(0) || !rightLeverage.gt(0)) return null;
+    // Quantities are expressed in left-leg units; the hedge leg converts through the ADR ratio.
+    const rightPerLeft = this.equalNotional(config) ? leftPrice.div(rightPrice) : adrRatioOf(config);
+    const perUnit = leftPrice.div(leftLeverage).plus(rightPrice.mul(rightPerLeft).div(rightLeverage));
+    return target.mul(perUnit).mul('1.10');
+  }
+
+  /** Drop this strategy's margin claim (terminal states, reduce-only plans, close plans). */
+  private releaseStrategyMargin(actorId: string): void {
+    this.strategyMarginBasis.delete(actorId);
+    this.runtime.setStrategyMarginReservation(actorId, null);
+  }
+
   private persist(actor: StrategyActor, exposure: { left: Decimal; right: Decimal }): StrategyRecord {
+    this.refreshMarginReservation(actor, exposure);
     const matched = this.matchedQuantity(exposure);
     const target = this.strategyTarget(actor.config);
     const progress = target.gt(0) ? Decimal.min(matched.div(target).mul(100), new Decimal(100)).toNumber() : 0;
@@ -2211,6 +2309,7 @@ export class StrategyEngine {
       open_position = '0', stopped_at = ?, updated_at = ? WHERE id = ?`).run(now, now, actor.id);
     this.runtime.addStrategyLog(actor.id, 'info', 'Strategy completed', condition, result, details);
     this.releaseQuoteWatch(actor);
+    this.releaseStrategyMargin(actor.id);
     this.actors.delete(actor.id);
     this.runtime.emitStrategyUpdate(this.runtime.getStrategy(actor.id));
   }
@@ -2295,6 +2394,7 @@ export class StrategyEngine {
         actor.quiesceReason ?? 'Safety pause');
     }
     this.releaseQuoteWatch(actor);
+    this.releaseStrategyMargin(actor.id);
     this.actors.delete(actor.id);
     this.runtime.emitStrategyUpdate(this.runtime.getStrategy(actor.id));
     return true;
@@ -3839,7 +3939,7 @@ export class StrategyEngine {
     requested: Decimal,
     desired: { price: Decimal; makerLeg: LegDefinition; takerLeg: LegDefinition },
   ): Promise<Decimal> {
-    const available = await this.runtime.accountAvailableMargin();
+    const available = await this.runtime.accountAvailableMargin(actor.id);
     if (available === null) return requested;
     const legs = legsOf(actor.config);
     const leftIsMaker = legs.left.symbol === desired.makerLeg.symbol;
