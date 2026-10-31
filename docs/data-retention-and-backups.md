@@ -20,6 +20,7 @@
 | 类别 | 处理方式 | 涉及的表 |
 | --- | --- | --- |
 | **缓存 / 排行 / 机会类**（瞬时，可丢） | 超过 **24 小时**即删，下次按需重新向上游取（`portfolio_snapshots` 例外：永远保留最新一行，见 1.4） | `spread_samples`、`public_market_snapshots`、`portfolio_snapshots` |
+| **审计流水（按扫描节奏有界）** | 只保留最近 **6 小时**的“被拒候选”快照；`PASS` 行与已开仓行永久保留（见 1.7） | `funding_arb_decisions` |
 | **历史数据**（禁止按 24h 删） | 保留自有窗口，不参与 24h 清理 | `candle_cache`、`funding_rate_history`、`funding_history_coverage`、`portfolio_equity_samples`、`audit_events`、`reconciliation_reports`，以及执行/成交/策略记录、用户偏好、凭据元数据 |
 | **业务数据**（永不清） | 只在月度备份里被快照 | `execution_orders`、`execution_fills`、`execution_strategies`、`execution_strategy_logs`、`live_positions`、`live_balances`、`risk_rules`、`hedge_strategies`、`hedge_legs`、`saved_strategy_pairs`、`user_preferences`、`credential_metadata`、`credential_session`、`auth_user` |
 | **元数据缓存（豁免 24h）** | 有界、按 symbol 唯一、下单校验依赖，不参与 24h 清理 | `crossex_instruments`、`crossex_risk_tiers`、`hyperliquid_perp_metadata`、`market_data_sync` |
@@ -32,6 +33,7 @@ export const SPREAD_SAMPLE_GRACE_MS = 2 * 60 * 60_000;           // 见 1.1
 export const SPREAD_SAMPLE_RETENTION_MS = CACHE_RETENTION_MS + SPREAD_SAMPLE_GRACE_MS;
 export const CACHE_PRUNE_BATCH_SIZE = 500;                        // 每批 DELETE 行数
 export const CACHE_PRUNE_MAX_BATCHES_PER_TABLE = 100;             // 单次维护的批次数上限
+export const FUNDING_ARB_REJECT_RETENTION_MS = 6 * 60 * 60_000;  // 被拒候选审计流水，见 1.7
 ```
 
 ### 1.1 决策：`spread_samples` 保留 24h + 2h 宽限（不是正好 24h）
@@ -89,6 +91,29 @@ export const CACHE_PRUNE_MAX_BATCHES_PER_TABLE = 100;             // 单次维�
 | 2 | 元数据表（`crossex_instruments` / `crossex_risk_tiers` / `hyperliquid_perp_metadata` / `market_data_sync`）豁免 24h | 已批准 |
 | 3 | `reconciliation_reports` 归为对账历史、不按 24h 删 | 已批准 |
 | 4 | `portfolio_snapshots` 按 24h 清理，但永远保留最新一行 | 已批准（本轮补入） |
+| 5 | `funding_arb_decisions` 只保留 6 小时的被拒候选，PASS / 已开仓行永久保留 | 已批准（本轮补入） |
+
+### 1.7 决策：`funding_arb_decisions` 只保留 6 小时的“被拒候选”
+
+资金费率自动扫描每 10 分钟评估约 6.9k 个候选，`funding-arb-monitor.ts` 里
+"AUDIT: every evaluated candidate of this scan" 会把**每一个**候选（PASS 与 REJECT 都算）写一行。
+2026-10-31 检查生产库发现该表漏在保留策略之外：4 天写入 254.8 万行，其中只有 34 行是 `PASS`，
+表 + 3 个索引占 **2.86 GB**（全库 3.07 GB 的 93%），并以约 0.6M 行/天（≈0.69 GB/天）继续增长——
+这是库“无故变 3 GB”的唯一原因。
+
+规则（`CACHE_RETENTION_TABLES` 里的 `funding_arb_decisions`）：
+
+- 时间列 `scanned_at`（ISO 文本），窗口 **6 小时**（`FUNDING_ARB_REJECT_RETENTION_MS`）。
+  审计页只读最新 200 行（`listFundingArbDecisions` 的 `ORDER BY scanned_at DESC LIMIT 200`，
+  约等于 2 次扫描），6 小时仍能回溯约 36 次扫描，足够回答“刚才这一对为什么没开”。
+- 只删 `verdict = 'REJECT' AND strategy_id IS NULL`（`CacheRetentionRule.predicate`）：
+  `PASS` 行和任何已绑定策略的行记录的是真实交易，每天只有几十行，按业务数据永久保留。
+- 批大小与批次上限单独放大到 1000 × 1200（最多 120 万行/轮）：默认的 500 × 100 = 5 万行/轮
+  远小于每天约 61 万行的产量，会越清越积。每批仍是独立事务，写锁不会被长时间占用。
+- 存量清理是一次性的（删除 + `VACUUM`，见 §5）；此后每天一次的维护通道自动维持，
+  稳态体积约为“6 小时被拒候选（≈170 MB）+ 其余表”。
+
+被删的只有“当时被拒、且没有任何策略从中开仓”的候选快照；`PASS` 行照旧进入月度备份。
 
 ---
 
@@ -205,4 +230,7 @@ sqlite3 /tmp/restored.sqlite "PRAGMA quick_check"   # 输出 ok
   时会用那一行兜底快照先画首屏，随后被实时刷新覆盖。历史权益由 `portfolio_equity_samples` 提供。
 - **删除不回收磁盘**：SQLite 会把释放的页留给后续写入复用；如需真正缩小文件，需离线 `VACUUM`
   （月度 `VACUUM INTO` 的**备份文件**本身已是压实后的体积）。
+- **3 GB 库的根因已处理（5.4.4）**：`funding_arb_decisions` 无界增长（见 1.7）。加规则后新行不再
+  累积，但**存量已占的页不会自己还回去**——2026-10-31 在云服务器上做了一次停机
+  `DELETE` + `VACUUM`，3.07 GB → 约 0.3 GB；之后每天维护自动维持。
 - **`reconciliation_reports` 不按 24h 删**：见 1.5（已归档为决策，不再是遗留争议）。

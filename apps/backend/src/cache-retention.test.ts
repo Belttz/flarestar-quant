@@ -8,6 +8,7 @@ import {
   CACHE_RETENTION_MS,
   CACHE_RETENTION_TABLES,
   DAY_MS,
+  FUNDING_ARB_REJECT_RETENTION_MS,
   SPREAD_SAMPLE_RETENTION_MS,
   pruneExpiredCacheTables,
 } from './cache-retention.js';
@@ -56,6 +57,20 @@ function insertPortfolioSnapshot(database: Database.Database, id: string, fetche
   `).run(id, fetchedAt, fetchedAt);
 }
 
+function insertFundingArbDecision(
+  database: Database.Database,
+  id: string,
+  scannedAt: string,
+  verdict: string,
+  strategyId: string | null,
+): void {
+  database.prepare(`
+    INSERT INTO funding_arb_decisions (
+      id, scanned_at, candidate_key, verdict, reasons_json, payload_json, strategy_id, created_at
+    ) VALUES (?, ?, 'BINANCE_FUTURE_BTC_USDT:OKX_FUTURE_BTC_USDT', ?, '[]', '{}', ?, ?)
+  `).run(id, scannedAt, verdict, strategyId, scannedAt);
+}
+
 function count(database: Database.Database, table: string): number {
   return (database.prepare(`SELECT COUNT(*) AS c FROM ${table}`).get() as { c: number }).c;
 }
@@ -73,6 +88,44 @@ describe('cache retention window', () => {
       'spread_samples',
       'public_market_snapshots',
       'portfolio_snapshots',
+      'funding_arb_decisions',
+    ]);
+    // The rejected-candidate audit trail is not a 24h cache: it is pruned much harder, because the
+    // scanner writes ~0.6M rows/day and nothing reads past the newest 200.
+    expect(FUNDING_ARB_REJECT_RETENTION_MS).toBe(6 * 60 * 60_000);
+    expect(FUNDING_ARB_REJECT_RETENTION_MS).toBeLessThan(CACHE_RETENTION_MS);
+  });
+
+  it('sizes the funding-arb rule so one daily pass can drain a day of rejected candidates', () => {
+    const rule = CACHE_RETENTION_TABLES.find((entry) => entry.table === 'funding_arb_decisions');
+    expect(rule?.column).toBe('scanned_at');
+    expect(rule?.timestamp).toBe('iso');
+    expect(rule?.predicate).toBe("verdict = 'REJECT' AND strategy_id IS NULL");
+    // The shared 500 x 100 valve only removes 50k rows per pass; the audit table produces ~610k.
+    expect((rule?.batchSize ?? 0) * (rule?.maxBatchesPerPass ?? 0)).toBeGreaterThan(500_000);
+  });
+
+  it('prunes only rejected funding-arb candidates and keeps PASS rows forever', () => {
+    const database = open();
+    insertFundingArbDecision(database, 'reject-old', iso(NOW - 2 * DAY_MS), 'REJECT', null);
+    insertFundingArbDecision(database, 'reject-fresh', iso(NOW - 60_000), 'REJECT', null);
+    insertFundingArbDecision(database, 'pass-ancient', iso(NOW - 40 * DAY_MS), 'PASS', null);
+    insertFundingArbDecision(
+      database,
+      'reject-with-strategy',
+      iso(NOW - 40 * DAY_MS),
+      'REJECT',
+      'strategy-1',
+    );
+
+    const result = pruneExpiredCacheTables(database, NOW);
+
+    // Only the old, strategy-less REJECT expires; PASS and strategy-bound rows are audit history.
+    expect(result.deletedByTable.funding_arb_decisions).toBe(1);
+    expect(database.prepare('SELECT id FROM funding_arb_decisions ORDER BY id').all()).toEqual([
+      { id: 'pass-ancient' },
+      { id: 'reject-fresh' },
+      { id: 'reject-with-strategy' },
     ]);
   });
 

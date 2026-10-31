@@ -2,6 +2,16 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [5.4.4] - 2026-10-31
+
+### Fixed
+
+- **The local SQLite file no longer grows without bound.** `funding_arb_decisions` (the funding-arb scanner's per-candidate audit trail) had no retention rule: one row per evaluated candidate every 10 minutes — ~6.9k rows per scan, 99.999% of them `REJECT` — reached 2.55M rows and 2.86 GB (93% of a 3.07 GB database) in four days, growing ~0.6M rows/day. It is now pruned to the newest 6 hours of rejected candidates (`FUNDING_ARB_REJECT_RETENTION_MS`); `PASS` rows and rows bound to an opened strategy are kept forever, because they document an actual trade. The rule carries its own batch sizing (1000 × 1200) so one daily pass can drain a day of production instead of falling behind the shared 50k-row valve.
+
+### Changed
+
+- `CacheRetentionRule` gained optional `predicate`, `batchSize` and `maxBatchesPerPass` fields; the retention table is documented in `docs/data-retention-and-backups.md` §1.7.
+
 ## [5.4.3] - 2026-10-31
 
 ### Fixed

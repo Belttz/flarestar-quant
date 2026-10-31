@@ -43,6 +43,21 @@ export const SPREAD_SAMPLE_GRACE_MS = 2 * 60 * 60_000;
 /** Effective retention for `spread_samples`: the 24h cache window plus the span grace. */
 export const SPREAD_SAMPLE_RETENTION_MS = CACHE_RETENTION_MS + SPREAD_SAMPLE_GRACE_MS;
 
+/**
+ * Retention for **rejected** funding-arb scan candidates (`funding_arb_decisions`).
+ *
+ * That table is an audit trail, not a cache: every 10-minute scan writes one row per evaluated
+ * candidate (≈6.9k rows per scan, 99.999% of them `REJECT`). Nothing ever reads a row older than
+ * the newest 200 the audit tab asks for, yet the table had no retention rule at all and grew to
+ * ~3 GB (0.6M rows/day) in four days — the single largest object in the database.
+ *
+ * Six hours is deliberately far below the 24h cache window: rejected candidates are only useful
+ * for explaining "why did the scanner skip this pair *just now*", and six hours still covers ~36
+ * scans. `PASS` rows and rows bound to an opened strategy are never pruned by age: they document
+ * an actual trade and are cheap (tens per day), so they stay.
+ */
+export const FUNDING_ARB_REJECT_RETENTION_MS = 6 * 60 * 60_000;
+
 /** How many rows one DELETE statement may remove, so a maintenance pass never holds the write lock. */
 export const CACHE_PRUNE_BATCH_SIZE = 500;
 
@@ -76,6 +91,29 @@ export interface CacheRetentionRule {
    * "only the last 24h of *instant* data" (nothing accumulates) while removing that cold-start gap.
    */
   readonly keepNewest?: boolean;
+  /**
+   * Constant SQL predicate (never user input) that narrows which rows this rule may delete.
+   *
+   * Used by `funding_arb_decisions`, whose rows are not uniformly disposable: only `REJECT` rows
+   * that never opened a strategy expire. The fragment is a compile-time literal in this module —
+   * do not interpolate values into it; every real value stays bound as a parameter.
+   */
+  readonly predicate?: string;
+  /**
+   * Per-rule batch size override; defaults to `CACHE_PRUNE_BATCH_SIZE`.
+   *
+   * The funding-arb audit table produces ~0.6M rows/day, so a daily pass has to remove that many
+   * rows; the smaller cache tables are happy with the shared 500-row batch.
+   */
+  readonly batchSize?: number;
+  /**
+   * Per-rule batch cap override; defaults to `CACHE_PRUNE_MAX_BATCHES_PER_TABLE`.
+   *
+   * Together with `batchSize` this keeps a pass bounded while still being able to drain a full
+   * day of rejected candidates instead of falling behind (the 50k-row default is tuned for the
+   * small cache tables and would leave the backlog growing).
+   */
+  readonly maxBatchesPerPass?: number;
   /** Human-readable justification, also rendered by `docs/data-retention-and-backups.md`. */
   readonly reason: string;
 }
@@ -115,6 +153,23 @@ export const CACHE_RETENTION_TABLES: readonly CacheRetentionRule[] = [
       'Whole-document account snapshots behind the cold-start portfolio paint; equity history '
       + 'lives in portfolio_equity_samples, so anything older than a day is dead weight — except '
       + 'the newest row, which is kept as the cold-start fallback.',
+  },
+  {
+    table: 'funding_arb_decisions',
+    column: 'scanned_at',
+    timestamp: 'iso',
+    retentionMs: FUNDING_ARB_REJECT_RETENTION_MS,
+    // Only rejected candidates that never opened a strategy are audit noise; a PASS row (and any
+    // row bound to an opened strategy) documents a real trade and is kept forever.
+    predicate: "verdict = 'REJECT' AND strategy_id IS NULL",
+    // ≈0.6M rows/day has to be drainable in one daily pass; 1 000-row batches keep each write lock
+    // short while 1 200 batches leave headroom over the ~610 batches a pass actually needs.
+    batchSize: 1_000,
+    maxBatchesPerPass: 1_200,
+    reason:
+      'Per-candidate audit trail of the funding-arb scanner (≈6.9k rows every 10 min, 99.999% '
+      + 'REJECT). The panel only reads the newest 200 rows, so a rejected candidate older than 6h '
+      + 'is dead weight; PASS rows and rows tied to an opened strategy are kept regardless of age.',
   },
 ] as const;
 
@@ -244,16 +299,19 @@ function pruneTableInBatches(
 ): number | null {
   if (!tableExists(database, rule.table)) return null;
   const keepRowId = rule.keepNewest === true ? newestRowId(database, rule) : null;
-  // Only these constant table/column names reach the SQL text; every value is always bound.
+  // Constant table/column/predicate names reach the SQL text; every value is always bound.
+  const scope = rule.predicate === undefined ? '' : ` AND (${rule.predicate})`;
+  const effectiveBatchSize = Math.max(1, Math.trunc(rule.batchSize ?? batchSize));
+  const effectiveMaxBatches = Math.max(1, Math.trunc(rule.maxBatchesPerPass ?? maxBatches));
   const statement = keepRowId === null
     ? database.prepare(`
       DELETE FROM ${rule.table} WHERE rowid IN (
-        SELECT rowid FROM ${rule.table} WHERE ${rule.column} < ? ORDER BY rowid LIMIT ?
+        SELECT rowid FROM ${rule.table} WHERE ${rule.column} < ?${scope} ORDER BY rowid LIMIT ?
       )
     `)
     : database.prepare(`
       DELETE FROM ${rule.table} WHERE rowid IN (
-        SELECT rowid FROM ${rule.table} WHERE ${rule.column} < ? AND rowid <> ?
+        SELECT rowid FROM ${rule.table} WHERE ${rule.column} < ? AND rowid <> ?${scope}
         ORDER BY rowid LIMIT ?
       )
     `);
@@ -261,14 +319,14 @@ function pruneTableInBatches(
     ? new Date(cutoff).toISOString()
     : Math.trunc(cutoff);
   let deleted = 0;
-  for (let batch = 0; batch < maxBatches; batch += 1) {
+  for (let batch = 0; batch < effectiveMaxBatches; batch += 1) {
     const changes = keepRowId === null
-      ? statement.run(cutoffValue, batchSize).changes
-      : statement.run(cutoffValue, keepRowId, batchSize).changes;
+      ? statement.run(cutoffValue, effectiveBatchSize).changes
+      : statement.run(cutoffValue, keepRowId, effectiveBatchSize).changes;
     onBatch();
     deleted += changes;
     // A short batch means the table ran dry; stop instead of issuing another no-op DELETE.
-    if (changes < batchSize) break;
+    if (changes < effectiveBatchSize) break;
   }
   return deleted;
 }
