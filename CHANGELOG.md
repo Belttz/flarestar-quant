@@ -2,6 +2,12 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [5.4.7] - 2026-10-31
+
+### Fixed
+
+- **The portfolio "margin usage" meter no longer reports the maintenance ratio a second time.** The tile divided maintenance margin by the margin balance (production: 12.11 / 86.70 = 13.9%), which is exactly the reciprocal of the maintenance-margin-ratio tile beside it — a number that reads as "barely any of my money is committed" while 39.4% of the balance was already posted as initial margin. It now shows initial margin ÷ margin balance (39.4%) and is labelled "Initial margin used", so it answers "how much of my equity is doing work" instead of restating liquidation proximity.
+
 ## [5.4.6] - 2026-10-31
 
 ### Fixed

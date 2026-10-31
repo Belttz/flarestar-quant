@@ -561,11 +561,14 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
   const marginBalance = parseNumber(account?.marginBalance);
   const availableMargin = parseNumber(account?.availableMargin);
   const initialMargin = parseNumber(account?.initialMargin);
-  const maintenanceMargin = parseNumber(account?.maintenanceMargin);
   const initialMarginRate = marginRatePercent(account?.initialMarginRate);
   const maintenanceMarginRate = marginRatePercent(account?.maintenanceMarginRate);
-  const marginUsage = marginBalance !== null && marginBalance > 0 && maintenanceMargin !== null
-    ? (maintenanceMargin / marginBalance) * 100
+  // Share of the Gate margin balance already posted as initial margin - the same ratio the venue
+  // reports as "used margin". It must not be derived from the maintenance margin: that already
+  // shows up as the maintenance ratio tile (its reciprocal), which made the meter look far calmer
+  // than the account actually was (13.9% here versus the real 39.4% of equity in use).
+  const marginUsage = marginBalance !== null && marginBalance > 0 && initialMargin !== null
+    ? (initialMargin / marginBalance) * 100
     : null;
   const usageTone = marginUsage === null ? '' : marginUsage >= 85 ? 'critical' : marginUsage >= 60 ? 'hot' : '';
 
@@ -799,10 +802,10 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
         <em>{openLegCount} {t('open venue legs')}</em>
       </article>
       <article>
-        <span>{t('Margin usage')}</span>
+        <span>{t('Initial margin used')}</span>
         <strong>{marginUsage !== null ? `${marginUsage.toFixed(1)}%` : '—'}</strong>
         <span className="margin-meter"><i className={usageTone} style={{ width: `${Math.min(100, Math.max(0, marginUsage ?? 0))}%` }} /></span>
-        <em>{maintenanceMargin !== null ? `${t('Maintenance margin')} $${formatAmount(maintenanceMargin)}` : '—'} · {t('Gate basis: the denominator is Gate margin balance, where DEX legs have already netted their margin.')}</em>
+        <em>{initialMargin !== null ? `${t('Initial margin')} $${formatAmount(initialMargin)}` : '—'} · {t('Gate basis: the denominator is Gate margin balance, where DEX legs have already netted their margin.')}</em>
       </article>
     </section>
 
