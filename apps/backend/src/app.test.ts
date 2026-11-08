@@ -1763,6 +1763,66 @@ describe('local backend', () => {
     ]);
   });
 
+  it('clamps a snapshot-sized overshoot of the maximum transfer amount instead of rejecting it', async () => {
+    const { app, gateway } = await createTestApp({ liveTradingEnabled: true });
+    const host = { host: '127.0.0.1:17840' };
+    // 250.12500002 is what the page's "maximum" button produces when available margin drifts by a few
+    // low decimals between the snapshot and the submit; it must be clamped down to the live value.
+    const clamped = await app.inject({
+      method: 'POST', url: '/api/crossex/transfers',
+      headers: { ...host, 'x-gct-trading-intent': 'transfer-funds' },
+      payload: { coin: 'USDT', amount: '250.12500002', from: 'SPOT', to: 'CROSSEX' },
+    });
+    const oversized = await app.inject({
+      method: 'POST', url: '/api/crossex/transfers',
+      headers: { ...host, 'x-gct-trading-intent': 'transfer-funds' },
+      payload: { coin: 'USDT', amount: '250.2', from: 'SPOT', to: 'CROSSEX' },
+    });
+
+    expect(clamped.statusCode).toBe(200);
+    expect(gateway.createdTransfers).toHaveLength(1);
+    expect(gateway.createdTransfers[0]).toMatchObject({ coin: 'USDT', amount: '250.125', from: 'SPOT', to: 'CROSSEX' });
+    expect(oversized.statusCode).toBe(400);
+    expect(oversized.json()).toEqual({ error: 'invalid_transfer_amount', label: 'TRANSFER_AMOUNT_EXCEEDS_AVAILABLE' });
+  });
+
+  it('uses the CrossEx coin balance, not the available margin, as the transferable amount', async () => {
+    const { app, gateway } = await createTestApp({ liveTradingEnabled: true });
+    const host = { host: '127.0.0.1:17840' };
+    // Production case: 30 USDT of available margin while the CrossEx USDT balance is 0.15 — Gate
+    // answers TRANSFER_AMOUNT_INSUFFICIENT for anything above the balance.
+    accountFixture.assets.push({
+      coin: 'USDT', exchange_type: 'CROSSEX', balance: '0.15', upnl: '0', equity: '0.15',
+      futures_initial_margin: '0', futures_maintenance_margin: '0', borrowing_initial_margin: '0',
+      borrowing_maintenance_margin: '0', available_balance: '0.15', liability: '0',
+    });
+    try {
+      const balances = await app.inject({
+        method: 'GET', url: '/api/crossex/transfer-balances',
+        headers: { ...host, 'x-gct-read-intent': 'transfer-balances' },
+      });
+      const oversized = await app.inject({
+        method: 'POST', url: '/api/crossex/transfers',
+        headers: { ...host, 'x-gct-trading-intent': 'transfer-funds' },
+        payload: { coin: 'USDT', amount: '20', from: 'CROSSEX', to: 'SPOT' },
+      });
+      const exact = await app.inject({
+        method: 'POST', url: '/api/crossex/transfers',
+        headers: { ...host, 'x-gct-trading-intent': 'transfer-funds' },
+        payload: { coin: 'USDT', amount: '0.15', from: 'CROSSEX', to: 'SPOT' },
+      });
+
+      expect(balances.json().items).toContainEqual({ account: 'CROSSEX', coin: 'USDT', available: '0.15' });
+      expect(oversized.statusCode).toBe(400);
+      expect(oversized.json()).toEqual({ error: 'invalid_transfer_amount', label: 'TRANSFER_AMOUNT_EXCEEDS_AVAILABLE' });
+      expect(exact.statusCode).toBe(200);
+      expect(gateway.createdTransfers.at(-1)).toMatchObject({ coin: 'USDT', amount: '0.15', from: 'CROSSEX', to: 'SPOT' });
+    } finally {
+      const index = accountFixture.assets.findIndex((asset) => asset.exchange_type === 'CROSSEX' && asset.coin === 'USDT');
+      if (index >= 0) accountFixture.assets.splice(index, 1);
+    }
+  });
+
   it('rejects DNS-rebinding host headers and unexpected browser origins', async () => {
     const { app } = await createTestApp();
     const foreignHost = await app.inject({

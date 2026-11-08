@@ -465,9 +465,10 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
   const knownSourceAvailable = useMemo(() => {
     const queried = transferBalances.find((balance) => balance.account === transferFrom && balance.coin === transferCoin);
     if (queried) return queried.available;
-    if (transferFrom === 'CROSSEX' && transferCoin === 'USDT') return account?.availableMargin ?? null;
-    if (!transferFrom.startsWith('CROSSEX_')) return null;
-    const venue = transferFrom.slice('CROSSEX_'.length);
+    // The transferable amount is the coin balance inside that account, never the aggregate margin:
+    // available margin is not something Gate lets a transfer debit.
+    const venue = transferFrom.startsWith('CROSSEX_') ? transferFrom.slice('CROSSEX_'.length) : transferFrom === 'CROSSEX' ? 'CROSSEX' : null;
+    if (venue === null) return null;
     const available = balanceRows.find((row) => row.venue === venue && row.coin === transferCoin)?.available;
     return available === undefined ? null : String(available);
   }, [transferFrom, transferCoin, transferBalances, balanceRows, account?.availableMargin]);

@@ -2,6 +2,13 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [5.4.9] - 2026-11-08
+
+### Fixed
+
+- **The transfer panel no longer offers a "maximum" that the exchange can never accept.** For USDT out of CrossEx the panel (and the server-side pre-check) used the aggregate *available margin*, but Gate validates a CrossEx debit against that coin's own balance inside the CrossEx account. On the live account this meant a "maximum" of 30.047 USDT against a real USDT balance of 0.149 USDT: the click produced a 400 every time — either our own `TRANSFER_AMOUNT_EXCEEDS_AVAILABLE` when the snapshot was a hair stale, or Gate's `TRANSFER_AMOUNT_INSUFFICIENT`. Both the balances route and the transfer route now read the coin's CrossEx balance (`available_balance`), falling back to available margin only when the account reports no CrossEx row at all, and the panel derives its "maximum" from the same figure.
+- **A snapshot-sized overshoot of the maximum is clamped instead of rejected.** Transfer amounts are derived from a snapshot while available margin drifts in the low decimals with mark price and funding, so an exact "maximum" click could land a few 1e-9 above the live value. An overshoot within 0.0001 of the live balance is now clamped down to the live floor (never up); anything larger is still rejected with `TRANSFER_AMOUNT_EXCEEDS_AVAILABLE`.
+
 ## [5.4.8] - 2026-10-31
 
 ### Fixed

@@ -195,6 +195,10 @@ const PUBLIC_SNAPSHOT_FRESH_MS = 4_000;
 const BOROS_STRATEGIES_URL = 'https://api-boros.pendle.finance/apis/v1/strategies';
 const BOROS_MARKETS_URL = 'https://api-boros.pendle.finance/apis/v1/markets/by-ids';
 const BOROS_STRATEGIES_CACHE_MS = 30_000;
+// A "transfer everything" request is derived from a snapshot, so it can exceed the live available
+// balance by a rounding-sized amount (available margin drifts in the low decimals). Anything within
+// this tolerance is clamped down to the live floor before submission; larger overshoots are rejected.
+const TRANSFER_MAX_OVERSHOOT_TOLERANCE = new Decimal('0.0001');
 
 const CATALOG_VENUES = ['GATE', 'BINANCE', 'OKX', 'BYBIT', 'KRAKEN', 'HYPERLIQUID', 'DERIBIT', 'LIGHTER'] as const;
 const QUOTE_PREFERENCE = ['USDT', 'USDC', 'USD'] as const;
@@ -3473,7 +3477,11 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         const exchange = asset.exchange_type.toUpperCase();
         addBalance(exchange === 'CROSSEX' ? 'CROSSEX' : `CROSSEX_${exchange}`, asset.coin, asset.available_balance);
       }
-      addBalance('CROSSEX', 'USDT', account.available_margin);
+      // Gate validates a CROSSEX debit against that coin's own balance inside the CrossEx account,
+      // not against the aggregate available margin (an account can hold 30 USDT of margin while its
+      // USDT balance is 0.15 USDT, and Gate then answers TRANSFER_AMOUNT_INSUFFICIENT). Only when the
+      // account reports no CROSSEX row at all do we fall back to available margin.
+      if (!balances.has('CROSSEX:USDT')) addBalance('CROSSEX', 'USDT', account.available_margin);
       return {
         items: [...balances.values()].sort((left, right) => left.account.localeCompare(right.account) || left.coin.localeCompare(right.coin)),
         fetchedAt: new Date().toISOString(),
@@ -3579,22 +3587,42 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         if (canonicalTransfer.from === 'SPOT') {
           sourceAvailable = spotAccounts?.find((balance) => balance.currency === canonicalTransfer.coin)?.available ?? null;
         } else if (canonicalTransfer.from === 'CROSSEX') {
-          sourceAvailable = canonicalTransfer.coin === 'USDT' ? account.available_margin : null;
+          // Same rule as the balances route: Gate checks the coin balance inside CrossEx, so a
+          // "maximum" built from available margin would always be rejected.
+          const crossExAsset = account.assets.find(
+            (asset) => asset.exchange_type.toUpperCase() === 'CROSSEX' && asset.coin === canonicalTransfer.coin,
+          );
+          sourceAvailable = crossExAsset
+            ? crossExAsset.available_balance
+            : canonicalTransfer.coin === 'USDT' ? account.available_margin : null;
         } else {
           const exchange = canonicalTransfer.from.slice('CROSSEX_'.length);
           sourceAvailable = account.assets.find((asset) => asset.exchange_type === exchange && asset.coin === canonicalTransfer.coin)?.available_balance ?? null;
         }
         if (sourceAvailable === null) return reply.code(409).send({ error: 'source_balance_unavailable' });
+        // The client fills its "maximum" from a portfolio snapshot, but available margin drifts in the low
+        // decimals with mark price and funding. A "transfer everything" click therefore lands a hair above
+        // the live value and used to fail with TRANSFER_AMOUNT_EXCEEDS_AVAILABLE every time. A hair-sized
+        // overshoot is clamped down to the live floor (never up); anything bigger stays a hard rejection.
+        let requestedAmount = amount;
         if (amount.gt(sourceAvailable)) {
-          return reply.code(400).send({ error: 'invalid_transfer_amount', label: 'TRANSFER_AMOUNT_EXCEEDS_AVAILABLE' });
+          const flooredAvailable = new Decimal(sourceAvailable).toDecimalPlaces(coinRule.precision, Decimal.ROUND_DOWN);
+          if (flooredAvailable.gt(0) && amount.minus(flooredAvailable).lte(TRANSFER_MAX_OVERSHOOT_TOLERANCE)) {
+            requestedAmount = flooredAvailable;
+          } else {
+            return reply.code(400).send({ error: 'invalid_transfer_amount', label: 'TRANSFER_AMOUNT_EXCEEDS_AVAILABLE' });
+          }
         }
+        const transferRequest = requestedAmount.eq(amount)
+          ? canonicalTransfer
+          : { ...canonicalTransfer, amount: requestedAmount.toFixed() };
 
-        const transfer = await operationsGateway.createTransfer!(stableCredentials, canonicalTransfer);
+        const transfer = await operationsGateway.createTransfer!(stableCredentials, transferRequest);
         addAuditEvent(database, 'fund_transfer_submitted', {
           transactionId: transfer.tx_id,
           coin: canonicalTransfer.coin,
-          amount: canonicalTransfer.amount,
-          from: canonicalTransfer.from,
+          amount: transferRequest.amount,
+          from: transferRequest.from,
           to: canonicalTransfer.to,
         });
         request.log.info({ transactionId: transfer.tx_id, coin: canonicalTransfer.coin, from: canonicalTransfer.from, to: canonicalTransfer.to }, 'fund transfer submitted');
