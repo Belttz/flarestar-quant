@@ -2,6 +2,12 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [5.4.10] - 2026-11-08
+
+### Changed
+
+- **The transfer form now says what "available" actually means.** The field is labelled *Transferable* and carries the explanation that this is the coin balance inside the selected account, while the account's available margin is a margin figure Gate will not let a transfer debit. The old label said *Available* next to an amount derived from margin, which is how a wallet showing 30 USDT of available margin answered a 0.149 USDT transfer ceiling.
+
 ## [5.4.9] - 2026-11-08
 
 ### Fixed

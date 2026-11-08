@@ -873,7 +873,7 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
             </label>
           </div>
           <label className="transfer-field transfer-amount-field">
-            <span>{t('Amount')}<small>{t('Available')} {knownSourceAvailableNumber !== null ? formatAmount(knownSourceAvailableNumber, selectedTransferCoin?.precision ?? 6) : '—'} {transferCoin}</small></span>
+            <span>{t('Amount')}<small>{t('Transferable')} {knownSourceAvailableNumber !== null ? formatAmount(knownSourceAvailableNumber, selectedTransferCoin?.precision ?? 6) : '—'} {transferCoin}</small></span>
             <span className="transfer-input-wrap">
               <input
                 value={transferAmount}
@@ -893,6 +893,7 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
             <span>{t('Precision')}<strong>{selectedTransferCoin ? selectedTransferCoin.precision : '—'}</strong></span>
           </div>
           {transferCoinError && <p className="transfer-note warn">{t('Transfers are disabled until Gate limits are available.')}</p>}
+          <p className="transfer-note">{t('Transferable is the coin balance held in the selected account; available margin cannot be transferred out.')}</p>
           <p className="transfer-note">{t('Gate may restrict outbound transfers when account margin is near its risk limit.')}</p>
           {transferFeedback && <p className={`transfer-feedback ${transferFeedback.tone}`} role="status">{transferFeedback.message}</p>}
           <button className="transfer-submit" type="submit" disabled={transferring || transferCoinError || transferCoins.length === 0}>
